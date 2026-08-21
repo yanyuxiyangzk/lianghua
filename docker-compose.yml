@@ -1,0 +1,109 @@
+name: lianghua-quant
+
+# ============================================================
+# 量化闭环架构
+#   rdagent  : RD-Agent + Qlib 因子自动发掘/进化闭环（唯一智能体）
+#   qsys     : QSYS(QuantSys) 自研看板 —— 只做可视化/回测浏览/K线
+#
+# 关键机制（docker-out-of-docker）：
+#   RD-Agent 在容器内通过挂载的 docker.sock 调用宿主机 dockerd，
+#   启动 local_qlib 容器跑 qrun 回测。因此 RD-Agent 容器内的路径
+#   必须与宿主机路径一致（同路径挂载 ${LIANGHUA_ROOT}），
+#   且 HOME 指向宿主机有效目录，使 ~/.qlib 解析出的路径对
+#   宿主机 dockerd 同样有效。
+# ============================================================
+
+services:
+  # 本地 embedding 服务：DeepSeek 官方无 embedding 模型，
+  # RD-Agent 的因子知识库检索需要 embedding，用 ollama 跑 bge-m3（免费、本地、多语言）
+  ollama:
+    image: ollama/ollama:latest
+    container_name: lh-ollama
+    volumes:
+      - ollama_models:/root/.ollama
+    # 不对外暴露端口，仅供 compose 内网 rdagent 访问
+    restart: unless-stopped
+
+  rdagent:
+    build:
+      context: ./rdagent
+    image: lianghua/rdagent:0.8.0
+    container_name: lh-rdagent
+    working_dir: ${LIANGHUA_ROOT}
+    env_file:
+      - .env
+    environment: &rdagent-env
+      # 让 ~/.qlib 解析为宿主机有效路径（docker-out-of-docker 的命脉）
+      HOME: ${LIANGHUA_ROOT}/data/qlib_home
+      # 本机无 GPU，关闭 qlib 子容器的 GPU 申请
+      QLIB_DOCKER_ENABLE_GPU: "False"
+      # local_qlib:latest 已预构建，跳过 RD-Agent 每次启动时的自动重建
+      QLIB_DOCKER_BUILD_FROM_DOCKERFILE: "False"
+      QLIB_DOCKER_SHM_SIZE: "8g"
+      # rdagent 0.8.0 适配（官方按 conda 安装设计，容器内无 conda）：
+      # 1) get_factor_env 强制走 LocalEnv(CondaConf(CONDA_DEFAULT_ENV))，
+      #    给个占位名即可——conda 不存在时 bin_path 为空，落到容器系统 python（pandas/pyarrow 齐）
+      CONDA_DEFAULT_ENV: "rdagent"
+      # 2) 回测执行 env_type 默认 conda，必须切 docker 才走 local_qlib 容器
+      MODEL_COSTEER_ENV_TYPE: "docker"
+      # 3) rdagent 会把"包内模板目录"作为子容器挂载源（如 factor_data_template），
+      #    该路径必须落在宿主可见的项目目录下 → 用 vendor 副本优先于 site-packages
+      PYTHONPATH: "${LIANGHUA_ROOT}/vendor/py"
+      PYTHONUNBUFFERED: "1"
+      TZ: Asia/Shanghai
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      # 同路径挂载：容器内路径 == 宿主机路径
+      - ${LIANGHUA_ROOT}:${LIANGHUA_ROOT}
+    # pandarallel 并行算 IC 时往 /dev/shm 写中间文件，默认 64MB 会写爆（ENOSPC）；
+    # 因子库变大后 deduplicate 步骤峰值超过 2G → 提到 6G
+    shm_size: "6g"
+    ports:
+      - "19899:19899"   # RD-Agent 官方监控 UI（rdagent ui，可选）
+    command: ["tail", "-f", "/dev/null"]
+    restart: unless-stopped
+
+  # 进化循环常驻服务：看门狗作为主进程（崩溃自动断点续跑 + 卡死检测重启），
+  # 容器重启（reboot/compose up）自动拉起，彻底免人工
+  rdagent-loop:
+    image: lianghua/rdagent:0.8.0
+    container_name: lh-rdagent-loop
+    working_dir: ${LIANGHUA_ROOT}
+    env_file:
+      - .env
+    environment: *rdagent-env
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ${LIANGHUA_ROOT}:${LIANGHUA_ROOT}
+    shm_size: "6g"
+    command: ["bash", "rdagent/factor_supervisor.sh"]
+    restart: unless-stopped
+
+  qsys:
+    build:
+      context: ./qsys
+    image: lianghua/qsys:0.1.0
+    container_name: lh-qsys
+    env_file:
+      - .env
+    environment:
+      QLIB_DATA_DIR: /data/qlib/cn_data
+      LOG_DIR: /work/log
+      WORKSPACE_ROOT: /work
+      WATCHLIST_FILE: /data/watchlist.json
+      LIANGHUA_ROOT: ${LIANGHUA_ROOT}
+      STREAMLIT_SERVER_ADDRESS: 0.0.0.0
+      STREAMLIT_SERVER_PORT: "8501"
+      STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
+      TZ: Asia/Shanghai
+    volumes:
+      - ./log:/work/log:ro                       # RD-Agent 进化日志/会话（只读）
+      - ./git_ignore_folder:/work/git_ignore_folder:ro   # RD-Agent workspace（qlib mlruns 产物）
+      - ./data/qlib_home/.qlib/qlib_data:/data/qlib      # Qlib 行情（rw：定时任务"数据更新"要写）
+      - ./qsys/data:/data                        # 自选股等看板自身数据（可写）
+    ports:
+      - "8501:8501"
+    restart: unless-stopped
+
+volumes:
+  ollama_models:

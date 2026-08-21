@@ -1,0 +1,31 @@
+# Local configuration and secrets
+.env
+
+# Runtime output and logs
+*.log
+log/
+
+# Generated datasets and caches
+data/
+pickle_cache/
+git_ignore_folder/
+**/__pycache__/
+*.py[cod]
+*.pkl
+*.pickle
+*.h5
+*.parquet
+*.feather
+
+# Local tooling state
+.claude/*.lock
+.agents/
+.codex/
+
+# Build and editor artifacts
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.DS_Store

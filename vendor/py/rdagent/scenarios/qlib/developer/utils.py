@@ -41,11 +41,20 @@ def process_factor_data(exp_or_list: List[QlibFactorExperiment] | QlibFactorExpe
                     n=RD_AGENT_SETTINGS.multi_proc_n,
                 )
                 error_message = ""
-                for message, df in message_and_df_list:
+                for i, (message, df) in enumerate(message_and_df_list):
                     # Check if factor generation was successful
                     if df is not None and "datetime" in df.index.names:
                         time_diff = df.index.get_level_values("datetime").to_series().diff().dropna().unique()
                         if pd.Timedelta(minutes=1) not in time_diff:
+                            # 本地补丁：float64 -> float32，并回写 list 替换掉原件引用。
+                            # qlib 原生数据本就是 float32，精度无损、内存减半；
+                            # 不回写则 float64 原件被 message_and_df_list 持有至整个
+                            # exp 处理完，副本与原件同时驻留，SOTA 因子库逐轮累积后
+                            # 在 concat 时撑爆 WSL2 内存（OOM Kill）。
+                            float64_cols = df.select_dtypes("float64").columns
+                            if len(float64_cols) > 0:
+                                df = df.astype({c: "float32" for c in float64_cols}, copy=False)
+                                message_and_df_list[i] = (message, df)
                             factor_dfs.append(df)
                             logger.info(
                                 f"Factor data from {exp.hypothesis.concise_justification} is successfully generated."

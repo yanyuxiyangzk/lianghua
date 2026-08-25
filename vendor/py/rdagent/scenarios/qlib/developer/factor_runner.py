@@ -1,5 +1,8 @@
 from pathlib import Path
+import os
+import warnings
 
+import numpy as np
 import pandas as pd
 from pandarallel import pandarallel
 
@@ -59,16 +62,29 @@ class QlibFactorRunner(CachedRunner[QlibFactorExperiment]):
         # return the new_feature
 
         concat_feature = pd.concat([SOTA_feature, new_feature], axis=1)
-        IC_max = (
-            concat_feature.groupby("datetime")
-            .parallel_apply(
-                lambda x: self.calculate_information_coefficient(x, SOTA_feature.shape[1], new_feature.shape[1])
-            )
-            .mean()
+        n_sota, n_new = SOTA_feature.shape[1], new_feature.shape[1]
+        # 本地补丁 v2：弃用 pandarallel 的 parallel_apply（其 SyncManager 在 worker 被 OOM
+        # 杀掉后主进程永久挂起）；且逐日 np.corrcoef 遇 NaN 整天作废（A 股停牌/新股
+        # 使 6075 只票几乎每天都有 NaN → IC 全 NaN → 误判"高度相似"整轮拒绝）。
+        # 现改为逐日 df.corr()：与原版逐列 Series.corr 同为"成对完整观测"语义，
+        # 但一次算完整个相关块再取 SOTA×new 子块，比逐对调用快约两个数量级。
+        day_ics = []
+        for _, day_df in concat_feature.groupby("datetime"):
+            corr = day_df.corr()  # pairwise 完整观测，NaN 安全
+            day_ics.append(corr.iloc[:n_sota, n_sota:].to_numpy())
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            ic_mean = np.nanmean(np.stack(day_ics), axis=0)  # (n_sota, n_new)
+            IC_max = pd.Series(np.nanmax(ic_mean, axis=0))  # 每个新因子与全部 SOTA 的最大 IC
+        # 阈值可配 + 数值透明化：如需放宽去重，在 .env 设 QLIB_FACTOR_DEDUP_IC；
+        # 日志逐因子输出实际 IC_max，便于判断"高度相似"拒绝是否属实。
+        threshold = float(os.environ.get("QLIB_FACTOR_DEDUP_IC", "0.99"))
+        logger.info(
+            "新因子 vs SOTA 最大|IC|: "
+            + ", ".join(f"{c}={v:.3f}" for c, v in zip(new_feature.columns, IC_max))
+            + f"(剔除阈值 {threshold})"
         )
-        IC_max.index = pd.MultiIndex.from_product([range(SOTA_feature.shape[1]), range(new_feature.shape[1])])
-        IC_max = IC_max.unstack().max(axis=0)
-        return new_feature.iloc[:, IC_max[IC_max < 0.99].index]
+        return new_feature.iloc[:, IC_max[IC_max < threshold].index]
 
     @cache_with_pickle(CachedRunner.get_cache_key, CachedRunner.assign_cached_result)
     def develop(self, exp: QlibFactorExperiment) -> QlibFactorExperiment:

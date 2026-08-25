@@ -22,6 +22,8 @@ MAIN_FWD = 20          # 主评估窗口（交易日）
 EST_WINDOW = 250       # walk-forward 估计窗（交易日）
 STEP_DAYS = 20         # walk-forward 应用窗/步长
 CORR_THRESHOLD = 0.7   # 去冗余相关性阈值
+# 多周期胜率标准（交易日）：1天/5天/1月/3月/6月 —— 因子与策略统一按此衡量
+WIN_HORIZONS = {"1日": 1, "5日": 5, "20日": 20, "60日": 60, "120日": 120}
 
 
 # ---------------------------------------------------------------- 基础件
@@ -114,9 +116,12 @@ def decay_curve(fac: dict, codes: list[str], end: str, source: str | None = None
 
 
 def top_group_winrate(vals: pd.Series, panel: pd.DataFrame, fwd_days: int = MAIN_FWD,
-                      step: int = STEP_DAYS, pct: float = 0.1) -> float:
-    """每 step 个交易日取 Top 十分位组合，forward 超额>0 的占比。"""
-    fwd = forward_returns(panel, fwd_days)
+                      step: int = STEP_DAYS, pct: float = 0.1,
+                      fwd: pd.DataFrame | None = None) -> float:
+    """每 step 个交易日取 Top 十分位组合，forward 超额>0 的占比。
+    fwd 可传入预算好的远期收益表（批量多周期评估时避免重复计算）。"""
+    if fwd is None:
+        fwd = forward_returns(panel, fwd_days)
     v = _norm(vals.dropna())
     days = v.index.get_level_values("datetime").unique()[::step]
     wins = []
@@ -134,26 +139,45 @@ def top_group_winrate(vals: pd.Series, panel: pd.DataFrame, fwd_days: int = MAIN
 
 
 def build_scorecard(factors: list[dict], codes: list[str], end: str,
-                    source: str | None = None) -> pd.DataFrame:
-    """因子体检表：每个因子一行。"""
+                    source: str | None = None, train_end: str | None = None) -> pd.DataFrame:
+    """因子体检表：每个因子一行，含 1/5/20/60/120 日五档 Top 组胜率（统一多周期标准）。
+
+    train_end（防未来函数预选）：给定则把面板/因子值/IC 全部物理截断到该日——
+    截断后长周期远期收益为 NaN 自然跳过，统计零泄漏；"这批因子好不好"的结论
+    只来自 train_end 之前，其后区间留给 walk-forward 做真样本外。"""
     rows = []
+    panel, fwds = None, {}
     for fac in factors:
         try:
             ic = get_ic_series(fac, codes, end, source=source)
             if ic.empty:
                 raise RuntimeError("IC 序列为空")
             vals = get_factor_values(fac, codes, end, source=source)
-            panel = sig.get_panel_cached(codes, end, 800, source=source)
+            if panel is None:
+                panel = sig.get_panel_cached(codes, end, 800, source=source)
+                if train_end:
+                    panel = panel[panel.index.get_level_values("datetime") <= train_end]
+                fwds = {d: forward_returns(panel, d) for d in WIN_HORIZONS.values()}
+            if train_end:
+                ic = ic[ic.index <= train_end]
+                vals = vals[vals.index.get_level_values("datetime") <= train_end]
+                if ic.empty or vals.empty:
+                    raise RuntimeError("预选窗内无数据")
             kind_label = {"evolved": "进化", "builtin": "内置", "tech": "技术指标",
                             "loopengine": "演化引擎"}.get(fac["kind"], fac["kind"])
-            rows.append({
+            row = {
                 "因子": fac["name"], "来源": kind_label,
                 "IC均值": ic.mean(), "ICIR": ic.mean() / (ic.std() + 1e-12),
                 "IC胜率": (ic > 0).mean(),
-                "Top组胜率": top_group_winrate(vals, panel),
+                "Top组胜率": top_group_winrate(vals, panel, fwd=fwds[MAIN_FWD]),
                 "建议方向": "正向" if ic.mean() >= 0 else "负向",
                 "天数": len(ic),
-            })
+            }
+            for label, d in WIN_HORIZONS.items():
+                # 短周期加密采样（1日/5日 step=5），长周期按默认步长
+                row[f"{label}胜率"] = top_group_winrate(
+                    vals, panel, fwd_days=d, step=(5 if d <= 5 else STEP_DAYS), fwd=fwds[d])
+            rows.append(row)
         except Exception as e:
             rows.append({"因子": fac["name"], "来源": fac["kind"], "IC均值": np.nan,
                          "ICIR": np.nan, "IC胜率": np.nan, "Top组胜率": np.nan,
@@ -190,14 +214,18 @@ def dedup_factors(corr: pd.DataFrame, scorecard: pd.DataFrame, threshold: float 
 
 
 # ---------------------------------------------------------------- 加权
-def compute_weights(scorecard: pd.DataFrame, method: str, names: list[str]) -> dict:
-    """返回 {因子名: (权重, 方向±1)}。方向自动修正：IC 均值为负 → 负向。"""
+def compute_weights(scorecard: pd.DataFrame, method: str, names: list[str],
+                    win_col: str = "Top组胜率") -> dict:
+    """返回 {因子名: (权重, 方向±1)}。方向自动修正：IC 均值为负 → 负向。
+    win_col 指定胜率来源列（多周期标准下用所选持有期的胜率，如 "1日胜率"）。"""
     sc = scorecard.set_index("因子")
+    if win_col not in sc.columns:
+        win_col = "Top组胜率"
     direction = {n: (1 if sc.loc[n, "IC均值"] >= 0 else -1) for n in names}
     raw = {}
     for n in names:
         icir = abs(sc.loc[n, "ICIR"]) if np.isfinite(sc.loc[n, "ICIR"]) else 0
-        win = sc.loc[n, "Top组胜率"] if np.isfinite(sc.loc[n, "Top组胜率"]) else 0.5
+        win = sc.loc[n, win_col] if np.isfinite(sc.loc[n, win_col]) else 0.5
         if method == "等权":
             raw[n] = 1.0
         elif method == "ICIR加权":
@@ -264,11 +292,16 @@ def factor_group_backtest(vals: pd.Series, panel: pd.DataFrame, n_groups: int = 
             "ic": ic_series(vals, forward_returns(panel, fwd_days))}
 def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method: str,
                  top_n: int, est: int = EST_WINDOW, step: int = STEP_DAYS,
-                 fwd_days: int = MAIN_FWD) -> pd.DataFrame:
+                 fwd_days: int = MAIN_FWD, cost: float = 0.0025,
+                 buffer_n: int = 0) -> pd.DataFrame:
     """滚动样本外：每个应用点 t，用 [t-est, t-fwd] 的 IC 统计定权重与方向，
     在 t 截面打分取 Top-N，记录随后 fwd_days 的超额收益。
 
-    同时输出等权组合对照列。返回逐点 DataFrame。
+    同时输出等权组合对照列。cost=双边往返成本（默认 0.25%）——
+    换手率 = 与上期名单的替换比例，扣费超额 = 毛超额 - 换手×cost。
+    1 日口径下换手极高，扣费后超额才是能装进口袋的部分。
+    buffer_n>0 时启用缓冲带：上期持仓只要没跌出 Top(top_n+buffer_n) 就继续持有，
+    是降换手的标准做法（实测可把 1 日口径 80%/日的换手压到 ~30%）。
     """
     fwd = forward_returns(panel, fwd_days)
     # 全历史 IC 序列（每个因子算一次，应用点只做切片统计 → 快）
@@ -285,6 +318,7 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
     if len(days) < est + fwd_days + step:
         return pd.DataFrame()
 
+    prev_picks: dict[str, set] = {"优化组合": set(), "等权组合": set()}
     rows = []
     for t_idx in range(est, len(days) - fwd_days, step):
         t = days[t_idx]
@@ -323,10 +357,24 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
         row = {"调仓日": str(t)[:10], "池内中位收益": fr.median()}
         for label, weights in [("优化组合", w_opt), ("等权组合", w_eq)]:
             sc_t = _score(weights)
-            picks = sc_t[sc_t.index.isin(fr.index)].nlargest(top_n)
+            ranked = sc_t[sc_t.index.isin(fr.index)].sort_values(ascending=False)
+            prev = prev_picks[label]
+            if buffer_n > 0 and prev:
+                # 缓冲带：上期持仓未跌出 Top(top_n+buffer_n) 的保留，空位按分补
+                eligible = set(ranked.index[:top_n + buffer_n])
+                keep = [c for c in prev if c in eligible]
+                picks_codes = (keep + [c for c in ranked.index if c not in keep])[:top_n]
+            else:
+                picks_codes = list(ranked.index[:top_n])
+            picks = ranked[ranked.index.isin(picks_codes)]
             if len(picks) >= max(3, top_n // 2):
+                cur = set(picks.index)
+                turnover = 1.0 if not prev else 1 - len(cur & prev) / len(picks)
+                prev_picks[label] = cur
                 row[f"{label}收益"] = fr[picks.index].mean()
                 row[f"{label}超额"] = row[f"{label}收益"] - fr.median()
+                row[f"{label}换手率"] = turnover
+                row[f"{label}扣费超额"] = row[f"{label}超额"] - turnover * cost
         if "优化组合超额" in row:
             rows.append(row)
     return pd.DataFrame(rows)

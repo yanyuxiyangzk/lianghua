@@ -28,6 +28,8 @@ SOURCES = {
     "akshare": {"name": "akshare·新浪日线（前复权）", "minute": True, "note": "网页接口，首次抓取较慢"},
     "easytdx": {"name": "easy-tdx·通达信（日线/分钟/逐笔竞价）", "minute": True,
                 "note": "TDX TCP 行情，含集合竞价逐笔标记"},
+    "ths_ifind": {"name": "同花顺 iFinD（日线·官方接口）", "minute": False,
+                  "note": "需 iFinDPy SDK + 账号凭证，见 README 同花顺接入"},
 }
 
 _QLIB_READY = False
@@ -182,6 +184,114 @@ def _ak_daily_cached(code: str, start: str, end: str) -> pd.DataFrame:
     return df
 
 
+# ---------------------------------------------------------------- 同花顺 iFinD 通道
+# SDK 不在 PyPI：需到 https://quantapi.51ifind.com 下载 Linux 版 iFinDPy 安装进 lh-qsys 容器。
+# 凭证（三选二之一）：环境变量 THS_IFIND_ACCOUNT + THS_IFIND_PASSWORD，
+# 或 THS_IFIND_REFRESH_TOKEN；也可写在 settings.json 的 "ths_ifind" 节。
+_THS = {"logged_in": False}
+
+
+def _ths_credentials() -> tuple[str, str, str]:
+    acc = os.environ.get("THS_IFIND_ACCOUNT", "")
+    pwd = os.environ.get("THS_IFIND_PASSWORD", "")
+    token = os.environ.get("THS_IFIND_REFRESH_TOKEN", "")
+    if not (acc or token) and SETTINGS_FILE.exists():
+        try:
+            cfg = json.loads(SETTINGS_FILE.read_text()).get("ths_ifind", {})
+            acc, pwd = acc or cfg.get("account", ""), pwd or cfg.get("password", "")
+            token = token or cfg.get("refresh_token", "")
+        except Exception:
+            pass
+    return acc, pwd, token
+
+
+def _ths_login() -> bool:
+    """iFinDPy 登录单例。返回 True 表示可用；否则抛带指引的异常。"""
+    if _THS["logged_in"]:
+        return True
+    try:
+        import iFinDPy as ths
+    except ImportError:
+        raise RuntimeError(
+            "未安装 iFinDPy SDK：到 quantapi.51ifind.com 下载 Linux 版，"
+            "在 lh-qsys 容器内 pip 安装后重试")
+    acc, pwd, token = _ths_credentials()
+    if token:
+        ret = ths.THS_iFinDLogin(token)
+    elif acc and pwd:
+        ret = ths.THS_iFinDLogin(acc, pwd)
+    else:
+        raise RuntimeError(
+            "未配置同花顺凭证：设置 THS_IFIND_ACCOUNT/THS_IFIND_PASSWORD "
+            "或 THS_IFIND_REFRESH_TOKEN（.env 或 settings.json 的 ths_ifind 节）")
+    # 返回值版本兼容：老版 int(0=成功)；新版 dict/对象带 errorcode
+    if isinstance(ret, int):
+        errcode = ret
+    elif isinstance(ret, dict):
+        errcode = ret.get("errorcode", -1)
+    else:
+        errcode = getattr(ret, "errorcode", -1)
+    if errcode != 0:
+        _THS["logged_in"] = False
+        raise RuntimeError(f"iFinD 登录失败(errorcode={errcode})：检查账号/权限/refresh_token")
+    _THS["logged_in"] = True
+    return True
+
+
+def _to_ths_code(code: str) -> str:
+    """SH600519 → 600519.SH（同花顺 thscode 版式）。"""
+    m = re.match(r"^([A-Za-z]{2})(\d{6})$", code)
+    return f"{m.group(2)}.{m.group(1).upper()}" if m else code
+
+
+def _ths_fetch_daily(code: str, start: str, end: str) -> int:
+    """iFinD 日线 → market.db（source='ths_ifind'），返回写入行数。
+
+    联调注意（拿到账号后核对一次）：
+      - volume 单位（股/手）与其他源是否一致，不一致则在此 ×100 对齐
+      - THS_HQ 默认不复权；如需前复权在第三个参数加复权标志（以官方文档为准）
+    """
+    _ths_login()
+    import iFinDPy as ths
+
+    res = ths.THS_HQ(_to_ths_code(code), "open,high,low,close,volume,amount", "", start, end)
+    df = res if isinstance(res, pd.DataFrame) else getattr(res, "data", None)
+    if df is None or df.empty:
+        return 0
+    # 列名归一：time/date/trade_date → date；数值列小写对齐
+    df.columns = [str(c).strip().lower() for c in df.columns]
+    date_col = next((c for c in ("time", "date", "trade_date") if c in df.columns), None)
+    if date_col is None:
+        return 0
+    df = df.rename(columns={date_col: "date"})
+    df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+    df = df[(df["date"] >= start) & (df["date"] <= end)]
+    if df.empty:
+        return 0
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with _conn() as c:
+        c.executemany(
+            "INSERT OR REPLACE INTO market_daily (source, code, date, open, high, low, close, volume, amount, fetched_at)"
+            " VALUES ('ths_ifind',?,?,?,?,?,?,?,?,?)",
+            [(code, r.date, r.open, r.high, r.low, r.close, r.volume, r.amount, now)
+             for r in df.itertuples()])
+    return len(df)
+
+
+def ths_selftest() -> str:
+    """凭证/连通性自检：登录 + 拉茅台近 10 天日线。供命令行快速验证：
+    docker exec lh-qsys python -c "import datasource; print(datasource.ths_selftest())"
+    """
+    try:
+        _ths_login()
+        end = datetime.now().strftime("%Y-%m-%d")
+        start = (datetime.now() - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
+        n = _ths_fetch_daily("SH600519", start, end)
+        return f"OK：登录成功，SH600519 近10天日线写入 {n} 行" if n else "登录成功但未取到数据（检查权限）"
+    except Exception as e:
+        return f"FAIL：{e}"
+
+
 # ---------------------------------------------------------------- easy-tdx（通达信 TCP）通道
 _TDX = {"client": None}
 # 实测数据质量+速度双优的服务器（2026-08 验证；from_best_host 会选到返回空数据的坏节点，故钉死）
@@ -251,8 +361,9 @@ def _tdx_fetch_daily(code: str, start: str, end: str) -> int:
 
 
 def _cached_daily(code: str, start: str, end: str, source: str) -> pd.DataFrame:
-    """通用读穿缓存（akshare/easytdx 共用）。"""
-    fetcher = {"akshare": _ak_fetch_daily, "easytdx": _tdx_fetch_daily}[source]
+    """通用读穿缓存（akshare/easytdx/ths_ifind 共用）。"""
+    fetcher = {"akshare": _ak_fetch_daily, "easytdx": _tdx_fetch_daily,
+               "ths_ifind": _ths_fetch_daily}[source]
     with _conn() as c:
         have = c.execute("SELECT MIN(date), MAX(date), COUNT(*) FROM market_daily"
                          " WHERE source=? AND code=?", (source, code)).fetchone()

@@ -163,7 +163,7 @@ def sector_daily_status() -> dict:
 
 
 def backfill_sector_daily(days: int = 260, background: bool = True):
-    """用 stock_industry 映射 × qlib 股票日线，回填板块日线（等权涨跌幅/成交额/涨跌家数）。"""
+    """用 stock_industry 映射 × 股票日线回填板块日线（跟随全局数据源，qlib 兜底；等权涨跌幅/成交额/涨跌家数）。"""
     if _backfill_state["running"]:
         return
 
@@ -177,21 +177,35 @@ def backfill_sector_daily(days: int = 260, background: bool = True):
                 raise RuntimeError("行业分类为空，先同步行业分类")
             codes = imap["code"].tolist()
             code2sector = dict(zip(imap["code"], imap["sector_name"]))
-            cal = ds.QLIB_DATA_DIR / "calendars" / "day.txt"
-            end = cal.read_text().splitlines()[-1].strip()
+            src = ds.get_source()
+            if src == "qlib_local":
+                cal = ds.QLIB_DATA_DIR / "calendars" / "day.txt"
+                end = cal.read_text().splitlines()[-1].strip()
+            else:
+                # 在线源（easytdx/ths_ifind/akshare）数据到今天，不套 qlib 日历的截止日期
+                end = datetime.now().strftime("%Y-%m-%d")
             start = (pd.Timestamp(end) - pd.Timedelta(days=int(days * 1.6))).strftime("%Y-%m-%d")
-            panel = ds._qlib_daily(codes, ["$close", "$amount"], start=start, end=end)
+            # 跟随全局数据源；在线源首次逐股回填较慢（读穿缓存，逐日增量后很快）
+            used_qlib = src == "qlib_local"
+            panel = ds._qlib_daily(codes, ["$close", "$amount"], start=start, end=end) \
+                if used_qlib else ds.get_panel(codes, start, end, ["$close", "$amount"], source=src)
+            if panel.empty and not used_qlib:
+                # 在线源不可用时回退本地库，保证页面有数据
+                panel = ds._qlib_daily(codes, ["$close", "$amount"], start=start, end=end)
+                used_qlib = True
             if panel.empty:
                 raise RuntimeError("qlib 取数为空")
             close = panel["$close"].unstack("instrument").sort_index().tail(days + 1)
             amount = panel["$amount"].unstack("instrument").sort_index().tail(days + 1)
             chg = close.pct_change(fill_method=None) * 100
             sector_series = pd.Series(code2sector)
+            # 单位对齐：qlib $amount 为千元，market.db 各在线源为元
+            amount_scale = 1000 if used_qlib else 1
             rows = []
             dates = chg.index[1:]
             for i, dt in enumerate(dates):
                 c_row = chg.iloc[i + 1]
-                a_row = amount.iloc[i + 1] * 1000  # qlib $amount 单位为千元 → 元
+                a_row = amount.iloc[i + 1] * amount_scale
                 tmp = pd.DataFrame({"chg": c_row, "amt": a_row})
                 tmp["sector"] = sector_series.reindex(tmp.index)
                 # 量价净流：个股涨记 +成交额、跌记 -成交额（日线级资金流代理，可回填全历史）

@@ -547,6 +547,41 @@ def composite_score(factor_series: dict[str, pd.Series], weights: dict[str, tupl
     return (combo / max(w_total, 1e-12)).dropna().sort_values(ascending=False)
 
 
+def industry_cap_select(score: pd.Series, cap: int = 2) -> pd.Series:
+    """行业分散：按综合分降序贪心选取，每个行业最多 cap 只（防单一赛道扎堆回撤）。
+    行业映射用 stock_industry 表；无映射的票不受限。"""
+    import sectorflow
+
+    imap = sectorflow.industry_map()
+    if imap.empty:
+        return score
+    code2sec = dict(zip(imap["code"], imap["sector_name"]))
+    kept, cnt = [], {}
+    for code in score.sort_values(ascending=False).index:
+        sec = code2sec.get(code)
+        if sec is not None and cnt.get(sec, 0) >= cap:
+            continue
+        cnt[sec] = cnt.get(sec, 0) + 1
+        kept.append(code)
+    return score.loc[kept]
+
+
+def resonance_select(f_series: dict, weights_a: dict, weights_b: dict,
+                     top_n: int, k: int | None = None) -> pd.Series:
+    """多周期共振：两套权重（如 1日口径 + 5日口径）各打一次综合分，
+    双 Top(2N) 交集优先（按名次和排序），不足部分用主口径 A 名单补。
+    返回按共振顺序的前 k 名（分数取 A 口径），调用方再做过滤/截断。"""
+    sa = composite_score(f_series, weights_a)
+    sb = composite_score(f_series, weights_b)
+    k = k or top_n * 2
+    top_a, top_b = list(sa.head(k).index), list(sb.head(k).index)
+    bset = set(top_b)
+    both = [c for c in top_a if c in bset]
+    both.sort(key=lambda c: top_a.index(c) + top_b.index(c))
+    order = both + [c for c in top_a if c not in bset]
+    return sa.loc[order[:k]]
+
+
 # ---------------------------------------------------------------- 策略过滤（基于最新行情）
 STRATEGY_FILTERS = {
     "tradable": "排除停牌（最后一日成交量>0）",

@@ -57,6 +57,25 @@ def init_qlib():
     return True
 
 
+def _qlib_cal_last_day() -> str:
+    """qlib 本地库日历末日——成分股任期文件的天然参照系。"""
+    cal = QLIB_DATA_DIR / "calendars" / "day.txt"
+    return cal.read_text().splitlines()[-1].strip() if cal.exists() else "未知"
+
+
+def trade_day_offset(day: str, n: int) -> str:
+    """日历上 day 偏移 n 个交易日（负=往前），越界钳到端点。"""
+    import bisect
+
+    cal = QLIB_DATA_DIR / "calendars" / "day.txt"
+    days = [x.strip() for x in cal.read_text().splitlines() if x.strip()] if cal.exists() else []
+    if not days:
+        return day
+    i = bisect.bisect_left(days, day)
+    j = min(max(i + n, 0), len(days) - 1)
+    return days[j]
+
+
 @st.cache_data(ttl=3600)
 def get_instruments(pool_file: str = "all") -> list[str]:
     """读取指数成分文件。qlib instruments 文件含历史任期段（code\\tstart\\tend 多行），
@@ -66,7 +85,9 @@ def get_instruments(pool_file: str = "all") -> list[str]:
         return []
     if pool_file == "all":
         return sorted({line.split("\t")[0].strip() for line in f.read_text().splitlines() if line.strip()})
-    asof = get_last_trade_day()
+    # asof 必须用 qlib 日历末日而非今天：任期 end 跟随数据包截止日，
+    # 用今天会超出所有任期、筛出空池（2026-08-25 实测踩坑）
+    asof = _qlib_cal_last_day()
     codes = set()
     for line in f.read_text().splitlines():
         parts = line.split("\t")
@@ -98,8 +119,18 @@ def set_data_source(source: str):
 
 @st.cache_data(ttl=1800)
 def get_last_trade_day() -> str:
-    cal = QLIB_DATA_DIR / "calendars" / "day.txt"
-    return cal.read_text().splitlines()[-1].strip() if cal.exists() else "未知"
+    """评估/取数截止日，跟随当前数据源：
+    在线源（easytdx/ths_ifind/akshare）取到今天（抓取器自然截到最近交易日）；
+    qlib_local 用 qlib 日历末日（本地库的真实边界）。"""
+    try:
+        import datasource
+        from datetime import datetime as _dt
+
+        if datasource.get_source() != "qlib_local":
+            return _dt.now().strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    return _qlib_cal_last_day()
 
 
 # ---------------------------------------------------------------- 自选/板块组
@@ -134,11 +165,26 @@ def all_pools() -> dict:
 
 
 # ---------------------------------------------------------------- RD-Agent 日志解析
+def trace_last_activity(path: Path) -> float:
+    """trace 的最近活动时间(浅扫两层,避免目录 mtime 不冒泡导致误判)。"""
+    latest = path.stat().st_mtime
+    try:
+        for sub in path.iterdir():
+            latest = max(latest, sub.stat().st_mtime)
+            if sub.is_dir():
+                for f in sub.iterdir():
+                    latest = max(latest, f.stat().st_mtime)
+    except OSError:
+        pass
+    return latest
+
+
 def list_traces() -> list[Path]:
+    """按最近活动时间倒序(长跑会话靠断点续跑,目录名永远是启动日,按名字排序会把活跃会话排错)。"""
     if not LOG_DIR.exists():
         return []
-    return sorted([p for p in LOG_DIR.iterdir() if p.is_dir() and re.match(r"\d{4}-\d{2}-\d{2}_", p.name)],
-                  reverse=True)
+    traces = [p for p in LOG_DIR.iterdir() if p.is_dir() and re.match(r"\d{4}-\d{2}-\d{2}_", p.name)]
+    return sorted(traces, key=trace_last_activity, reverse=True)
 
 
 def _rebase_workspace(ws_path: str) -> Path | None:

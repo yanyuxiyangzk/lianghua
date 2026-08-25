@@ -14,7 +14,19 @@ if not traces:
     st.info(f"未发现 RD-Agent 运行记录（{LOG_DIR} 下没有 trace 目录）。先跑 `rdagent fin_factor`。")
     st.stop()
 
-sel = st.selectbox("选择一次进化运行（trace）", traces, format_func=lambda p: p.name)
+# trace 目录名是会话启动日(长跑会话靠断点续跑,名字永远不变),
+# 选择器同时展示最近活动时间,避免误以为数据陈旧
+from common import trace_last_activity  # noqa: E402
+from datetime import datetime  # noqa: E402
+
+
+def _trace_label(p) -> str:
+    last = datetime.fromtimestamp(trace_last_activity(p))
+    fresh = " 🟢" if (datetime.now() - last).total_seconds() < 1800 else ""
+    return f"{p.name} · 最近活动 {last:%m-%d %H:%M}{fresh}"
+
+
+sel = st.selectbox("选择一次进化运行（trace）", traces, format_func=_trace_label)
 data = load_trace(str(sel))
 rounds = data["rounds"]
 for err in data["errors"][:5]:

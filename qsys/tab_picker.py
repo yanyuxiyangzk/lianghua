@@ -11,7 +11,8 @@ import experience
 import library
 import signals as sig
 from common import (DATA_DIR, GROUPS_FILE, WATCHLIST_FILE, all_pools, get_evolved_factors,
-                    get_last_trade_day, load_groups, load_json, load_watchlist, save_json)
+                    get_last_trade_day, load_groups, load_json, load_watchlist, save_json,
+                    trade_day_offset)
 
 PACKS_FILE = DATA_DIR / "packs.json"
 WEIGHT_METHODS = ["等权", "ICIR加权", "胜率加权", "均值方差"]
@@ -51,6 +52,28 @@ def render():
     end = get_last_trade_day()
     facs = _factor_universe()
 
+    # ---- 体检范围收敛：全宇宙 8000+ 因子全评不现实，按来源圈定范围 ----
+    SCOPE_KINDS = {"内置经典": ["builtin"], "技术指标": ["tech"], "RD-Agent进化": ["evolved"]}
+    scope = st.multiselect(
+        "参与体检的因子范围", list(SCOPE_KINDS) + ["LoopEngine精选(已有评分卡Top50)"],
+        default=["内置经典", "技术指标", "RD-Agent进化"],
+        help="LoopEngine 已自动生成数千因子，全量体检需按个执行代码、耗时以天计；"
+             "精选模式只取已有评分卡中 |ICIR| 最高的 50 个")
+    kinds = sum((SCOPE_KINDS[s] for s in scope if s in SCOPE_KINDS), [])
+    eval_facs = [f for f in facs if f["kind"] in kinds]
+    if "LoopEngine精选(已有评分卡Top50)" in scope:
+        try:
+            sc = library.get_latest_scorecard(pool_name)
+            if sc is not None and not sc.empty:
+                sc = sc.assign(_abs=pd.to_numeric(sc["icir"], errors="coerce").abs())
+                top_names = sc.sort_values("_abs", ascending=False).head(50)["name"].tolist()
+                rank = {n: i for i, n in enumerate(top_names)}
+                le = [f for f in facs if f["kind"] == "loopengine" and f["name"] in rank]
+                le.sort(key=lambda f: rank[f["name"]])
+                eval_facs += le
+        except Exception:
+            pass
+
     # ================= 🏆 策略包速用（加载高胜率包直接出名单） =================
     packs = library.list_strategies()
     if packs:
@@ -85,13 +108,22 @@ def render():
 
     # ================= ① 因子体检 =================
     st.markdown("### ① 因子体检（每个因子的胜率）")
-    st.caption("评估窗口约 3 年 · 主指标为 20 日 RankIC · 首次评估每因子需执行一次（之后走缓存）")
+    st.caption(f"评估窗口约 3 年 · 主指标为 20 日 RankIC · 首次评估每因子需执行一次（之后走缓存）· "
+               f"当前范围 **{len(eval_facs)}** 个因子")
+    if not eval_facs:
+        st.warning("当前范围内没有因子——至少勾一类因子范围。")
+        return
+    pre_oos = st.checkbox("预选防未来函数（体检统计只用到 250 个交易日之前，"
+                          "最近一年留给 ③ 样本外验证做裁决）", value=True)
+    train_end = trade_day_offset(end, -250) if pre_oos else None
+    if pre_oos:
+        st.caption(f"当前体检统计窗口截止 **{train_end}**（≈1 年前）")
     if st.button("🔬 开始/刷新体检", type="primary"):
         bar = st.status("评估中…（进化因子首次需逐个执行，请耐心）", expanded=True)
         card_rows = []
-        for fac in facs:
+        for fac in eval_facs:
             bar.write(f"评估 `{fac['name']}`（{'进化' if fac['kind']=='evolved' else '内置'}）…")
-            card = fe.build_scorecard([fac], codes, end)
+            card = fe.build_scorecard([fac], codes, end, train_end=train_end)
             card_rows.append(card)
         st.session_state["pe_card"] = pd.concat(card_rows, ignore_index=True)
         # 体检结果 + 因子注册 → 本地库（library 层，market.db）
@@ -101,12 +133,20 @@ def render():
 
     card = st.session_state.get("pe_card")
     if card is None:
+        # 会话内没有体检结果时,先加载库内最近一批(避免每次进页面都要重跑)
+        persisted = library.get_latest_scorecard(pool_name)
+        if persisted is not None and not persisted.empty:
+            card = persisted
+            st.session_state["pe_card"] = card
+            st.caption(f"已载入库内最新一批体检（评估日 {persisted['eval_date'].iloc[0]}），点上方按钮可重跑")
+    if card is None:
         st.info("点「开始/刷新体检」生成因子体检表。")
         return
     show = card.copy()
     for c in ["IC均值", "ICIR"]:
-        show[c] = show[c].map(lambda x: f"{x:.4f}" if pd.notna(x) else "—")
-    for c in ["IC胜率", "Top组胜率"]:
+        if c in show:
+            show[c] = show[c].map(lambda x: f"{x:.4f}" if pd.notna(x) else "—")
+    for c in [c for c in show.columns if "胜率" in c]:  # IC胜率/Top组胜率/1日~120日胜率
         show[c] = show[c].map(lambda x: f"{x:.1%}" if pd.notna(x) else "—")
     st.dataframe(show, width='stretch', height=280)
 
@@ -132,10 +172,15 @@ def render():
     c1, c2 = st.columns([2, 3])
     with c1:
         method = st.radio("加权方法", WEIGHT_METHODS, index=1, horizontal=True)
+        hold_h = st.radio("决策持有期（选股锚定的预测窗口）", ["1日", "5日", "20日"],
+                          index=0, horizontal=True,
+                          help="默认 1 日：胜率加权与样本外验证都按该窗口的远期收益评估")
         chosen = st.multiselect("参与组合的因子（已按去冗余过滤，可再调）", kept, default=kept[:6])
         filters = st.multiselect("策略过滤器", list(sig.STRATEGY_FILTERS.keys()), default=["tradable"],
                                  format_func=lambda k: sig.STRATEGY_FILTERS[k])
-        top_n = st.slider("Top-N", 5, 50, 20)
+        top_n = st.slider("Top-N", 5, 50, 10)
+        ind_cap = st.checkbox("行业分散（每行业≤2只，防单一赛道扎堆）", value=True)
+        resonance = st.checkbox("多周期共振（1日+5日 双口径交集，信号更少更稳）", value=False)
     lp = st.session_state.get("loaded_pack")
     if lp:  # 加载策略包：池/因子/权重/过滤器/TopN 全部按包配置
         pool_name = lp["pool_name"] if lp["pool_name"] in pools else pool_name
@@ -146,7 +191,8 @@ def render():
         top_n = lp["top_n"]
         weights = {f["name"]: (f["weight"], f["direction"]) for f in lp["factors"]}
     else:
-        weights = fe.compute_weights(valid, method, chosen) if chosen else {}
+        win_col = f"{hold_h}胜率"
+        weights = fe.compute_weights(valid, method, chosen, win_col=win_col) if chosen else {}
     with c2:
         if weights:
             wt = pd.DataFrame([{"因子": n, "权重": f"{w:.1%}", "方向": "正向" if d > 0 else "负向"}
@@ -172,7 +218,8 @@ def render():
     final = None
     if weights:
         combo_key = json.dumps({"m": method, "c": chosen, "f": filters, "n": top_n,
-                                "p": pool_name, "e": end}, sort_keys=True)
+                                "p": pool_name, "e": end, "h": hold_h, "ic": ind_cap,
+                                "res": resonance}, sort_keys=True)
         if st.session_state.get("pe_combo_key") != combo_key:
             with st.spinner("组合已构建，正在生成今日名单…"):
                 try:
@@ -181,7 +228,17 @@ def render():
                     score = sig.composite_score(fvals, weights)
                     panel_now = sig.get_panel_cached(codes, end, 800)
                     survived = sig.apply_filters(score.index.tolist(), panel_now, filters)
-                    st.session_state["pe_final"] = score[score.index.isin(survived)].head(top_n)
+                    if resonance:
+                        # 双口径共振：当前持有期 + 另一短线口径各打一次分，取交集
+                        other_h = "5日" if hold_h == "1日" else "1日"
+                        w2 = fe.compute_weights(valid, method, chosen, win_col=f"{other_h}胜率")
+                        sel = sig.resonance_select(fvals, weights, w2, top_n, k=top_n * 3)
+                        sel = sel[sel.index.isin(survived)]
+                    else:
+                        sel = score[score.index.isin(survived)]
+                    if ind_cap:
+                        sel = sig.industry_cap_select(sel, cap=2)
+                    st.session_state["pe_final"] = sel.head(top_n)
                     # 经验库落库（不管对错，到期自动回填战果）
                     fcfg = [{"name": n, "kind": next(f for f in facs if f["name"] == n)["kind"],
                              "weight": float(w), "direction": int(d)} for n, (w, d) in weights.items()]
@@ -195,7 +252,33 @@ def render():
         final = st.session_state.get("pe_final")
         if final is not None and not final.empty:
             st.markdown(f"**📋 今日 Top-{len(final)}（按当前组合自动计算，{end}）**")
-            st.dataframe(pd.DataFrame({"综合分": final.round(3)}), width='stretch')
+            show_final = pd.DataFrame({"综合分": final.round(3)})
+            try:
+                import datasource as _ds
+                import experience as _exp
+
+                snaps, snap_ts = _ds.get_latest_snapshots(list(final.index))
+                smap = {s["code"]: s for s in snaps}
+                show_final["最新价"] = [smap.get(c, {}).get("price") for c in show_final.index]
+                show_final["较昨收%"] = [
+                    round((smap[c]["price"] / smap[c]["prev_close"] - 1) * 100, 2)
+                    if smap.get(c) and smap[c].get("price") and smap[c].get("prev_close") else None
+                    for c in show_final.index
+                ]
+                # 交易计划：参考买入价(快照最新价,缺省用昨收) + 止盈/止损价
+                rules = _exp.DEFAULT_RULES
+                ref = [smap.get(c, {}).get("price") or smap.get(c, {}).get("prev_close")
+                       for c in show_final.index]
+                show_final["参考买入价"] = [round(p, 2) if p else None for p in ref]
+                show_final["止盈价"] = [round(p * (1 + rules["take_profit"]), 2) if p else None for p in ref]
+                show_final["止损价"] = [round(p * (1 + rules["stop_loss"]), 2) if p else None for p in ref]
+                plan = _exp.trade_plan(None, end)
+                st.caption(f"📝 交易计划：{plan['买入时间']}按开盘价买入（参考价=最近可得价）；{plan['规则']}；"
+                           f"最迟 {plan['最迟平仓']}平仓。名单方向均为**看涨**（持有窗口 ≤{rules['hold_days']} 交易日）；"
+                           f"实时快照 {snap_ts or '暂无'}")
+            except Exception:
+                pass
+            st.dataframe(show_final, width='stretch')
         elif final is not None:
             st.warning("当前过滤器下没有股票通过——放宽过滤器或换大一点的池子试试。")
 
@@ -213,7 +296,9 @@ def render():
                     fac = next(f for f in facs if f["name"] == n)
                     fvals[n] = fe.get_factor_values(fac, codes, end)
                 panel = sig.get_panel_cached(codes, end, 800)
-                wf = fe.walk_forward(fvals, panel, method, top_n)
+                hdays = fe.WIN_HORIZONS.get(hold_h, fe.MAIN_FWD)
+                wf = fe.walk_forward(fvals, panel, method, top_n,
+                                     fwd_days=hdays, step=max(1, min(fe.STEP_DAYS, hdays)))
                 st.session_state["pe_wf"] = wf
     wf = st.session_state.get("pe_wf")
     if wf is not None and not wf.empty:
@@ -222,12 +307,21 @@ def render():
         st.markdown(
             f"**OOS 胜率：优化组合 {oos_win:.0%}（平均超额 {wf['优化组合超额'].mean():.2%}/期）"
             f" vs 等权 {eq_win:.0%}** · 共 {len(wf)} 个应用点")
-        cum = wf.set_index("调仓日")[[c for c in ["优化组合超额", "等权组合超额"] if c in wf]].add(1).cumprod()
+        if "优化组合扣费超额" in wf:
+            net = wf["优化组合扣费超额"]
+            net_win = (net > 0).mean()
+            tvr = wf["优化组合换手率"].mean() if "优化组合换手率" in wf else float("nan")
+            st.markdown(f"**扣费后（双边 0.25%）：胜率 {net_win:.0%} · 平均净超额 {net.mean():+.2%}/期 · "
+                        f"平均换手 {tvr:.0%}/期** —— 决策以扣费后为准")
+        cum_cols = [c for c in ["优化组合超额", "优化组合扣费超额", "等权组合超额"] if c in wf]
+        cum = wf.set_index("调仓日")[cum_cols].add(1).cumprod()
         st.line_chart(cum)
         with st.expander("逐点明细"):
             st.dataframe(wf, width='stretch')
         if oos_win < 0.55:
             st.warning("OOS 胜率 < 55%：该组合方向有效性不足，建议换因子/换池/降 Top-N，不要固化。")
+        elif "优化组合扣费超额" in wf and net.mean() <= 0:
+            st.warning("毛胜率合格但扣费后净超额 ≤ 0：换手吃掉利润——考虑延长持有期或降 Top-N 波动。")
 
     # ================= ④ 名单应用 & 策略包 =================
     st.markdown("### ④ 名单应用 & 策略包")
@@ -261,6 +355,7 @@ def render():
                 oos = f"{(wf['优化组合超额'] > 0).mean():.0%}"
             library.save_strategy(pname, {
                 "pool_name": pool_name, "top_n": top_n, "method": method, "filters": filters,
+                "horizon": hold_h,
                 "factors": [{"name": n, "kind": next(f for f in facs if f['name'] == n)["kind"],
                              "weight": w, "direction": d} for n, (w, d) in weights.items()],
                 "oos_winrate": oos, "updated": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),

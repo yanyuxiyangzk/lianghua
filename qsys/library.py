@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS strategies (
     filters TEXT,                 -- JSON array
     factors TEXT,                 -- JSON array [{name,kind,weight,direction}]
     oos_winrate TEXT,
+    horizon TEXT,                 -- 决策持有期（1日/5日/20日），调度器共振用
     updated_at TEXT
 );
 CREATE TABLE IF NOT EXISTS tested_hashes (
@@ -68,6 +69,14 @@ def _lconn():
                      ("engine", "TEXT DEFAULT 'rdagent'")]:
         if col not in cols:
             c.execute(f"ALTER TABLE factor_registry ADD COLUMN {col} {ddl}")
+    # 迁移：factor_scorecards 加多周期胜率 JSON（1/5/20/60/120 日）
+    sc_cols = [r[1] for r in c.execute("PRAGMA table_info(factor_scorecards)")]
+    if "winrates" not in sc_cols:
+        c.execute("ALTER TABLE factor_scorecards ADD COLUMN winrates TEXT")
+    # 迁移：strategies 加持有期（多周期共振用）
+    st_cols = [r[1] for r in c.execute("PRAGMA table_info(strategies)")]
+    if "horizon" not in st_cols:
+        c.execute("ALTER TABLE strategies ADD COLUMN horizon TEXT")
     _migrate(c)
     return c
 
@@ -143,19 +152,22 @@ def get_factor_registry() -> pd.DataFrame:
 
 # ---------------------------------------------------------------- 因子体检表
 def save_scorecard(card: pd.DataFrame, pool_name: str, eval_date: str):
-    """保存一批体检结果（build_scorecard 的输出 DataFrame）。"""
+    """保存一批体检结果（build_scorecard 的输出 DataFrame，含多周期胜率列）。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    win_cols = [c for c in card.columns if c.endswith("日胜率")]
     rows = []
     for _, r in card.iterrows():
+        winrates = {c: _f(r.get(c)) for c in win_cols} if win_cols else {}
         rows.append((r["因子"], pool_name, eval_date, r.get("来源"),
                      _f(r.get("IC均值")), _f(r.get("ICIR")), _f(r.get("IC胜率")),
                      _f(r.get("Top组胜率")), str(r.get("建议方向", "")),
-                     int(r.get("天数", 0) or 0), now))
+                     int(r.get("天数", 0) or 0),
+                     json.dumps(winrates, ensure_ascii=False), now))
     with _lconn() as c:
         c.executemany(
             "INSERT OR REPLACE INTO factor_scorecards (name, pool_name, eval_date, kind,"
-            " ic_mean, icir, ic_winrate, top_winrate, direction, days, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+            " ic_mean, icir, ic_winrate, top_winrate, direction, days, winrates, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)
 
 
 def _f(v):
@@ -177,6 +189,14 @@ def get_latest_scorecard(pool_name: str) -> pd.DataFrame:
     df = df.rename(columns={"name": "因子", "kind": "来源", "ic_mean": "IC均值", "icir": "ICIR",
                             "ic_winrate": "IC胜率", "top_winrate": "Top组胜率",
                             "direction": "建议方向", "days": "天数"})
+    # 多周期胜率 JSON 展开回列（1日/5日/20日/60日/120日胜率）
+    if "winrates" in df.columns:
+        wr = df["winrates"].map(lambda s: json.loads(s) if isinstance(s, str) and s else {})
+        wr_df = pd.DataFrame(list(wr), index=df.index)
+        if not wr_df.empty:
+            df = pd.concat([df.drop(columns=["winrates"]), wr_df], axis=1)
+        else:
+            df = df.drop(columns=["winrates"])
     return df
 
 
@@ -189,24 +209,25 @@ def list_scorecard_pools() -> list[str]:
 def save_strategy(name: str, pack: dict):
     with _lconn() as c:
         c.execute(
-            "INSERT OR REPLACE INTO strategies (name, pool_name, top_n, method, filters, factors, oos_winrate, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO strategies (name, pool_name, top_n, method, filters, factors, oos_winrate, horizon, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
             (name, pack.get("pool_name"), pack.get("top_n"), pack.get("method"),
              json.dumps(pack.get("filters", []), ensure_ascii=False),
              json.dumps(pack.get("factors", []), ensure_ascii=False),
-             pack.get("oos_winrate"),
+             pack.get("oos_winrate"), pack.get("horizon"),
              pack.get("updated") or datetime.now().strftime("%Y-%m-%d %H:%M")))
 
 
 def list_strategies() -> dict:
     """返回与 packs.json 相同的结构 {name: pack_dict}，便于各处平滑切换。"""
     with _lconn() as c:
-        rows = c.execute("SELECT * FROM strategies").fetchall()
+        rows = c.execute("SELECT name, pool_name, top_n, method, filters, factors, oos_winrate,"
+                         " horizon, updated_at FROM strategies").fetchall()
     out = {}
-    for (name, pool, top_n, method, filters, factors, oos, updated) in rows:
+    for (name, pool, top_n, method, filters, factors, oos, horizon, updated) in rows:
         out[name] = {"pool_name": pool, "top_n": top_n, "method": method,
                      "filters": json.loads(filters or "[]"), "factors": json.loads(factors or "[]"),
-                     "oos_winrate": oos, "updated": updated}
+                     "oos_winrate": oos, "horizon": horizon, "updated": updated}
     return out
 
 

@@ -17,7 +17,8 @@ import pandas as pd
 import streamlit as st
 
 from common import (QLIB_DATA_DIR, SCHED_LAST_FILE, SCHED_STATE_FILE, SIGNALS_DIR,
-                    all_pools, get_evolved_factors, get_last_trade_day, load_watchlist, save_json, load_json)
+                    all_pools, get_evolved_factors, get_last_trade_day, load_watchlist, save_json, load_json,
+                    trade_day_offset)
 import datasource
 import signals as sig
 
@@ -95,15 +96,35 @@ def job_watchlist_signals() -> str:
     return f"{end} 自选股信号完成：{len(codes)} 只 × {len(factors)} 因子"
 
 
-def job_pool_scan(pool_name: str = "沪深300", top_n: int = 20, pack: str = "") -> str:
-    """板块/池任务：综合打分输出 Top-N。指定策略包时按包配置执行。"""
+def _best_pack(packs: dict) -> str:
+    """OOS 胜率最高（% 格式）的策略包名；无有效胜率则空串。"""
+    best, best_wr = "", -1.0
+    for name, pk in packs.items():
+        v = str(pk.get("oos_winrate") or "")
+        if not v.endswith("%"):
+            continue
+        try:
+            wr = float(v.rstrip("%"))
+        except ValueError:
+            continue
+        if wr > best_wr:
+            best, best_wr = name, wr
+    return best
+
+
+def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "") -> str:
+    """板块/池任务：综合打分输出 Top-N。pack 为空时自动选用 OOS 胜率最高的策略包。"""
     end = get_last_trade_day()
     import library
     packs = library.list_strategies()
+    if not pack:
+        pack = _best_pack(packs)
     pk = packs.get(pack) if pack else None
 
     if pk:
-        pool_name, top_n = pk["pool_name"], pk["top_n"]
+        pool_name = pk["pool_name"]
+        # 每日自动名单以任务参数为上限(默认10只);包的 Top-N 更大时取分更高的前段
+        top_n = min(int(pk["top_n"]), int(top_n))
     pools = all_pools()
     codes = pools.get(pool_name) or pools.get("沪深300")
 
@@ -111,20 +132,64 @@ def job_pool_scan(pool_name: str = "沪深300", top_n: int = 20, pack: str = "")
     panel = sig.get_panel_cached(codes, end)
     if pk:  # 策略包：按其因子+权重+方向+过滤器
         evolved_by_name = {f["name"]: f for f in get_evolved_factors(only_accepted=False)}
+        # LoopEngine 因子从注册表取代码（之前只查 evolved，loopengine/tech 因子会被静默丢弃）
+        try:
+            reg = library.get_factor_registry()
+            le_code = {r["name"]: r["code"] for _, r in reg[reg["engine"] == "loopengine"].iterrows()}
+        except Exception:
+            le_code = {}
+        dropped = []
         for f in pk["factors"]:
-            if f["kind"] == "builtin":
-                f_series[f["name"]] = sig.compute_builtin(panel, f["name"])
+            kind, fname = f.get("kind"), f["name"]
+            if kind == "builtin":
+                s = sig.compute_builtin(panel, fname)
+            elif kind == "tech":
+                s = sig.compute_common(panel, fname) if fname in sig.CATALOG_NAMES \
+                    else sig.compute_tech(panel, fname)
             else:
-                fac = evolved_by_name.get(f["name"])
-                if not fac or not fac["code"]:
+                ef = evolved_by_name.get(fname)
+                code = (ef or {}).get("code") or le_code.get(fname)
+                if not code:
+                    dropped.append(fname)
                     continue
-                df = sig.run_factor_code(fac["code"], f["name"], codes, end)
-                f_series[f["name"]] = df.iloc[:, 0]
-            weights[f["name"]] = (f["weight"], f["direction"])
+                df = sig.run_factor_code(code, fname, codes, end)
+                s = df.iloc[:, 0]
+            f_series[fname] = s
+            weights[fname] = (f["weight"], f["direction"])
+        if not weights:
+            raise RuntimeError(f"策略包「{pack}」因子全部无法解析，未出名单")
         score = sig.composite_score(f_series, weights)
         survived = sig.apply_filters(score.index.tolist(), panel, pk.get("filters", []))
-        picks = score[score.index.isin(survived)].head(top_n)
-        note = f"策略包「{pack}」（{len(weights)} 因子）"
+        sel = score[score.index.isin(survived)]
+        reso_note = ""
+        # 多周期共振：包带持有期时，用最新评分卡在 主口径+另一短线口径 各配权取交集
+        try:
+            sc = library.get_latest_scorecard(pool_name)
+            if not sc.empty and pk.get("horizon"):
+                scm = sc.drop_duplicates(subset=["因子"]).set_index("因子")
+                h_main = pk["horizon"] if pk["horizon"] in ("1日", "5日") else "5日"
+                h_pair = "1日" if h_main == "5日" else "5日"
+
+                def _hw(h):
+                    col = f"{h}胜率"
+                    out = {}
+                    for f in pk["factors"]:
+                        n = f["name"]
+                        if n in scm.index and col in scm.columns and pd.notna(scm.loc[n, col]):
+                            out[n] = (max(float(scm.loc[n, col]) - 0.5, 0.0), f["direction"])
+                    t = sum(w for w, _ in out.values())
+                    return {n: (w / t, d) for n, (w, d) in out.items()} if t > 0 else None
+
+                wa, wb = _hw(h_main), _hw(h_pair)
+                if wa and wb and len(wa) >= 2:
+                    sel = sig.resonance_select(f_series, wa, wb, top_n, k=top_n * 3)
+                    sel = sel[sel.index.isin(survived)]
+                    reso_note = f"·{h_main}+{h_pair}共振"
+        except Exception:
+            pass
+        picks = sig.industry_cap_select(sel, cap=2).head(top_n)
+        note = f"策略包「{pack}」（{len(weights)} 因子·行业≤2{reso_note}" + \
+               (f"，{len(dropped)} 个无法解析已跳过" if dropped else "") + ")"
     else:  # 默认组合：最新进化因子 + 内置三件套
         factors = _pick_evolved_factors(2)
         for f in factors:
@@ -203,6 +268,60 @@ def job_trade_simulate() -> str:
     return experience.backfill_trades()
 
 
+def job_auction_confirm() -> str:
+    """竞价确认（09:26，集合竞价落锤后）：对昨晚名单逐只检查竞价表现，标记回避信号。
+
+    规则（保守，宁缺毋滥）：
+      回避 = 竞价低开 ≤ -2%（隔夜利空跳空）或 竞价量 < 20日均量的 0.5%（无量承接）
+    结果存 signals/auction_<当日>.parquet，选股列表页次日名单旁显示确认状态。
+    """
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5:
+        return "非交易日，跳过"
+    import experience
+
+    dates = experience.list_pick_dates(5)
+    if not dates:
+        return "无选股名单，跳过"
+    # 名单必须足够新：最近名单日期 = 上一交易日（周末近似往前推）
+    prev = now - pd.Timedelta(days=1)
+    while prev.weekday() >= 5:
+        prev -= pd.Timedelta(days=1)
+    if dates[0] < prev.strftime("%Y-%m-%d"):
+        return f"最新名单为 {dates[0]}（过旧），跳过"
+    picks = experience.picks_on_date(dates[0])
+    items = experience.pick_items_detail(int(picks.iloc[0]["id"]))
+    rows = []
+    for code in items["code"]:
+        try:
+            snap = datasource.get_realtime_snapshot(code)
+            price, prev_close = snap.get("price"), snap.get("prev_close")
+            if not price or not prev_close:
+                continue
+            gap = price / prev_close - 1
+            d40 = (now - pd.Timedelta(days=45)).strftime("%Y-%m-%d")
+            daily = datasource.get_daily(code, d40, now.strftime("%Y-%m-%d"))
+            avg20 = daily["$volume"].tail(20).mean() if not daily.empty else None
+            # 快照 volume 单位为手，×100 对齐日线（股）
+            ratio = (snap.get("volume") or 0) * 100 / avg20 if avg20 else None
+            verdict = "回避" if (gap <= -0.02 or (ratio is not None and ratio < 0.005)) else "确认"
+            rows.append({"code": code, "竞价涨幅%": round(gap * 100, 2),
+                         "竞价量比%": round(ratio * 100, 2) if ratio is not None else None,
+                         "竞价结论": verdict})
+        except Exception:
+            continue
+    if not rows:
+        return "竞价数据为空（可能尚未开盘）"
+    out = pd.DataFrame(rows)
+    SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
+    day = now.strftime("%Y-%m-%d")
+    out.to_parquet(SIGNALS_DIR / f"auction_{day}.parquet")
+    avoid = out[out["竞价结论"] == "回避"]["code"].tolist()
+    return f"{day} 竞价确认：{len(rows)} 只 · 回避 {len(avoid)} 只（{','.join(avoid) or '无'}）"
+
+
 def job_quote_collect(pool_name: str = "沪深300", interval_sec: int = 30) -> str:
     """行情快照采集：交易时段内批量拉取并落库（给 1分钟涨速/现手 供历史）。"""
     from zoneinfo import ZoneInfo
@@ -219,6 +338,37 @@ def job_quote_collect(pool_name: str = "沪深300", interval_sec: int = 30) -> s
     return f"{now.strftime('%H:%M:%S')} 采集 {pool_name} {n} 只快照"
 
 
+def job_le_factor_eval(batch: int = 15, pool_name: str = "沪深300") -> str:
+    """LoopEngine 因子滚动体检（每晚）：从未评估/最久未评估的演化因子里取一批出评分卡。
+
+    演化引擎日产出数百因子，全量体检不现实；每日一批滚动覆盖，
+    已有评分卡的按 updated_at 最旧的优先重估（因子会衰减）。
+    """
+    import factor_eval as fe
+    import library
+
+    reg = library.get_factor_registry()
+    le = reg[reg["engine"] == "loopengine"] if not reg.empty else reg
+    if le.empty:
+        return "无 LoopEngine 因子，跳过"
+    with library._lconn() as c:
+        evaluated = dict(c.execute(
+            "SELECT name, MAX(updated_at) FROM factor_scorecards GROUP BY name").fetchall())
+    le = le.assign(_eval_at=le["name"].map(lambda n: evaluated.get(n, "")))
+    le = le.sort_values("_eval_at")  # 空串(从未评估)排最前，其次最久未评估
+    picked = le.head(batch)
+    codes = all_pools().get(pool_name) or []
+    if len(codes) < 30:
+        return f"池 {pool_name} 为空，跳过"
+    end = get_last_trade_day()
+    train_end = trade_day_offset(end, -250)
+    facs = [{"name": r["name"], "kind": "loopengine", "code": r["code"]} for _, r in picked.iterrows()]
+    card = fe.build_scorecard(facs, codes, end, train_end=train_end)
+    library.save_scorecard(card, pool_name, end)
+    ok = card.dropna(subset=["ICIR"])
+    return f"LoopEngine 体检 {len(facs)} 个（有效 {len(ok)} 个），累计已评估 {len(evaluated) + len(facs) - len([n for n in picked['name'] if n in evaluated])}/{len(reg[reg['engine']=='loopengine'])}"
+
+
 # ---------------------------------------------------------------- 调度器
 JOBS = {
     "update_data": {"name": "📥 每日数据更新", "func": job_update_data,
@@ -227,7 +377,7 @@ JOBS = {
                           "default": {"enabled": False, "hour": 18, "minute": 30, "params": {}}},
     "pool_scan": {"name": "🏛️ 板块/股票池扫描（Top-N）", "func": job_pool_scan,
                   "default": {"enabled": False, "hour": 19, "minute": 0,
-                              "params": {"pool_name": "沪深300", "top_n": 20, "pack": ""}}},
+                              "params": {"pool_name": "沪深300", "top_n": 10, "pack": ""}}},
     "outcome_backfill": {"name": "🎯 战果回填（经验库）", "func": job_outcome_backfill,
                          "default": {"enabled": False, "hour": 18, "minute": 45, "params": {}}},
     "gate_check": {"name": "🛡 硬闸门筛查（因子库）", "func": job_gate_check,
@@ -245,14 +395,27 @@ JOBS = {
                        "default": {"enabled": False, "hour": 18, "minute": 20, "params": {}}},
     "trade_simulate": {"name": "📈 模拟交易回填（每日）", "func": job_trade_simulate,
                        "default": {"enabled": False, "hour": 20, "minute": 5, "params": {}}},
+    "auction_confirm": {"name": "🔔 竞价确认（09:26 对最新名单）", "func": job_auction_confirm,
+                        "default": {"enabled": False, "hour": 9, "minute": 26, "params": {}}},
+    "le_factor_eval": {"name": "🧪 LoopEngine 因子滚动体检（每晚一批）", "func": job_le_factor_eval,
+                       "default": {"enabled": False, "hour": 21, "minute": 30,
+                                   "params": {"batch": 15, "pool_name": "沪深300"}}},
 }
 
 
 class SchedulerManager:
     def __init__(self):
+        from apscheduler.executors.pool import ThreadPoolExecutor
         from apscheduler.schedulers.background import BackgroundScheduler
 
-        self.sched = BackgroundScheduler(timezone=TZ)
+        # 线程隔离：loopengine/quote_collect 等高频 interval 任务走独立小线程池，
+        # 否则它们长时间占满默认线程池，cron 任务(数据更新/扫描/回填)会被饿死跳过
+        # ——2026-08-19~24 实测 pool_scan 连续缺席即此因。
+        self.sched = BackgroundScheduler(
+            timezone=TZ,
+            executors={"default": ThreadPoolExecutor(3), "interval": ThreadPoolExecutor(2)},
+            job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 3600},
+        )
         self.sched.start()
         self._apply_state()
 
@@ -273,7 +436,7 @@ class SchedulerManager:
             if cfg.get("trigger") == "interval":
                 self.sched.add_job(lambda k=key: self._run(k), "interval", id=key,
                                    seconds=int(cfg["params"].get("interval_sec", 30)),
-                                   replace_existing=True)
+                                   executor="interval", replace_existing=True)
             else:
                 self.sched.add_job(lambda k=key: self._run(k), "cron", id=key,
                                    day_of_week="mon-fri", hour=cfg["hour"], minute=cfg["minute"],

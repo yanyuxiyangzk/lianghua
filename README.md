@@ -97,6 +97,10 @@ docker compose up -d          # 启动 lh-rdagent + lh-qsys + lh-ollama
 
 # 4. 数据更新（建议每周）
 ./scripts/update_data.sh
+
+# 5. 磁盘清理（默认 dry-run 预览，确认后加 -y；详见 ./scripts/cleanup.sh -h）
+./scripts/cleanup.sh           # 预览:旧假设工作区 + 因子执行缓存 + 循环日志
+./scripts/cleanup.sh -y        # 执行(各保留 7 天;不会动会话检查点与 qlib 数据)
 ```
 
 ## 五、调参入口（.env 追加，按需）
@@ -110,6 +114,25 @@ docker compose up -d          # 启动 lh-rdagent + lh-qsys + lh-ollama
 
 完整可配项：`docker compose exec rdagent python -c "from rdagent.app.qlib_rd_loop.conf import FACTOR_PROP_SETTING as s; print(s.model_fields.keys())"`
 
+## 五点五、同花顺 iFinD 接入（QSYS 分析层可选数据源）
+
+分两条独立通道，按需开通：
+
+**A. iFinD API → QSYS 数据源（日线行情，让资金趋势/轮动走势每日变新）**
+
+1. 到 [quantapi.51ifind.com](https://quantapi.51ifind.com) 注册并开通数据接口权限，下载 **Linux 版 iFinDPy SDK**
+2. SDK 装进 qsys 容器并重建镜像（SDK 不在 PyPI，需手动放入）：
+   `docker cp iFinDPy*.whl lh-qsys:/tmp/ && docker exec lh-qsys pip install /tmp/iFinDPy*.whl`（验证后再 `docker compose build qsys` 固化）
+3. `.env` 配置凭证（三选二之一）：`THS_IFIND_ACCOUNT` + `THS_IFIND_PASSWORD`，或 `THS_IFIND_REFRESH_TOKEN`
+4. `docker compose up -d qsys` 后自检：`docker exec lh-qsys python -c "import datasource; print(datasource.ths_selftest())"`
+5. 看板 ⚙️设置页切换数据源为「同花顺 iFinD」——板块日线回填会跟随全局源（在线源首次全量回填较慢，之后逐日增量）
+
+**B. iFinD MCP → Claude Code（对话式查数据，辅助开发）**
+
+1. 到 [mcp.51ifind.com](https://mcp.51ifind.com) → 密钥管理获取 Token（无 iFinD 账号可走快查开放平台 open.kuaicha365.com，内测有免费额度）
+2. `export IFIND_AUTH_TOKEN=<你的token>`（写进 ~/.bashrc），重启 Claude Code
+3. 项目根 `.mcp.json` 已预置 `ifind-stock` 服务（StreamableHTTP，注意该端点不支持 SSE），首次会话批准即可用
+
 ## 六、常见问题
 
 - **fin_factor 报 docker 权限**：确认 `docker.sock` 已挂载且宿主机当前用户可 `docker ps`。
@@ -119,5 +142,13 @@ docker compose up -d          # 启动 lh-rdagent + lh-qsys + lh-ollama
 - **log/、git_ignore_folder/、vendor/ 里文件属 root**：rdagent 容器以 root 运行所致，
   宿主机要清理时执行 `docker compose exec rdagent chown -R 1000:1000 ${LIANGHUA_ROOT}/{log,git_ignore_folder,vendor}`。
 - **vendor/py 是 rdagent 0.8.0 的可编辑副本**（PYTHONPATH 优先于镜像 site-packages），
-  内含两处本地补丁（generate.py 的 pandas 兼容、workspace.py 的 MLFLOW_ALLOW_FILE_STORE），
+  内含三处本地补丁（generate.py 的 pandas 兼容、workspace.py 的 MLFLOW_ALLOW_FILE_STORE、
+  utils.py 的因子数据 float32 降内存——防 SOTA 因子库累积撑爆 WSL2 内存被 OOM Kill），
   升级 rdagent 版本时需同步。
+- **WSL 里删了文件但 Windows D 盘空间没回来**：WSL2 的 VHDX 只自动膨胀不自动缩。
+  步骤：① 先在 WSL 里发 TRIM（`./scripts/cleanup.sh -y` 已内置，或手动
+  `docker run --rm --privileged -v /:/host lianghua/rdagent:0.8.0 fstrim -v /host`）；
+  ② Windows 管理员 PowerShell 执行 `wsl --shutdown`，然后
+  `diskpart` → `select vdisk file="D:\WSL\Ubuntu2404\ext4.vhdx"` → `attach vdisk readonly`
+  → `compact vdisk` → `detach vdisk`（有 Hyper-V 模块也可 `Optimize-VHD -Mode Full`）。
+  ③ 重开 WSL，容器与进化循环自动恢复。

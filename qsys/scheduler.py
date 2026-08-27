@@ -92,7 +92,7 @@ def job_watchlist_signals() -> str:
     out = pd.DataFrame(rows).pivot(index="code", columns="factor", values=["最新值", "5日前"])
     out.columns = [f"{f}|{k}" for k, f in out.columns]
     SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
-    out.to_parquet(SIGNALS_DIR / f"watchlist_{end}.parquet")
+    sig._write_parquet_atomic(out, SIGNALS_DIR / f"watchlist_{end}.parquet")
     return f"{end} 自选股信号完成：{len(codes)} 只 × {len(factors)} 因子"
 
 
@@ -112,6 +112,76 @@ def _best_pack(packs: dict) -> str:
     return best
 
 
+def compute_pack_picks(pk: dict, codes: list[str], end: str, top_n: int):
+    """按策略包配置计算 Top-N 名单（job_pool_scan 与 🧩选股组合页共用，同一套逻辑）。
+    返回 (picks 综合分 Series, note, weights, f_series)；因子全部无法解析时抛错。"""
+    import library
+
+    f_series, weights = {}, {}
+    panel = sig.get_panel_cached(codes, end)
+    # 策略包：按其因子+权重+方向+过滤器
+    evolved_by_name = {f["name"]: f for f in get_evolved_factors(only_accepted=False)}
+    # LoopEngine 因子从注册表取代码（之前只查 evolved，loopengine/tech 因子会被静默丢弃）
+    try:
+        reg = library.get_factor_registry()
+        le_code = {r["name"]: r["code"] for _, r in reg[reg["engine"] == "loopengine"].iterrows()}
+    except Exception:
+        le_code = {}
+    dropped = []
+    for f in pk["factors"]:
+        kind, fname = f.get("kind"), f["name"]
+        if kind == "builtin":
+            s = sig.compute_builtin(panel, fname)
+        elif kind == "tech":
+            s = sig.compute_common(panel, fname) if fname in sig.CATALOG_NAMES \
+                else sig.compute_tech(panel, fname)
+        else:
+            ef = evolved_by_name.get(fname)
+            code = (ef or {}).get("code") or le_code.get(fname)
+            if not code:
+                dropped.append(fname)
+                continue
+            df = sig.run_factor_code(code, fname, codes, end)
+            s = df.iloc[:, 0]
+        f_series[fname] = s
+        weights[fname] = (f["weight"], f["direction"])
+    if not weights:
+        raise RuntimeError("策略包因子全部无法解析，未出名单")
+    score = sig.composite_score(f_series, weights)
+    survived = sig.apply_filters(score.index.tolist(), panel, pk.get("filters", []))
+    sel = score[score.index.isin(survived)]
+    reso_note = ""
+    # 多周期共振：包带持有期时，用最新评分卡在 主口径+另一短线口径 各配权取交集
+    try:
+        sc = library.get_latest_scorecard(pk["pool_name"])
+        if not sc.empty and pk.get("horizon"):
+            scm = sc.drop_duplicates(subset=["因子"]).set_index("因子")
+            h_main = pk["horizon"] if pk["horizon"] in ("1日", "5日") else "5日"
+            h_pair = "1日" if h_main == "5日" else "5日"
+
+            def _hw(h):
+                col = f"{h}胜率"
+                out = {}
+                for f in pk["factors"]:
+                    n = f["name"]
+                    if n in scm.index and col in scm.columns and pd.notna(scm.loc[n, col]):
+                        out[n] = (max(float(scm.loc[n, col]) - 0.5, 0.0), f["direction"])
+                t = sum(w for w, _ in out.values())
+                return {n: (w / t, d) for n, (w, d) in out.items()} if t > 0 else None
+
+            wa, wb = _hw(h_main), _hw(h_pair)
+            if wa and wb and len(wa) >= 2:
+                sel = sig.resonance_select(f_series, wa, wb, top_n, k=top_n * 3)
+                sel = sel[sel.index.isin(survived)]
+                reso_note = f"·{h_main}+{h_pair}共振"
+    except Exception:
+        pass
+    picks = sig.industry_cap_select(sel, cap=2).head(top_n)
+    note = f"{len(weights)} 因子·行业≤2{reso_note}" + \
+        (f"，{len(dropped)} 个无法解析已跳过" if dropped else "")
+    return picks, note, weights, f_series
+
+
 def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "") -> str:
     """板块/池任务：综合打分输出 Top-N。pack 为空时自动选用 OOS 胜率最高的策略包。"""
     end = get_last_trade_day()
@@ -128,69 +198,12 @@ def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "")
     pools = all_pools()
     codes = pools.get(pool_name) or pools.get("沪深300")
 
-    f_series, weights = {}, {}
-    panel = sig.get_panel_cached(codes, end)
-    if pk:  # 策略包：按其因子+权重+方向+过滤器
-        evolved_by_name = {f["name"]: f for f in get_evolved_factors(only_accepted=False)}
-        # LoopEngine 因子从注册表取代码（之前只查 evolved，loopengine/tech 因子会被静默丢弃）
-        try:
-            reg = library.get_factor_registry()
-            le_code = {r["name"]: r["code"] for _, r in reg[reg["engine"] == "loopengine"].iterrows()}
-        except Exception:
-            le_code = {}
-        dropped = []
-        for f in pk["factors"]:
-            kind, fname = f.get("kind"), f["name"]
-            if kind == "builtin":
-                s = sig.compute_builtin(panel, fname)
-            elif kind == "tech":
-                s = sig.compute_common(panel, fname) if fname in sig.CATALOG_NAMES \
-                    else sig.compute_tech(panel, fname)
-            else:
-                ef = evolved_by_name.get(fname)
-                code = (ef or {}).get("code") or le_code.get(fname)
-                if not code:
-                    dropped.append(fname)
-                    continue
-                df = sig.run_factor_code(code, fname, codes, end)
-                s = df.iloc[:, 0]
-            f_series[fname] = s
-            weights[fname] = (f["weight"], f["direction"])
-        if not weights:
-            raise RuntimeError(f"策略包「{pack}」因子全部无法解析，未出名单")
-        score = sig.composite_score(f_series, weights)
-        survived = sig.apply_filters(score.index.tolist(), panel, pk.get("filters", []))
-        sel = score[score.index.isin(survived)]
-        reso_note = ""
-        # 多周期共振：包带持有期时，用最新评分卡在 主口径+另一短线口径 各配权取交集
-        try:
-            sc = library.get_latest_scorecard(pool_name)
-            if not sc.empty and pk.get("horizon"):
-                scm = sc.drop_duplicates(subset=["因子"]).set_index("因子")
-                h_main = pk["horizon"] if pk["horizon"] in ("1日", "5日") else "5日"
-                h_pair = "1日" if h_main == "5日" else "5日"
-
-                def _hw(h):
-                    col = f"{h}胜率"
-                    out = {}
-                    for f in pk["factors"]:
-                        n = f["name"]
-                        if n in scm.index and col in scm.columns and pd.notna(scm.loc[n, col]):
-                            out[n] = (max(float(scm.loc[n, col]) - 0.5, 0.0), f["direction"])
-                    t = sum(w for w, _ in out.values())
-                    return {n: (w / t, d) for n, (w, d) in out.items()} if t > 0 else None
-
-                wa, wb = _hw(h_main), _hw(h_pair)
-                if wa and wb and len(wa) >= 2:
-                    sel = sig.resonance_select(f_series, wa, wb, top_n, k=top_n * 3)
-                    sel = sel[sel.index.isin(survived)]
-                    reso_note = f"·{h_main}+{h_pair}共振"
-        except Exception:
-            pass
-        picks = sig.industry_cap_select(sel, cap=2).head(top_n)
-        note = f"策略包「{pack}」（{len(weights)} 因子·行业≤2{reso_note}" + \
-               (f"，{len(dropped)} 个无法解析已跳过" if dropped else "") + ")"
+    if pk:
+        picks, pnote, weights, f_series = compute_pack_picks(pk, codes, end, top_n)
+        note = f"策略包「{pack}」（{pnote}）"
     else:  # 默认组合：最新进化因子 + 内置三件套
+        panel = sig.get_panel_cached(codes, end)
+        f_series, weights = {}, {}
         factors = _pick_evolved_factors(2)
         for f in factors:
             df = sig.run_factor_code(f["code"], f["name"], codes, end)
@@ -206,7 +219,7 @@ def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "")
     out = pd.DataFrame({"score": picks})
     SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
     safe_pool = pool_name.replace("/", "_")
-    out.to_parquet(SIGNALS_DIR / f"scan_{safe_pool}_{end}.parquet")
+    sig._write_parquet_atomic(out, SIGNALS_DIR / f"scan_{safe_pool}_{end}.parquet")
 
     # 经验库落库（不管对错都记，到期由 outcome_backfill 回填战果）
     import experience
@@ -317,7 +330,7 @@ def job_auction_confirm() -> str:
     out = pd.DataFrame(rows)
     SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
     day = now.strftime("%Y-%m-%d")
-    out.to_parquet(SIGNALS_DIR / f"auction_{day}.parquet")
+    sig._write_parquet_atomic(out, SIGNALS_DIR / f"auction_{day}.parquet")
     avoid = out[out["竞价结论"] == "回避"]["code"].tolist()
     return f"{day} 竞价确认：{len(rows)} 只 · 回避 {len(avoid)} 只（{','.join(avoid) or '无'}）"
 
@@ -338,11 +351,13 @@ def job_quote_collect(pool_name: str = "沪深300", interval_sec: int = 30) -> s
     return f"{now.strftime('%H:%M:%S')} 采集 {pool_name} {n} 只快照"
 
 
-def job_le_factor_eval(batch: int = 15, pool_name: str = "沪深300") -> str:
-    """LoopEngine 因子滚动体检（每晚）：从未评估/最久未评估的演化因子里取一批出评分卡。
+def job_le_factor_eval(batch: int = 60, pool_name: str = "沪深300") -> str:
+    """LoopEngine 因子滚动体检（每晚）：族配额优先取一批出评分卡。
 
-    演化引擎日产出数百因子，全量体检不现实；每日一批滚动覆盖，
-    已有评分卡的按 updated_at 最旧的优先重估（因子会衰减）。
+    演化引擎日产出数百因子，全量体检不现实；每晚一批滚动覆盖：已评估覆盖越少的
+    机制族越优先，族内按最久未评估轮询（因子会衰减）。
+    速度：树因子（代码首行带 # sexpr:）在进程内向量化直算并预填因子值缓存，
+    跳过子进程（~10s/个 → ~0.1s/个），只有非树因子才回退子进程执行。
     """
     import factor_eval as fe
     import library
@@ -355,18 +370,61 @@ def job_le_factor_eval(batch: int = 15, pool_name: str = "沪深300") -> str:
         evaluated = dict(c.execute(
             "SELECT name, MAX(updated_at) FROM factor_scorecards GROUP BY name").fetchall())
     le = le.assign(_eval_at=le["name"].map(lambda n: evaluated.get(n, "")))
-    le = le.sort_values("_eval_at")  # 空串(从未评估)排最前，其次最久未评估
-    picked = le.head(batch)
+    # 族配额优先：库内因子同质化严重（波动族占绝大多数），按"最久未评估"轮询会把
+    # 体检预算全花在波动族克隆上。改为：已评估覆盖越少的机制族越优先，族内按最旧轮询。
+    le["_fam"] = le["family"].fillna("其他") if "family" in le.columns else "其他"
+    fam_cov = le.groupby("_fam")["_eval_at"].apply(lambda s: int((s != "").sum()))
+    fam_order = fam_cov.sort_values().index.tolist()
+    by_fam = {f: g.sort_values("_eval_at") for f, g in le.groupby("_fam")}
+    picked_idx, cursor = [], {f: 0 for f in fam_order}
+    while len(picked_idx) < batch and any(cursor[f] < len(by_fam[f]) for f in fam_order):
+        for f in fam_order:
+            if len(picked_idx) >= batch:
+                break
+            if cursor[f] < len(by_fam[f]):
+                picked_idx.append(by_fam[f].index[cursor[f]])
+                cursor[f] += 1
+    picked = le.loc[picked_idx]
     codes = all_pools().get(pool_name) or []
     if len(codes) < 30:
         return f"池 {pool_name} 为空，跳过"
     end = get_last_trade_day()
     train_end = trade_day_offset(end, -250)
     facs = [{"name": r["name"], "kind": "loopengine", "code": r["code"]} for _, r in picked.iterrows()]
+
+    # 树直算快速路径：预填 get_factor_values 同款缓存，build_scorecard 随后全部命中
+    fast_done = 0
+    try:
+        from loopengine.tree import build_field_frames, evaluate_tree, parse
+
+        panel = sig.get_panel_cached(codes, end, 800, source="qlib_local")
+        frames = build_field_frames(panel)
+        ck_prefix = "|".join(sorted(codes))
+        for fac in facs:
+            code = fac.get("code") or ""
+            if not code.startswith("# sexpr: "):
+                continue
+            try:
+                ck = fe._cache("fvals", f"qlib_local|{fac['name']}|{fac['kind']}|{ck_prefix}|{end}|800")
+                if ck.exists():
+                    fast_done += 1
+                    continue
+                tree = parse(code.split("\n", 1)[0][len("# sexpr: "):])
+                vals = evaluate_tree(tree, frames).stack().rename("f").dropna()
+                vals.index = vals.index.set_names(["datetime", "instrument"])
+                sig._write_parquet_atomic(fe._norm(vals).to_frame(fac["name"]), ck)
+                fast_done += 1
+            except Exception:
+                continue  # 单个失败回退 build_scorecard 的子进程路径
+    except Exception:
+        pass
+
     card = fe.build_scorecard(facs, codes, end, train_end=train_end)
     library.save_scorecard(card, pool_name, end)
     ok = card.dropna(subset=["ICIR"])
-    return f"LoopEngine 体检 {len(facs)} 个（有效 {len(ok)} 个），累计已评估 {len(evaluated) + len(facs) - len([n for n in picked['name'] if n in evaluated])}/{len(reg[reg['engine']=='loopengine'])}"
+    return (f"LoopEngine 体检 {len(facs)} 个（树直算 {fast_done} · 有效 {len(ok)} 个），"
+            f"累计已评估 {len(evaluated) + len(facs) - len([n for n in picked['name'] if n in evaluated])}"
+            f"/{len(reg[reg['engine']=='loopengine'])}")
 
 
 # ---------------------------------------------------------------- 调度器
@@ -399,7 +457,7 @@ JOBS = {
                         "default": {"enabled": False, "hour": 9, "minute": 26, "params": {}}},
     "le_factor_eval": {"name": "🧪 LoopEngine 因子滚动体检（每晚一批）", "func": job_le_factor_eval,
                        "default": {"enabled": False, "hour": 21, "minute": 30,
-                                   "params": {"batch": 15, "pool_name": "沪深300"}}},
+                                   "params": {"batch": 60, "pool_name": "沪深300"}}},
 }
 
 

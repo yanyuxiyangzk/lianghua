@@ -48,6 +48,26 @@ def _cache_key(kind: str, payload: str) -> Path:
     return CACHE_DIR / f"{kind}_{h}.parquet"
 
 
+def _read_parquet_safe(ck: Path) -> pd.DataFrame | None:
+    """缓存读取容错：文件损坏（写一半中断/磁盘满）时删掉并返回 None → 调用方走重算。
+    不修这个则一个坏 parquet 会把相关页面永久卡死（2026-08-26 实盘踩过）。"""
+    try:
+        return pd.read_parquet(ck)
+    except Exception:
+        try:
+            ck.unlink()
+        except OSError:
+            pass
+        return None
+
+
+def _write_parquet_atomic(df: pd.DataFrame, ck: Path):
+    """原子写：先写 .tmp 再改名，杜绝中断留下半个 parquet。"""
+    tmp = ck.with_suffix(".tmp")
+    df.to_parquet(tmp)
+    tmp.replace(ck)
+
+
 def run_factor_code(code: str, name: str, codes: list[str], end: str, lookback_days: int = 400,
                     source: str | None = None) -> pd.DataFrame:
     """子进程执行进化因子代码，返回长表 [(datetime, instrument)] -> factor 值。
@@ -60,7 +80,9 @@ def run_factor_code(code: str, name: str, codes: list[str], end: str, lookback_d
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     ck = _cache_key("evo", source + code + "|".join(codes) + end)
     if ck.exists():
-        return pd.read_parquet(ck)
+        hit = _read_parquet_safe(ck)
+        if hit is not None:
+            return hit
 
     start = (pd.Timestamp(end) - pd.Timedelta(days=int(lookback_days * 1.6))).strftime("%Y-%m-%d")
     with tempfile.TemporaryDirectory() as td:
@@ -74,7 +96,7 @@ def run_factor_code(code: str, name: str, codes: list[str], end: str, lookback_d
         res = pd.read_hdf(td / "result.h5", key="data")
     res.columns = [name] if len(res.columns) == 1 else res.columns
     res = res.sort_index()
-    res.to_parquet(ck)
+    _write_parquet_atomic(res, ck)
     return res
 
 
@@ -478,12 +500,14 @@ def get_panel_cached(codes: list[str], end: str, lookback_days: int = 400,
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     ck = _cache_key("panel", source + "|".join(sorted(codes)) + end + str(lookback_days))
     if ck.exists():
-        return pd.read_parquet(ck)
+        hit = _read_parquet_safe(ck)
+        if hit is not None:
+            return hit
     start = (pd.Timestamp(end) - pd.Timedelta(days=int(lookback_days * 1.6))).strftime("%Y-%m-%d")
     df = fetch_panel(codes, start, end, _PANEL_FIELDS, source=source)
     if df.empty:
         raise RuntimeError("取数为空")
-    df.to_parquet(ck)
+    _write_parquet_atomic(df, ck)
     return df
 
 
@@ -681,3 +705,42 @@ def forward_hit_stats(codes: list[str], end: str, weights: dict[str, tuple[float
         rows.append({"调仓日": t_day, f"Top{top_n}平均{forward_days}日收益": pick_ret,
                      "池内中位收益": fwd_t.median(), "超额": pick_ret - fwd_t.median()})
     return pd.DataFrame(rows).sort_values("调仓日")
+
+
+# ---------------------------------------------------------------- 「为什么选它」白话解释
+def factor_contributions(f_series: dict[str, pd.Series], weights: dict[str, tuple[float, int]],
+                         code: str, asof: str | None = None) -> list[tuple[str, float]]:
+    """某只股票综合分的因子贡献分解：z_i(c)×w_i×d_i，按贡献降序。
+    与 composite_score 同口径（z-score 截面标准化），正负号=该因子推/拉这只票上榜。"""
+    out = []
+    for name, s in f_series.items():
+        w, direction = weights.get(name, (0.0, 1))
+        if w <= 0:
+            continue
+        s = s.dropna()
+        if s.empty:
+            continue
+        dt_level = "datetime" if "datetime" in s.index.names else s.index.names[0]
+        day = asof or s.index.get_level_values(dt_level).max()
+        cross = s[s.index.get_level_values(dt_level) == day]
+        cross.index = cross.index.get_level_values("instrument")
+        if code not in cross.index:
+            continue
+        out.append((name, float(zscore(cross)[code]) * w * direction))
+    return sorted(out, key=lambda x: -x[1])
+
+
+def plain_factor_name(name: str) -> str:
+    """因子名 → 白话短标签（「为什么选它」用）。
+    内置/技术指标用中文字典描述；目录因子挂机制族；LoopEngine 因子名自带族前缀（le_跳空_xxx）。"""
+    if name in BUILTIN_FACTORS:
+        return BUILTIN_FACTORS[name].split("（")[0]
+    if name in TECH_INDICATORS:
+        return TECH_INDICATORS[name].split("（")[0]
+    if name.startswith("le_"):  # le_{族}_{hash}
+        parts = name.split("_")
+        if len(parts) >= 2 and parts[1]:
+            return f"{parts[1]}类因子"
+    if name in NAME2CAT:
+        return f"{NAME2CAT[name]}类·{name}"
+    return name  # RD-Agent 进化因子名通常是描述性英文，原样展示

@@ -3,7 +3,7 @@
 页面拆分（st.navigation，侧栏可折叠）：
   进化工厂: 🧬 进化看板 / 📊 回测浏览
   行情:     📈 股票行情 / 🏛️ 板块行情 / 🕯️ 自选K线 / 📉 专业K线
-  选股:     🧮 因子策略库 / 🪄 选股组合 / 📋 选股列表 / 📈 模拟交易 / 📚 经验库 / ⏰ 定时任务
+  选股:     🎯 今日选股 / 🧩 选股组合 / 📋 选股列表 / 📈 模拟交易 / 📚 经验库 / 🧮 因子策略库 / 🪄 选股工作台 / ⏰ 定时任务
   系统:     ⚙️ 设置（数据源切换/缓存/状态/说明）
 
 注意：页面文件放在 views/ 而非 pages/ —— pages/ 是 Streamlit 旧版自动发现
@@ -42,11 +42,13 @@ pages = {
         st.Page("views/p_kpro.py", title="专业K线", icon="📉", url_path="kpro"),
     ],
        "选股": [
-        st.Page("views/p_factorlib.py", title="因子策略库", icon="🧮", url_path="factorlib"),
-        st.Page("views/p_picker.py", title="选股组合", icon="🪄", url_path="picker"),
+        st.Page("views/p_today.py", title="今日选股", icon="🎯", url_path="today"),
+        st.Page("views/p_combo.py", title="选股组合", icon="🧩", url_path="combo"),
         st.Page("views/p_picks.py", title="选股列表", icon="📋", url_path="picks"),
         st.Page("views/p_trades.py", title="模拟交易", icon="📈", url_path="trades"),
         st.Page("views/p_exp.py", title="经验库", icon="📚", url_path="exp"),
+        st.Page("views/p_factorlib.py", title="因子策略库", icon="🧮", url_path="factorlib"),
+        st.Page("views/p_picker.py", title="选股工作台", icon="🪄", url_path="picker"),
         st.Page("views/p_sched.py", title="定时任务", icon="⏰", url_path="sched"),
     ],
     "系统": [

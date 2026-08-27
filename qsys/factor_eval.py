@@ -27,6 +27,36 @@ WIN_HORIZONS = {"1日": 1, "5日": 5, "20日": 20, "60日": 60, "120日": 120}
 
 
 # ---------------------------------------------------------------- 基础件
+def resolve_factor(name: str, kind: str | None = None,
+                   evo_map: dict | None = None, le_map: dict | None = None) -> dict | None:
+    """因子名 → get_factor_values 可用的 fac dict（自动补进化/LoopEngine 因子代码）。
+    evo_map/le_map 可传入预建的 {name: code} 避免逐因子查库；解析不到代码返回 None。"""
+    import datasource  # noqa: F401  保持与 get_factor_values 相同的延迟导入约定
+    if name in sig.BUILTIN_FACTORS:
+        return {"name": name, "kind": "builtin", "code": None}
+    if name in sig.CATALOG_NAMES or name in sig.TECH_INDICATORS:
+        return {"name": name, "kind": "tech", "code": None}
+    code = None
+    if evo_map is not None or le_map is not None:
+        code = (evo_map or {}).get(name) or (le_map or {}).get(name)
+    else:
+        from common import get_evolved_factors
+        import library
+        for f in get_evolved_factors(only_accepted=False):
+            if f["name"] == name:
+                code = f["code"]
+                break
+        if not code:
+            try:
+                reg = library.get_factor_registry()
+                r = reg[reg["name"] == name]
+                if not r.empty:
+                    code = r.iloc[0]["code"]
+            except Exception:
+                pass
+    return {"name": name, "kind": kind or "evolved", "code": code} if code else None
+
+
 def _norm(s: pd.Series) -> pd.Series:
     """统一成长表索引 (datetime, instrument) 并排序（容忍历史遗留的 date 层名）。"""
     if "date" in (s.index.names or []):
@@ -60,7 +90,9 @@ def get_factor_values(fac: dict, codes: list[str], end: str, lookback_days: int 
     source = source or "qlib_local"
     ck = _cache("fvals", f"{source}|{fac['name']}|{fac['kind']}|{'|'.join(sorted(codes))}|{end}|{lookback_days}")
     if ck.exists():
-        return pd.read_parquet(ck).iloc[:, 0]
+        hit = sig._read_parquet_safe(ck)
+        if hit is not None:
+            return hit.iloc[:, 0]
     if fac["kind"] == "builtin":
         panel = sig.get_panel_cached(codes, end, lookback_days, source=source)
         s = sig.compute_builtin(panel, fac["name"])
@@ -74,7 +106,7 @@ def get_factor_values(fac: dict, codes: list[str], end: str, lookback_days: int 
         df = sig.run_factor_code(fac["code"], fac["name"], codes, end, lookback_days, source=source)
         s = df.iloc[:, 0]
     s = _norm(s.dropna())
-    s.to_frame(fac["name"]).to_parquet(ck)
+    sig._write_parquet_atomic(s.to_frame(fac["name"]), ck)
     return s
 
 
@@ -100,11 +132,13 @@ def get_ic_series(fac: dict, codes: list[str], end: str, fwd_days: int = MAIN_FW
     source = source or "qlib_local"
     ck = _cache("ic", f"{source}|{fac['name']}|{fac['kind']}|{'|'.join(sorted(codes))}|{end}|{fwd_days}|{lookback_days}")
     if ck.exists():
-        return pd.read_parquet(ck).iloc[:, 0]
+        hit = sig._read_parquet_safe(ck)
+        if hit is not None:
+            return hit.iloc[:, 0]
     vals = get_factor_values(fac, codes, end, lookback_days, source=source)
     panel = sig.get_panel_cached(codes, end, lookback_days, source=source)
     ic = ic_series(vals, forward_returns(panel, fwd_days))
-    ic.to_frame("ic").to_parquet(ck)
+    sig._write_parquet_atomic(ic.to_frame("ic"), ck)
     return ic
 
 
@@ -290,10 +324,25 @@ def factor_group_backtest(vals: pd.Series, panel: pd.DataFrame, n_groups: int = 
                  "调仓点数": str(len(ls_ret))}
     return {"group_mean": group_mean, "ls_ret": ls_ret, "ls_nav": nav, "ls_stats": stats,
             "ic": ic_series(vals, forward_returns(panel, fwd_days))}
+# ---------------------------------------------------------------- 截面打分（walk_forward / static_backtest 共用）
+def _score_at(vals_norm: dict[str, pd.Series], weights: dict, t) -> pd.Series:
+    """调仓日 t 的截面综合分（z-score × 权重 × 方向）。"""
+    zl = []
+    for n, (w, d) in weights.items():
+        if w <= 0:
+            continue
+        cross = vals_norm[n][vals_norm[n].index.get_level_values("datetime") == t]
+        cross.index = cross.index.get_level_values("instrument")
+        zl.append(sig.zscore(cross) * w * d)
+    return pd.concat(zl, axis=1).mean(axis=1).dropna() if zl else pd.Series(dtype=float)
+
+
+# ---------------------------------------------------------------- 滚动样本外
 def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method: str,
                  top_n: int, est: int = EST_WINDOW, step: int = STEP_DAYS,
                  fwd_days: int = MAIN_FWD, cost: float = 0.0025,
-                 buffer_n: int = 0) -> pd.DataFrame:
+                 buffer_n: int = 0, ic_full: dict[str, pd.Series] | None = None,
+                 min_factors: int = 2) -> pd.DataFrame:
     """滚动样本外：每个应用点 t，用 [t-est, t-fwd] 的 IC 统计定权重与方向，
     在 t 截面打分取 Top-N，记录随后 fwd_days 的超额收益。
 
@@ -302,17 +351,19 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
     1 日口径下换手极高，扣费后超额才是能装进口袋的部分。
     buffer_n>0 时启用缓冲带：上期持仓只要没跌出 Top(top_n+buffer_n) 就继续持有，
     是降换手的标准做法（实测可把 1 日口径 80%/日的换手压到 ~30%）。
+    ic_full 可传入预计算的全历史 IC 序列（贪心搜索批量评估时避免重复计算）。
+    min_factors：估计窗内有效因子的最少个数（贪心搜索单因子起步时用 1）。
     """
     fwd = forward_returns(panel, fwd_days)
     # 全历史 IC 序列（每个因子算一次，应用点只做切片统计 → 快）
-    ic_full = {}
     vals_norm = {}
     for name, s in factor_vals.items():
         s2 = _norm(s.dropna())
         if s2.empty:
             continue
         vals_norm[name] = s2
-        ic_full[name] = ic_series(s2, fwd)
+    if ic_full is None:
+        ic_full = {name: ic_series(s, fwd) for name, s in vals_norm.items()}
     days = sorted(set.intersection(*[set(s.index.get_level_values("datetime").unique())
                                      for s in vals_norm.values()])) if vals_norm else []
     if len(days) < est + fwd_days + step:
@@ -327,13 +378,15 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
         # 切片统计 → 权重
         stats = {}
         for name, ic in ic_full.items():
+            if name not in vals_norm:
+                continue
             seg = ic[(ic.index >= est_lo) & (ic.index <= est_hi)]
             if len(seg) < 60:
                 stats[name] = None
                 continue
             stats[name] = (seg.mean(), seg.mean() / (seg.std() + 1e-12), (seg > 0).mean())
         valid = {n: s for n, s in stats.items() if s is not None}
-        if len(valid) < 2:
+        if len(valid) < min_factors:
             continue
         sc = pd.DataFrame({n: {"IC均值": v[0], "ICIR": v[1], "Top组胜率": v[2]}
                            for n, v in valid.items()}).T
@@ -341,22 +394,12 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
         w_opt = compute_weights(sc.reset_index(names="因子"), method, names)
         w_eq = {n: (1.0 / len(names), w_opt[n][1]) for n in names}
 
-        def _score(weights):
-            zl = []
-            for n, (w, d) in weights.items():
-                if w <= 0:
-                    continue
-                cross = vals_norm[n][vals_norm[n].index.get_level_values("datetime") == t]
-                cross.index = cross.index.get_level_values("instrument")
-                zl.append(sig.zscore(cross) * w * d)
-            return pd.concat(zl, axis=1).mean(axis=1).dropna() if zl else pd.Series(dtype=float)
-
         fr = fwd.loc[t].dropna() if t in fwd.index else pd.Series(dtype=float)
         if fr.empty:
             continue
         row = {"调仓日": str(t)[:10], "池内中位收益": fr.median()}
         for label, weights in [("优化组合", w_opt), ("等权组合", w_eq)]:
-            sc_t = _score(weights)
+            sc_t = _score_at(vals_norm, weights, t)
             ranked = sc_t[sc_t.index.isin(fr.index)].sort_values(ascending=False)
             prev = prev_picks[label]
             if buffer_n > 0 and prev:
@@ -377,4 +420,157 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
                 row[f"{label}扣费超额"] = row[f"{label}超额"] - turnover * cost
         if "优化组合超额" in row:
             rows.append(row)
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------- 样本内对照（固定权重）
+def static_backtest(factor_vals: dict[str, pd.Series], panel: pd.DataFrame,
+                    weights: dict, top_n: int, fwd_days: int = MAIN_FWD,
+                    step: int = STEP_DAYS, cost: float = 0.0025,
+                    upto: str | None = None, collect_picks: bool = False) -> pd.DataFrame:
+    """样本内对照回测：用 ② 组合构建算好的**固定权重**（不滚动重估），
+    在 upto（默认全历史）之前的调仓点上截面打分取 Top-N。
+
+    输出与 walk_forward 同构，用于 ③ 的 IS/OOS 双轨对比：
+    IS 胜率高、OOS 胜率低 = 权重过拟合样本内的直接证据。
+    collect_picks=True 时附 "picks" 列（每点名单），供策略组合投票复用。"""
+    fwd = forward_returns(panel, fwd_days)
+    vals_norm = {n: _norm(s.dropna()) for n, s in factor_vals.items() if not s.dropna().empty}
+    if not vals_norm:
+        return pd.DataFrame()
+    days = sorted(set.intersection(*[set(s.index.get_level_values("datetime").unique())
+                                     for s in vals_norm.values()]))
+    if upto:
+        days = [d for d in days if str(d)[:10] <= str(upto)[:10]]
+    prev: set = set()
+    rows = []
+    for t in days[::step]:
+        if t not in fwd.index:
+            continue
+        fr = fwd.loc[t].dropna()
+        if fr.empty:
+            continue
+        sc_t = _score_at(vals_norm, weights, t)
+        ranked = sc_t[sc_t.index.isin(fr.index)].sort_values(ascending=False)
+        picks = ranked.head(top_n)
+        if len(picks) < max(3, top_n // 2):
+            continue
+        cur = set(picks.index)
+        turnover = 1.0 if not prev else 1 - len(cur & prev) / len(picks)
+        prev = cur
+        ret = float(fr[picks.index].mean())
+        row = {"调仓日": str(t)[:10], "池内中位收益": float(fr.median()),
+               "组合收益": ret, "组合超额": ret - float(fr.median()),
+               "组合换手率": turnover,
+               "组合扣费超额": ret - float(fr.median()) - turnover * cost}
+        if collect_picks:
+            row["picks"] = list(picks.index)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------- 贪心组合推荐（OOS 前向选择）
+def greedy_combo(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method: str,
+                 top_n: int, candidates: list[str], fwd_days: int = MAIN_FWD,
+                 step: int = STEP_DAYS, cost: float = 0.0025, max_n: int = 8,
+                 min_points: int = 8, buffer_n: int = 0) -> dict:
+    """前向贪心选因子：从空集开始，每轮把使 walk-forward **扣费胜率**提升最大
+    的因子加入组合（胜率并列时比平均净超额），直到无提升或满 max_n 个。
+
+    IC 全序列只预计算一次并注入 walk_forward，单轮评估亚秒级；
+    候选建议先去冗余再截到 ~12 个（调用方负责）。选择本身用了 OOS 信息，
+    属于"用验证集选模型"——配合 ③ 的多重检验提示解读，别当作无偏胜率。
+    """
+    vals_norm = {n: _norm(factor_vals[n].dropna()) for n in candidates
+                 if n in factor_vals and not factor_vals[n].dropna().empty}
+    avail = [n for n in candidates if n in vals_norm]
+    if not avail:
+        return {"selected": [], "history": pd.DataFrame(), "wf": pd.DataFrame()}
+    fwd = forward_returns(panel, fwd_days)
+    ic_full = {n: ic_series(vals_norm[n], fwd) for n in avail}
+
+    def _eval(names: list[str]):
+        wf = walk_forward({n: vals_norm[n] for n in names}, panel, method, top_n,
+                          step=step, fwd_days=fwd_days, cost=cost,
+                          buffer_n=buffer_n, ic_full=ic_full, min_factors=1)
+        if wf.empty or len(wf) < min_points or "优化组合扣费超额" not in wf:
+            return None, wf
+        net = wf["优化组合扣费超额"]
+        return (float((net > 0).mean()), float(net.mean())), wf
+
+    selected, history = [], []
+    best, best_wf = (-1.0, -9e9), pd.DataFrame()
+    while avail and len(selected) < max_n:
+        round_best, round_name, round_wf = None, None, None
+        for n in avail:
+            obj, wf = _eval(selected + [n])
+            if obj and (round_best is None or obj > round_best):
+                round_best, round_name, round_wf = obj, n, wf
+        if round_name is None or (selected and round_best <= best):
+            break
+        selected.append(round_name)
+        avail.remove(round_name)
+        best, best_wf = round_best, round_wf
+        history.append({"步骤": len(selected), "加入因子": round_name,
+                        "OOS扣费胜率": f"{round_best[0]:.0%}",
+                        "平均净超额": f"{round_best[1]:+.2%}"})
+    return {"selected": selected, "history": pd.DataFrame(history), "wf": best_wf}
+
+
+# ---------------------------------------------------------------- 策略组合（多包投票）回测
+def combo_backtest(pack_defs: list[dict], panel: pd.DataFrame, min_votes: int = 2,
+                   fwd_days: int = MAIN_FWD, step: int = STEP_DAYS,
+                   cost: float = 0.0025) -> pd.DataFrame:
+    """策略组合回测：统一调仓网格上每个策略包各自打分取 Top-N，按票数合成名单。
+
+    pack_defs: [{"name": str, "weights": {因子: (w, d)}, "fvals": {因子: Series}, "top_n": int}]
+    合成规则：票数 ≥ min_votes 入选；不足 3 只时按票数降序放宽到 3~5 只。
+    返回 DataFrame：调仓日 / 组合超额 / 组合扣费超额 / 组合换手率 / 入选只数 / 各包超额（对比曲线用）。
+    各包权重为保存时的固定权重（不做滚动重估）——回测的是"这组包按此规则合用"的表现。
+    """
+    fwd = forward_returns(panel, fwd_days)
+    packs = []
+    for pd_ in pack_defs:
+        vals = {n: _norm(s.dropna()) for n, s in pd_["fvals"].items() if not s.dropna().empty}
+        if vals:
+            packs.append({"name": pd_["name"], "weights": pd_["weights"],
+                          "top_n": int(pd_["top_n"]), "vals": vals})
+    if len(packs) < 2:
+        return pd.DataFrame()
+    days = list(panel.index.get_level_values("datetime").unique())
+    prev: set = set()
+    rows = []
+    for t in days[::step]:
+        if t not in fwd.index:
+            continue
+        fr = fwd.loc[t].dropna()
+        if fr.empty:
+            continue
+        med = float(fr.median())
+        row = {"调仓日": str(t)[:10], "池内中位收益": med}
+        votes: dict[str, int] = {}
+        for p in packs:
+            sc_t = _score_at(p["vals"], p["weights"], t)
+            ranked = sc_t[sc_t.index.isin(fr.index)].sort_values(ascending=False)
+            picks = list(ranked.head(p["top_n"]).index)
+            if len(picks) < max(3, p["top_n"] // 2):
+                continue
+            row[f"{p['name']}超额"] = float(fr[picks].mean()) - med
+            for c in picks:
+                votes[c] = votes.get(c, 0) + 1
+        merged = [c for c, v in votes.items() if v >= min_votes]
+        if len(merged) < 3 and votes:  # 太严格时放宽：按票数降序取 3~5 只
+            merged = sorted(votes, key=lambda c: -votes[c])[:max(3, min(5, len(votes)))]
+        merged = [c for c in merged if c in fr.index]
+        if len(merged) < 3:
+            continue
+        cur = set(merged)
+        turnover = 1.0 if not prev else 1 - len(cur & prev) / len(merged)
+        prev = cur
+        excess = float(fr[merged].mean()) - med
+        row["入选只数"] = len(merged)
+        row["组合超额"] = excess
+        row["组合换手率"] = turnover
+        row["组合扣费超额"] = excess - turnover * cost
+        rows.append(row)
     return pd.DataFrame(rows)

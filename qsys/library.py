@@ -54,6 +54,13 @@ CREATE TABLE IF NOT EXISTS failure_patterns (
     factor_name TEXT, skeleton TEXT, family TEXT, reason TEXT,
     engine TEXT, created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS combo_strategies (
+    name TEXT PRIMARY KEY,
+    pool_name TEXT, top_n INTEGER,
+    rule TEXT,                    -- vote2 / intersect
+    packs TEXT,                   -- JSON array：成员策略包名
+    created_at TEXT
+);
 """
 
 _PACKS_JSON = DATA_DIR / "packs.json"
@@ -77,6 +84,9 @@ def _lconn():
     st_cols = [r[1] for r in c.execute("PRAGMA table_info(strategies)")]
     if "horizon" not in st_cols:
         c.execute("ALTER TABLE strategies ADD COLUMN horizon TEXT")
+    # 迁移：strategies 加样本内胜率（🎯今日选股的过拟合信号灯用）
+    if "is_winrate" not in st_cols:
+        c.execute("ALTER TABLE strategies ADD COLUMN is_winrate TEXT")
     _migrate(c)
     return c
 
@@ -209,12 +219,13 @@ def list_scorecard_pools() -> list[str]:
 def save_strategy(name: str, pack: dict):
     with _lconn() as c:
         c.execute(
-            "INSERT OR REPLACE INTO strategies (name, pool_name, top_n, method, filters, factors, oos_winrate, horizon, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?)",
+            "INSERT OR REPLACE INTO strategies (name, pool_name, top_n, method, filters, factors,"
+            " oos_winrate, horizon, is_winrate, updated_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?)",
             (name, pack.get("pool_name"), pack.get("top_n"), pack.get("method"),
              json.dumps(pack.get("filters", []), ensure_ascii=False),
              json.dumps(pack.get("factors", []), ensure_ascii=False),
-             pack.get("oos_winrate"), pack.get("horizon"),
+             pack.get("oos_winrate"), pack.get("horizon"), pack.get("is_winrate"),
              pack.get("updated") or datetime.now().strftime("%Y-%m-%d %H:%M")))
 
 
@@ -222,18 +233,45 @@ def list_strategies() -> dict:
     """返回与 packs.json 相同的结构 {name: pack_dict}，便于各处平滑切换。"""
     with _lconn() as c:
         rows = c.execute("SELECT name, pool_name, top_n, method, filters, factors, oos_winrate,"
-                         " horizon, updated_at FROM strategies").fetchall()
+                         " horizon, is_winrate, updated_at FROM strategies").fetchall()
     out = {}
-    for (name, pool, top_n, method, filters, factors, oos, horizon, updated) in rows:
+    for (name, pool, top_n, method, filters, factors, oos, horizon, is_wr, updated) in rows:
         out[name] = {"pool_name": pool, "top_n": top_n, "method": method,
                      "filters": json.loads(filters or "[]"), "factors": json.loads(factors or "[]"),
-                     "oos_winrate": oos, "horizon": horizon, "updated": updated}
+                     "oos_winrate": oos, "horizon": horizon, "is_winrate": is_wr, "updated": updated}
     return out
 
 
 def delete_strategy(name: str):
     with _lconn() as c:
         c.execute("DELETE FROM strategies WHERE name=?", (name,))
+
+
+# ---------------------------------------------------------------- 策略组合（多包投票）
+def save_combo(name: str, cfg: dict):
+    """保存策略组合：{pool_name, top_n, rule, packs[包名...]}。
+    独立于 strategies 表——组合包不是因子包，调度器 _best_pack 不会误选。"""
+    with _lconn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO combo_strategies (name, pool_name, top_n, rule, packs, created_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (name, cfg.get("pool_name"), cfg.get("top_n"), cfg.get("rule"),
+             json.dumps(cfg.get("packs", []), ensure_ascii=False),
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+
+
+def list_combos() -> dict:
+    with _lconn() as c:
+        rows = c.execute(
+            "SELECT name, pool_name, top_n, rule, packs, created_at FROM combo_strategies").fetchall()
+    return {n: {"pool_name": pool, "top_n": top_n, "rule": rule,
+                "packs": json.loads(packs or "[]"), "created_at": created}
+            for n, pool, top_n, rule, packs, created in rows}
+
+
+def delete_combo(name: str):
+    with _lconn() as c:
+        c.execute("DELETE FROM combo_strategies WHERE name=?", (name,))
 
 
 # ---------------------------------------------------------------- P1：哈希检查点
@@ -299,3 +337,35 @@ def failure_stats(limit: int = 20) -> pd.DataFrame:
             "SELECT skeleton, family, COUNT(*) AS n, MAX(created_at) AS last_fail"
             " FROM failure_patterns GROUP BY skeleton ORDER BY n DESC LIMIT ?",
             c, params=(limit,))
+
+
+# ---------------------------------------------------------------- 族实战统计（回喂 LoopEngine 生成预算）
+def family_live_stats(min_n: int = 3) -> dict:
+    """{机制族: 实战胜率} —— 经验库因子近似归因 × 注册表族标签。
+    结算周期按 20/5/1 日逐级回退（20 日战果积累慢，新库先用短周期让回喂尽快生效）；
+    只统计有 ≥min_n 次实战结算的因子；无数据返回 {}（调用方按无偏置处理）。"""
+    try:
+        import experience
+        flb = pd.DataFrame()
+        win_col = None
+        for fwd in (20, 5, 1):
+            flb = experience.factor_leaderboard(fwd=fwd)
+            if not flb.empty:
+                win_col = f"{fwd}日胜率(近似)"
+                break
+        if flb.empty or not win_col:
+            return {}
+        reg = get_factor_registry()
+        fam_map = dict(zip(reg["name"], reg["family"].fillna("其他"))) if not reg.empty else {}
+        acc = {}
+        for _, r in flb.iterrows():
+            n_ = int(r["参与且有战果的次数"])
+            if n_ < min_n:
+                continue
+            fam = fam_map.get(r["因子"])
+            if not fam:
+                continue
+            acc.setdefault(fam, []).extend([float(r[win_col])] * n_)
+        return {f: sum(v) / len(v) for f, v in acc.items()}
+    except Exception:
+        return {}

@@ -221,8 +221,9 @@ def pack_leaderboard() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def factor_leaderboard() -> pd.DataFrame:
-    """因子实战近似归因：含有该因子的组合，其后战果均值（有混杂，仅作参考）。"""
+def factor_leaderboard(fwd: int = 20) -> pd.DataFrame:
+    """因子实战近似归因：含有该因子的组合，其后战果均值（有混杂，仅作参考）。
+    fwd 可指定结算周期（默认 20 日；回喂生成端等场景可用 5/1 日提前获得信号）。"""
     with _conn() as c:
         picks = pd.read_sql("SELECT id, factors FROM picks", c)
         outs = pd.read_sql("SELECT * FROM outcomes", c)
@@ -235,7 +236,7 @@ def factor_leaderboard() -> pd.DataFrame:
             facs = json.loads(p["factors"])
         except Exception:
             continue
-        o = outs[(outs["pick_id"] == p["id"]) & (outs["fwd_days"] == 20)]
+        o = outs[(outs["pick_id"] == p["id"]) & (outs["fwd_days"] == fwd)]
         if o.empty:
             continue
         for f in facs:
@@ -243,9 +244,9 @@ def factor_leaderboard() -> pd.DataFrame:
             name2ex.setdefault(f["name"], []).extend(o["excess"].tolist())
     for name, hits in name2hits.items():
         rows.append({"因子": name, "参与且有战果的次数": len(hits),
-                     "20日胜率(近似)": float(np.mean(hits)),
-                     "20日均超额(近似)": float(np.mean(name2ex[name]))})
-    return pd.DataFrame(rows).sort_values("20日胜率(近似)", ascending=False) if rows else pd.DataFrame()
+                     f"{fwd}日胜率(近似)": float(np.mean(hits)),
+                     f"{fwd}日均超额(近似)": float(np.mean(name2ex[name]))})
+    return pd.DataFrame(rows).sort_values(f"{fwd}日胜率(近似)", ascending=False) if rows else pd.DataFrame()
 
 
 def pick_history(limit: int = 50) -> pd.DataFrame:
@@ -271,11 +272,12 @@ def list_pick_dates(limit: int = 120) -> list[str]:
 
 
 def picks_on_date(trade_date: str) -> pd.DataFrame:
-    """某交易日的全部选股记录（同一日可能有手动+自动多条）。"""
+    """某交易日的全部选股记录（同一日可能有手动+自动多条）。含 factors/filters 供解释页复算。"""
     with _conn() as c:
         return pd.read_sql(
             "SELECT id, created_at, source, pool_name, pack_name, method, top_n,"
-            " oos_winrate_at_save, COALESCE(data_source,'qlib_local') AS data_source"
+            " filters, factors, oos_winrate_at_save,"
+            " COALESCE(data_source,'qlib_local') AS data_source"
             " FROM picks WHERE trade_date=? ORDER BY id DESC", c, params=(trade_date,))
 
 

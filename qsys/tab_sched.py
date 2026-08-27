@@ -81,7 +81,10 @@ def render():
         for f in files[:10]:
             st.caption(f"`{f.name}` — {pd.Timestamp(f.stat().st_mtime, unit='s').strftime('%m-%d %H:%M')}")
             if st.button("预览", key=f"pv_{f.name}"):
-                st.dataframe(pd.read_parquet(f), width='stretch')
+                try:
+                    st.dataframe(pd.read_parquet(f), width='stretch')
+                except Exception as e:
+                    st.error(f"文件损坏（可删除后重跑任务重新生成）：{e}")
 
     with st.expander("📜 运行历史"):
         hist = Path(SCHED_LAST_FILE).parent / "scheduler_history.jsonl"

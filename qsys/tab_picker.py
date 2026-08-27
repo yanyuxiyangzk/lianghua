@@ -38,7 +38,8 @@ def _factor_universe():
 
 
 def render():
-    st.subheader("🪄 选股神奇组合")
+    st.subheader("🪄 选股工作台")
+    st.caption("💡 只想知道**今天买什么、为什么、靠不靠谱**？去左侧 **🎯 今日选股**。本页是调策略的专业工作台。")
     st.caption(f"胜率驱动的因子组合：体检 → 去冗余 → 加权 → 样本外验证 → 固化执行 · 数据截至 **{get_last_trade_day()}**")
 
     pools = all_pools()
@@ -55,18 +56,27 @@ def render():
     # ---- 体检范围收敛：全宇宙 8000+ 因子全评不现实，按来源圈定范围 ----
     SCOPE_KINDS = {"内置经典": ["builtin"], "技术指标": ["tech"], "RD-Agent进化": ["evolved"]}
     scope = st.multiselect(
-        "参与体检的因子范围", list(SCOPE_KINDS) + ["LoopEngine精选(已有评分卡Top50)"],
+        "参与体检的因子范围", list(SCOPE_KINDS) + ["LoopEngine精选(族配额Top50)"],
         default=["内置经典", "技术指标", "RD-Agent进化"],
         help="LoopEngine 已自动生成数千因子，全量体检需按个执行代码、耗时以天计；"
-             "精选模式只取已有评分卡中 |ICIR| 最高的 50 个")
+             "精选模式按机制族配额取每族 |ICIR| 最高的若干（共约 50 个）——"
+             "全局 Top50 会被同质化的波动族克隆占满，族配额保证候选池多样性")
     kinds = sum((SCOPE_KINDS[s] for s in scope if s in SCOPE_KINDS), [])
     eval_facs = [f for f in facs if f["kind"] in kinds]
-    if "LoopEngine精选(已有评分卡Top50)" in scope:
+    if "LoopEngine精选(族配额Top50)" in scope:
         try:
             sc = library.get_latest_scorecard(pool_name)
+            reg = library.get_factor_registry()
+            fam_map = dict(zip(reg["name"], reg["family"].fillna("其他")))
             if sc is not None and not sc.empty:
-                sc = sc.assign(_abs=pd.to_numeric(sc["icir"], errors="coerce").abs())
-                top_names = sc.sort_values("_abs", ascending=False).head(50)["name"].tolist()
+                # get_latest_scorecard 返回中列已汉化（因子/ICIR）
+                sc = sc.assign(_abs=pd.to_numeric(sc["ICIR"], errors="coerce").abs(),
+                               _fam=sc["因子"].map(lambda n: fam_map.get(n, "其他")))
+                sc = sc.dropna(subset=["_abs"])
+                n_fams = max(1, sc["_fam"].nunique())
+                k = max(3, -(-50 // n_fams))  # 每族配额，共约 50 个
+                top_names = (sc.sort_values("_abs", ascending=False)
+                               .groupby("_fam").head(k)["因子"].tolist())
                 rank = {n: i for i, n in enumerate(top_names)}
                 le = [f for f in facs if f["kind"] == "loopengine" and f["name"] in rank]
                 le.sort(key=lambda f: rank[f["name"]])
@@ -175,7 +185,15 @@ def render():
         hold_h = st.radio("决策持有期（选股锚定的预测窗口）", ["1日", "5日", "20日"],
                           index=0, horizontal=True,
                           help="默认 1 日：胜率加权与样本外验证都按该窗口的远期收益评估")
-        chosen = st.multiselect("参与组合的因子（已按去冗余过滤，可再调）", kept, default=kept[:6])
+        # 推荐回填守卫：pe_chosen 可能含已被去冗余剔除的因子，创建控件前过滤（允许空选择）
+        # 贪心推荐的回填走 _pe_chosen_next 中转：widget 实例化后禁止直写其 key，
+        # 必须在下一轮 rerun、控件创建之前落位（否则 StreamlitAPIException）
+        if "_pe_chosen_next" in st.session_state:
+            st.session_state["pe_chosen"] = st.session_state.pop("_pe_chosen_next")
+        if "pe_chosen" in st.session_state:
+            st.session_state["pe_chosen"] = [n for n in st.session_state["pe_chosen"] if n in kept]
+        chosen = st.multiselect("参与组合的因子（已按去冗余过滤，可再调）", kept,
+                                default=kept[:6], key="pe_chosen")
         filters = st.multiselect("策略过滤器", list(sig.STRATEGY_FILTERS.keys()), default=["tradable"],
                                  format_func=lambda k: sig.STRATEGY_FILTERS[k])
         top_n = st.slider("Top-N", 5, 50, 10)
@@ -198,6 +216,35 @@ def render():
             wt = pd.DataFrame([{"因子": n, "权重": f"{w:.1%}", "方向": "正向" if d > 0 else "负向"}
                                for n, (w, d) in weights.items()])
             st.dataframe(wt, width='stretch', height=200)
+
+    # ---- 🤖 一键贪心组合推荐：以 OOS 扣费胜率为目标做前向选择 ----
+    if kept and not lp:
+        if st.button("🤖 一键推荐组合（OOS贪心）",
+                     help="在去冗余后的因子里做前向选择：每轮加入使样本外扣费胜率提升最大的因子，"
+                          "直到无提升或满 8 个。候选按 |ICIR| 截前 12，IC 序列预计算后单轮亚秒级。"):
+            cands = kept[:12]
+            with st.spinner(f"贪心搜索中（{len(cands)} 候选 × walk-forward 滚动验证）…"):
+                fvals = {}
+                for n in cands:
+                    fac = next(f for f in facs if f["name"] == n)
+                    fvals[n] = fe.get_factor_values(fac, codes, end)
+                panel = sig.get_panel_cached(codes, end, 800)
+                hdays = fe.WIN_HORIZONS.get(hold_h, fe.MAIN_FWD)
+                reco = fe.greedy_combo(fvals, panel, method, top_n, cands,
+                                       fwd_days=hdays, step=max(1, min(fe.STEP_DAYS, hdays)))
+            st.session_state["pe_reco"] = {"selected": reco["selected"], "history": reco["history"]}
+            if reco["selected"]:
+                st.session_state["_pe_chosen_next"] = reco["selected"]
+                st.rerun()
+            else:
+                st.warning("贪心搜索没有找到可用的因子组合（候选因子 OOS 数据不足）。")
+        reco = st.session_state.get("pe_reco")
+        if reco and reco.get("selected"):
+            st.caption("🤖 推荐路径（每步加入使 OOS 扣费胜率提升最大的因子）："
+                       + " → ".join(f"`{n}`" for n in reco["selected"]))
+            h = reco.get("history")
+            if h is not None and not h.empty:
+                st.dataframe(h, width='stretch', hide_index=True, height=200)
 
     # 相关矩阵：全宽 + 斜排标签 + 高度随因子数自适应（防挤压截断）
     if not corr.empty and len(corr) > 1:
@@ -300,6 +347,12 @@ def render():
                 wf = fe.walk_forward(fvals, panel, method, top_n,
                                      fwd_days=hdays, step=max(1, min(fe.STEP_DAYS, hdays)))
                 st.session_state["pe_wf"] = wf
+                # IS 对照：② 的固定权重（不滚动重估）在样本内区间的表现
+                if weights:
+                    upto = train_end if (pre_oos and train_end) else None
+                    st.session_state["pe_is"] = fe.static_backtest(
+                        fvals, panel, weights, top_n, upto=upto,
+                        fwd_days=hdays, step=max(1, min(fe.STEP_DAYS, hdays)))
     wf = st.session_state.get("pe_wf")
     if wf is not None and not wf.empty:
         oos_win = (wf["优化组合超额"] > 0).mean()
@@ -322,6 +375,26 @@ def render():
             st.warning("OOS 胜率 < 55%：该组合方向有效性不足，建议换因子/换池/降 Top-N，不要固化。")
         elif "优化组合扣费超额" in wf and net.mean() <= 0:
             st.warning("毛胜率合格但扣费后净超额 ≤ 0：换手吃掉利润——考虑延长持有期或降 Top-N 波动。")
+
+        # ---- IS/OOS 双轨对比（设计文档：IS 仅参考，OOS 才用于决策；差距大 = 过拟合警报） ----
+        is_df = st.session_state.get("pe_is")
+        if is_df is not None and not is_df.empty and "组合扣费超额" in is_df:
+            oos_col = "优化组合扣费超额" if "优化组合扣费超额" in wf else "优化组合超额"
+            is_win = (is_df["组合扣费超额"] > 0).mean()
+            oos_win_net = (wf[oos_col] > 0).mean()
+            st.markdown(
+                f"**IS/OOS 双轨**：样本内（② 固定权重）扣费胜率 **{is_win:.0%}**（{len(is_df)} 点）"
+                f" vs 样本外（滚动重估）**{oos_win_net:.0%}**（{len(wf)} 点）"
+                f" · 平均净超额 IS {is_df['组合扣费超额'].mean():+.2%} / OOS {wf[oos_col].mean():+.2%}")
+            cum_is = is_df.set_index("调仓日")["组合扣费超额"].add(1).cumprod().rename("样本内(固定权重)")
+            cum_oos = wf.set_index("调仓日")[oos_col].add(1).cumprod().rename("样本外(walk-forward)")
+            st.line_chart(pd.concat([cum_is, cum_oos], axis=1), height=260)
+            if is_win - oos_win_net > 0.10:
+                st.warning(f"⚠️ 过拟合警报：IS 胜率比 OOS 高 {is_win - oos_win_net:.0%}（>10pp）——"
+                           "权重/因子选择过度拟合了样本内。建议：减因子数量、换低相关因子、"
+                           "拉长持有期，或退守等权。")
+            st.caption("多重检验提示：组合是试出来的（含 🤖 贪心推荐），其 OOS 胜率仍偏乐观——"
+                       "固化策略包后以经验库的实战命中做最终裁决。")
 
     # ================= ④ 名单应用 & 策略包 =================
     st.markdown("### ④ 名单应用 & 策略包")
@@ -353,9 +426,13 @@ def render():
             oos = None
             if wf is not None and not wf.empty:
                 oos = f"{(wf['优化组合超额'] > 0).mean():.0%}"
+            is_wr = None
+            is_df = st.session_state.get("pe_is")
+            if is_df is not None and not is_df.empty and "组合扣费超额" in is_df:
+                is_wr = f"{(is_df['组合扣费超额'] > 0).mean():.0%}"
             library.save_strategy(pname, {
                 "pool_name": pool_name, "top_n": top_n, "method": method, "filters": filters,
-                "horizon": hold_h,
+                "horizon": hold_h, "is_winrate": is_wr,
                 "factors": [{"name": n, "kind": next(f for f in facs if f['name'] == n)["kind"],
                              "weight": w, "direction": d} for n, (w, d) in weights.items()],
                 "oos_winrate": oos, "updated": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M"),

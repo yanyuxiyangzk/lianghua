@@ -60,50 +60,67 @@ class LoopEngine:
         return panel, build_field_frames(panel), end
 
     # ---------------- 生成 ----------------
-    def _gen_candidate(self, rng, families_low):
+    def _gen_candidate(self, rng, gaps, proven, live_boost):
         src = self.state["budget"].choose(rng)
         fw = self.state["field_weights"].w
         if src == "llm":
-            tree = self._llm_generate(families_low) or genetics.random_tree(rng, 4, fw)
+            tree = self._llm_generate(rng, gaps, proven) or genetics.random_tree(rng, 4, fw)
         elif src == "mutate":
-            parent = self._pick_parent(rng)
+            parent = self._pick_parent(rng, live_boost)
             tree = genetics.mutate(parent, rng, fw) if parent else genetics.random_tree(rng, 4, fw)
         elif src == "crossover":
-            p1, p2 = self._pick_parent(rng), self._pick_parent(rng)
+            p1, p2 = self._pick_parent(rng, live_boost), self._pick_parent(rng, live_boost)
             tree = genetics.crossover(p1, p2, rng) if p1 and p2 else genetics.random_tree(rng, 4, fw)
         elif src == "perturb":
-            parent = self._pick_parent(rng)
+            parent = self._pick_parent(rng, live_boost)
             tree = genetics.perturb(parent, rng, self.state["momentum"]) if parent else genetics.random_tree(rng, 4, fw)
         else:
             tree = genetics.random_tree(rng, 4, fw)
         return src, tree
 
-    def _pick_parent(self, rng):
-        """从已通过硬闸门的 loopengine 因子中选取父本（从代码首行注释解析 S 表达式）。"""
+    def _pick_parent(self, rng, live_boost: dict | None = None):
+        """从已通过硬闸门的 loopengine 因子中选取父本（从代码首行注释解析 S 表达式）。
+        live_boost 非空时按族实战胜率加权——实战强的族更容易留下后代。"""
         with library._lconn() as c:
-            row = c.execute(
-                "SELECT code FROM factor_registry WHERE engine='loopengine' AND gate_status=1"
-                " ORDER BY RANDOM() LIMIT 1").fetchone()
-        if not row or not row[0]:
+            rows = c.execute(
+                "SELECT code, family FROM factor_registry WHERE engine='loopengine' AND gate_status=1"
+                " ORDER BY RANDOM() LIMIT 12").fetchall()
+        if not rows:
+            return None
+        if live_boost:
+            w = [1.0 + live_boost.get(r[1] or "", 0.0) for r in rows]
+            row = rng.choices(rows, weights=w, k=1)[0]
+        else:
+            row = rows[0]
+        if not row[0]:
             return None
         first = row[0].split("\n", 1)[0]
         if first.startswith("# sexpr: "):
             return parse(first[len("# sexpr: "):])
         return None
 
-    def _llm_generate(self, families_low):
-        """LLM 机制引导：补最空缺机制族（无 key/失败则回退 None）。"""
+    def _llm_generate(self, rng, gaps, proven):
+        """LLM 机制引导，双目标轮转（无 key/失败则回退 None）：
+        探索——补最空缺机制族；开采——深挖实战验证过的强族（经验库回喂）。"""
         import os
 
-        if not os.environ.get("DEEPSEEK_API_KEY") or not families_low:
+        if not os.environ.get("DEEPSEEK_API_KEY"):
             return None
-        fam = families_low[0]
+        targets = []  # [(族, 引导语)]
+        if gaps:
+            targets.append((rng.choice(gaps), "该机制族在因子库中覆盖极少，探索这个方向的新机制"))
+        if proven:
+            targets.append((rng.choice(proven), "该机制族实盘命中表现最好，在它基础上深挖变体"))
+        if not targets:
+            return None
+        fam, why = rng.choice(targets)
         try:
             from litellm import completion
 
             fields = "open,high,low,close,volume,amount,vwap,overnight,amplitude,upper_shadow,lower_shadow,hl_ratio,body_ratio"
             ops = "sub,mul,div,abs,sign,rank_cs,ma,ts_min,ts_max,ts_rank,decay_linear,std,skew,delta,roc,corr"
-            prompt = (f"你是量化因子工程师。用以下 S 表达式语法写一个属于「{fam}」机制族的 A 股日频量价因子。\n"
+            prompt = (f"你是量化因子工程师。用以下 S 表达式语法写一个属于「{fam}」机制族的 A 股日频量价因子。"
+                      f"（{why}）\n"
                       f"字段: {fields}\n算子: {ops}（窗口算子需带整数窗口，如 ma(close,20)）\n"
                       "规则: 深度≤6，corr/mul/div/sub 两端维度一致，至少含一个窗口算子。\n"
                       "只输出一个 S 表达式，如 sub(ma(overnight,20),delta(ma(overnight,20),5))，不要任何解释。")
@@ -121,16 +138,20 @@ class LoopEngine:
         rng = random.Random(s["iteration"] * 7919 + 13)
         s["iteration"] += 1
 
-        # 机制族空缺指引
+        # 机制族引导：探索（覆盖最少的族）+ 开采（经验库实战最强的族）
         registry = library.get_factor_registry()
         cov = structure.family_coverage(registry[registry["engine"] == "loopengine"] if not registry.empty else registry)
-        families_low = sorted(cov, key=cov.get)[:3]
+        gaps = sorted(cov, key=cov.get)[:3]
+        live = library.family_live_stats()
+        proven = sorted(live, key=lambda f: -live[f])[:3]
+        # 父本选择偏置：胜率 0.55→+0.2，0.60→+0.4，封顶 +1.0；无数据族不偏置
+        live_boost = {f: min(1.0, max(0.0, (w - 0.5) * 4)) for f, w in live.items()}
 
         library.fsa_recompute()
         stats = {"tested": 0, "rejected_review": 0, "llm_rejected": 0, "dup": 0, "frozen": 0, "passed": 0, "new": []}
         llm_review_budget = 5  # P4：每轮随机抽样 5 个候选交独立审查 sub-agent 精判
         for _ in range(batch):
-            src, tree = self._gen_candidate(rng, families_low)
+            src, tree = self._gen_candidate(rng, gaps, proven, live_boost)
             ok, why = review.review(tree)
             if not ok:
                 stats["rejected_review"] += 1
@@ -199,5 +220,5 @@ class LoopEngine:
                     sexprs.append(r[0].split("\n", 1)[0][len("# sexpr: "):])
         s["field_weights"].boost_from_factors(sexprs)
         self._save_state()
-        return {"iteration": s["iteration"], **stats,
+        return {"iteration": s["iteration"], **stats, "gaps": gaps, "proven": proven,
             "budget": {k: round(v, 2) for k, v in s["budget"].p.items()}}

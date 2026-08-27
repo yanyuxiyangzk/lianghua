@@ -166,6 +166,39 @@ def render():
         pool_name = st.selectbox("体检口径（股票池）", pools, index=0, key="fl_pool")
     card = library.get_latest_scorecard(pool_name)
 
+    # 概览：注册总量 vs 本池已体检（之前只显示已体检的，看起来像"库不全"）
+    n_reg = len(registry)
+    n_ev = int(registry["name"].str.startswith("ev_").sum()) if not registry.empty else 0
+    n_gate1 = int((registry.get("gate_status") == 1).sum()) if not registry.empty else 0
+    st.caption(f"库内注册因子 **{n_reg}** 个（收益闸门通过 {n_gate1} · 事件口径 ev_ {n_ev}）· "
+               f"本池（{pool_name}）已体检 **{len(card)}** 个 —— 体检每晚自动扩 60 个，"
+               f"全量覆盖需要数月，属正常")
+
+    view_all = st.toggle("📚 显示全部注册因子（含未体检）", value=False, key="fl_all")
+    if view_all:
+        f1, f2, f3 = st.columns([1, 1, 2])
+        with f1:
+            fams = ["全部"] + sorted(registry["family"].dropna().unique().tolist()) if not registry.empty else ["全部"]
+            fam_sel = st.selectbox("机制族", fams, key="fl_fam")
+        with f2:
+            srcs = ["全部", "loopengine", "rdagent", "builtin", "tech"]
+            src_sel = st.selectbox("来源引擎", srcs, key="fl_src")
+        with f3:
+            kw = st.text_input("搜索因子名", "", key="fl_kw")
+        reg_show = registry.copy()
+        if fam_sel != "全部":
+            reg_show = reg_show[reg_show["family"] == fam_sel]
+        if src_sel != "全部":
+            reg_show = reg_show[reg_show["engine"] == src_sel]
+        if kw.strip():
+            reg_show = reg_show[reg_show["name"].str.contains(kw.strip(), case=False)]
+        reg_show["闸门"] = reg_show["gate_status"].map({1: "收益✅", 0: "❌", 2: "事件✅"}).fillna("未测")
+        disp_all = reg_show[["name", "family", "engine", "闸门", "first_seen"]].rename(
+            columns={"name": "因子", "family": "机制族", "engine": "来源", "first_seen": "入库时间"})
+        st.caption(f"命中 {len(disp_all)} 个" + ("（仅显示前 2000 个，用筛选/搜索收敛）" if len(disp_all) > 2000 else ""))
+        st.dataframe(disp_all.head(2000), width='stretch', height=380, hide_index=True)
+        st.markdown("---")
+
     fac_live = experience.factor_leaderboard()
     packs = library.list_strategies()
     usage = {}

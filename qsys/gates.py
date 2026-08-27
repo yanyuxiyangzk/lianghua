@@ -125,3 +125,86 @@ def factor_hash(text: str) -> str:
     norm = re.sub(r"#.*", "", str(text))
     norm = re.sub(r"\s+", "", norm)
     return hashlib.md5(norm.encode()).hexdigest()
+
+
+# ---------------------------------------------------------------- 事件版硬闸门（定向挖因子用）
+# 与收益版闸门的区别：标签是"未来 h 日内是否发生事件"（0/1），不是远期收益。
+# 稀有事件（涨停基础率 ~1-3%）下 IC 数值天然偏小，阈值重新标定；
+# 核心指标是十分位提升倍数：Top10% 组合的事件发生率 / 全池基础率。
+EVT_GATE = {
+    "IC_MIN": 0.01,        # 事件标签 |RankIC| 下限（稀有事件口径，先跑标定再收紧）
+    "LIFT_MIN": 2.0,       # 十分位事件率提升倍数 ≥ 2x
+    "HALF_LIFT_MIN": 1.3,  # 时间轴前后两半各自的提升倍数下限（稳定性）
+    "CORR_MAX": 0.70,      # 与已入库事件因子的 IC 相关上限
+    "HORIZON": 5,          # 标签窗口：未来 h 日内发生事件
+}
+
+
+def event_labels(panel: pd.DataFrame, kind: str, horizon: int = EVT_GATE["HORIZON"]) -> pd.Series:
+    """未来 horizon 日事件标签长表 [(datetime, instrument)] → 0.0/1.0。
+    label_t = 事件在 (t, t+horizon] 任一日发生。"""
+    m = fe._event_mask(panel, kind)  # datetime × instrument 布尔
+    lab = m.iloc[::-1].rolling(horizon).max().iloc[::-1].shift(-1)  # 反向滚动=向后看
+    return lab.stack().dropna().astype(float)
+
+
+def evaluate_event_gates(vals: pd.Series, panel: pd.DataFrame, kind: str,
+                         horizon: int = EVT_GATE["HORIZON"],
+                         library_ics: dict | None = None) -> dict:
+    """事件版闸门：事件IC |μ|≥阈值 + 十分位提升≥2x + 两半稳定 + 库内相关<0.7。
+    返回 {pass, reasons, metrics}，与 evaluate_gates 同构。"""
+    v = fe._norm(vals.dropna())
+    if GATE["LOOKBACK_DAYS"]:
+        cutoff = v.index.get_level_values("datetime").unique()[-GATE["LOOKBACK_DAYS"]:][0]
+        v = v[v.index.get_level_values("datetime") >= cutoff]
+    lab = event_labels(panel, kind, horizon)
+    j = v.rename("f").to_frame().join(lab.rename("y"), how="inner").dropna()
+    metrics, reasons = {}, []
+    if j.empty or j["y"].sum() < 20:
+        return {"pass": False, "reasons": ["事件样本不足（<20）"], "metrics": {}}
+
+    def _ic(g):
+        return g["f"].corr(g["y"], method="spearman") if len(g) >= 30 else np.nan
+
+    ic = j.groupby(level="datetime").apply(_ic).dropna()
+    if len(ic) < 60:
+        return {"pass": False, "reasons": ["有效 IC 天数不足"], "metrics": {}}
+    ic_abs = abs(float(ic.mean()))
+    metrics["事件IC"] = round(float(ic.mean()), 4)
+    if ic_abs < EVT_GATE["IC_MIN"]:
+        reasons.append(f"|事件IC| {ic_abs:.3f} < {EVT_GATE['IC_MIN']}")
+
+    # 十分位提升：因子 Top10% 的日子-股票上，事件率 / 基础率
+    def _lift(sub: pd.DataFrame) -> float:
+        base = float(sub["y"].mean())
+        if base <= 0:
+            return 0.0
+        top_rate = (
+            sub.groupby(level="datetime")
+               .apply(lambda g: g.loc[g["f"] >= g["f"].quantile(0.9), "y"].mean()
+                      if len(g) >= 30 else np.nan)
+               .dropna().mean())
+        return float(top_rate / base) if top_rate == top_rate else 0.0
+
+    metrics["基础事件率"] = round(float(j["y"].mean()), 4)
+    lift = _lift(j)
+    metrics["十分位提升"] = round(lift, 2)
+    if lift < EVT_GATE["LIFT_MIN"]:
+        reasons.append(f"十分位提升 {lift:.1f}x < {EVT_GATE['LIFT_MIN']}x")
+    mid = j.index.get_level_values("datetime").unique()[len(j.index.get_level_values("datetime").unique()) // 2]
+    for tag, sub in [("前半", j[j.index.get_level_values("datetime") < mid]),
+                     ("后半", j[j.index.get_level_values("datetime") >= mid])]:
+        lh = _lift(sub)
+        metrics[f"{tag}提升"] = round(lh, 2)
+        if lh < EVT_GATE["HALF_LIFT_MIN"]:
+            reasons.append(f"{tag}提升 {lh:.1f}x < {EVT_GATE['HALF_LIFT_MIN']}x（不稳定）")
+
+    max_corr = 0.0
+    for name, other in (library_ics or {}).items():
+        both = pd.concat([ic, other], axis=1, keys=["a", "b"]).dropna()
+        if len(both) > 30:
+            max_corr = max(max_corr, abs(float(both["a"].corr(both["b"]))))
+    metrics["最大IC相关"] = round(max_corr, 2)
+    if max_corr >= EVT_GATE["CORR_MAX"]:
+        reasons.append(f"IC相关 {max_corr:.2f} ≥ {EVT_GATE['CORR_MAX']}")
+    return {"pass": len(reasons) == 0, "reasons": reasons, "metrics": metrics}

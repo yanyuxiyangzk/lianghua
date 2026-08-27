@@ -263,6 +263,17 @@ def job_loopengine(batch: int = 30, **_ignored) -> str:
             f"LLM否决{r.get('llm_rejected', 0)} · 重复{r['dup']} · FSA拦截{r['frozen']} · 入库{r['passed']} {r['new'][:3]}")
 
 
+def job_event_mine(kind: str = "涨停", batch: int = 30, horizon: int = 5, **_ignored) -> str:
+    """事件定向挖因子：围绕「涨停/大涨/跌停/创新高」做事件目标演化，
+    入库前缀 ev_（gate_status=2 事件闸门，区别于收益管线）。"""
+    from loopengine.engine import LoopEngine
+
+    eng = LoopEngine("沪深300")
+    r = eng.run_event_round(kind, batch=batch, horizon=horizon)
+    return (f"事件[{kind}|{horizon}日] 第{r['iteration']}轮 · 测试{r['tested']} · "
+            f"重复{r['dup']} · FSA拦截{r['frozen']} · 入库{r['passed']} {r['new'][:3]}")
+
+
 def job_top5_composite() -> str:
     """Top5 复合因子：过硬闸门因子按夏普取 Top5，方向修正等权合成并固化策略包。"""
     import composite
@@ -458,6 +469,9 @@ JOBS = {
     "le_factor_eval": {"name": "🧪 LoopEngine 因子滚动体检（每晚一批）", "func": job_le_factor_eval,
                        "default": {"enabled": False, "hour": 21, "minute": 30,
                                    "params": {"batch": 60, "pool_name": "沪深300"}}},
+    "event_mine": {"name": "🧬 事件定向挖因子（涨停等）", "func": job_event_mine,
+                   "default": {"enabled": False, "hour": 22, "minute": 30,
+                               "params": {"kind": "涨停", "batch": 30, "horizon": 5}}},
 }
 
 

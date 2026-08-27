@@ -11,6 +11,7 @@ from datetime import datetime
 import pandas as pd
 
 import gates as G
+import factor_eval as fe
 import library
 import structure
 from loopengine import genetics, review
@@ -222,3 +223,95 @@ class LoopEngine:
         self._save_state()
         return {"iteration": s["iteration"], **stats, "gaps": gaps, "proven": proven,
             "budget": {k: round(v, 2) for k, v in s["budget"].p.items()}}
+
+    # ---------------- 定向挖因子（事件目标） ----------------
+    def run_event_round(self, kind: str, batch: int = 30, horizon: int = 5) -> dict:
+        """围绕事件（涨停/大涨/跌停/创新高）定向演化：生成管线与 run_round 相同，
+        但适应度换成事件版硬闸门（事件IC + 十分位提升 + 两半稳定 + 库内相关）。
+
+        入库因子名前缀 ev_、gate_status=2（事件闸门通过——区别于收益闸门的 1，
+        不会被 Top5 复合等收益管线误用）；哈希按事件命名空间去重（同结构在
+        收益口径测过仍可在事件口径测）。
+        """
+        panel, frames, end = self._frames()
+        s = self.state
+        rng = random.Random(s["iteration"] * 7919 + 17 + hash(kind) % 1000)
+        s["iteration"] += 1
+
+        registry = library.get_factor_registry()
+        cov = structure.family_coverage(registry[registry["engine"] == "loopengine"] if not registry.empty else registry)
+        gaps = sorted(cov, key=cov.get)[:3]
+        live = library.family_live_stats()
+        proven = sorted(live, key=lambda f: -live[f])[:3]
+        live_boost = {f: min(1.0, max(0.0, (w - 0.5) * 4)) for f, w in live.items()}
+
+        # 已通过事件闸门的因子的 IC 序列（相关性闸门基准）
+        lab = G.event_labels(panel, kind, horizon)
+        passed_ics = {}
+
+        stats = {"tested": 0, "rejected_review": 0, "llm_rejected": 0, "dup": 0,
+                 "frozen": 0, "passed": 0, "new": []}
+        llm_review_budget = 3
+        for _ in range(batch):
+            src, tree = self._gen_candidate(rng, gaps, proven, live_boost)
+            ok, _why = review.review(tree)
+            if not ok:
+                stats["rejected_review"] += 1
+                s["budget"].record(src, False)
+                continue
+            sexpr = tree.sexpr()
+            if llm_review_budget > 0 and rng.random() < 0.3:
+                from loopengine.llm_review import llm_review
+
+                llm_review_budget -= 1
+                passed_review, reason = llm_review(sexpr)
+                if not passed_review:
+                    stats["llm_rejected"] += 1
+                    sk0 = review.skeleton_of(tree)
+                    library.record_failure(sexpr[:60], sk0, structure.assign_family(sexpr, sk0),
+                                           f"llm_review: {reason}", "loopengine")
+                    s["budget"].record(src, False)
+                    continue
+            h = f"ev:{kind}:" + G.factor_hash(sexpr)
+            if library.is_tested(h):
+                stats["dup"] += 1
+                continue
+            sk = review.skeleton_of(tree)
+            if library.is_frozen(sk):
+                stats["frozen"] += 1
+                s["budget"].record(src, False)
+                continue
+
+            stats["tested"] += 1
+            try:
+                X = evaluate_tree(tree, frames)
+                vals = X.stack().rename("f").dropna()
+                vals.index = vals.index.set_names(["datetime", "instrument"])
+                result = G.evaluate_event_gates(vals, panel, kind, horizon, library_ics=passed_ics)
+            except Exception:
+                result = {"pass": False, "reasons": ["eval error"], "metrics": {}}
+
+            library.record_tested(h, sexpr[:60], "loopengine", "loopengine", end,
+                                  result["pass"], result["metrics"].get("事件IC"))
+            s["budget"].record(src, result["pass"])
+            if result["pass"]:
+                fam = structure.assign_family(sexpr, sk)
+                name = f"ev_{fam}_{G.factor_hash(sexpr)[:6]}"
+                library.sync_factor_registry([{
+                    "name": name, "kind": "loopengine",
+                    "code": emit_code(sexpr, name), "engine": "loopengine"}])
+                with library._lconn() as c:
+                    c.execute("UPDATE factor_registry SET gate_status=2, skeleton=?, family=? WHERE name=?",
+                              (sk, fam, name))
+                ic_s = fe._norm(vals).rename("f").to_frame().join(lab.rename("y"), how="inner").dropna()
+                passed_ics[name] = ic_s.groupby(level="datetime").apply(
+                    lambda g: g["f"].corr(g["y"], method="spearman") if len(g) >= 30 else float("nan")).dropna()
+                stats["passed"] += 1
+                stats["new"].append(name)
+                s["accepted"] += 1
+            else:
+                library.record_failure(sexpr[:60], sk, structure.assign_family(sexpr, sk),
+                                       "; ".join(result["reasons"])[:200], "loopengine")
+
+        self._save_state()
+        return {"iteration": s["iteration"], "kind": kind, "horizon": horizon, **stats}

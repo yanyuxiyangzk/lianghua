@@ -529,21 +529,26 @@ def _limit_ratio(code: str) -> float:
     return 0.20 if d.startswith(("30", "68")) else 0.10
 
 
+def _event_mask(panel: pd.DataFrame, kind: str) -> pd.DataFrame:
+    """事件布尔矩阵（datetime × instrument）。"""
+    close = panel["$close"].unstack("instrument")
+    ret = close.pct_change()
+    if kind == "创60日新高":
+        return close >= close.rolling(60).max() * 0.999
+    thr = pd.Series({c: _limit_ratio(c) - 0.002 for c in close.columns})
+    if kind == "涨停":
+        return ret.ge(thr, axis=1)
+    if kind == "跌停":
+        return ret.le(-thr, axis=1)
+    return ret.ge(0.07)  # 大涨≥7%
+
+
 def find_events(panel: pd.DataFrame, kind: str = "涨停") -> pd.DataFrame:
     """在面板上找事件点，返回 [(datetime, instrument)] 索引 + 当日涨幅列。
     涨停判定用日涨幅阈值（留 0.2% 余量）；创60日新高为收盘≥60日最高价×0.999。"""
     close = panel["$close"].unstack("instrument")
     ret = close.pct_change()
-    if kind == "创60日新高":
-        m = close >= close.rolling(60).max() * 0.999
-    else:
-        thr = pd.Series({c: _limit_ratio(c) - 0.002 for c in close.columns})
-        if kind == "涨停":
-            m = ret.ge(thr, axis=1)
-        elif kind == "跌停":
-            m = ret.le(-thr, axis=1)
-        else:  # 大涨≥7%
-            m = ret.ge(0.07)
+    m = _event_mask(panel, kind)
     hit = m.stack().rename("hit")
     df = pd.concat([hit, ret.stack().rename("ret")], axis=1)
     return df[df["hit"]].drop(columns="hit").dropna()

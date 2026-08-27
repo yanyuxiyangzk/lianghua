@@ -45,11 +45,27 @@ if picks.empty:
     st.warning("该日无记录")
     st.stop()
 
+# 来源中文标签（一眼看出这份名单是哪个功能出的）
+SRC_LABEL = {"sched_pool_scan": "⏰定时扫描", "manual_picker": "🪄选股工作台",
+             "combo_vote": "🧩策略组合投票", "auto_combo": "🤖自动因子组合"}
+
+# 当日多条记录时先给总览表（否则组合/自动名单藏在选择器后面看不见）
+if len(picks) > 1:
+    ov_rows = []
+    for r in picks.itertuples():
+        o = experience.pick_outcomes(int(r.id))
+        hit = f"{(o['hit'] == 1).mean():.0%}（{len(o)}期）" if not o.empty else "未到期"
+        ov_rows.append({"来源": SRC_LABEL.get(r.source, r.source),
+                        "策略包/方法": r.pack_name or r.method,
+                        "只数": int(r.top_n), "实战命中": hit})
+    st.dataframe(pd.DataFrame(ov_rows), width='stretch', hide_index=True)
+
 with c2:
     if len(picks) > 1:
-        labels = [f"{r.pack_name or r.method}（{r.source} · Top{r.top_n} · {r.data_source}）"
-                  for r in picks.itertuples()]
-        sel_idx = st.selectbox("该日有多条记录", range(len(picks)), format_func=lambda i: labels[i])
+        labels = [f"{SRC_LABEL.get(r.source, r.source)} · {r.pack_name or r.method}"
+                  f"（Top{r.top_n} · {r.data_source}）" for r in picks.itertuples()]
+        sel_idx = st.selectbox("该日有多条记录，逐条查看", range(len(picks)),
+                               format_func=lambda i: labels[i])
     else:
         sel_idx = 0
 pick = picks.iloc[sel_idx]

@@ -292,6 +292,53 @@ def ths_selftest() -> str:
         return f"FAIL：{e}"
 
 
+# ---------------------------------------------------------------- iFinD 通用调用（📡 iFinD数据 页面用）
+def ths_call(func_name: str, *args, **kwargs):
+    """通用 iFinD 调用：登录 → 按函数名分发 → 返回 (DataFrame|None, 原始对象, 错误码)。
+    iFinDPy 返回形如 THSData 对象（.data 为 DataFrame，.errorcode 为 0 表示成功）。"""
+    _ths_login()
+    import iFinDPy as ths
+
+    fn = getattr(ths, func_name, None)
+    if fn is None:
+        raise RuntimeError(f"iFinDPy 没有函数 {func_name}——以官方文档的函数名为准")
+    res = fn(*args, **kwargs)
+    df = res if isinstance(res, pd.DataFrame) else getattr(res, "data", None)
+    err = getattr(res, "errorcode", 0 if isinstance(res, pd.DataFrame) else None)
+    return df, res, err
+
+
+def ths_realtime(codes: list[str], indicators: str = "latest,open,high,low,volume,amount"):
+    """实时行情（THS_RQ）。indicators 逗号分隔，字段名以官方文档为准。"""
+    return ths_call("THS_RQ", ",".join(_to_ths_code(c) for c in codes), indicators)
+
+
+def ths_history(codes: list[str], indicators: str, start: str, end: str,
+                params: str = "Fill:Original,Interval:D"):
+    """历史行情（THS_HQ）。params 含复权/周期（Fill/Interval/Days 等，见官方文档）。"""
+    return ths_call("THS_HQ", ",".join(_to_ths_code(c) for c in codes), indicators, params, start, end)
+
+
+def ths_highfreq(code: str, indicators: str, start: str, end: str, interval: str = "1min"):
+    """高频数据（THS_HF）。start/end 形如 2026-08-27 09:30:00。"""
+    return ths_call("THS_HF", _to_ths_code(code), indicators, f"Interval:{interval}", start, end)
+
+
+def ths_snapshot(codes: list[str], indicators: str, snap_time: str = ""):
+    """日内快照（THS_Snapshot）。snap_time 为空取最新。"""
+    return ths_call("THS_Snapshot", ",".join(_to_ths_code(c) for c in codes), indicators, snap_time)
+
+
+def ths_basic(codes: list[str], indicators: str, params: str = ""):
+    """基础数据（THS_DS）：截面基本面指标，如市盈率/市值/营收。"""
+    return ths_call("THS_DS", ",".join(_to_ths_code(c) for c in codes), indicators, params)
+
+
+def ths_date_serial(code: str, indicators: str, start: str, end: str, params: str = ""):
+    """日期序列（THS_DateSerial）：基本面/专题指标的时序。"""
+    return ths_call("THS_DateSerial", _to_ths_code(code), indicators, params, "", start, end)
+
+
 # ---------------------------------------------------------------- easy-tdx（通达信 TCP）通道
 _TDX = {"client": None}
 # 实测数据质量+速度双优的服务器（2026-08 验证；from_best_host 会选到返回空数据的坏节点，故钉死）

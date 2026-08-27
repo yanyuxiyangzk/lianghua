@@ -42,6 +42,7 @@ pages = {
         st.Page("views/p_sectorflow.py", title="资金趋势", icon="🌐", url_path="sectorflow"),
         st.Page("views/p_kline.py", title="自选K线", icon="🕯️", url_path="kline"),
         st.Page("views/p_kpro.py", title="专业K线", icon="📉", url_path="kpro"),
+        st.Page("views/p_ifind.py", title="iFinD数据", icon="📡", url_path="ifind"),
     ],
     "专业区（调参研究，平时不用看）": [
         st.Page("views/p_combo.py", title="选股组合", icon="🧩", url_path="combo"),

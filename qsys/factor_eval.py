@@ -517,6 +517,80 @@ def greedy_combo(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
     return {"selected": selected, "history": pd.DataFrame(history), "wf": best_wf}
 
 
+# ---------------------------------------------------------------- 事件研究（事件前兆因子挖掘）
+EVENT_KINDS = ["涨停", "大涨≥7%", "跌停", "创60日新高"]
+
+
+def _limit_ratio(code: str) -> float:
+    """各板块涨跌停幅度：北交所 30% / 创业板(30)科创板(68) 20% / 主板 10%。"""
+    if code.startswith("BJ"):
+        return 0.30
+    d = "".join(ch for ch in code if ch.isdigit())
+    return 0.20 if d.startswith(("30", "68")) else 0.10
+
+
+def find_events(panel: pd.DataFrame, kind: str = "涨停") -> pd.DataFrame:
+    """在面板上找事件点，返回 [(datetime, instrument)] 索引 + 当日涨幅列。
+    涨停判定用日涨幅阈值（留 0.2% 余量）；创60日新高为收盘≥60日最高价×0.999。"""
+    close = panel["$close"].unstack("instrument")
+    ret = close.pct_change()
+    if kind == "创60日新高":
+        m = close >= close.rolling(60).max() * 0.999
+    else:
+        thr = pd.Series({c: _limit_ratio(c) - 0.002 for c in close.columns})
+        if kind == "涨停":
+            m = ret.ge(thr, axis=1)
+        elif kind == "跌停":
+            m = ret.le(-thr, axis=1)
+        else:  # 大涨≥7%
+            m = ret.ge(0.07)
+    hit = m.stack().rename("hit")
+    df = pd.concat([hit, ret.stack().rename("ret")], axis=1)
+    return df[df["hit"]].drop(columns="hit").dropna()
+
+
+def event_premonition(factor_vals: dict[str, pd.Series], events: pd.DataFrame,
+                      panel: pd.DataFrame, lag: int = 1, mode: str = "cs",
+                      min_n: int = 5) -> pd.DataFrame:
+    """事件前兆分析：事件前 lag 个交易日的因子分位 vs 基准 0.5。
+
+    mode="cs"（池模式）：横截面分位——事件日的因子值在全池中的位置；
+    mode="ts"（单票模式）：时序分位——在该股自身历史中的位置（单票无截面）。
+    返回按 |差值| 降序的表：因子/方向/事件前平均分位/差值/前20%分位占比/t值/样本数。
+    """
+    cal = sorted(panel.index.get_level_values("datetime").unique())
+    pos = {d: i for i, d in enumerate(cal)}
+    pairs = set()
+    for d, c in zip(events.index.get_level_values("datetime"),
+                    events.index.get_level_values("instrument")):
+        i = pos.get(d)
+        if i is not None and i >= lag:
+            pairs.add((cal[i - lag], c))
+    if len(pairs) < min_n:
+        return pd.DataFrame()
+    pdf = pd.DataFrame(list(pairs), columns=["datetime", "instrument"])
+    rows = []
+    for name, s in factor_vals.items():
+        s = _norm(s.dropna())
+        if s.empty:
+            continue
+        if mode == "ts":
+            cs = s.groupby(level="instrument", group_keys=False).apply(lambda x: x.rank(pct=True))
+        else:
+            cs = s.groupby(level="datetime").rank(pct=True)
+        j = pdf.merge(cs.rename("cs").reset_index(), on=["datetime", "instrument"])["cs"].dropna()
+        if len(j) < min_n:
+            continue
+        diff = float(j.mean() - 0.5)
+        t = diff / (float(j.std()) / np.sqrt(len(j)) + 1e-12)
+        rows.append({"因子": name, "方向": "事件前偏高" if diff >= 0 else "事件前偏低",
+                     "事件前平均分位": round(float(j.mean()), 3), "差值": round(diff, 3),
+                     "前20%分位占比": round(float((j >= 0.8).mean()), 3),
+                     "t值": round(t, 2), "样本数": len(j)})
+    out = pd.DataFrame(rows)
+    return out.sort_values("差值", key=abs, ascending=False).reset_index(drop=True) if not out.empty else out
+
+
 # ---------------------------------------------------------------- 策略组合（多包投票）回测
 def combo_backtest(pack_defs: list[dict], panel: pd.DataFrame, min_votes: int = 2,
                    fwd_days: int = MAIN_FWD, step: int = STEP_DAYS,

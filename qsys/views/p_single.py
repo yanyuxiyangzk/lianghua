@@ -180,18 +180,24 @@ try:
     n_ev = int(reg["name"].str.startswith("ev_").sum()) if not reg.empty else 0
 except Exception:
     n_ev = 0
+# 挖掘范围：池模式跟随所选股票池；单票事件样本太少（统计上不可行），回落沪深300 并说明
+mine_pool = pool_name if pool_mode else "沪深300"
+if not pool_mode:
+    st.caption(f"⚠️ 单票的事件样本太少（个位数），无法支撑定向演化——挖掘在 **{mine_pool}** 池上进行，"
+               f"挖出的因子再去个股上对照（上面的单票画像）")
 m1, m2 = st.columns([1, 3])
 with m1:
     rounds = st.selectbox("跑多少轮", [10, 30, 50], index=1, key="ps_mine_batch",
                           help="一轮≈30 个候选；事件闸门很严，一轮入库 0~2 个是常态")
 with m2:
-    st.caption(f"当前事件：**{kind}**（未来5日内发生） · 库内已有 ev_ 因子 **{n_ev}** 个 · "
+    st.caption(f"当前事件：**{kind}**（未来5日内发生） · 挖掘池：**{mine_pool}** · "
+               f"库内已有 ev_ 因子 **{n_ev}** 个 · "
                "入库后可在 🪄选股工作台 体检（收益口径）与 🧩选股组合 中使用")
 if st.button("🧬 围绕「{}」定向挖因子".format(kind), key="ps_mine"):
     from loopengine.engine import LoopEngine
 
-    with st.spinner(f"定向演化中（{rounds} 轮 × ~30 候选，事件闸门把关）…"):
-        r = LoopEngine("沪深300").run_event_round(kind, batch=rounds)
+    with st.spinner(f"定向演化中（{rounds} 轮 × ~30 候选，{mine_pool} 池，事件闸门把关）…"):
+        r = LoopEngine(mine_pool).run_event_round(kind, batch=rounds)
     st.success(f"完成：测试 {r['tested']} · 重复 {r['dup']} · FSA拦截 {r['frozen']} · "
                f"**入库 {r['passed']} 个** {r['new'][:5]}")
     if r["passed"] == 0:

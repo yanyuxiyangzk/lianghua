@@ -263,12 +263,13 @@ def job_loopengine(batch: int = 30, **_ignored) -> str:
             f"LLM否决{r.get('llm_rejected', 0)} · 重复{r['dup']} · FSA拦截{r['frozen']} · 入库{r['passed']} {r['new'][:3]}")
 
 
-def job_event_mine(kind: str = "涨停", batch: int = 30, horizon: int = 5, **_ignored) -> str:
+def job_event_mine(kind: str = "涨停", batch: int = 30, horizon: int = 5,
+                   pool_name: str = "沪深300", **_ignored) -> str:
     """事件定向挖因子：围绕「涨停/大涨/跌停/创新高」做事件目标演化，
     入库前缀 ev_（gate_status=2 事件闸门，区别于收益管线）。"""
     from loopengine.engine import LoopEngine
 
-    eng = LoopEngine("沪深300")
+    eng = LoopEngine(pool_name)
     r = eng.run_event_round(kind, batch=batch, horizon=horizon)
     return (f"事件[{kind}|{horizon}日] 第{r['iteration']}轮 · 测试{r['tested']} · "
             f"重复{r['dup']} · FSA拦截{r['frozen']} · 入库{r['passed']} {r['new'][:3]}")

@@ -27,20 +27,24 @@ def _metrics_html(items: dict) -> str:
 
 
 def _paginate(df: pd.DataFrame, key: str, sizes=(50, 100, 200)) -> tuple:
-    """大表分页：行数少于一页时原样返回。返回 (当前页切片, 页起始偏移)——
-    带行选择的表用偏移把页内序号换算回全表位置。"""
+    """大表分页，控件在表格**下方**（占位符实现）。
+    返回 (页切片, 页起始偏移, 表格占位符)；行数少于一页时占位符为 None，
+    调用方用 `(ph or st).dataframe(...)` 渲染——行选择表用偏移把页内序号换算回全表。"""
     if len(df) <= sizes[0]:
-        return df, 0
-    c1, c2, c3 = st.columns([1, 1, 4])
-    with c1:
-        size = st.selectbox("每页行数", list(sizes), index=0, key=f"{key}_size")
-    total = -(-len(df) // size)
-    with c2:
-        page = st.number_input("页码", 1, total, 1, key=f"{key}_page")
-    with c3:
-        st.caption(f"共 {len(df)} 行 · 第 {page}/{total} 页")
+        return df, 0, None
+    tbl_area = st.empty()      # 表格位置（视觉上在前）
+    ctl = st.container()       # 控件位置（视觉上在后）
+    with ctl:
+        c1, c2, c3 = st.columns([1, 1, 4])
+        with c1:
+            size = st.selectbox("每页行数", list(sizes), index=0, key=f"{key}_size")
+        total = -(-len(df) // size)
+        with c2:
+            page = st.number_input("页码", 1, total, 1, key=f"{key}_page")
+        with c3:
+            st.caption(f"共 {len(df)} 行 · 第 {page}/{total} 页")
     start = (page - 1) * size
-    return df.iloc[start: start + size], start
+    return df.iloc[start: start + size], start, tbl_area
 
 
 # ---------------------------------------------------------------- 因子详情
@@ -213,7 +217,8 @@ def render():
         disp_all = reg_show[["name", "family", "engine", "闸门", "first_seen"]].rename(
             columns={"name": "因子", "family": "机制族", "engine": "来源", "first_seen": "入库时间"})
         st.caption(f"命中 {len(disp_all)} 个")
-        st.dataframe(_paginate(disp_all, "fl_all_pg")[0], width='stretch', height=380, hide_index=True)
+        all_page, _, all_ph = _paginate(disp_all, "fl_all_pg")
+        (all_ph or st).dataframe(all_page, width='stretch', height=380, hide_index=True)
         st.markdown("---")
 
     fac_live = experience.factor_leaderboard()
@@ -227,6 +232,9 @@ def render():
         st.info(f"暂无「{pool_name}」的因子体检数据。到 🪄选股组合 页点「开始/刷新体检」生成。")
     else:
         show = card.copy()
+        kw_card = st.text_input("🔍 搜索因子名", "", key="fl_card_kw")
+        if kw_card.strip():
+            show = show[show["因子"].str.contains(kw_card.strip(), case=False)]
         if not fac_live.empty:
             live_map = fac_live.set_index("因子")["20日胜率(近似)"].to_dict()
             show["实战胜率"] = show["因子"].map(lambda n: live_map.get(n))
@@ -245,9 +253,9 @@ def render():
             disp[c] = disp[c].map(lambda x: f"{x:.4f}" if pd.notna(x) else "—")
         for c in ["IC胜率", "Top组胜率", "实战胜率"]:
             disp[c] = disp[c].map(lambda x: f"{x:.0%}" if pd.notna(x) else "—")
-        disp_page, disp_start = _paginate(disp, "fl_card_pg")
-        event = st.dataframe(disp_page, width='stretch', height=320, hide_index=True,
-                             on_select="rerun", selection_mode="single-row", key="fl_table")
+        disp_page, disp_start, disp_ph = _paginate(disp, "fl_card_pg")
+        event = (disp_ph or st).dataframe(disp_page, width='stretch', height=320, hide_index=True,
+                                          on_select="rerun", selection_mode="single-row", key="fl_table")
         # ---- P1：硬闸门 ----
         g1, g2 = st.columns([1.6, 4.4])
         with g1:
@@ -297,6 +305,12 @@ def render():
     if not packs:
         st.info("还没有策略包。到 🪄选股组合 完成「样本外验证」后保存当前组合为策略包。")
         return
+    kw_pack = st.text_input("🔍 搜索策略包名", "", key="fl_pack_kw")
+    if kw_pack.strip():
+        packs = {n: pk for n, pk in packs.items() if kw_pack.strip().lower() in n.lower()}
+        if not packs:
+            st.warning("没有命中的策略包")
+            return
     pack_lb = experience.pack_leaderboard()
     live_map = {}
     if not pack_lb.empty:
@@ -315,9 +329,9 @@ def render():
             "更新": pk.get("updated"),
         })
     dfp = pd.DataFrame(rows)
-    dfp_page, dfp_start = _paginate(dfp, "fl_pack_pg")
-    event2 = st.dataframe(dfp_page, width='stretch', hide_index=True,
-                          on_select="rerun", selection_mode="single-row", key="st_table")
+    dfp_page, dfp_start, dfp_ph = _paginate(dfp, "fl_pack_pg")
+    event2 = (dfp_ph or st).dataframe(dfp_page, width='stretch', hide_index=True,
+                                      on_select="rerun", selection_mode="single-row", key="st_table")
     sel2 = event2.selection.rows if event2 and event2.selection else []
     if sel2:
         name = dfp.reset_index(drop=True).iloc[dfp_start + sel2[0]]["策略包"]

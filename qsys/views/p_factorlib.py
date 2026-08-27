@@ -26,6 +26,23 @@ def _metrics_html(items: dict) -> str:
     return f"<div style='background:#161618;padding:8px 12px;border-radius:6px'>{spans}</div>"
 
 
+def _paginate(df: pd.DataFrame, key: str, sizes=(50, 100, 200)) -> tuple:
+    """大表分页：行数少于一页时原样返回。返回 (当前页切片, 页起始偏移)——
+    带行选择的表用偏移把页内序号换算回全表位置。"""
+    if len(df) <= sizes[0]:
+        return df, 0
+    c1, c2, c3 = st.columns([1, 1, 4])
+    with c1:
+        size = st.selectbox("每页行数", list(sizes), index=0, key=f"{key}_size")
+    total = -(-len(df) // size)
+    with c2:
+        page = st.number_input("页码", 1, total, 1, key=f"{key}_page")
+    with c3:
+        st.caption(f"共 {len(df)} 行 · 第 {page}/{total} 页")
+    start = (page - 1) * size
+    return df.iloc[start: start + size], start
+
+
 # ---------------------------------------------------------------- 因子详情
 def _render_factor_detail(pick: str, pool_name: str, row: pd.Series, reg_map: dict):
     cat = row.get("类别", "")
@@ -195,8 +212,8 @@ def render():
         reg_show["闸门"] = reg_show["gate_status"].map({1: "收益✅", 0: "❌", 2: "事件✅"}).fillna("未测")
         disp_all = reg_show[["name", "family", "engine", "闸门", "first_seen"]].rename(
             columns={"name": "因子", "family": "机制族", "engine": "来源", "first_seen": "入库时间"})
-        st.caption(f"命中 {len(disp_all)} 个" + ("（仅显示前 2000 个，用筛选/搜索收敛）" if len(disp_all) > 2000 else ""))
-        st.dataframe(disp_all.head(2000), width='stretch', height=380, hide_index=True)
+        st.caption(f"命中 {len(disp_all)} 个")
+        st.dataframe(_paginate(disp_all, "fl_all_pg")[0], width='stretch', height=380, hide_index=True)
         st.markdown("---")
 
     fac_live = experience.factor_leaderboard()
@@ -228,7 +245,8 @@ def render():
             disp[c] = disp[c].map(lambda x: f"{x:.4f}" if pd.notna(x) else "—")
         for c in ["IC胜率", "Top组胜率", "实战胜率"]:
             disp[c] = disp[c].map(lambda x: f"{x:.0%}" if pd.notna(x) else "—")
-        event = st.dataframe(disp, width='stretch', height=320, hide_index=True,
+        disp_page, disp_start = _paginate(disp, "fl_card_pg")
+        event = st.dataframe(disp_page, width='stretch', height=320, hide_index=True,
                              on_select="rerun", selection_mode="single-row", key="fl_table")
         # ---- P1：硬闸门 ----
         g1, g2 = st.columns([1.6, 4.4])
@@ -246,8 +264,9 @@ def render():
                        f"通过率 {ts['passed']/max(ts['tested'],1):.1%}（对标文章 0.41%）")
         sel_rows = event.selection.rows if event and event.selection else []
         if sel_rows:
-            pick = show.iloc[sel_rows[0]]["因子"]
-            _render_factor_detail(pick, pool_name, show.iloc[sel_rows[0]], reg_map)
+            raw_row = show.reset_index(drop=True).iloc[disp_start + sel_rows[0]]
+            pick = raw_row["因子"]
+            _render_factor_detail(pick, pool_name, raw_row, reg_map)
         else:
             st.caption("👆 点击表格中的因子行查看详情与回测")
 
@@ -296,11 +315,12 @@ def render():
             "更新": pk.get("updated"),
         })
     dfp = pd.DataFrame(rows)
-    event2 = st.dataframe(dfp, width='stretch', hide_index=True,
+    dfp_page, dfp_start = _paginate(dfp, "fl_pack_pg")
+    event2 = st.dataframe(dfp_page, width='stretch', hide_index=True,
                           on_select="rerun", selection_mode="single-row", key="st_table")
     sel2 = event2.selection.rows if event2 and event2.selection else []
     if sel2:
-        name = dfp.iloc[sel2[0]]["策略包"]
+        name = dfp.reset_index(drop=True).iloc[dfp_start + sel2[0]]["策略包"]
         _render_strategy_detail(name, packs[name], reg_map)
         if st.button("🗑 删除该策略包", key="fl_del"):
             library.delete_strategy(name)

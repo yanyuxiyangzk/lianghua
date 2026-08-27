@@ -93,7 +93,7 @@ if st.button("🤖 自动组建因子组合", type="primary", key="pc_build"):
         facs = {n: f for n, f in facs.items() if f}
         bar.write(f"② 去冗余（候选 {len(facs)} 个，|IC 相关|>0.7 剔除）…")
         corr = fe.ic_corr_matrix(list(facs.values()), codes, end)
-        kept, dropped = fe.dedup_factors(corr, valid)
+        kept, dropped = fe.dedup_factors(corr, valid, family_map=fam_map)
         kept = [n for n in kept if n in facs][:12]
         bar.write(f"③ 贪心搜索（{len(kept)} 候选 × walk-forward）…")
         fvals = {n: fe.get_factor_values(facs[n], codes, end) for n in kept}

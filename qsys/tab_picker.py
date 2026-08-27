@@ -176,7 +176,12 @@ def render():
     # ================= ② 组合构建 =================
     st.markdown("### ② 组合构建")
     corr = fe.ic_corr_matrix([f for f in facs if f["name"] in set(valid["因子"])], codes, end)
-    kept, dropped = fe.dedup_factors(corr, valid)
+    try:
+        _fam_map = dict(zip(library.get_factor_registry()["name"],
+                            library.get_factor_registry()["family"].fillna("其他")))
+    except Exception:
+        _fam_map = None
+    kept, dropped = fe.dedup_factors(corr, valid, family_map=_fam_map)
     if dropped:
         st.info("🧹 去冗余建议：已剔除 " + "；".join(f"`{k}`（{v}）" for k, v in dropped.items()))
     c1, c2 = st.columns([2, 3])

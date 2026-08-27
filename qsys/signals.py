@@ -732,15 +732,16 @@ def factor_contributions(f_series: dict[str, pd.Series], weights: dict[str, tupl
 
 def plain_factor_name(name: str) -> str:
     """因子名 → 白话短标签（「为什么选它」用）。
-    内置/技术指标用中文字典描述；目录因子挂机制族；LoopEngine 因子名自带族前缀（le_跳空_xxx）。"""
+    内置/技术指标用中文字典描述；目录因子挂机制族；演化因子带族+短哈希
+    （le_跳空_79ccd2 → 跳空类·79ccd2——同族不同因子必须可区分，否则组合看着像重复）。"""
     if name in BUILTIN_FACTORS:
         return BUILTIN_FACTORS[name].split("（")[0]
     if name in TECH_INDICATORS:
         return TECH_INDICATORS[name].split("（")[0]
-    if name.startswith("le_"):  # le_{族}_{hash}
+    if name.startswith(("le_", "ev_")):  # {引擎}_{族}_{hash}
         parts = name.split("_")
-        if len(parts) >= 2 and parts[1]:
-            return f"{parts[1]}类因子"
+        if len(parts) >= 3 and parts[1]:
+            return f"{parts[1]}类·{parts[2]}"
     if name in NAME2CAT:
         return f"{NAME2CAT[name]}类·{name}"
     return name  # RD-Agent 进化因子名通常是描述性英文，原样展示

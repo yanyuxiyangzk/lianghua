@@ -13,7 +13,23 @@ _CODE_FIELDS = ["$open", "$high", "$low", "$close", "$volume", "$amount", "$fact
 
 
 def extract_skeleton(name: str, code: str | None = None) -> str:
-    """从因子代码提取结构骨架；无代码（内置/目录因子）则用名称本身。"""
+    """从因子代码提取结构骨架；无代码（内置/目录因子）则用名称本身。
+
+    LoopEngine 因子（代码首行 `# sexpr: ...`）直接从 S 表达式提取
+    算子序列@字段集合——与引擎内 review.skeleton_of 同构，是唯一准确的结构签名；
+    从代码文本子串匹配会把不同树塌缩成同一个骨架（实测 5 个 IC 相关 0.9+ 的
+    跳空因子骨架完全相同，FSA 因此漏冻结）。"""
+    if code and code.startswith("# sexpr: "):
+        import re as _re
+
+        from loopengine.tree import FIELDS as _FIELDS, OPS as _OPS
+
+        sexpr = code.split("\n", 1)[0][len("# sexpr: "):]
+        toks = _re.findall(r"[a-z_]+", sexpr)
+        ops = [t for t in toks if t in _OPS]
+        fields = sorted({t for t in toks if t in _FIELDS})
+        if ops:
+            return f"{'-'.join(ops[:8])}@{','.join(fields) or 'derived'}"
     if not code:
         return name
     ops = [op for op in _CODE_OPS if op in code]

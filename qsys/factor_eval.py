@@ -233,15 +233,24 @@ def ic_corr_matrix(factors: list[dict], codes: list[str], end: str,
     return pd.DataFrame(series).corr()
 
 
-def dedup_factors(corr: pd.DataFrame, scorecard: pd.DataFrame, threshold: float = CORR_THRESHOLD):
-    """按 |ICIR| 降序贪心去冗余。返回 (保留名单, 剔除原因 dict)。"""
+def dedup_factors(corr: pd.DataFrame, scorecard: pd.DataFrame, threshold: float = CORR_THRESHOLD,
+                  family_map: dict | None = None, same_family_threshold: float = 0.6):
+    """按 |ICIR| 降序贪心去冗余。返回 (保留名单, 剔除原因 dict)。
+    family_map 给定（{因子: 机制族}）时同族因子用更严的阈值——
+    同族因子天然共享机制，0.7 的宽松线会放走大量近亲（实测跳空族两两 0.9+）。"""
     strength = scorecard.set_index("因子")["ICIR"].abs()
     order = [n for n in strength.sort_values(ascending=False).index if n in corr.columns]
     kept, dropped = [], {}
     for n in order:
-        conflict = next((k for k in kept if abs(corr.loc[n, k]) > threshold), None)
+        conflict = None
+        for k in kept:
+            thr = (same_family_threshold
+                   if family_map and family_map.get(n, "") == family_map.get(k, "") else threshold)
+            if abs(corr.loc[n, k]) > thr:
+                conflict = (k, thr)
+                break
         if conflict:
-            dropped[n] = f"与 {conflict} 相关 {corr.loc[n, conflict]:.2f} > {threshold}"
+            dropped[n] = f"与 {conflict[0]} 相关 {corr.loc[n, conflict[0]]:.2f} > {conflict[1]}"
         else:
             kept.append(n)
     return kept, dropped

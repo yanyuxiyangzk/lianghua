@@ -363,6 +363,114 @@ def job_quote_collect(pool_name: str = "沪深300", interval_sec: int = 30) -> s
     return f"{now.strftime('%H:%M:%S')} 采集 {pool_name} {n} 只快照"
 
 
+def job_sector_flow_collect(interval_sec: int = 30, **_ignored) -> str:
+    """板块资金流采集：交易时段内抓板块快照+资金净流入落库
+    （sector_flow_snapshots / sector_inflow_snapshots），给 🌐资金趋势/🏛板块行情 页供数。
+    页面开关的采集线程随容器重启消失，此任务让采集不依赖页面是否打开。"""
+    from zoneinfo import ZoneInfo
+
+    import sectorflow as sf
+
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5 or not ("0915" <= now.strftime("%H%M") <= "1505"):
+        return "非交易时段，跳过"
+    n = sf.save_sector_spot(sf.fetch_sector_spot())
+    sf.save_sector_inflow_snapshot()
+    return f"{now.strftime('%H:%M:%S')} 板块快照 {n} 个 + 资金流快照已存"
+
+
+def job_ifind_daily_sync(pool_name: str = "自选股", lookback_days: int = 10, **_ignored) -> str:
+    """iFinD 日线自动入库：每日盘后把自选股/池子的日线增量写入 market.db
+    （market_daily 表，source='ths_ifind'）。INSERT OR REPLACE 幂等，
+    lookback 留冗余覆盖缺数；交易日判断交给 cron（mon-fri），节假日空跑无害。"""
+    from zoneinfo import ZoneInfo
+
+    codes = load_watchlist() if pool_name == "自选股" else (all_pools().get(pool_name) or [])
+    if not codes:
+        return f"{pool_name} 为空，跳过"
+    now = datetime.now(ZoneInfo(TZ))
+    end = now.strftime("%Y-%m-%d")
+    # 日历日 ≈ 交易日×2+5，保证覆盖 lookback_days 个交易日
+    start = (now - pd.Timedelta(days=int(lookback_days) * 2 + 5)).strftime("%Y-%m-%d")
+    total, failed = 0, []
+    for code in codes:
+        try:
+            total += datasource._ths_fetch_daily(code, start, end)
+        except Exception:
+            failed.append(code)
+    msg = f"{end} iFinD 日线入库：{len(codes)} 只 → {total} 行（回看 {lookback_days} 个交易日）"
+    if failed:
+        msg += f" · 失败 {len(failed)} 只（{','.join(failed[:5])}{'…' if len(failed) > 5 else ''}）"
+    return msg
+
+
+def job_ifind_calendar(exchange: str = "SSE", **_ignored) -> str:
+    """iFinD 交易日历入库（ifind_calendar 表）——给各页面提供真实交易日历。"""
+    df, res, err = datasource.ths_trade_dates(exchange)
+    if err not in (0, None) or df is None or df.empty:
+        return f"交易日历拉取失败 err={err}（凭证问题见 📡 iFinD 页状态）"
+    col = next((c for c in df.columns if "date" in c.lower() or "time" in c.lower()), df.columns[0])
+    dates = sorted(pd.to_datetime(df[col]).dt.strftime("%Y-%m-%d").tolist())
+    with datasource._conn() as c:
+        c.executemany("INSERT OR IGNORE INTO ifind_calendar(exchange, date) VALUES (?,?)",
+                      [(exchange, d) for d in dates])
+    return f"{exchange} 交易日历 {len(dates)} 天（{dates[0]}~{dates[-1]}）"
+
+
+def job_ifind_basic_daily(pool_name: str = "自选股", **_ignored) -> str:
+    """基本面指标包每日入库（ifind_basic_daily 长表 code/date/indicator/value）。
+    走行情端点（cmd_history_quotation/THS_HQ）单日截面——实测比 basic_data_service
+    的 indiparams 规则稳得多：收盘价/PE_TTM/PB/总股本/总市值/流通市值/换手率。"""
+    codes = load_watchlist() if pool_name == "自选股" else (all_pools().get(pool_name) or [])
+    if not codes:
+        return f"{pool_name} 为空，跳过"
+    inds = "close,pe_ttm,pb,totalShares,totalCapital,floatCapitalOfAShares,turnoverRatio"
+    today = datetime.now().strftime("%Y-%m-%d")
+    df, res, err = datasource.ths_history(codes, inds, today, today, "")
+    if err not in (0, None) or df is None or df.empty:
+        return f"基本面拉取失败 err={err}（凭证问题见 📡 iFinD 页状态）"
+    date_col = "date" if "date" in df.columns else ("time" if "time" in df.columns else None)
+    ind_cols = [c for c in df.columns if c not in ("time", "date", "thscode")]
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = []
+    for _, r in df.iterrows():
+        rdate = str(r[date_col])[:10] if date_col else today  # HTTP 截面返回无日期列→用当天
+        for ind in ind_cols:
+            v = r.get(ind)
+            if pd.notna(v):
+                rows.append((str(r.get("thscode")), rdate, ind, float(v), now))
+    with datasource._conn() as c:
+        c.executemany("INSERT OR REPLACE INTO ifind_basic_daily"
+                      "(code,date,indicator,value,fetched_at) VALUES (?,?,?,?,?)", rows)
+    return f"{today} 基本面入库 {len(rows)} 行（{len(codes)} 只 × {len(ind_cols)} 指标）"
+
+
+def job_ifind_announce(pool_name: str = "自选股", days: int = 7, **_ignored) -> str:
+    """公告每日抓取得入 ifind_announcements 表（按 seq 去重，幂等）。"""
+    codes = load_watchlist() if pool_name == "自选股" else (all_pools().get(pool_name) or [])
+    if not codes:
+        return f"{pool_name} 为空，跳过"
+    df, res, err = datasource.ths_announce(codes, days=int(days))
+    if err not in (0, None) or df is None or df.empty:
+        return f"近 {days} 天无公告或拉取失败 err={err}"
+    df.columns = [str(c).lower() for c in df.columns]
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    n = 0
+    with datasource._conn() as c:
+        for _, r in df.iterrows():
+            seq = str(r.get("seq") or "")
+            if not seq:
+                continue
+            cur = c.execute("INSERT OR IGNORE INTO ifind_announcements"
+                            "(seq,code,report_date,title,pdf_url,ctime,fetched_at)"
+                            " VALUES (?,?,?,?,?,?,?)",
+                            (seq, str(r.get("thscode", "")), str(r.get("reportdate", ""))[:10],
+                             str(r.get("reporttitle", "")), str(r.get("pdfurl", "")),
+                             str(r.get("ctime", "")), now))
+            n += cur.rowcount
+    return f"公告入库：拉到 {len(df)} 条，新增 {n} 条（seq 去重）"
+
+
 def job_le_factor_eval(batch: int = 60, pool_name: str = "沪深300") -> str:
     """LoopEngine 因子滚动体检（每晚）：族配额优先取一批出评分卡。
 
@@ -443,6 +551,18 @@ def job_le_factor_eval(batch: int = 60, pool_name: str = "沪深300") -> str:
 JOBS = {
     "update_data": {"name": "📥 每日数据更新", "func": job_update_data,
                     "default": {"enabled": False, "hour": 17, "minute": 35, "params": {}}},
+    "ifind_daily_sync": {"name": "📡 iFinD 日线入库（盘后）", "func": job_ifind_daily_sync,
+                         "default": {"enabled": False, "hour": 15, "minute": 40,
+                                     "params": {"pool_name": "自选股", "lookback_days": 10}}},
+    "ifind_calendar": {"name": "🗓 iFinD 交易日历入库", "func": job_ifind_calendar,
+                       "default": {"enabled": False, "hour": 8, "minute": 30,
+                                   "params": {"exchange": "SSE"}}},
+    "ifind_basic_daily": {"name": "🏢 iFinD 基本面指标入库（盘后）", "func": job_ifind_basic_daily,
+                          "default": {"enabled": False, "hour": 15, "minute": 50,
+                                      "params": {"pool_name": "自选股"}}},
+    "ifind_announce": {"name": "📜 iFinD 公告抓取入库", "func": job_ifind_announce,
+                       "default": {"enabled": False, "hour": 16, "minute": 30,
+                                   "params": {"pool_name": "自选股", "days": 7}}},
     "watchlist_signals": {"name": "📈 个股信号（自选股 × 进化因子）", "func": job_watchlist_signals,
                           "default": {"enabled": False, "hour": 18, "minute": 30, "params": {}}},
     "pool_scan": {"name": "🏛️ 板块/股票池扫描（Top-N）", "func": job_pool_scan,
@@ -457,6 +577,10 @@ JOBS = {
                       "default": {"enabled": False, "hour": 0, "minute": 0,
                                   "params": {"pool_name": "沪深300", "interval_sec": 30},
                                   "trigger": "interval"}},
+    "sector_flow_collect": {"name": "🌐 板块资金流采集（盘中·资金趋势页供数）", "func": job_sector_flow_collect,
+                            "default": {"enabled": False, "hour": 0, "minute": 0,
+                                        "params": {"interval_sec": 30},
+                                        "trigger": "interval"}},
     "loopengine": {"name": "🧬 LoopEngine 演化引擎", "func": job_loopengine,
                    "default": {"enabled": False, "hour": 0, "minute": 0,
                                "params": {"batch": 30, "interval_sec": 300},

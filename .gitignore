@@ -29,3 +29,8 @@ dist/
 build/
 *.egg-info/
 .DS_Store
+
+# iFinD 官方 SDK（专有二进制，~50MB，不入库；构建镜像前手动放入）
+qsys/ifind_sdk/*.tar.gz
+qsys/ifind_sdk/*.tgz
+qsys/ifind_sdk/*.zip

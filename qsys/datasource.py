@@ -13,7 +13,7 @@ import os
 import re
 import sqlite3
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -68,6 +68,15 @@ def _conn():
         fetched_at TEXT, PRIMARY KEY(source, code, date));
     CREATE TABLE IF NOT EXISTS data_sources(
         source TEXT PRIMARY KEY, name TEXT, last_sync TEXT, rows INTEGER, note TEXT);
+    -- iFinD 自动入库（⏰定时任务 ifind_*）：
+    CREATE TABLE IF NOT EXISTS ifind_basic_daily(
+        code TEXT NOT NULL, date TEXT NOT NULL, indicator TEXT NOT NULL,
+        value REAL, fetched_at TEXT, PRIMARY KEY(code, date, indicator));
+    CREATE TABLE IF NOT EXISTS ifind_announcements(
+        seq TEXT PRIMARY KEY, code TEXT, report_date TEXT, title TEXT,
+        pdf_url TEXT, ctime TEXT, fetched_at TEXT);
+    CREATE TABLE IF NOT EXISTS ifind_calendar(
+        exchange TEXT NOT NULL, date TEXT NOT NULL, PRIMARY KEY(exchange, date));
     """)
     cols = [r[1] for r in c.execute("PRAGMA table_info(market_daily)")]
     if "outstanding_share" not in cols:
@@ -185,10 +194,13 @@ def _ak_daily_cached(code: str, start: str, end: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------- 同花顺 iFinD 通道
-# SDK 不在 PyPI：需到 https://quantapi.51ifind.com 下载 Linux 版 iFinDPy 安装进 lh-qsys 容器。
+# SDK 不在 PyPI 且非 pip 包：官方 tar.gz 放入 qsys/ifind_sdk/ 后随镜像构建安装
+# （解压到 /opt/iFinD + site-packages/iFinDPy.pth，见 Dockerfile）。
 # 凭证（三选二之一）：环境变量 THS_IFIND_ACCOUNT + THS_IFIND_PASSWORD，
 # 或 THS_IFIND_REFRESH_TOKEN；也可写在 settings.json 的 "ths_ifind" 节。
-_THS = {"logged_in": False}
+# cooldown：登录失败（尤其 -9 会话超限）后熔断一段时间再重试——
+# 页面自动刷新会反复触发登录，不限流会把服务端锁定窗口一直续期。
+_THS = {"logged_in": False, "cooldown_until": 0.0}
 
 
 def _ths_credentials() -> tuple[str, str, str]:
@@ -209,31 +221,51 @@ def _ths_login() -> bool:
     """iFinDPy 登录单例。返回 True 表示可用；否则抛带指引的异常。"""
     if _THS["logged_in"]:
         return True
+    cool = _THS["cooldown_until"] - time.time()
+    if cool > 0:
+        raise RuntimeError(
+            f"iFinD 登录冷却中（上次被限流，约 {int(cool) // 60 + 1} 分钟后自动重试）；"
+            "频繁重试会让服务端锁定窗口一直续期，请稍等")
     try:
         import iFinDPy as ths
     except ImportError:
         raise RuntimeError(
-            "未安装 iFinDPy SDK：到 quantapi.51ifind.com 下载 Linux 版，"
-            "在 lh-qsys 容器内 pip 安装后重试")
+            "未安装 iFinDPy SDK：官方包不在 PyPI 且非 pip 包，"
+            "将从 quantapi.51ifind.com 下载的 Linux tar.gz 放入 "
+            "qsys/ifind_sdk/ 后重新 build qsys 镜像即可")
     acc, pwd, token = _ths_credentials()
-    if token:
-        ret = ths.THS_iFinDLogin(token)
-    elif acc and pwd:
+    if acc and pwd:
         ret = ths.THS_iFinDLogin(acc, pwd)
+    elif token:
+        try:
+            # 新版 SDK（Windows 版等）支持单参数 refresh_token 登录
+            ret = ths.THS_iFinDLogin(token)
+        except TypeError:
+            # Linux tar.gz 版只有 THS_iFinDLogin(username, password)，
+            # 原生库无 refresh token 处理逻辑（实测返回 -2 认证失败）
+            raise RuntimeError(
+                "当前 Linux 版 iFinDPy SDK 仅支持账号密码登录（不认 refresh_token）："
+                "请在 settings.json 的 ths_ifind 节填 account/password"
+                "（数据接口账号密码），或设环境变量 THS_IFIND_ACCOUNT/THS_IFIND_PASSWORD")
     else:
         raise RuntimeError(
             "未配置同花顺凭证：设置 THS_IFIND_ACCOUNT/THS_IFIND_PASSWORD "
             "或 THS_IFIND_REFRESH_TOKEN（.env 或 settings.json 的 ths_ifind 节）")
-    # 返回值版本兼容：老版 int(0=成功)；新版 dict/对象带 errorcode
+    # 返回值版本兼容：老版 int(0=成功,-201=已登录也算成功)；新版 dict/对象带 errorcode
     if isinstance(ret, int):
         errcode = ret
     elif isinstance(ret, dict):
         errcode = ret.get("errorcode", -1)
     else:
         errcode = getattr(ret, "errorcode", -1)
-    if errcode != 0:
+    if errcode not in (0, -201):
         _THS["logged_in"] = False
-        raise RuntimeError(f"iFinD 登录失败(errorcode={errcode})：检查账号/权限/refresh_token")
+        # -9 会话超限：冷却 10 分钟（频繁重试会延长服务端锁定）；其余错误 1 分钟
+        _THS["cooldown_until"] = time.time() + (600 if errcode == -9 else 60)
+        hint = {-2: "账号或密码错误，请核对 settings.json ths_ifind 节的 account/password",
+                -9: "登录会话数超限（短时登录太频繁）。已自动冷却 10 分钟后再试；"
+                    "若长时间不恢复，到 quantapi.51ifind.com 查账号状态或联系同花顺客服"}
+        raise RuntimeError(f"iFinD 登录失败(errorcode={errcode})：{hint.get(errcode, '检查账号/权限/网络')}")
     _THS["logged_in"] = True
     return True
 
@@ -246,16 +278,13 @@ def _to_ths_code(code: str) -> str:
 
 def _ths_fetch_daily(code: str, start: str, end: str) -> int:
     """iFinD 日线 → market.db（source='ths_ifind'），返回写入行数。
+    走 ths_history（SDK 优先 / HTTP 兜底）。
 
     联调注意（拿到账号后核对一次）：
       - volume 单位（股/手）与其他源是否一致，不一致则在此 ×100 对齐
       - THS_HQ 默认不复权；如需前复权在第三个参数加复权标志（以官方文档为准）
     """
-    _ths_login()
-    import iFinDPy as ths
-
-    res = ths.THS_HQ(_to_ths_code(code), "open,high,low,close,volume,amount", "", start, end)
-    df = res if isinstance(res, pd.DataFrame) else getattr(res, "data", None)
+    df, _res, _err = ths_history([code], "open,high,low,close,volume,amount", start, end, "")
     if df is None or df.empty:
         return 0
     # 列名归一：time/date/trade_date → date；数值列小写对齐
@@ -279,7 +308,8 @@ def _ths_fetch_daily(code: str, start: str, end: str) -> int:
 
 
 def ths_selftest() -> str:
-    """凭证/连通性自检：登录 + 拉茅台近 10 天日线。供命令行快速验证：
+    """凭证/连通性自检：SDK 登录 + 拉茅台近 10 天日线；SDK 不可用自动改测 HTTP 通道。
+    供命令行快速验证：
     docker exec lh-qsys python -c "import datasource; print(datasource.ths_selftest())"
     """
     try:
@@ -287,9 +317,86 @@ def ths_selftest() -> str:
         end = datetime.now().strftime("%Y-%m-%d")
         start = (datetime.now() - pd.Timedelta(days=10)).strftime("%Y-%m-%d")
         n = _ths_fetch_daily("SH600519", start, end)
-        return f"OK：登录成功，SH600519 近10天日线写入 {n} 行" if n else "登录成功但未取到数据（检查权限）"
+        return f"OK：SDK 登录成功，SH600519 近10天日线写入 {n} 行" if n else "SDK 登录成功但未取到数据（检查权限）"
     except Exception as e:
-        return f"FAIL：{e}"
+        try:
+            df, res, err = _ths_http("real_time_quotation",
+                                     {"codes": "600519.SH", "indicators": "latest"})
+            if err == 0 and df is not None and not df.empty:
+                return f"OK：SDK 不可用（{e}）；HTTP 通道正常，茅台最新价 {df.iloc[-1].get('latest')}"
+            return f"FAIL：SDK（{e}）；HTTP 返回 errorcode={err}"
+        except Exception as e2:
+            return f"FAIL：SDK（{e}）；HTTP（{e2}）"
+
+
+def _tables_to_df(tables):
+    """把 iFinD JSON 结构 tables=[{thscode, time:[...], table:{指标:[值]}}] 拼成 DataFrame。
+    THS_DateSerial 等旧版 outflag 接口不走 dataframe 格式，直接返回这种 dict；
+    get_trade_dates 等则返回 {time:[...]} 裸 dict（非列表）。"""
+    if isinstance(tables, dict):
+        tables = [tables]
+    if not isinstance(tables, list) or not tables:
+        return None
+    frames = []
+    for t in tables:
+        if not isinstance(t, dict):
+            continue
+        times = t.get("time") or t.get("times") or []
+        tab = t.get("table") or {}
+        try:
+            f = pd.DataFrame(tab)
+        except (ValueError, TypeError):
+            f = pd.DataFrame([tab])  # 标量值 dict → 单行
+        if f.empty and times:
+            f = pd.DataFrame({"time": times})  # 纯时间表（交易日历）
+        elif times and len(times) == len(f) and "time" not in f.columns:
+            f.insert(0, "time", times)
+        if t.get("thscode") and "thscode" not in f.columns:
+            f.insert(1 if "time" in f.columns else 0, "thscode", t["thscode"])
+        frames.append(f)
+    return pd.concat(frames, ignore_index=True) if frames else None
+
+
+# ---------------------------------------------------------------- iFinD HTTP API 备用通道
+# SDK 未装/登录限流(-9)时自动切换。refresh_token → access_token（7天有效，进程内缓存6天），
+# 不占 SDK 会话数、无登录频次限制。端点/报文格式见官方 HTTPAPI 文档（quantapi 下载中心）。
+_THS_HTTP = {"access_token": "", "until": 0.0}
+_THS_API = "https://quantapi.51ifind.com/api/v1"
+
+
+def _ths_access_token() -> str:
+    if _THS_HTTP["access_token"] and time.time() < _THS_HTTP["until"]:
+        return _THS_HTTP["access_token"]
+    _, _, token = _ths_credentials()
+    if not token:
+        raise RuntimeError("iFinD HTTP 通道需要 refresh_token（settings.json 的 ths_ifind.refresh_token）")
+    import requests
+    res = requests.post(f"{_THS_API}/get_access_token", timeout=15,
+                        headers={"Content-Type": "application/json", "refresh_token": token}).json()
+    at = (res.get("data") or {}).get("access_token") or ""
+    if not at:
+        raise RuntimeError(f"refresh_token 换 access_token 失败：{res.get('errmsg') or str(res)[:120]}"
+                           "——到 quantapi.51ifind.com 账号信息页更新 refresh_token")
+    _THS_HTTP.update(access_token=at, until=time.time() + 6 * 86400)
+    return at
+
+
+def _ths_http(endpoint: str, payload: dict):
+    """iFinD HTTP API 调用 → (df, res, errcode)；tables JSON 复用 _tables_to_df 解析。"""
+    import requests
+    at = _ths_access_token()
+    res = requests.post(f"{_THS_API}/{endpoint}", json=payload, timeout=30,
+                        headers={"Content-Type": "application/json", "access_token": at}).json()
+    return _tables_to_df(res.get("tables")), res, res.get("errorcode", -1)
+
+
+def _sdk_or_http(sdk_call, http_call):
+    """优先 SDK（进程内会话快）；登录类失败（未装/限流/冷却中）自动落 HTTP 通道。"""
+    try:
+        _ths_login()
+    except Exception:
+        return http_call()
+    return sdk_call()
 
 
 # ---------------------------------------------------------------- iFinD 通用调用（📡 iFinD数据 页面用）
@@ -303,40 +410,172 @@ def ths_call(func_name: str, *args, **kwargs):
     if fn is None:
         raise RuntimeError(f"iFinDPy 没有函数 {func_name}——以官方文档的函数名为准")
     res = fn(*args, **kwargs)
-    df = res if isinstance(res, pd.DataFrame) else getattr(res, "data", None)
-    err = getattr(res, "errorcode", 0 if isinstance(res, pd.DataFrame) else None)
-    return df, res, err
+    if isinstance(res, pd.DataFrame):
+        return res, res, 0
+    payload = res if isinstance(res, dict) else getattr(res, "data", None)
+    err = (res.get("errorcode") if isinstance(res, dict)
+           else getattr(res, "errorcode", None))
+    if isinstance(payload, dict):  # JSON 风格返回（THS_DateSerial 等）：解析 tables
+        return _tables_to_df(payload.get("tables")), res, err
+    return payload, res, err
 
 
 def ths_realtime(codes: list[str], indicators: str = "latest,open,high,low,volume,amount"):
-    """实时行情（THS_RQ）。indicators 逗号分隔，字段名以官方文档为准。"""
-    return ths_call("THS_RQ", ",".join(_to_ths_code(c) for c in codes), indicators)
+    """实时行情（SDK: THS_RQ / HTTP: real_time_quotation）。indicators 逗号分隔。"""
+    cs = ",".join(_to_ths_code(c) for c in codes)
+    return _sdk_or_http(
+        lambda: ths_call("THS_RQ", cs, indicators),
+        lambda: _ths_http("real_time_quotation", {"codes": cs, "indicators": indicators}))
+
+
+def _parse_fn_params(params: str) -> dict:
+    """'Fill:Original,Interval:D' → {'Fill':'Original','Interval':'D'}（HTTP functionpara）。"""
+    return dict(kv.split(":", 1) for kv in (params or "").split(",") if ":" in kv)
 
 
 def ths_history(codes: list[str], indicators: str, start: str, end: str,
                 params: str = "Fill:Original,Interval:D"):
-    """历史行情（THS_HQ）。params 含复权/周期（Fill/Interval/Days 等，见官方文档）。"""
-    return ths_call("THS_HQ", ",".join(_to_ths_code(c) for c in codes), indicators, params, start, end)
+    """历史行情（SDK: THS_HQ / HTTP: cmd_history_quotation）。params 含复权/周期。"""
+    cs = ",".join(_to_ths_code(c) for c in codes)
+    return _sdk_or_http(
+        lambda: ths_call("THS_HQ", cs, indicators, params, start, end),
+        lambda: _ths_http("cmd_history_quotation",
+                          {"codes": cs, "indicators": indicators, "startdate": start,
+                           "enddate": end, "functionpara": _parse_fn_params(params)}))
 
 
 def ths_highfreq(code: str, indicators: str, start: str, end: str, interval: str = "1min"):
-    """高频数据（THS_HF）。start/end 形如 2026-08-27 09:30:00。"""
-    return ths_call("THS_HF", _to_ths_code(code), indicators, f"Interval:{interval}", start, end)
+    """高频数据（SDK: THS_HF / HTTP: high_frequency）。start/end 形如 2026-08-27 09:30:00。
+    实测（2026-08 Linux SDK）：SDK 指标分号分隔、Interval 为裸数字分钟（1 分钟传空参）；
+    HTTP 端指标逗号分隔。"""
+    m = re.match(r"\s*(\d+)", interval or "")
+    sdk_ind = indicators.replace(",", ";")
+    sdk_param = f"Interval:{m.group(1)}" if m and m.group(1) != "1" else ""
+
+    def http():
+        payload = {"codes": _to_ths_code(code), "indicators": indicators.replace(";", ","),
+                   "starttime": start, "endtime": end}
+        if m and m.group(1) != "1":
+            payload["functionpara"] = {"Interval": m.group(1)}
+        return _ths_http("high_frequency", payload)
+
+    return _sdk_or_http(
+        lambda: ths_call("THS_HF", _to_ths_code(code), sdk_ind, sdk_param, start, end), http)
 
 
 def ths_snapshot(codes: list[str], indicators: str, snap_time: str = ""):
-    """日内快照（THS_Snapshot）。snap_time 为空取最新。"""
-    return ths_call("THS_Snapshot", ",".join(_to_ths_code(c) for c in codes), indicators, snap_time)
+    """日内快照（SDK: THS_SS dataframe 版）。snap_time 支持 HH:MM:SS 或完整时间。
+    实测：SDK 指标分号分隔；params 必填 dataType:Original；begin==end 返回空，
+    必须给时间窗——单时点取 [t-2min, t]；留空=最新：先取最近 10 分钟，
+    非交易时段为空则逐日回退尾盘 14:55-15:00 窗口（最多回退 5 天）。
+    HTTP 无快照端点，备用通道退化为实时行情（同一时刻最新一笔）。"""
+    ind = indicators.replace(",", ";")
+    codes_s = ",".join(_to_ths_code(c) for c in codes)
+
+    def http():
+        return _ths_http("real_time_quotation",
+                         {"codes": codes_s, "indicators": indicators.replace(";", ",")})
+
+    now = datetime.now()
+    t = snap_time.strip()
+    if t:
+        if re.match(r"^\d{1,2}:\d{2}(:\d{2})?$", t):
+            t = f"{now:%Y-%m-%d} {t}"
+        end = datetime.strptime(t, "%Y-%m-%d %H:%M:%S")  # 格式错误会抛给 _go 提示
+        begin = end - timedelta(minutes=2)
+        return _sdk_or_http(
+            lambda: ths_call("THS_SS", codes_s, ind, "dataType:Original",
+                             f"{begin:%Y-%m-%d %H:%M:%S}", f"{end:%Y-%m-%d %H:%M:%S}"), http)
+    df, res, err = _sdk_or_http(
+        lambda: ths_call("THS_SS", codes_s, ind, "dataType:Original",
+                         f"{now - timedelta(minutes=10):%Y-%m-%d %H:%M:%S}",
+                         f"{now:%Y-%m-%d %H:%M:%S}"), http)
+    if df is None or df.empty:
+        for back in range(1, 6):
+            d = now - timedelta(days=back)
+            if d.weekday() >= 5:
+                continue
+            try:
+                _ths_login()
+            except Exception:
+                break  # HTTP 通道无历史快照可回退，直接返回空
+            df, res, err = ths_call("THS_SS", codes_s, ind, "dataType:Original",
+                                    f"{d:%Y-%m-%d} 14:55:00", f"{d:%Y-%m-%d} 15:00:00")
+            if df is not None and not df.empty:
+                break
+    return df, res, err
 
 
-def ths_basic(codes: list[str], indicators: str, params: str = ""):
-    """基础数据（THS_DS）：截面基本面指标，如市盈率/市值/营收。"""
-    return ths_call("THS_DS", ",".join(_to_ths_code(c) for c in codes), indicators, params)
+def ths_basic(codes: list[str], indicators: str, params: str = "", date: str = ""):
+    """基础数据（SDK: THS_BD / HTTP: basic_data_service）：截面基本面指标。
+
+    官方格式：指标分号分隔；params 为"每指标一组"的参数串（组间分号、组内逗号，
+    无参数留空），如 'ths_pe_ttm_stock;ths_stock_short_name_stock' 配 '2026-08-28;'。
+    params 留空时每个指标默认给交易日参数（估值/价格类指标必需；名称类会忽略）。
+    """
+    d = date.strip() or f"{datetime.now():%Y-%m-%d}"
+    codes_s = ",".join(_to_ths_code(c) for c in codes)
+    inds = [x.strip() for x in indicators.replace("；", ";").split(";") if x.strip()]
+
+    # 组装每指标参数组（与官方 paramOption 同格式）
+    if params.strip():
+        groups = params.replace("；", ";").split(";")
+        groups = [groups[i] if i < len(groups) else groups[-1] for i in range(len(inds))]
+    else:
+        groups = [d] * len(inds)
+
+    def http():
+        # 实测：HTTP 端截面指标 indiparams 日期要 YYYYMMDD（无横线），否则静默 None
+        return _ths_http("basic_data_service",
+                         {"codes": codes_s,
+                          "indipara": [{"indicator": i,
+                                        "indiparams": [p.replace("-", "") for p in g.split(",")]}
+                                       for i, g in zip(inds, groups)]})
+
+    def sdk():
+        # THS_BD 原生多指标（优于 THS_DS 的逐指标循环——实测 THS_DS 多指标恒 -209）
+        param_option = ";".join(groups)
+        return ths_call("THS_BD", codes_s, ";".join(inds), param_option)
+
+    return _sdk_or_http(sdk, http)
 
 
 def ths_date_serial(code: str, indicators: str, start: str, end: str, params: str = ""):
-    """日期序列（THS_DateSerial）：基本面/专题指标的时序。"""
-    return ths_call("THS_DateSerial", _to_ths_code(code), indicators, params, "", start, end)
+    """日期序列（SDK: THS_DateSerial / HTTP: date_sequence）：基本面/专题指标的时序。"""
+    cs = _to_ths_code(code)
+    inds = [x.strip() for x in indicators.replace("；", ";").replace(",", ";").split(";") if x.strip()]
+    return _sdk_or_http(
+        lambda: ths_call("THS_DateSerial", cs, indicators, params, "", start, end),
+        lambda: _ths_http("date_sequence",
+                          {"codes": cs, "startdate": start, "enddate": end,
+                           "functionpara": {"Days": "Tradedays", "Fill": "Previous", "Interval": "D"},
+                           "indipara": [{"indicator": i, "indiparams": [params]} for i in inds]}))
+
+
+def ths_trade_dates(exchange: str = "SSE", start: str = "", end: str = ""):
+    """交易日历（SDK: THS_Date_Query / HTTP: get_trade_dates）。exchange: SSE/SZSE。"""
+    start = start or f"{datetime.now().year}-01-01"
+    end = end or f"{datetime.now():%Y-%m-%d}"
+    mcode = {"SSE": "212001", "SZSE": "212100"}.get(exchange, "212001")
+    return _sdk_or_http(
+        lambda: ths_call("THS_Date_Query", exchange, "dateType:0", start, end),
+        lambda: _ths_http("get_trade_dates", {"marketcode": mcode,
+                                              "functionpara": {"dateType": "0"},
+                                              "startdate": start, "enddate": end}))
+
+
+def ths_announce(codes: list[str], days: int = 7):
+    """公告查询（SDK: THS_ReportQuery / HTTP: report_query）。
+    返回字段：reportDate/thscode/secName/ctime/reportTitle/pdfURL/seq。"""
+    end = datetime.now().strftime("%Y-%m-%d")
+    begin = (datetime.now() - timedelta(days=int(days))).strftime("%Y-%m-%d")
+    cs = ",".join(_to_ths_code(c) for c in codes)
+    output = "reportDate:Y,thscode:Y,secName:Y,ctime:Y,reportTitle:Y,pdfURL:Y,seq:Y"
+    return _sdk_or_http(
+        lambda: ths_call("THS_ReportQuery", cs, f"beginrDate:{begin};endrDate:{end}", output),
+        # 实测：HTTP 端 beginrDate/endrDate 是顶层字段，塞进 functionpara 会被忽略
+        lambda: _ths_http("report_query", {"codes": cs, "beginrDate": begin, "endrDate": end,
+                                           "outputpara": output}))
 
 
 # ---------------------------------------------------------------- easy-tdx（通达信 TCP）通道

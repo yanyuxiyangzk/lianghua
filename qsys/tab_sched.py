@@ -49,6 +49,24 @@ def render():
                         st.rerun()
                 st.caption(f"下次运行：{cfg['next'] or '未启用'}")
             with c3:
+                if key in ("ifind_daily_sync", "ifind_basic_daily", "ifind_announce"):
+                    opts = ["自选股"] + pools
+                    cur = cfg["params"].get("pool_name", "自选股")
+                    p = st.selectbox("入库范围", opts,
+                                     index=opts.index(cur) if cur in opts else 0, key=f"scope_{key}",
+                                     help="自选股在 🕯️自选K线 页维护；池子为板块成分")
+                    new_params = {"pool_name": p}
+                    if key == "ifind_daily_sync":
+                        lb = st.slider("回看交易日数", 3, 60,
+                                       int(cfg["params"].get("lookback_days", 10)), key=f"lb_{key}",
+                                       help="增量冗余：重复写靠主键覆盖，用于补缺口/修正")
+                        new_params["lookback_days"] = lb
+                    if key == "ifind_announce":
+                        days = st.slider("回看天数", 3, 30,
+                                         int(cfg["params"].get("days", 7)), key=f"days_{key}")
+                        new_params["days"] = days
+                    if new_params != {k: cfg["params"].get(k) for k in new_params}:
+                        mgr.set_params(key, new_params)
                 if key == "pool_scan":
                     import library
                     packs = library.list_strategies()

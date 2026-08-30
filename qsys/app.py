@@ -57,6 +57,9 @@ pages = {
         st.Page("views/p_ifind_doc.py", title="接口文档", icon="📖", url_path="ifind-doc"),
         st.Page("views/p_warehouse.py", title="数据仓库", icon="🗄", url_path="ifind-warehouse"),
     ],
+    "🔍 搜索增强": [
+        st.Page("views/p_newsense.py", title="舆情/新闻", icon="📰", url_path="newsense"),
+    ],
     "专业区（调参研究，平时不用看）": [
         st.Page("views/p_combo.py", title="选股组合", icon="🧩", url_path="combo"),
         st.Page("views/p_single.py", title="个股分析", icon="🔬", url_path="single"),

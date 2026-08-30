@@ -63,6 +63,10 @@ else:
         st.error("代码格式不对——输入 6 位数字或带交易所前缀（SH/SZ/BJ）")
         st.stop()
     pool_name, codes = f"个股 {code}", [code]
+    if st.button("🔍 该票舆情 / 新闻搜索增强", key="ps_newsense",
+                 help="跳到「搜索增强」页，已预填本票代码"):
+        st.session_state["ns_codes"] = code
+        st.switch_page("views/p_newsense.py")
     scope_note = "内置+技术指标（单票无横截面，截面排名类进化因子退化不适用）"
 st.caption(f"因子范围：{scope_note} · 数据截至 **{end}**")
 

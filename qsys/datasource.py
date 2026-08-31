@@ -993,3 +993,56 @@ def get_realtime_snapshot(code: str) -> dict:
         "limit_up": _f(47), "limit_down": _f(48),
         "avg_price": _f(51),
     }
+
+
+# ---------------------------------------------------------------- 全市场股票/指数列表
+def get_all_a_stocks() -> pd.DataFrame:
+    """获取全市场A股列表（通过 akshare）。
+
+    返回: DataFrame，包含 code, name, market 等字段
+    """
+    import akshare as ak
+
+    try:
+        # 使用 akshare 获取A股实时行情，包含所有A股代码和名称
+        df = ak.stock_zh_a_spot_em()
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        # 整理列名
+        result = pd.DataFrame({
+            "code": df["代码"],
+            "name": df["名称"],
+            "market": df["代码"].apply(lambda x: "SH" if x.startswith("6") else "SZ"),
+        })
+        return result.sort_values("code").reset_index(drop=True)
+    except Exception as e:
+        import logging
+        logging.getLogger("datasource").warning(f"获取A股列表失败: {e}")
+        return pd.DataFrame()
+
+
+def get_index_list() -> pd.DataFrame:
+    """获取主要指数列表（通过 akshare）。
+
+    返回: DataFrame，包含 code, name, market 等字段
+    """
+    import akshare as ak
+
+    try:
+        # 使用 akshare 获取A股指数实时行情
+        df = ak.stock_zh_index_spot_em()
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        # 整理列名
+        result = pd.DataFrame({
+            "code": df["代码"],
+            "name": df["名称"],
+            "market": df["代码"].apply(lambda x: "SH" if x.startswith("0") else "SZ"),
+        })
+        return result.sort_values("code").reset_index(drop=True)
+    except Exception as e:
+        import logging
+        logging.getLogger("datasource").warning(f"获取指数列表失败: {e}")
+        return pd.DataFrame()

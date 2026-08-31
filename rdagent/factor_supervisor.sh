@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # RD-Agent 进化循环看门狗（在 lh-rdagent 容器内常驻）
 # 能力：① 进程崩溃/退出 → 自动从最新检查点断点续跑
-#       ② 日志 45 分钟无更新（卡死）→ 杀掉重启续跑
+#       ② 日志 90 分钟无更新（卡死）→ 杀掉重启续跑
 # 启动：docker compose exec -d rdagent bash ${LIANGHUA_ROOT}/rdagent/factor_supervisor.sh
 cd "${LIANGHUA_ROOT:-/home/zk/code/lianghua}"
 LOG=log/factor_run.out
-STALE_SEC=2700
+STALE_SEC=5400  # 90分钟，给LLM调用和Qlib回测更多时间
 
 latest_trace() { ls -dt log/20*/ 2>/dev/null | head -1; }
 

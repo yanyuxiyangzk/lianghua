@@ -299,6 +299,46 @@ def get_evolved_factors(only_accepted: bool = False) -> list[dict]:
     return out
 
 
+def load_positions(trace_path: str, loop_num: int) -> pd.DataFrame | None:
+    """从 trace 目录中加载指定 Loop 的每日持仓数据。"""
+    # 把 /work/log 映射回容器内路径
+    container_path = trace_path
+    if trace_path.startswith("/work/log"):
+        container_path = HOST_PREFIX + trace_path[len("/work/log"):]
+    
+    trace_dir = Path(container_path)
+    if not trace_dir.exists():
+        return None
+    
+    # 找到对应的 Loop 目录
+    loop_dir = trace_dir / f"Loop_{loop_num}"
+    if not loop_dir.exists():
+        return None
+    
+    # 查找 positions.csv 文件
+    positions_path = loop_dir / "running" / "positions.csv"
+    if not positions_path.exists():
+        # 尝试在 workspace 中查找
+        workspace_dirs = list((loop_dir / "running").glob("*"))
+        for wd in workspace_dirs:
+            if wd.is_dir():
+                p = wd / "positions.csv"
+                if p.exists():
+                    positions_path = p
+                    break
+    
+    if not positions_path.exists():
+        return None
+    
+    try:
+        df = pd.read_csv(positions_path)
+        if "datetime" in df.columns:
+            df["datetime"] = pd.to_datetime(df["datetime"])
+        return df
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------- 工具
 def metric_subset(series) -> pd.Series:
     if series is None:

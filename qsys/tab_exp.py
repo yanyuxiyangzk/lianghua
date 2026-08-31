@@ -37,6 +37,8 @@ def render():
                 show[c] = show[c].map(lambda x: f"{x:.0%}" if pd.notna(x) else "—")
             if "均超额" in c:
                 show[c] = show[c].map(lambda x: f"{x:.2%}" if pd.notna(x) else "—")
+            if "收益率" in c:
+                show[c] = show[c].map(lambda x: f"{x:.2%}" if pd.notna(x) else "—")
         st.dataframe(show, width='stretch')
 
     st.markdown("**🧬 因子实战榜（近似归因）**")

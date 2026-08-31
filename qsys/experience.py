@@ -214,6 +214,7 @@ def pack_leaderboard() -> pd.DataFrame:
             if len(of):
                 row[f"{fwd}日胜率"] = (of["hit"] == 1).mean()
                 row[f"{fwd}日均超额"] = of["excess"].mean()
+                row[f"{fwd}日收益率"] = of["avg_ret"].mean()
         row["回测OOS胜率"] = grp["oos_winrate_at_save"].dropna().map(
             lambda x: f"{x:.0%}" if pd.notna(x) else None).dropna().unique()
         row["回测OOS胜率"] = row["回测OOS胜率"][0] if len(row["回测OOS胜率"]) else "—"

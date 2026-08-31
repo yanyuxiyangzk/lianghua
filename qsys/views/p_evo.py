@@ -171,26 +171,6 @@ if rows:
 else:
     st.info("该 trace 尚无包含回测指标的轮次（可能还在提案/编码阶段）。")
 
-st.subheader("假设与因子明细")
-for r in reversed(rounds):
-    label = ("基线" if r["round"] == 0 else f"Round {r['round']}") + f" · {r.get('time','')}"
-    if r["feedback"] and r["feedback"]["decision"] is not None:
-        label += " ✅ 被接受" if r["feedback"]["decision"] else " ❌ 被拒绝"
-    with st.expander(label, expanded=(r == rounds[-1])):
-        st.markdown(f"**假设**：{r['hypothesis']}")
-        if r["reason"]:
-            st.markdown(f"**理由**：{r['reason'][:1000]}")
-        if r["feedback"]:
-            st.markdown(f"**反馈**：{'被接受' if r['feedback']['decision'] else '被拒绝'} — {r['feedback']['reason']}")
-        for t in r["tasks"]:
-            st.markdown(f"**因子 `{t['name']}`**：{t['description']}")
-            if t.get("formulation"):
-                st.caption(f"公式：{t['formulation']}")
-            if t["code"]:
-                st.code(t["code"], language="python")
-            else:
-                st.caption("（因子代码见对应 workspace 的 factor.py）")
-
 # ---------------------------------------------------------------- 每日选股名单
 if backtest_charts:
     st.subheader("📋 每日选股名单")
@@ -230,3 +210,23 @@ if backtest_charts:
                 st.info("该日期无持仓数据")
         else:
             st.info("该轮次暂无持仓数据（需要新演化出的回测才会保存每日持仓）")
+
+st.subheader("假设与因子明细")
+for r in reversed(rounds):
+    label = ("基线" if r["round"] == 0 else f"Round {r['round']}") + f" · {r.get('time','')}"
+    if r["feedback"] and r["feedback"]["decision"] is not None:
+        label += " ✅ 被接受" if r["feedback"]["decision"] else " ❌ 被拒绝"
+    with st.expander(label, expanded=(r == rounds[-1])):
+        st.markdown(f"**假设**：{r['hypothesis']}")
+        if r["reason"]:
+            st.markdown(f"**理由**：{r['reason'][:1000]}")
+        if r["feedback"]:
+            st.markdown(f"**反馈**：{'被接受' if r['feedback']['decision'] else '被拒绝'} — {r['feedback']['reason']}")
+        for t in r["tasks"]:
+            st.markdown(f"**因子 `{t['name']}`**：{t['description']}")
+            if t.get("formulation"):
+                st.caption(f"公式：{t['formulation']}")
+            if t["code"]:
+                st.code(t["code"], language="python")
+            else:
+                st.caption("（因子代码见对应 workspace 的 factor.py）")

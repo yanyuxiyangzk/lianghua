@@ -471,6 +471,56 @@ def job_ifind_announce(pool_name: str = "自选股", days: int = 7, **_ignored) 
     return f"公告入库：拉到 {len(df)} 条，新增 {n} 条（seq 去重）"
 
 
+def job_ifind_stocklist_sync(**_ignored) -> str:
+    """iFinD 全市场A股列表同步（每日09:00执行）。
+
+    调用 datasource.fetch_stocklist_to_db() 拉取全量数据。
+    """
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    # 交易日判断：周一到周五
+    if now.weekday() >= 5:
+        return "非交易日，跳过"
+
+    n = datasource.fetch_stocklist_to_db()
+    if n > 0:
+        return f"{now.strftime('%Y-%m-%d')} A股列表同步完成：{n} 只"
+    else:
+        return "A股列表同步失败（可能iFinD限流或凭证问题）"
+
+
+def job_ifind_realtime_sync(**_ignored) -> str:
+    """iFinD 实时行情快照同步（盘中每15分钟执行）。
+
+    调用 datasource.fetch_realtime_to_db() 写入 ifind_realtime 表。
+    """
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    # 交易日判断：周一到周五
+    if now.weekday() >= 5:
+        return "非交易日，跳过"
+    # 交易时段判断：09:30-15:00
+    if not ("0930" <= now.strftime("%H%M") <= "1500"):
+        return "非交易时段，跳过"
+
+    n = datasource.fetch_realtime_to_db()
+    if n > 0:
+        return f"{now.strftime('%H:%M:%S')} 实时快照写入完成：{n} 只"
+    else:
+        return "实时快照写入失败（可能iFinD限流或无数据）"
+
+
+def job_ifind_cleanup(**_ignored) -> str:
+    """清理过期数据（每日16:00执行）。"""
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    datasource.cleanup_old_data()
+    return f"{now.strftime('%Y-%m-%d %H:%M:%S')} 过期数据清理完成"
+
+
 def job_le_factor_eval(batch: int = 60, pool_name: str = "沪深300") -> str:
     """LoopEngine 因子滚动体检（每晚）：族配额优先取一批出评分卡。
 
@@ -563,6 +613,14 @@ JOBS = {
     "ifind_announce": {"name": "📜 iFinD 公告抓取入库", "func": job_ifind_announce,
                        "default": {"enabled": False, "hour": 16, "minute": 30,
                                    "params": {"pool_name": "自选股", "days": 7}}},
+    "ifind_stocklist_sync": {"name": "📋 iFinD A股列表同步（每日）", "func": job_ifind_stocklist_sync,
+                             "default": {"enabled": False, "hour": 9, "minute": 0, "params": {}}},
+    "ifind_realtime_sync": {"name": "📊 iFinD 实时快照同步（盘中）", "func": job_ifind_realtime_sync,
+                            "default": {"enabled": False, "hour": 0, "minute": 0,
+                                        "params": {},
+                                        "trigger": "interval", "interval_sec": 900}},  # 15分钟
+    "ifind_cleanup": {"name": "🧹 iFinD 过期数据清理", "func": job_ifind_cleanup,
+                      "default": {"enabled": False, "hour": 16, "minute": 0, "params": {}}},
     "watchlist_signals": {"name": "📈 个股信号（自选股 × 进化因子）", "func": job_watchlist_signals,
                           "default": {"enabled": False, "hour": 18, "minute": 30, "params": {}}},
     "pool_scan": {"name": "🏛️ 板块/股票池扫描（Top-N）", "func": job_pool_scan,

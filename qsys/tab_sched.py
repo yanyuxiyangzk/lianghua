@@ -67,6 +67,13 @@ def render():
                         new_params["days"] = days
                     if new_params != {k: cfg["params"].get(k) for k in new_params}:
                         mgr.set_params(key, new_params)
+                # 新增的iFinD任务参数设置
+                elif key == "ifind_stocklist_sync":
+                    st.caption("📋 全市场A股列表同步（每日09:00）")
+                elif key == "ifind_realtime_sync":
+                    st.caption("📊 盘中每15分钟写入实时快照")
+                elif key == "ifind_cleanup":
+                    st.caption("🧹 自动清理过期数据（保留天数可在设置中调整）")
                 if key == "pool_scan":
                     import library
                     packs = library.list_strategies()

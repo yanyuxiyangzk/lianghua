@@ -59,6 +59,19 @@ st.markdown(f"""
 | 调度器 | 见 ⏰定时任务 页（进程内调度，容器停即停） |
 """)
 
+# ---------------------------------------------------------------- iFinD 连通性
+st.subheader("iFinD 连通性测试")
+acc, pwd, token = datasource._ths_credentials()
+st.markdown(f"""
+| 通道 | 状态 |
+|---|---|
+| SDK（账号密码） | {'✅ 已配置' if acc else '❌ 未配置'} |
+| HTTP（refresh_token） | {'✅ 已配置' if token else '❌ 未配置'} |
+""")
+if st.button("🔌 iFinD 连通性自检", type="primary"):
+    with st.spinner("登录并拉取测试数据…"):
+        st.info(datasource.ths_selftest())
+
 # ---------------------------------------------------------------- 使用说明
 st.subheader("使用说明")
 st.markdown(

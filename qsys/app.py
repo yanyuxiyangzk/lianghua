@@ -51,7 +51,7 @@ pages = {
     ],
     # iFinD 数据中心：独立菜单板块，每个子页只展示对应数据（逻辑在 ifind_hub.py）
     "📡 iFinD数据中心": [
-        st.Page("views/p_ifind_stocklist.py", title="股票/指数列表", icon="📋", url_path="ifind-stocklist"),
+        st.Page("views/p_ifind_stocklist.py", title="个股行情", icon="📋", url_path="ifind-stocklist"),
         st.Page("views/p_ifind_realtime.py", title="实时行情", icon="⚡", url_path="ifind-realtime"),
         st.Page("views/p_ifind_history.py", title="历史行情", icon="📅", url_path="ifind-history"),
         st.Page("views/p_ifind_highfreq.py", title="高频行情", icon="⏱️", url_path="ifind-highfreq"),

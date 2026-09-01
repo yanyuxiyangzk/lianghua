@@ -61,13 +61,12 @@ def _render_flow():
 def _go_flow(sector_type: str, indicators: str):
     """执行板块资金流向查询"""
     try:
-        # 使用 THS_WC 智能选股接口查询板块
+        # THS_WCQuery(query, domain) —— 智能选股接口（问财语义选股）
         condition = f"{sector_type}全部"
         result = datasource.ths_call(
-            "THS_WC",
+            "THS_WCQuery",
             condition,
-            "index",
-            indicators
+            "index"
         )
         st.session_state["ifind_res_flow_data"] = result
         st.session_state["ifind_call_flow_data"] = (sector_type, indicators)
@@ -86,37 +85,45 @@ def _render_flow_result(key: str):
     """渲染资金流向结果"""
     res = st.session_state.get(f"ifind_res_{key}")
     ts = st.session_state.get(f"ifind_ts_{key}")
+    call_params = st.session_state.get(f"ifind_call_{key}")
 
     if res is None:
         st.info("点击「查询板块资金流向」开始查询")
         return
 
-    # 解析结果（ths_call 返回三元组：df, res, err）
-    if isinstance(res, tuple) and len(res) >= 3:
-        df, 原始对象, err = res
-        if err not in (0, None):
-            st.error(f"查询失败，错误码：{err}")
-            return
-        if df is not None and not df.empty:
-            # 显示统计
-            st.caption(f"共 {len(df)} 个板块 · 数据源：同花顺 iFinD"
-                       + (f" · 查询于 {ts:%H:%M:%S}" if ts else ""))
-
-            # 显示表格
-            st.dataframe(df, use_container_width=True, height=600)
-
-            # 导出按钮
-            csv = df.to_csv(index=False, encoding="utf-8-sig")
-            st.download_button(
-                label="📥 导出CSV",
-                data=csv,
-                file_name=f"板块资金流向_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv",
-            )
-        else:
-            st.warning("查询成功但返回为空")
-    else:
+    if not isinstance(res, tuple) or len(res) < 3:
         st.warning("结果格式异常")
+        return
+
+    df, _raw, err = res
+    if err not in (0, None):
+        st.error(f"查询失败，错误码：{err}")
+        return
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        st.warning("查询成功但返回为空")
+        return
+
+    # THS_WCQuery 返回全量列，按用户指定的 indicators 筛选列
+    if call_params and len(call_params) >= 2:
+        indicators_str = call_params[1]
+        if indicators_str:
+            want_cols = [c.strip() for c in indicators_str.split(",") if c.strip()]
+            exist_cols = [c for c in df.columns if c in want_cols or c in ("thscode", "股票代码")]
+            if exist_cols:
+                df = df[exist_cols]
+
+    st.caption(f"共 {len(df)} 个板块 · 数据源：同花顺 iFinD"
+               + (f" · 查询于 {ts:%H:%M:%S}" if ts else ""))
+
+    st.dataframe(df, use_container_width=True, height=600)
+
+    csv = df.to_csv(index=False, encoding="utf-8-sig")
+    st.download_button(
+        label="📥 导出CSV",
+        data=csv,
+        file_name=f"板块资金流向_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
+        mime="text/csv",
+    )
 
 
 def _render_sector():

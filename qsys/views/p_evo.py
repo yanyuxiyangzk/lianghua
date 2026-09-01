@@ -42,14 +42,14 @@ def _load_backtest_chart(trace_path: Path) -> dict[int, pd.DataFrame]:
     """从 trace 目录中加载所有 Loop 的回测资金曲线。"""
     charts = {}
     trace_str = str(trace_path)
-    # 把 /work/log 映射回容器内路径
-    container_path = trace_str
-    if trace_str.startswith("/work/log"):
-        container_path = HOST_PREFIX + trace_str[len("/work/log"):]
     
-    trace_dir = Path(container_path)
+    # 先试容器内路径（/work/log），找不到再转宿主机路径
+    trace_dir = Path(trace_str)
     if not trace_dir.exists():
-        return charts
+        if trace_str.startswith("/work/log"):
+            trace_dir = Path(HOST_PREFIX + trace_str[len("/work/log"):])
+        if not trace_dir.exists():
+            return charts
     
     for loop_dir in trace_dir.iterdir():
         if not loop_dir.is_dir() or not loop_dir.name.startswith("Loop_"):
@@ -61,7 +61,7 @@ def _load_backtest_chart(trace_path: Path) -> dict[int, pd.DataFrame]:
         chart_dir = loop_dir / "running" / "Quantitative Backtesting Chart"
         if not chart_dir.exists():
             continue
-        for pkl_file in chart_dir.glob("*.pkl"):
+        for pkl_file in chart_dir.rglob("*.pkl"):
             try:
                 with open(pkl_file, "rb") as f:
                     df = pickle.load(f)

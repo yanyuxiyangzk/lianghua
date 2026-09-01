@@ -300,34 +300,37 @@ def get_evolved_factors(only_accepted: bool = False) -> list[dict]:
 
 
 def load_positions(trace_path: str, loop_num: int) -> pd.DataFrame | None:
-    """从 trace 目录中加载指定 Loop 的每日持仓数据。"""
-    # 把 /work/log 映射回容器内路径
-    container_path = trace_path
-    if trace_path.startswith("/work/log"):
-        container_path = HOST_PREFIX + trace_path[len("/work/log"):]
-    
-    trace_dir = Path(container_path)
+    """从 trace 目录中加载每日持仓数据。"""
+    trace_dir = Path(trace_path)
+    if not trace_dir.exists():
+        # 容器内 /work/log → 宿主机路径
+        host_path = trace_path
+        if trace_path.startswith("/work/log"):
+            host_path = HOST_PREFIX + trace_path[len("/work/log"):]
+        trace_dir = Path(host_path)
     if not trace_dir.exists():
         return None
     
-    # 找到对应的 Loop 目录
+    # 按优先级查找 positions.csv：
+    # 1. trace 根目录
+    # 2. Loop 目录/running/positions.csv
+    # 3. Loop 目录/running/*/positions.csv
+    candidates = [trace_dir / "positions.csv"]
+    
     loop_dir = trace_dir / f"Loop_{loop_num}"
-    if not loop_dir.exists():
-        return None
-    
-    # 查找 positions.csv 文件
-    positions_path = loop_dir / "running" / "positions.csv"
-    if not positions_path.exists():
-        # 尝试在 workspace 中查找
-        workspace_dirs = list((loop_dir / "running").glob("*"))
-        for wd in workspace_dirs:
+    if loop_dir.exists():
+        candidates.append(loop_dir / "running" / "positions.csv")
+        for wd in (loop_dir / "running").glob("*"):
             if wd.is_dir():
-                p = wd / "positions.csv"
-                if p.exists():
-                    positions_path = p
-                    break
+                candidates.append(wd / "positions.csv")
     
-    if not positions_path.exists():
+    positions_path = None
+    for p in candidates:
+        if p.exists():
+            positions_path = p
+            break
+    
+    if positions_path is None:
         return None
     
     try:

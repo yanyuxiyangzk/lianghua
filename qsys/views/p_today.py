@@ -19,6 +19,7 @@ import experience
 import library
 import scheduler
 from common import DATA_DIR, all_pools, get_last_trade_day, load_json, save_json
+from quotefeed import get_feed
 
 st.title("🎯 今日执行")
 
@@ -155,11 +156,26 @@ def _render_track(icon, title, pack_name, pick, kp, budget_pct):
                 f"涨 {RULES['take_profit']:.0%} 落袋 · 最迟 {plan['最迟平仓']} 必须卖**")
 
     nmap = _name_map(list(items["code"]))
+    codes = list(items["code"])
+
+    # 启动后台采集，确保快照数据可用
+    feed = get_feed()
+    feed_key = f"track:{kp}:{pack_name}"
+    feed.ensure(feed_key, codes, interval=10)
+
+    # 尝试从数据库读取快照；若无数据则立即抓取一次
     try:
-        snaps, _ = datasource.get_latest_snapshots(list(items["code"]))
+        snaps, _ = datasource.get_latest_snapshots(codes)
         smap = {s["code"]: s for s in snaps}
     except Exception:
         smap = {}
+    if not smap:
+        if st.button("🔄 立即抓取行情", key=f"{kp}_fetch"):
+            with st.spinner("抓取中…"):
+                rows = datasource.get_batch_snapshots(codes)
+                datasource.save_snapshots(rows)
+            st.rerun()
+        st.info("首次访问需要抓取行情数据，点击上方按钮或等待 3-5 秒自动采集。")
     ref = [smap.get(c, {}).get("price") or smap.get(c, {}).get("prev_close") for c in items["code"]]
     st.dataframe(pd.DataFrame({
         "代码": list(items["code"]),

@@ -24,17 +24,7 @@ except ImportError:
 
 # ---------------------------------------------------------------- 状态头
 def header():
-    """每个 iFinD 子页顶部的连通性/凭证/自动入库状态条。"""
-    acc, pwd, token = datasource._ths_credentials()
-    c1, c2 = st.columns([1, 3])
-    with c1:
-        if st.button("🔌 连通性自检", type="primary"):
-            with st.spinner("登录并拉取测试数据…"):
-                st.info(datasource.ths_selftest())
-    with c2:
-        st.caption(f"SDK 通道（账号密码）：{'✅ 已配置' if acc else '❌ 未配置'}　·　"
-                   f"HTTP 通道（refresh_token）：{'✅ 已配置' if token else '❌ 未配置'}　·　"
-                   "SDK 被限流/未安装时自动走 HTTP 通道")
+    """每个 iFinD 子页顶部的自动入库状态条。"""
     try:
         from scheduler import get_scheduler as _get_sched
         _sync = _get_sched().view().get("ifind_daily_sync", {})
@@ -223,39 +213,160 @@ def _live_row(key_prefix: str, default_on: bool = False) -> bool:
 
 # ---------------------------------------------------------------- 子页：行情
 def page_realtime():
+    """⚡ 实时行情页面（只读数据库，不直接调用iFinD API）"""
     st.title("⚡ 实时行情（同花顺 iFinD）")
     header()
+
     with st.container(border=True):
-        st.caption("每只股票一行：最新价、昨收、今开、最高、最低、涨跌幅、成交量、成交额、换手率、均价、市净率、总股本。")
-        with st.expander("⚙️ 查询参数（默认 茅台+平安，点开可改）", expanded=False):
-            codes = _codes_input("代码", "600519,000001", "rq_codes")
-            ind = st.text_input("指标", RQ_DEFAULT_IND, key="rq_ind",
-                                help="逗号分隔。这版 SDK 支持的实时字段已全部列入默认；"
-                                     "指标代码 ↔ 中文名对照见结果下方的「字段说明」")
-            if st.button("重新查询", key="rq_go") and codes:
-                _go(datasource.ths_realtime, codes, ind)
-        rq_live = _live_row("rq", default_on=True)
-        _auto("ths_realtime", datasource.ths_realtime, codes, ind)
-        _render("ths_realtime", refresh=rq_live)
+        st.caption("从 ifind_realtime 表读取最新快照数据（盘中每15分钟自动更新）。")
+
+        # 从数据库读取最新快照
+        try:
+            db_df = datasource.get_realtime_from_db()
+        except Exception:
+            db_df = pd.DataFrame()
+
+        # 检查数据新鲜度
+        data_age_minutes = None
+        if not db_df.empty and "datetime" in db_df.columns:
+            try:
+                latest_dt = pd.to_datetime(db_df["datetime"].max())
+                data_age_minutes = (datetime.now() - latest_dt).total_seconds() / 60
+            except Exception:
+                pass
+
+        # 数据为空时提示
+        if db_df.empty:
+            st.info("数据库中暂无实时行情数据，请点击「🔄 同步实时数据」按钮首次拉取。")
+            if st.button("🔄 同步实时数据", type="primary", key="rt_sync_first"):
+                with st.spinner("正在同步实时行情（约2-3分钟）…"):
+                    from scheduler import job_ifind_realtime_sync
+                    msg = job_ifind_realtime_sync()
+                st.success(msg)
+                st.rerun()
+            return
+
+        # 过期提示
+        if data_age_minutes is not None and data_age_minutes > 30:
+            st.warning(f"⚠️ 数据已{data_age_minutes:.0f}分钟未更新，建议点击「🔄 同步实时数据」按钮更新。")
+
+        # 手动刷新按钮
+        col1, col2, col3 = st.columns([1, 4, 1])
+        with col1:
+            if st.button("🔄 同步实时数据", type="secondary", key="rt_sync"):
+                with st.spinner("正在同步实时行情（约2-3分钟）…"):
+                    from scheduler import job_ifind_realtime_sync
+                    msg = job_ifind_realtime_sync()
+                st.success(msg)
+                st.rerun()
+        with col3:
+            if data_age_minutes is not None:
+                st.caption(f"更新于 {data_age_minutes:.0f}分钟前")
+
+        # 显示数据
+        st.caption(f"共 {len(db_df)} 只股票 · 数据源：iFinD THS_RQ")
+
+        # 字段映射（数据库字段 → 中文显示名）
+        display_cols = {
+            "code": "代码",
+            "price": "现价",
+            "prev_close": "昨收",
+            "open": "今开",
+            "high": "最高",
+            "low": "最低",
+            "change_pct": "涨跌幅(%)",
+            "volume": "成交量",
+            "amount": "成交额",
+            "turnover": "换手率(%)",
+            "quantity_ratio": "量比",
+            "amplitude": "振幅(%)",
+            "float_shares": "流通股",
+            "float_mv": "流通市值",
+        }
+
+        # 选择并重命名列
+        show_cols = [c for c in display_cols.keys() if c in db_df.columns]
+        display_df = db_df[show_cols].rename(columns=display_cols)
+
+        st.dataframe(display_df, use_container_width=True, height=min(35 * (len(display_df) + 1) + 3, 600))
 
 
 def page_history():
+    """📅 历史行情页面（只读数据库，不直接调用iFinD API）"""
     st.title("📅 历史行情 · 日K（同花顺 iFinD）")
     header()
+
     with st.container(border=True):
-        st.caption("每个交易日一行：开盘价、最高、最低、收盘、成交量、成交额——就是日 K 线的数据。")
+        st.caption("从 market_daily 表读取日线数据（每日15:05自动更新）。")
+
+        # 查询参数
         with st.expander("⚙️ 查询参数", expanded=False):
             codes = _codes_input("代码", "600519", "hq_codes")
-            ind = st.text_input("指标", "open,high,low,close,volume,amount", key="hq_ind")
-            c1, c2, c3 = st.columns(3)
-            d0 = c1.text_input("开始", (_ltd() - timedelta(days=40)).strftime("%Y-%m-%d"), key="hq_s")
-            d1 = c2.text_input("结束", _ltd().strftime("%Y-%m-%d"), key="hq_e")
-            params = c3.text_input("参数", "Fill:Original,Interval:D", key="hq_p",
-                                   help="复权/周期等，见官方文档（如前复权 Fill:Forward）")
-            if st.button("重新查询", key="hq_go") and codes:
-                _go(datasource.ths_history, codes, ind, d0, d1, params)
-        _auto("ths_history", datasource.ths_history, codes, ind, d0, d1, params)
-        _render("ths_history")
+            c1, c2 = st.columns(2)
+            d0 = c1.text_input("开始日期", (_ltd() - timedelta(days=40)).strftime("%Y-%m-%d"), key="hq_s")
+            d1 = c2.text_input("结束日期", _ltd().strftime("%Y-%m-%d"), key="hq_e")
+
+        # 从数据库读取数据
+        if codes:
+            try:
+                db_df = datasource.get_daily_from_db(codes[0], d0, d1)
+            except Exception:
+                db_df = pd.DataFrame()
+        else:
+            db_df = pd.DataFrame()
+
+        # 数据为空时提示
+        if db_df.empty:
+            st.info("数据库中暂无该股票的历史数据，请点击「🔄 同步日线数据」按钮首次拉取。")
+            if st.button("🔄 同步日线数据", type="primary", key="hist_sync_first"):
+                with st.spinner("正在同步日线数据（约2-3分钟）…"):
+                    from scheduler import job_ifind_daily_sync
+                    msg = job_ifind_daily_sync()
+                st.success(msg)
+                st.rerun()
+            return
+
+        # 手动刷新按钮
+        col1, col2, col3 = st.columns([1, 4, 1])
+        with col1:
+            if st.button("🔄 同步日线数据", type="secondary", key="hist_sync"):
+                with st.spinner("正在同步日线数据（约2-3分钟）…"):
+                    from scheduler import job_ifind_daily_sync
+                    msg = job_ifind_daily_sync()
+                st.success(msg)
+                st.rerun()
+        with col3:
+            if not db_df.empty and "fetched_at" in db_df.columns:
+                st.caption(f"更新于 {db_df['fetched_at'].iloc[0]}")
+
+        # 显示数据
+        st.caption(f"共 {len(db_df)} 条记录 · 股票：{codes[0] if codes else '-'} · 数据源：iFinD THS_HQ")
+
+        # 字段映射
+        display_cols = {
+            "date": "日期",
+            "open": "开盘价",
+            "high": "最高价",
+            "low": "最低价",
+            "close": "收盘价",
+            "volume": "成交量",
+            "amount": "成交额",
+        }
+
+        # 选择并重命名列
+        show_cols = [c for c in display_cols.keys() if c in db_df.columns]
+        display_df = db_df[show_cols].rename(columns=display_cols)
+
+        st.dataframe(display_df, use_container_width=True, height=min(35 * (len(display_df) + 1) + 3, 600))
+
+        # 导出CSV
+        csv = display_df.to_csv(index=False, encoding="utf-8-sig")
+        st.download_button(
+            label=f"📥 导出{codes[0] if codes else ''}日线CSV（{len(display_df)}条）",
+            data=csv,
+            file_name=f"{codes[0] if codes else 'stock'}_daily_{d0}_{d1}.csv",
+            mime="text/csv",
+        )
 
 
 def page_highfreq():
@@ -357,8 +468,8 @@ def page_feature():
         with st.expander("⚙️ 函数控制台（按官方文档填函数名与参数）", expanded=False):
             feat = st.selectbox("功能", ["智能选股", "公告查询", "期股联动", "公告下载"], key="ft_sel")
             presets = {
-                "智能选股": ("THS_WC", '["涨停 且 市值小于50亿", "stock"]'),
-                "公告查询": ("THS_ANN", '["600519.SH"]'),
+                "智能选股": ("THS_WCQuery", '["涨停 且 市值小于50亿", "stock"]'),
+                "公告查询": ("THS_ReportQuery", '["600519.SH", "beginrDate:2025-01-01;endrDate:2025-01-31", "reportDate:Y,thscode:Y,secName:Y,reportTitle:Y"]'),
                 "期股联动": ("THS_QGLD", '["600519.SH"]'),
                 "公告下载": ("THS_ANNDOWN", '["600519.SH"]'),
             }

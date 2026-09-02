@@ -1,4 +1,10 @@
-"""🌐 板块资金流（同花顺 iFinD）：行业板块资金流向与轮动"""
+"""🌐 板块资金流（同花顺 iFinD）：板块资金流向 / 板块行情 / 板块轮动。
+
+全部走问财语义查询（THS_WCQuery / HTTP smart_stock_picking，HTTP 优先），
+一次查询返回全量板块数据（行业板块 410 / 概念板块若干），带 [日期] 后缀的列名归一化。
+"""
+
+import re
 
 import pandas as pd
 import streamlit as st
@@ -7,306 +13,116 @@ import datasource
 import ifind_hub
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def _wc(query: str) -> pd.DataFrame:
+    """问财查询（HTTP 优先；缓存5分钟避免页面交互反复触发）。"""
+    df, _res, err = datasource.ths_wcquery(query, "index")
+    if err not in (0, None) or df is None or df.empty:
+        return pd.DataFrame()
+    # 列名归一："指数@涨跌幅:前复权[20260902]" → "涨跌幅"；"指数@主力资金流向[20260902]" → "主力资金流向"
+    out = {}
+    for c in df.columns:
+        name = str(c)
+        if "@" in name:
+            name = name.split("@", 1)[1]
+        name = re.sub(r"\[.*?\]", "", name)
+        name = re.sub(r":.*$", "", name).strip()
+        out[c] = name
+    df = df.rename(columns=out)
+    df = df.loc[:, ~df.columns.duplicated()]  # 归一化后去重名列（排名/排名名次 等与主列重名）
+    # 数值列转 float（问财返回字符串）
+    for c in df.columns:
+        if c not in ("指数代码", "指数简称", "股票市场类型") and df[c].dtype == object:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def _show(df: pd.DataFrame, caption: str, sort_col: str = None, export_name: str = "板块"):
+    if df.empty:
+        st.warning("查询成功但返回为空（非交易时段/接口限流），可稍后刷新重试")
+        return
+    if sort_col and sort_col in df.columns:
+        df = df.sort_values(sort_col, ascending=False, na_position="last")
+    st.caption(caption + f" · 共 {len(df)} 个板块")
+    st.dataframe(df, use_container_width=True, height=600, hide_index=True)
+    st.download_button("📥 导出CSV", df.to_csv(index=False, encoding="utf-8-sig"),
+                       file_name=f"{export_name}_{pd.Timestamp.now():%Y%m%d}.csv", mime="text/csv")
+
+
 def render():
     st.title("🌐 板块资金流（同花顺 iFinD）")
     ifind_hub.header()
-
-    # 选项卡
     tab_flow, tab_sector, tab_turnover = st.tabs(["💰 资金流向", "🏛️ 板块行情", "🔄 板块轮动"])
-
     with tab_flow:
         _render_flow()
-
     with tab_sector:
         _render_sector()
-
     with tab_turnover:
         _render_turnover()
 
 
 def _render_flow():
-    """渲染板块资金流向"""
-    st.subheader("板块资金流向")
-
-    # 查询参数
-    with st.expander("⚙️ 查询参数", expanded=False):
-        c1, c2 = st.columns(2)
-        with c1:
-            # 板块类型
-            sector_type = st.selectbox(
-                "板块类型",
-                ["行业板块", "概念板块", "地域板块"],
-                key="flow_sector_type",
-                help="选择要查询的板块类型"
-            )
-        with c2:
-            # 返回字段
-            indicators = st.text_input(
-                "返回字段",
-                "thscode,latest,changeRatio,volume,amount",
-                key="flow_indicators",
-                help="逗号分隔的指标代码，如：thscode,latest,changeRatio,volume,amount"
-            )
-
-        if st.button("查询板块资金流向", key="flow_go"):
-            _go_flow(sector_type, indicators)
-
-    # 自动查询
-    _auto_flow(sector_type, indicators)
-
-    # 渲染结果
-    _render_flow_result("flow_data")
-
-
-def _go_flow(sector_type: str, indicators: str):
-    """执行板块资金流向查询（HTTP 优先 / SDK 兜底）"""
-    try:
-        # THS_WCQuery(query, domain) —— 智能选股接口（问财语义选股）
-        condition = f"{sector_type}全部"
-        result = datasource.ths_wcquery(condition, "index")
-        st.session_state["ifind_res_flow_data"] = result
-        st.session_state["ifind_call_flow_data"] = (sector_type, indicators)
-        st.session_state["ifind_ts_flow_data"] = pd.Timestamp.now()
-    except Exception as e:
-        st.error(f"查询失败：{e}")
-
-
-def _auto_flow(sector_type: str, indicators: str):
-    """首次进页面自动查询"""
-    if "ifind_res_flow_data" not in st.session_state:
-        _go_flow(sector_type, indicators)
-
-
-def _render_flow_result(key: str):
-    """渲染资金流向结果"""
-    res = st.session_state.get(f"ifind_res_{key}")
-    ts = st.session_state.get(f"ifind_ts_{key}")
-    call_params = st.session_state.get(f"ifind_call_{key}")
-
-    if res is None:
-        st.info("点击「查询板块资金流向」开始查询")
-        return
-
-    if not isinstance(res, tuple) or len(res) < 3:
-        st.warning("结果格式异常")
-        return
-
-    df, _raw, err = res
-    if err not in (0, None):
-        st.error(f"查询失败，错误码：{err}")
-        return
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        st.warning("查询成功但返回为空")
-        return
-
-    # THS_WCQuery 返回全量列，按用户指定的 indicators 筛选列
-    if call_params and len(call_params) >= 2:
-        indicators_str = call_params[1]
-        if indicators_str:
-            want_cols = [c.strip() for c in indicators_str.split(",") if c.strip()]
-            exist_cols = [c for c in df.columns if c in want_cols or c in ("thscode", "股票代码")]
-            if exist_cols:
-                df = df[exist_cols]
-
-    st.caption(f"共 {len(df)} 个板块 · 数据源：同花顺 iFinD"
-               + (f" · 查询于 {ts:%H:%M:%S}" if ts else ""))
-
-    st.dataframe(df, use_container_width=True, height=600)
-
-    csv = df.to_csv(index=False, encoding="utf-8-sig")
-    st.download_button(
-        label="📥 导出CSV",
-        data=csv,
-        file_name=f"板块资金流向_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
-        mime="text/csv",
-    )
+    st.subheader("板块资金流向（主力资金净流入，当日）")
+    if st.button("🔄 刷新", key="flow_refresh"):
+        _wc.clear()
+    for label, query in [("行业板块", "行业板块，主力净流入"),
+                         ("概念板块", "概念板块，主力净流入")]:
+        df = _wc(query)
+        if df.empty:
+            continue
+        keep = [c for c in ["指数代码", "指数简称", "主力资金流向"] if c in df.columns]
+        df = df[keep].rename(columns={"指数代码": "板块代码", "指数简称": "板块",
+                                      "主力资金流向": "主力净流入(元)"})
+        if "主力净流入(元)" in df.columns:
+            df["主力净流入(亿)"] = df["主力净流入(元)"] / 1e8
+            df = df.drop(columns=["主力净流入(元)"])
+            df["主力净流入(亿)"] = df["主力净流入(亿)"].round(2)
+        st.markdown(f"**{label}**")
+        _show(df, "数据源：同花顺问财 · 主力资金流向", "主力净流入(亿)", f"板块资金流向_{label}")
 
 
 def _render_sector():
-    """渲染板块行情"""
-    st.subheader("板块行情")
-
-    # 查询参数
-    with st.expander("⚙️ 查询参数", expanded=False):
-        c1, c2 = st.columns(2)
-        with c1:
-            # 指数代码列表
-            codes = st.text_input(
-                "板块代码（逗号分隔）",
-                "000001.SH,399001.SZ,399006.SZ,000300.SH,000905.SH",
-                key="sector_codes",
-                help="多个板块代码用逗号分隔"
-            )
-        with c2:
-            # 返回字段
-            indicators = st.text_input(
-                "返回字段",
-                "thscode,latest,changeRatio,volume,amount",
-                key="sector_indicators",
-                help="逗号分隔的指标代码"
-            )
-
-        if st.button("查询板块行情", key="sector_go"):
-            _go_sector(codes, indicators)
-
-    # 自动查询
-    _auto_sector(codes, indicators)
-
-    # 渲染结果
-    _render_sector_result("sector_data")
-
-
-def _go_sector(codes: str, indicators: str):
-    """执行板块行情查询"""
-    try:
-        # 使用 THS_RQ 接口获取板块实时行情
-        code_list = [c.strip() for c in codes.split(",") if c.strip()]
-        result = datasource.ths_realtime(code_list, indicators)
-        st.session_state["ifind_res_sector_data"] = result
-        st.session_state["ifind_call_sector_data"] = (codes, indicators)
-        st.session_state["ifind_ts_sector_data"] = pd.Timestamp.now()
-    except Exception as e:
-        st.error(f"查询失败：{e}")
-
-
-def _auto_sector(codes: str, indicators: str):
-    """首次进页面自动查询"""
-    if "ifind_res_sector_data" not in st.session_state:
-        _go_sector(codes, indicators)
-
-
-def _render_sector_result(key: str):
-    """渲染板块行情结果"""
-    res = st.session_state.get(f"ifind_res_{key}")
-    ts = st.session_state.get(f"ifind_ts_{key}")
-
-    if res is None:
-        st.info("点击「查询板块行情」开始查询")
+    st.subheader("板块行情（全量板块指数）")
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        kind = st.radio("板块类型", ["行业板块", "概念板块"], horizontal=True, key="sector_kind")
+    with c2:
+        if st.button("🔄 刷新", key="sector_refresh"):
+            _wc.clear()
+    df = _wc(f"{kind}，最新价，涨跌幅，成交额")
+    if df.empty:
+        st.warning("查询成功但返回为空（非交易时段/接口限流），可稍后刷新重试")
         return
-
-    # 解析结果（ths_realtime 返回三元组：df, res, err）
-    if isinstance(res, tuple) and len(res) >= 3:
-        df, 原始对象, err = res
-        if err not in (0, None):
-            st.error(f"查询失败，错误码：{err}")
-            return
-        if df is not None and not df.empty:
-            # 显示统计
-            st.caption(f"共 {len(df)} 条记录 · 数据源：同花顺 iFinD"
-                       + (f" · 查询于 {ts:%H:%M:%S}" if ts else ""))
-
-            # 显示表格
-            st.dataframe(df, use_container_width=True, height=600)
-
-            # 导出按钮
-            csv = df.to_csv(index=False, encoding="utf-8-sig")
-            st.download_button(
-                label="📥 导出CSV",
-                data=csv,
-                file_name=f"板块行情_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv",
-            )
-        else:
-            st.warning("查询成功但返回为空")
-    else:
-        st.warning("结果格式异常")
+    keep = [c for c in ["指数代码", "指数简称", "收盘价", "涨跌幅", "成交额"] if c in df.columns]
+    df = df[keep].rename(columns={"指数代码": "板块代码", "指数简称": "板块",
+                                  "收盘价": "最新价", "成交额": "成交额(元)"})
+    if "成交额(元)" in df.columns:
+        df["成交额(亿)"] = (df["成交额(元)"] / 1e8).round(1)
+        df = df.drop(columns=["成交额(元)"])
+    if "涨跌幅" in df.columns:
+        df["涨跌幅"] = df["涨跌幅"].round(2)
+    _show(df, f"数据源：同花顺问财 · {kind}", "涨跌幅", f"板块行情_{kind}")
 
 
 def _render_turnover():
-    """渲染板块轮动"""
-    st.subheader("板块轮动")
-
-    # 查询参数
-    with st.expander("⚙️ 查询参数", expanded=False):
-        c1, c2 = st.columns(2)
-        with c1:
-            # 指数代码
-            code = st.text_input(
-                "指数代码",
-                "000300.SH",
-                key="turnover_code",
-                help="要查询轮动的指数代码"
-            )
-        with c2:
-            # 时间范围
-            c21, c22 = st.columns(2)
-            with c21:
-                start = st.text_input(
-                    "开始日期",
-                    (pd.Timestamp.now() - pd.Timedelta(days=30)).strftime("%Y-%m-%d"),
-                    key="turnover_start"
-                )
-            with c22:
-                end = st.text_input(
-                    "结束日期",
-                    pd.Timestamp.now().strftime("%Y-%m-%d"),
-                    key="turnover_end"
-                )
-
-        if st.button("查询板块轮动", key="turnover_go"):
-            _go_turnover(code, start, end)
-
-    # 自动查询
-    _auto_turnover(code, start, end)
-
-    # 渲染结果
-    _render_turnover_result("turnover_data")
-
-
-def _go_turnover(code: str, start: str, end: str):
-    """执行板块轮动查询"""
-    try:
-        # 使用 THS_HQ 接口获取历史行情
-        indicators = "thscode,open,high,low,close,volume,amount"
-        result = datasource.ths_history([code], indicators, start, end)
-        st.session_state["ifind_res_turnover_data"] = result
-        st.session_state["ifind_call_turnover_data"] = (code, start, end)
-        st.session_state["ifind_ts_turnover_data"] = pd.Timestamp.now()
-    except Exception as e:
-        st.error(f"查询失败：{e}")
-
-
-def _auto_turnover(code: str, start: str, end: str):
-    """首次进页面自动查询"""
-    if "ifind_res_turnover_data" not in st.session_state:
-        _go_turnover(code, start, end)
-
-
-def _render_turnover_result(key: str):
-    """渲染板块轮动结果"""
-    res = st.session_state.get(f"ifind_res_{key}")
-    ts = st.session_state.get(f"ifind_ts_{key}")
-
-    if res is None:
-        st.info("点击「查询板块轮动」开始查询")
+    st.subheader("板块轮动（区间涨跌幅排名）")
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        span = st.radio("轮动区间", ["近5日", "近20日", "近60日"], horizontal=True, key="turnover_span")
+        kind = st.radio("板块类型", ["行业板块", "概念板块"], horizontal=True, key="turnover_kind")
+    with c2:
+        if st.button("🔄 刷新", key="turnover_refresh"):
+            _wc.clear()
+    df = _wc(f"{kind}{span}涨跌幅排名")
+    if df.empty:
+        st.warning("查询成功但返回为空（非交易时段/接口限流），可稍后刷新重试")
         return
-
-    # 解析结果（ths_history 返回三元组：df, res, err）
-    if isinstance(res, tuple) and len(res) >= 3:
-        df,原始对象, err = res
-        if err not in (0, None):
-            st.error(f"查询失败，错误码：{err}")
-            return
-        if df is not None and not df.empty:
-            # 显示统计
-            st.caption(f"共 {len(df)} 条记录 · 数据源：同花顺 iFinD"
-                       + (f" · 查询于 {ts:%H:%M:%S}" if ts else ""))
-
-            # 显示表格
-            st.dataframe(df, use_container_width=True, height=600)
-
-            # 导出按钮
-            csv = df.to_csv(index=False, encoding="utf-8-sig")
-            st.download_button(
-                label="📥 导出CSV",
-                data=csv,
-                file_name=f"板块轮动_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
-                mime="text/csv",
-            )
-        else:
-            st.warning("查询成功但返回为空")
-    else:
-        st.warning("结果格式异常")
+    ret_col = next((c for c in df.columns if "区间涨跌幅" in c and "排名" not in c), None)
+    keep = [c for c in ["指数代码", "指数简称"] if c in df.columns] + ([ret_col] if ret_col else [])
+    df = df[keep].rename(columns={"指数代码": "板块代码", "指数简称": "板块",
+                                  ret_col: f"{span}涨跌幅(%)" if ret_col else ""})
+    _show(df, f"数据源：同花顺问财 · {kind}{span}区间涨跌幅排名", f"{span}涨跌幅(%)",
+          f"板块轮动_{kind}_{span}")
 
 
 render()

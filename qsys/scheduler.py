@@ -639,8 +639,8 @@ JOBS = {
                              "default": {"enabled": False, "hour": 9, "minute": 5, "params": {}}},
     "ifind_realtime_sync": {"name": "📊 iFinD 实时快照同步（盘中）", "func": job_ifind_realtime_sync,
                             "default": {"enabled": False, "hour": 0, "minute": 0,
-                                        "params": {},
-                                        "trigger": "interval", "interval_sec": 900}},  # 15分钟
+                                        "params": {"interval_sec": 300},
+                                        "trigger": "interval"}},  # interval_sec 必须放 params 里（调度器从 params 读）
     "ifind_cleanup": {"name": "🧹 iFinD 过期数据清理", "func": job_ifind_cleanup,
                       "default": {"enabled": False, "hour": 16, "minute": 0, "params": {}}},
     "watchlist_signals": {"name": "📈 个股信号（自选股 × 进化因子）", "func": job_watchlist_signals,

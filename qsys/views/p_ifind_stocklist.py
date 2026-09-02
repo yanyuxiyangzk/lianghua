@@ -245,17 +245,26 @@ def _render_stock_list():
             # 添加序号列
             display_df.insert(0, "序号", range(start + 1, start + 1 + len(display_df)))
 
-            # 点击行跳转到该股K线页（streamlit dataframe 行选择）
+            # 单击选中行（仅高亮）；再点同一行（双击语义）跳转到该股K线页
             sel_event = st.dataframe(
                 display_df, use_container_width=True, hide_index=True,
                 height=35 * (len(display_df) + 1) + 3,
                 on_select="rerun", selection_mode="single-row",
                 key=f"tbl_{label}")
-            if sel_event and sel_event.selection.rows:
-                st.session_state["kline_code"] = page_df.iloc[sel_event.selection.rows[0]]["code"]
-                st.switch_page("views/p_ifind_kline.py")
+            _pk = "_stk_pending"
+            _rows = sel_event.selection.rows if sel_event else []
+            if _rows:
+                st.session_state[_pk] = (label, page, _rows[0])
+            else:
+                _pend = st.session_state.get(_pk)
+                if _pend and _pend[0] == label and _pend[1] == page:
+                    st.session_state["kline_code"] = page_df.iloc[_pend[2]]["code"]
+                    st.session_state.pop(_pk, None)
+                    st.switch_page("views/p_ifind_kline.py")
+                elif _pend and _pend[0] == label and _pend[1] != page:
+                    st.session_state.pop(_pk, None)  # 翻页后清空待跳转状态
             if label == "全部股票":
-                st.caption("💡 点击表格任意一行，跳转到该股的「📈 股价K线」页")
+                st.caption("💡 单击选中行，**双击**（再点一次同一行）跳转到该股的「📈 股价K线」页")
 
             # 分页导航（数据下方）
             nav1, nav2, nav3, nav4, nav5 = st.columns([1, 1, 2, 1, 1])
@@ -362,15 +371,24 @@ def _render_index_list():
     display_df["成交额(亿)"] = [f"{v/1e8:.1f}" if pd.notna(v) else "" for v in page_df["amount"]]
     display_df.insert(0, "序号", range(start + 1, start + 1 + len(display_df)))
 
-    # 点击行跳转到该指数K线页
+    # 单击选中行（仅高亮）；再点同一行（双击语义）跳转到该指数K线页
     idx_sel = st.dataframe(display_df, use_container_width=True, hide_index=True,
                            height=35 * (len(display_df) + 1) + 3,
                            on_select="rerun", selection_mode="single-row",
                            key="tbl_index")
-    if idx_sel and idx_sel.selection.rows:
-        st.session_state["kline_code"] = page_df.iloc[idx_sel.selection.rows[0]]["code"]
-        st.switch_page("views/p_ifind_kline.py")
-    st.caption("💡 点击表格任意一行，跳转到该指数的「📈 股价K线」页")
+    _ipk = "_idx_pending"
+    _irows = idx_sel.selection.rows if idx_sel else []
+    if _irows:
+        st.session_state[_ipk] = (page, _irows[0])
+    else:
+        _ipend = st.session_state.get(_ipk)
+        if _ipend and _ipend[0] == page:
+            st.session_state["kline_code"] = page_df.iloc[_ipend[1]]["code"]
+            st.session_state.pop(_ipk, None)
+            st.switch_page("views/p_ifind_kline.py")
+        elif _ipend:
+            st.session_state.pop(_ipk, None)
+    st.caption("💡 单击选中行，**双击**（再点一次同一行）跳转到该指数的「📈 股价K线」页")
 
     # 分页导航
     nav1, nav2, nav3, nav4, nav5 = st.columns([1, 1, 2, 1, 1])

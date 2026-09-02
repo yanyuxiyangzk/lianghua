@@ -36,9 +36,7 @@ st.markdown(
 
 pages = {
     "我的": [
-        st.Page("views/p_today.py", title="今日执行", icon="🎯", url_path="today"),
-        st.Page("views/p_exp.py", title="实战成绩", icon="📚", url_path="exp"),
-        st.Page("views/p_picks.py", title="选股列表", icon="📋", url_path="picks"),
+        st.Page("views/p_desk.py", title="今日执行", icon="🎯", url_path="today"),
     ],
     "行情": [
         st.Page("views/p_quotes.py", title="股票行情", icon="📈", url_path="quotes"),

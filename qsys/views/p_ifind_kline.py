@@ -222,8 +222,9 @@ def _fenshi_fig(df: pd.DataFrame, title: str, prev_close: float | None) -> go.Fi
 def render():
     st.title("📈 股价K线")
 
-    # 代码输入（行情页点击跳转时从 session_state 带入）
-    default_code = st.session_state.get("kline_code", "000001.SH")
+    # 代码输入（优先级：URL 参数 ?code=（超链接跳入）> session_state（双击跳入）> 默认）
+    default_code = (st.query_params.get("code")
+                    or st.session_state.get("kline_code", "000001.SH"))
     c1, c2 = st.columns([3, 1])
     with c1:
         raw = st.text_input("股票/指数代码", value=default_code,

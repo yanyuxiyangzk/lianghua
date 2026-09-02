@@ -245,10 +245,20 @@ def _render_stock_list():
             # 添加序号列
             display_df.insert(0, "序号", range(start + 1, start + 1 + len(display_df)))
 
+            # 代码/名称列加 K线页超链接（点击跳转；名称嵌在 URL 里供正则提取显示文本）
+            _codes = page_df["code"].values
+            _names = page_df["_name_display"].values if "_name_display" in page_df.columns else page_df["name"].values
+            display_df["代码"] = [f"/ifind-kline?code={c}" for c in _codes]
+            display_df["名称"] = [f"/ifind-kline?code={c}&n={n}" for c, n in zip(_codes, _names)]
+
             # 单击选中行（仅高亮）；再点同一行（双击语义）跳转到该股K线页
             sel_event = st.dataframe(
                 display_df, use_container_width=True, hide_index=True,
                 height=35 * (len(display_df) + 1) + 3,
+                column_config={
+                    "代码": st.column_config.LinkColumn("代码", display_text=r"[?&]code=(.+)$"),
+                    "名称": st.column_config.LinkColumn("名称", display_text=r"[?&]n=(.+)$"),
+                },
                 on_select="rerun", selection_mode="single-row",
                 key=f"tbl_{label}")
             _pk = "_stk_pending"
@@ -358,8 +368,10 @@ def _render_index_list():
 
     # 格式化显示
     display_df = pd.DataFrame()
-    display_df["指数代码"] = page_df["code"].values
-    display_df["指数名称"] = page_df["name"].values
+    _icodes = page_df["code"].values
+    _inames = page_df["name"].values
+    display_df["指数代码"] = [f"/ifind-kline?code={c}" for c in _icodes]
+    display_df["指数名称"] = [f"/ifind-kline?code={c}&n={n}" for c, n in zip(_icodes, _inames)]
     display_df["最新价"] = [f"{v:.2f}" if pd.notna(v) else "" for v in page_df["price"]]
     display_df["涨跌额"] = [f"{(p - pc):+.2f}" if pd.notna(p) and pd.notna(pc) else ""
                           for p, pc in zip(page_df["price"], page_df["prev_close"])]
@@ -374,6 +386,10 @@ def _render_index_list():
     # 单击选中行（仅高亮）；再点同一行（双击语义）跳转到该指数K线页
     idx_sel = st.dataframe(display_df, use_container_width=True, hide_index=True,
                            height=35 * (len(display_df) + 1) + 3,
+                           column_config={
+                               "指数代码": st.column_config.LinkColumn("指数代码", display_text=r"[?&]code=(.+)$"),
+                               "指数名称": st.column_config.LinkColumn("指数名称", display_text=r"[?&]n=(.+)$"),
+                           },
                            on_select="rerun", selection_mode="single-row",
                            key="tbl_index")
     _ipk = "_idx_pending"

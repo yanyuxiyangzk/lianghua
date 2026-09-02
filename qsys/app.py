@@ -52,6 +52,7 @@ pages = {
     # （实时行情/历史行情/高频行情/日内快照/基本面数据/特色数据 已下线——被「行情」页覆盖或用不到，页面文件保留在 views/ 可随时恢复）
     "📡 iFinD数据中心": [
         st.Page("views/p_ifind_stocklist.py", title="行情", icon="📋", url_path="ifind-stocklist"),
+        st.Page("views/p_ifind_announce.py", title="公告信息", icon="📜", url_path="ifind-announce"),
         st.Page("views/p_ifind_sectorflow.py", title="板块资金流", icon="🌐", url_path="ifind-sectorflow"),
         st.Page("views/p_newsense.py", title="舆情/新闻", icon="📰", url_path="newsense"),
         st.Page("views/p_ifind_doc.py", title="接口文档", icon="📖", url_path="ifind-doc"),

@@ -1786,6 +1786,27 @@ def fetch_realtime_to_db() -> int:
     return len(vals)
 
 
+def get_announcements_from_db() -> pd.DataFrame:
+    """从 ifind_announcements 表读取公告（新→旧），附带股票名称（从 ifind_stocklist 映射）。
+
+    数据由 ⏰定时任务 job_ifind_announce 每日抓取（自选股近7天），保留7天自动清理。
+    """
+    with _qconn() as c:
+        df = pd.read_sql_query(
+            "SELECT seq, code, report_date, title, pdf_url, ctime, fetched_at"
+            " FROM ifind_announcements ORDER BY ctime DESC", c)
+        if df.empty:
+            return df
+        names = dict(c.execute("SELECT code, name FROM ifind_stocklist").fetchall())
+
+    def _norm(code):
+        m = re.match(r"(\d{6})\.([A-Z]{2})", str(code).strip())
+        return f"{m.group(2)}{m.group(1)}" if m else str(code)
+
+    df["name"] = df["code"].map(lambda x: names.get(_norm(x), ""))
+    return df
+
+
 def cleanup_old_data(retention_days: dict = None):
     """清理过期数据。
 
@@ -1797,7 +1818,7 @@ def cleanup_old_data(retention_days: dict = None):
             "ifind_realtime": 7,
             "market_daily": 15,
             "ifind_basic_daily": 15,
-            "ifind_announcements": 30,
+            "ifind_announcements": 7,
         }
 
     with _qconn() as c:

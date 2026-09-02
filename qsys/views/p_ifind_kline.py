@@ -176,6 +176,41 @@ def _load_kline(code: str, period: str) -> pd.DataFrame:
     return _norm_ohlcv(df)
 
 
+# ---------------------------------------------------------------- 演化因子（loopengine 树因子求值叠加）
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_factor_registry() -> pd.DataFrame:
+    """loopengine 演化因子注册表（2.7万+，全部为树因子可直接求值）。"""
+    import library
+    reg = library.get_factor_registry()
+    return reg[reg["engine"] == "loopengine"][["name", "family", "code"]]
+
+
+def _factor_choices(kw: str, limit: int = 200) -> list[str]:
+    facs = _load_factor_registry()
+    if kw.strip():
+        facs = facs[facs["name"].str.contains(kw.strip(), na=False)]
+    return facs["name"].head(limit).tolist()
+
+
+def _factor_code_by_name(name: str) -> str:
+    facs = _load_factor_registry()
+    row = facs[facs["name"] == name]
+    return str(row.iloc[0]["code"]) if not row.empty else ""
+
+
+def _eval_factor_daily(code_ifind: str, factor_code: str, df_daily: pd.DataFrame) -> pd.Series:
+    """在日K数据上求 loopengine 树因子值（单票），返回 datetime 索引 Series。"""
+    from loopengine.tree import build_field_frames, evaluate_tree, parse
+    p = df_daily.rename(columns={"open": "$open", "high": "$high", "low": "$low",
+                                 "close": "$close", "volume": "$volume",
+                                 "amount": "$amount"}).reset_index()
+    p["instrument"] = to_db_code(code_ifind)
+    panel = p.set_index(["instrument", "datetime"])
+    sexpr = factor_code.split("\n", 1)[0][len("# sexpr: "):]
+    vals = evaluate_tree(parse(sexpr), build_field_frames(panel))
+    return vals.iloc[:, 0].rename("factor")
+
+
 # ---------------------------------------------------------------- 图表
 def _calc_boll(df: pd.DataFrame, n: int = 20, k: float = 2.0):
     mid = df["close"].rolling(n).mean()
@@ -204,15 +239,19 @@ _IND_COLORS = ["#f5c542", "#4fc3f7", "#ba68c8"]
 
 
 def _kline_fig(df: pd.DataFrame, title: str, indicator: str | None = None,
-               show_boll: bool = False) -> go.Figure:
+               show_boll: bool = False,
+               factor_series: pd.Series | None = None, factor_name: str = "") -> go.Figure:
     d = df.copy()
     for w, _c in MA_WINDOWS:
         d[f"ma{w}"] = d["close"].rolling(w).mean()
 
     has_ind = indicator in ("MACD", "KDJ", "RSI")
     ind_df = _indicator_frame(df, indicator) if has_ind else pd.DataFrame()
-    nrows = 3 if (has_ind and not ind_df.empty) else 2
-    heights = [0.60, 0.20, 0.20] if nrows == 3 else [0.78, 0.22]
+    has_ind = has_ind and not ind_df.empty
+    has_fac = factor_series is not None and not factor_series.empty
+    nrows = 2 + int(has_ind) + int(has_fac)
+    heights = {2: [0.78, 0.22], 3: [0.60, 0.20, 0.20],
+               4: [0.52, 0.16, 0.16, 0.16]}[nrows]
     fig = make_subplots(rows=nrows, cols=1, shared_xaxes=True,
                         row_heights=heights, vertical_spacing=0.02)
 
@@ -237,24 +276,31 @@ def _kline_fig(df: pd.DataFrame, title: str, indicator: str | None = None,
     fig.add_trace(go.Bar(x=d.index, y=d["volume"], name="VOL",
                          marker_color=colors, opacity=0.85), row=2, col=1)
 
-    if nrows == 3:
+    if has_ind:
+        ind_row = 3
         if indicator == "MACD":
             hist_colors = [UP if v >= 0 else DOWN for v in ind_df["MACD"].fillna(0)]
             fig.add_trace(go.Bar(x=d.index, y=ind_df["MACD"], name="MACD",
-                                 marker_color=hist_colors), row=3, col=1)
+                                 marker_color=hist_colors), row=ind_row, col=1)
             for ci, col in enumerate(["DIF", "DEA"]):
                 fig.add_trace(go.Scatter(x=d.index, y=ind_df[col], name=col,
                                          line=dict(width=1.1, color=_IND_COLORS[ci])),
-                              row=3, col=1)
+                              row=ind_row, col=1)
         else:
             for ci, col in enumerate(ind_df.columns):
                 fig.add_trace(go.Scatter(x=d.index, y=ind_df[col], name=col,
                                          line=dict(width=1.1, color=_IND_COLORS[ci % 3])),
-                              row=3, col=1)
+                              row=ind_row, col=1)
+
+    if has_fac:
+        fac_row = nrows
+        fs = factor_series.reindex(d.index)
+        fig.add_trace(go.Scatter(x=d.index, y=fs, name=f"因子:{factor_name}",
+                                 line=dict(width=1.3, color="#00bcd4")), row=fac_row, col=1)
 
     fig.update_layout(
         title=dict(text=title, font=dict(size=13)),
-        height=760 if nrows == 3 else 680, hovermode="x unified",
+        height={2: 680, 3: 760, 4: 840}[nrows], hovermode="x unified",
         xaxis_rangeslider_visible=False,
         legend=dict(orientation="h", yanchor="bottom", y=1.01, font=dict(size=11)),
         margin=dict(l=10, r=10, t=40, b=10),
@@ -313,6 +359,15 @@ def render():
         _auto = st.toggle("自动刷新(30s)", value=False, key="kline_auto")
     indicator = None if ind_sel == "无" else ind_sel
 
+    # 演化因子叠加（loopengine 树因子，仅日K）：搜索 + 选择
+    _f1, _f2 = st.columns([1, 2])
+    with _f1:
+        fac_kw = st.text_input("演化因子搜索", key="kline_fac_kw",
+                               placeholder="关键字筛选因子（如 跳空/动量）")
+    with _f2:
+        fac_opts = ["（不叠加）"] + _factor_choices(fac_kw)
+        fac_sel = st.selectbox("RD-Agent 演化因子叠加（仅日K）", fac_opts, key="kline_fac")
+
     # 自动刷新开关：开启后每30秒重新调 iFinD 取数（K线/分时图表实时更新）
     if _auto:
         if st_autorefresh:
@@ -331,13 +386,26 @@ def render():
         st.warning(f"{code} {period} 数据获取失败（非交易时段/接口限流/代码不支持）")
         return
 
+    # 演化因子求值（仅日K）
+    factor_series, factor_name = None, ""
+    if fac_sel != "（不叠加）":
+        if period == "日K":
+            try:
+                factor_series = _eval_factor_daily(code, _factor_code_by_name(fac_sel), df)
+                factor_name = fac_sel
+            except Exception as e:
+                st.caption(f"⚠️ 因子 {fac_sel} 求值失败：{e}")
+        else:
+            st.caption("💡 演化因子叠加仅支持日K周期")
+
     name = info.get("name") or code
     if period == "分时":
         st.plotly_chart(_fenshi_fig(df, f"{name} {code} 分时", info.get("prev_close")),
                         width="stretch")
     else:
         st.plotly_chart(_kline_fig(df, f"{name} {code} {period}（前复权）",
-                                   indicator=indicator, show_boll=show_boll),
+                                   indicator=indicator, show_boll=show_boll,
+                                   factor_series=factor_series, factor_name=factor_name),
                         width="stretch")
     st.caption(f"数据范围: {df.index[0]:%Y-%m-%d %H:%M} ~ {df.index[-1]:%Y-%m-%d %H:%M}，"
                f"共 {len(df)} 根 · 数据源：同花顺 iFinD（"

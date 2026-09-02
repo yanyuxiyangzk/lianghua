@@ -57,6 +57,29 @@ def set_source(source: str):
     SETTINGS_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1))
 
 
+# loop 因子分析（LoopEngine 演化/体检/闸门）专用数据源——与全局数据源分开开关：
+# 这些任务历史上硬编码 qlib_local，全局开关管不到（2026-09 用户要求可切同花顺）。
+def get_loop_source() -> str:
+    try:
+        return json.loads(SETTINGS_FILE.read_text()).get("loop_factor_source", "qlib_local")
+    except Exception:
+        return "qlib_local"
+
+
+def set_loop_source(source: str):
+    if source not in SOURCES:
+        raise ValueError(f"未知数据源: {source}")
+    SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    cfg = {}
+    if SETTINGS_FILE.exists():
+        try:
+            cfg = json.loads(SETTINGS_FILE.read_text())
+        except Exception:
+            cfg = {}
+    cfg["loop_factor_source"] = source
+    SETTINGS_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=1))
+
+
 # ---------------------------------------------------------------- market.db（来源标识）
 def _conn():
     c = sqlite3.connect(MKT_DB)

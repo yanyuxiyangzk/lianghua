@@ -587,7 +587,7 @@ def job_le_factor_eval(batch: int = 60, pool_name: str = "沪深300") -> str:
     try:
         from loopengine.tree import build_field_frames, evaluate_tree, parse
 
-        panel = sig.get_panel_cached(codes, end, 800, source="qlib_local")
+        panel = sig.get_panel_cached(codes, end, 800, source=datasource.get_loop_source())
         frames = build_field_frames(panel)
         ck_prefix = "|".join(sorted(codes))
         for fac in facs:

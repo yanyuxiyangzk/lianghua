@@ -363,7 +363,7 @@ def simulate_trade(code: str, signal_date: str, rules: dict | None = None,
     entry_date = entry_date_override or cal[i0 + 1]
     end = cal[min(i0 + 1 + r["hold_days"], len(cal) - 1)]
     df = sig.fetch_panel([code], signal_date, end, ["$open", "$high", "$low", "$close"],
-                         source="qlib_local")
+                         source=datasource.get_loop_source())
     if df.empty:
         return None
     s = df.droplevel("instrument").sort_index()

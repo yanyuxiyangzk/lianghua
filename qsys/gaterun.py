@@ -3,6 +3,7 @@
 
 import pandas as pd
 
+import datasource
 import factor_eval as fe
 import gates as G
 import library
@@ -21,7 +22,7 @@ def run_gates_for_pool(pool_name: str = "沪深300", only_pending: bool = True) 
 
     codes = all_pools()[pool_name]
     end = get_last_trade_day()
-    panel = sig.get_panel_cached(codes, end, 800, source="qlib_local")
+    panel = sig.get_panel_cached(codes, end, 800, source=datasource.get_loop_source())
     end_date = panel.index.get_level_values("datetime").max().strftime("%Y-%m-%d")
 
     # 已通过因子的 IC 序列用于相关性闸门

@@ -26,6 +26,19 @@ if sel != cur:
 st.dataframe(pd.DataFrame(datasource.source_status()).rename(
     columns={"source": "源标识", "name": "名称", "last_sync": "最近同步", "rows": "缓存行数", "note": "备注"}),
     width='stretch')
+
+# loop 因子分析（LoopEngine 演化/体检/闸门/合成）专用数据源——可切同花顺 iFinD
+st.subheader("loop 因子分析数据源")
+loop_cur = datasource.get_loop_source()
+loop_sel = st.selectbox("LoopEngine 演化/体检/闸门/Top5合成的面板数据源", opts,
+                        index=opts.index(loop_cur) if loop_cur in opts else 0,
+                        format_func=lambda k: datasource.SOURCES[k]["name"])
+if loop_sel != loop_cur:
+    datasource.set_loop_source(loop_sel)
+    st.success(f"loop 因子分析数据源已切换到 {datasource.SOURCES[loop_sel]['name']}（首次切换需补抓日线，之后定时任务每日维护）")
+    st.rerun()
+st.caption("💡 切到 ths_ifind 后，演化因子全部基于同花顺数据（与展示端口径一致）；"
+           "首次会按需补抓池内股票日K（THS_HQ，几分钟），之后由 ifind_daily_sync 每日维护。")
 st.caption("⚠️ 进化闭环与回测（🧬/📊）固定使用 qlib 本地库，切换只影响分析展示层；"
            "akshare 为前复权口径，与 qlib 价格基准不同（水平差异属正常，形态一致）。")
 

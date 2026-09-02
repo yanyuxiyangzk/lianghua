@@ -7,6 +7,7 @@
 import numpy as np
 import pandas as pd
 
+import datasource
 import factor_eval as fe
 import gates as G
 import library
@@ -32,7 +33,7 @@ def build_top5_composite(pool_name: str = "沪深300", top_n: int = 5) -> dict:
 
     codes = all_pools()[pool_name]
     end = get_last_trade_day()
-    panel = sig.get_panel_cached(codes, end, 800, source="qlib_local")
+    panel = sig.get_panel_cached(codes, end, 800, source=datasource.get_loop_source())
 
     # 预筛：用检查点入库时的 IC 取 Top25，避免对全部过闸因子逐个重算（规模上来后的必需优化）
     try:

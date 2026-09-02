@@ -59,15 +59,11 @@ def _render_flow():
 
 
 def _go_flow(sector_type: str, indicators: str):
-    """执行板块资金流向查询"""
+    """执行板块资金流向查询（HTTP 优先 / SDK 兜底）"""
     try:
         # THS_WCQuery(query, domain) —— 智能选股接口（问财语义选股）
         condition = f"{sector_type}全部"
-        result = datasource.ths_call(
-            "THS_WCQuery",
-            condition,
-            "index"
-        )
+        result = datasource.ths_wcquery(condition, "index")
         st.session_state["ifind_res_flow_data"] = result
         st.session_state["ifind_call_flow_data"] = (sector_type, indicators)
         st.session_state["ifind_ts_flow_data"] = pd.Timestamp.now()

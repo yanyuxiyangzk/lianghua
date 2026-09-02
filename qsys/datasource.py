@@ -715,6 +715,14 @@ def ths_date_serial(code: str, indicators: str, start: str, end: str, params: st
                            "indipara": [{"indicator": i, "indiparams": [params]} for i in inds]}))
 
 
+def ths_wcquery(query: str, domain: str = "stock"):
+    """问财语义查询（SDK: THS_WCQuery / HTTP: smart_stock_picking，HTTP 优先）。"""
+    return _sdk_or_http(
+        lambda: ths_call("THS_WCQuery", query, domain),
+        lambda: _ths_http("smart_stock_picking",
+                          {"searchstring": query, "searchtype": domain}))
+
+
 def ths_trade_dates(exchange: str = "SSE", start: str = "", end: str = ""):
     """交易日历（SDK: THS_Date_Query / HTTP: get_trade_dates）。exchange: SSE/SZSE。"""
     start = start or f"{datetime.now().year}-01-01"

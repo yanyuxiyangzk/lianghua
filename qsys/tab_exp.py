@@ -52,6 +52,39 @@ def render():
         show["20日均超额(近似)"] = show["20日均超额(近似)"].map(lambda x: f"{x:.2%}")
         st.dataframe(show, width='stretch')
 
+    # ---------------- 每日选股情况 ----------------
+    st.markdown("**📅 每日选股情况（按交易日查看当天选了哪些股票）**")
+    dates = sorted(hist["trade_date"].dropna().unique(), reverse=True)
+    if dates:
+        sel_date = st.selectbox("选择交易日", dates, key="exp_daily_date")
+        day = hist[hist["trade_date"] == sel_date]
+        try:  # 股票名称映射（ifind_stocklist）
+            import datasource as _ds
+            with _ds._qconn() as _c:
+                _names = dict(_c.execute("SELECT code, name FROM ifind_stocklist").fetchall())
+        except Exception:
+            _names = {}
+        for _, prow in day.iterrows():
+            if pd.notna(prow["命中率"]):
+                title = (f"#{prow['id']} {prow['pack_name'] or prow['source']} · Top{prow['top_n']}"
+                         f" · 命中率 {prow['命中率']:.0%} · 超额 {prow['平均超额']:+.2%}")
+            else:
+                title = f"#{prow['id']} {prow['pack_name'] or prow['source']} · Top{prow['top_n']} · 未结算"
+            with st.expander(title, expanded=True):
+                with experience._conn() as conn:
+                    items = pd.read_sql(
+                        "SELECT rank, code, score FROM pick_items WHERE pick_id=? ORDER BY rank",
+                        conn, params=(int(prow["id"]),))
+                if items.empty:
+                    st.caption("无明细")
+                else:
+                    items["name"] = items["code"].map(_names)
+                    items["score"] = items["score"].map(lambda x: f"{x:.4f}")
+                    st.dataframe(
+                        items.rename(columns={"rank": "排名", "code": "代码",
+                                              "name": "名称", "score": "综合分"}),
+                        hide_index=True, width='stretch')
+
     # ---------------- 历史明细 ----------------
     st.markdown("**🗂 选股历史**")
     show = hist.copy()

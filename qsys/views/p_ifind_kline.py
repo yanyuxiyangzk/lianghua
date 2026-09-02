@@ -225,8 +225,6 @@ def _fenshi_fig(df: pd.DataFrame, title: str, prev_close: float | None) -> go.Fi
 
 # ---------------------------------------------------------------- 页面
 def render():
-    st.title("📈 股价K线")
-
     # 代码输入（优先级：URL 参数 ?code=（超链接跳入）> session_state（双击跳入）> 默认）
     default_code = (st.query_params.get("code")
                     or st.session_state.get("kline_code", "000001.SH"))

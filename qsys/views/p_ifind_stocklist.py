@@ -245,8 +245,17 @@ def _render_stock_list():
             # 添加序号列
             display_df.insert(0, "序号", range(start + 1, start + 1 + len(display_df)))
 
-            st.dataframe(display_df, use_container_width=True, hide_index=True,
-                         height=35 * (len(display_df) + 1) + 3)
+            # 点击行跳转到该股K线页（streamlit dataframe 行选择）
+            sel_event = st.dataframe(
+                display_df, use_container_width=True, hide_index=True,
+                height=35 * (len(display_df) + 1) + 3,
+                on_select="rerun", selection_mode="single-row",
+                key=f"tbl_{label}")
+            if sel_event and sel_event.selection.rows:
+                st.session_state["kline_code"] = page_df.iloc[sel_event.selection.rows[0]]["code"]
+                st.switch_page("views/p_ifind_kline.py")
+            if label == "全部股票":
+                st.caption("💡 点击表格任意一行，跳转到该股的「📈 股价K线」页")
 
             # 分页导航（数据下方）
             nav1, nav2, nav3, nav4, nav5 = st.columns([1, 1, 2, 1, 1])
@@ -353,8 +362,15 @@ def _render_index_list():
     display_df["成交额(亿)"] = [f"{v/1e8:.1f}" if pd.notna(v) else "" for v in page_df["amount"]]
     display_df.insert(0, "序号", range(start + 1, start + 1 + len(display_df)))
 
-    st.dataframe(display_df, use_container_width=True, hide_index=True,
-                 height=35 * (len(display_df) + 1) + 3)
+    # 点击行跳转到该指数K线页
+    idx_sel = st.dataframe(display_df, use_container_width=True, hide_index=True,
+                           height=35 * (len(display_df) + 1) + 3,
+                           on_select="rerun", selection_mode="single-row",
+                           key="tbl_index")
+    if idx_sel and idx_sel.selection.rows:
+        st.session_state["kline_code"] = page_df.iloc[idx_sel.selection.rows[0]]["code"]
+        st.switch_page("views/p_ifind_kline.py")
+    st.caption("💡 点击表格任意一行，跳转到该指数的「📈 股价K线」页")
 
     # 分页导航
     nav1, nav2, nav3, nav4, nav5 = st.columns([1, 1, 2, 1, 1])

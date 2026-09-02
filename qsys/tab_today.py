@@ -187,6 +187,18 @@ def render():
             "止损价（无条件卖）": [round(p * (1 + RULES["stop_loss"]), 2) if p else None for p in ref],
             "止盈价（落袋）": [round(p * (1 + RULES["take_profit"]), 2) if p else None for p in ref],
         }), width='stretch', hide_index=True)
+        # 选股方式与因子组合（可追溯：这批名单是怎么选出来的）
+        pk_info = packs.get(pack_name) or {}
+        facs = pk_info.get("factors", [])
+        with st.expander(f"🧬 选股方式：策略包「{pack_name}」（{pk_info.get('method', '-')}）"
+                         f" · {len(facs)} 因子组合 · 池 {pk_info.get('pool_name', '-')}"
+                         f" · 买入时间：次日开盘"):
+            if facs:
+                st.dataframe(pd.DataFrame(
+                    [{"因子": f.get("name"), "类型": f.get("kind"),
+                      "权重": round(float(f.get("weight", 1)), 3),
+                      "方向": ("正向" if f.get("direction", 1) > 0 else "负向")} for f in facs]),
+                    hide_index=True, width='stretch')
         if st.button("➕ 加入自选股", key=f"{kp}_wl"):
             wl = load_json(WATCHLIST_FILE, [])
             add = [c for c in items["code"] if c not in wl]
@@ -206,6 +218,62 @@ def render():
     st.markdown("---")
     _render_track("🎲", "卫星轨 · 博涨停（仓位小头，建议 ≤2 成，亏了不伤筋骨）",
                   sat_name, _pick_for(sat_name), "sat", "卫星轨资金")
+
+    # ---------------------------------------------------------------- 昨日执行回顾（T+1：昨日名单今开买入，逐股收益率+胜率）
+    def _render_yesterday_review():
+        dates = experience.list_pick_dates(limit=5)
+        if len(dates) < 2:
+            return
+        prev_date = dates[1]  # dates[0]=今天用的名单（昨晚扫描），dates[1]=昨天名单（今开买入）
+        ypicks = experience.picks_on_date(prev_date)
+        if ypicks.empty:
+            return
+        st.markdown("---")
+        st.markdown(f"### 📊 昨日执行回顾（{prev_date} 名单 · 今日开盘买入）")
+        for r in ypicks.itertuples():
+            items = experience.pick_items_detail(int(r.id))
+            if items.empty:
+                continue
+            codes = list(items["code"])
+            # 最新价 + 今开（ifind_realtime 5分钟快照）
+            try:
+                with datasource._qconn() as conn:
+                    rt = pd.read_sql(
+                        f"SELECT code, price, open FROM ifind_realtime"
+                        f" WHERE datetime=(SELECT MAX(datetime) FROM ifind_realtime)"
+                        f" AND code IN ({','.join('?' * len(codes))})",
+                        conn, params=codes)
+                rmap = {x.code: (x.price, x.open) for x in rt.itertuples()}
+            except Exception:
+                rmap = {}
+            rows = []
+            for it in items.itertuples():
+                entry = getattr(it, "entry_price", None)  # 模拟成交的买入价（今晚 20:05 回填）
+                price, open_p = rmap.get(it.code, (None, None))
+                entry = entry if pd.notna(entry) else open_p  # 未回填时用今开
+                pnl = getattr(it, "pnl_pct", None)
+                if pd.notna(pnl):
+                    ret, status = float(pnl), getattr(it, "exit_reason", "已平仓")
+                elif entry and price:
+                    ret, status = price / entry - 1, "持有中"
+                else:
+                    ret, status = None, "待数据"
+                rows.append({"代码": it.code, "买入价": round(entry, 2) if entry else None,
+                             "最新价": round(price, 2) if price else None,
+                             "收益率": f"{ret:+.2%}" if ret is not None else "-",
+                             "状态": status})
+            df_r = pd.DataFrame(rows)
+            done = [r for r in rows if isinstance(r["收益率"], str) and r["收益率"] != "-"]
+            if done:
+                rets = [float(r["收益率"].strip("%")) / 100 for r in done]
+                win = sum(1 for x in rets if x > 0) / len(rets)
+                st.markdown(f"**{r.pack_name or r.method}**（{r.source}）：{len(done)}/{len(rows)} 只有数"
+                            f" · 当日胜率 **{win:.0%}** · 平均收益率 **{sum(rets)/len(rets):+.2%}**")
+                st.dataframe(df_r, hide_index=True, width='stretch')
+            else:
+                st.markdown(f"**{r.pack_name or r.method}**（{r.source}）：盘中快照未就绪，稍后再看")
+
+    _render_yesterday_review()
 
     with st.expander("⚙️ 轨道设置（每条轨用哪个策略包，平时不用动）"):
         names = list(packs.keys())

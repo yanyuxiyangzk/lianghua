@@ -14,6 +14,21 @@ import datasource
 PAGE_SIZE = 20
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def _fetch_pdf_b64(url: str):
+    """服务器端抓取 PDF 并 base64 编码（同花顺 PDF 是 force-download，浏览器无法直接内嵌，
+    转成 data URI 才能在 iframe 里在线预览；按 URL 缓存一天）"""
+    import base64
+    import requests
+    try:
+        r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code == 200 and r.content[:4] == b"%PDF":
+            return base64.b64encode(r.content).decode()
+    except Exception:
+        pass
+    return None
+
+
 def render():
     st.title("📜 公告信息")
     st.caption("数据源：同花顺 iFinD（THS_ReportQuery）· 保存最近 7 天，超期自动清理"
@@ -116,6 +131,35 @@ def render():
         mime="text/csv",
         key="dl_ann",
     )
+
+    # ---------------------------------------------------------------- PDF 在线预览
+    st.divider()
+    st.subheader("📄 PDF 在线预览")
+    opts = list(range(len(page_df)))
+    sel = st.selectbox(
+        "选择本页一条公告进行预览", opts, index=None,
+        placeholder="点击选择公告…",
+        format_func=lambda i: f"{start + i + 1}. {page_df.iloc[i]['name'] or page_df.iloc[i]['code']} "
+                              f"{str(page_df.iloc[i]['title'])[:42]}",
+        key="ann_pdf_sel")
+    if sel is not None:
+        row = page_df.iloc[sel]
+        url = str(row["pdf_url"] or "")
+        if not url.startswith("http"):
+            st.warning("该公告没有有效的 PDF 链接")
+        else:
+            with st.spinner("加载 PDF…（首次约几秒，之后有缓存）"):
+                b64 = _fetch_pdf_b64(url)
+            if b64:
+                import streamlit.components.v1 as components
+                components.html(
+                    f'<iframe src="data:application/pdf;base64,{b64}" '
+                    f'width="100%" height="820px" style="border:1px solid #ddd;border-radius:6px;"></iframe>',
+                    height=840)
+                st.link_button("⬇️ 在新标签页打开/下载", url)
+            else:
+                st.error("PDF 加载失败（源站不可用或格式异常），可尝试新标签页打开")
+                st.link_button("在新标签页打开", url)
 
 
 render()

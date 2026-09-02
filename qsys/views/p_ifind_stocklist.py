@@ -340,11 +340,16 @@ def _render_index_list():
 
     # 格式化显示
     display_df = pd.DataFrame()
-    display_df["代码"] = page_df["code"].values
-    display_df["名称"] = page_df["name"].values
-    display_df["分类"] = page_df["category"].values
-    display_df["最新价"] = [f"{v:.3f}" if pd.notna(v) else "" for v in page_df["price"]]
+    display_df["指数代码"] = page_df["code"].values
+    display_df["指数名称"] = page_df["name"].values
+    display_df["最新价"] = [f"{v:.2f}" if pd.notna(v) else "" for v in page_df["price"]]
+    display_df["涨跌额"] = [f"{(p - pc):+.2f}" if pd.notna(p) and pd.notna(pc) else ""
+                          for p, pc in zip(page_df["price"], page_df["prev_close"])]
     display_df["涨跌幅(%)"] = [f"{v:+.2f}" if pd.notna(v) else "" for v in page_df["change_pct"]]
+    display_df["昨收"] = [f"{v:.2f}" if pd.notna(v) else "" for v in page_df["prev_close"]]
+    display_df["今开"] = [f"{v:.2f}" if pd.notna(v) else "" for v in page_df["open"]]
+    display_df["最高价"] = [f"{v:.2f}" if pd.notna(v) else "" for v in page_df["high"]]
+    display_df["成交量(亿手)"] = [f"{v/1e8:.2f}" if pd.notna(v) else "" for v in page_df["volume"]]
     display_df["成交额(亿)"] = [f"{v/1e8:.1f}" if pd.notna(v) else "" for v in page_df["amount"]]
     display_df.insert(0, "序号", range(start + 1, start + 1 + len(display_df)))
 

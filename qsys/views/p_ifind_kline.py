@@ -177,12 +177,45 @@ def _load_kline(code: str, period: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------- 图表
-def _kline_fig(df: pd.DataFrame, title: str) -> go.Figure:
+def _calc_boll(df: pd.DataFrame, n: int = 20, k: float = 2.0):
+    mid = df["close"].rolling(n).mean()
+    std = df["close"].rolling(n).std()
+    return mid, mid + k * std, mid - k * std
+
+
+def _indicator_frame(df: pd.DataFrame, name: str) -> pd.DataFrame:
+    """复用 tab_kline_pro 的指标计算（它们吃 $close/$high/$low 列名）。"""
+    from tab_kline_pro import calc_kdj, calc_macd, calc_rsi
+    d = df.rename(columns={"open": "$open", "high": "$high", "low": "$low",
+                           "close": "$close", "volume": "$volume"})
+    if name == "MACD":
+        dif, dea, hist = calc_macd(d)
+        return pd.DataFrame({"DIF": dif, "DEA": dea, "MACD": hist})
+    if name == "KDJ":
+        k, dd, j = calc_kdj(d)
+        return pd.DataFrame({"K": k, "D": dd, "J": j})
+    if name == "RSI":
+        r = calc_rsi(d)
+        return pd.DataFrame({f"RSI{w}": s for w, s in r.items()})
+    return pd.DataFrame()
+
+
+_IND_COLORS = ["#f5c542", "#4fc3f7", "#ba68c8"]
+
+
+def _kline_fig(df: pd.DataFrame, title: str, indicator: str | None = None,
+               show_boll: bool = False) -> go.Figure:
     d = df.copy()
     for w, _c in MA_WINDOWS:
         d[f"ma{w}"] = d["close"].rolling(w).mean()
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
-                        row_heights=[0.78, 0.22], vertical_spacing=0.02)
+
+    has_ind = indicator in ("MACD", "KDJ", "RSI")
+    ind_df = _indicator_frame(df, indicator) if has_ind else pd.DataFrame()
+    nrows = 3 if (has_ind and not ind_df.empty) else 2
+    heights = [0.60, 0.20, 0.20] if nrows == 3 else [0.78, 0.22]
+    fig = make_subplots(rows=nrows, cols=1, shared_xaxes=True,
+                        row_heights=heights, vertical_spacing=0.02)
+
     fig.add_trace(go.Candlestick(
         x=d.index, open=d["open"], high=d["high"], low=d["low"], close=d["close"],
         increasing_line_color=UP, increasing_fillcolor=UP,
@@ -192,12 +225,36 @@ def _kline_fig(df: pd.DataFrame, title: str) -> go.Figure:
         fig.add_trace(go.Scatter(x=d.index, y=d[f"ma{w}"], name=f"MA{w}",
                                  line=dict(width=1.1, color=color), opacity=0.9),
                       row=1, col=1)
+    if show_boll:
+        mid, up_b, lo_b = _calc_boll(d)
+        for s, nm, dash in [(mid, "BOLL中轨", "solid"), (up_b, "BOLL上轨", "dot"),
+                            (lo_b, "BOLL下轨", "dot")]:
+            fig.add_trace(go.Scatter(x=d.index, y=s, name=nm,
+                                     line=dict(width=1, color="#ff9800", dash=dash)),
+                          row=1, col=1)
+
     colors = [UP if c >= o else DOWN for o, c in zip(d["open"], d["close"])]
     fig.add_trace(go.Bar(x=d.index, y=d["volume"], name="VOL",
                          marker_color=colors, opacity=0.85), row=2, col=1)
+
+    if nrows == 3:
+        if indicator == "MACD":
+            hist_colors = [UP if v >= 0 else DOWN for v in ind_df["MACD"].fillna(0)]
+            fig.add_trace(go.Bar(x=d.index, y=ind_df["MACD"], name="MACD",
+                                 marker_color=hist_colors), row=3, col=1)
+            for ci, col in enumerate(["DIF", "DEA"]):
+                fig.add_trace(go.Scatter(x=d.index, y=ind_df[col], name=col,
+                                         line=dict(width=1.1, color=_IND_COLORS[ci])),
+                              row=3, col=1)
+        else:
+            for ci, col in enumerate(ind_df.columns):
+                fig.add_trace(go.Scatter(x=d.index, y=ind_df[col], name=col,
+                                         line=dict(width=1.1, color=_IND_COLORS[ci % 3])),
+                              row=3, col=1)
+
     fig.update_layout(
         title=dict(text=title, font=dict(size=13)),
-        height=680, hovermode="x unified",
+        height=760 if nrows == 3 else 680, hovermode="x unified",
         xaxis_rangeslider_visible=False,
         legend=dict(orientation="h", yanchor="bottom", y=1.01, font=dict(size=11)),
         margin=dict(l=10, r=10, t=40, b=10),
@@ -246,10 +303,17 @@ def render():
     period = st.radio("周期", PERIODS, index=1, horizontal=True,
                       label_visibility="collapsed")
 
-    # 自动刷新开关：开启后每30秒重新调 iFinD 取数（K线/分时图表实时更新）
-    _ar1, _ar2 = st.columns([4, 1])
+    # 右上功能区：副图指标 / BOLL / 自动刷新
+    _ar1, _ar2, _ar3 = st.columns([2, 1, 1])
+    with _ar1:
+        ind_sel = st.selectbox("副图指标", ["无", "MACD", "KDJ", "RSI"], key="kline_ind")
     with _ar2:
+        show_boll = st.checkbox("BOLL 布林带", value=False, key="kline_boll")
+    with _ar3:
         _auto = st.toggle("自动刷新(30s)", value=False, key="kline_auto")
+    indicator = None if ind_sel == "无" else ind_sel
+
+    # 自动刷新开关：开启后每30秒重新调 iFinD 取数（K线/分时图表实时更新）
     if _auto:
         if st_autorefresh:
             st_autorefresh(interval=30_000, key="kline_autorefresh")
@@ -272,7 +336,9 @@ def render():
         st.plotly_chart(_fenshi_fig(df, f"{name} {code} 分时", info.get("prev_close")),
                         width="stretch")
     else:
-        st.plotly_chart(_kline_fig(df, f"{name} {code} {period}（前复权）"), width="stretch")
+        st.plotly_chart(_kline_fig(df, f"{name} {code} {period}（前复权）",
+                                   indicator=indicator, show_boll=show_boll),
+                        width="stretch")
     st.caption(f"数据范围: {df.index[0]:%Y-%m-%d %H:%M} ~ {df.index[-1]:%Y-%m-%d %H:%M}，"
                f"共 {len(df)} 根 · 数据源：同花顺 iFinD（"
                f"{'THS_HF 高频' if period == '分时' or period.endswith('分') else 'THS_HQ 历史行情'}）")

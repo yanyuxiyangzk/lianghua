@@ -490,6 +490,26 @@ def job_ifind_stocklist_sync(**_ignored) -> str:
         return "A股列表同步失败（可能iFinD限流或凭证问题）"
 
 
+def job_ifind_indexlist_sync(**_ignored) -> str:
+    """iFinD 指数列表同步（每日09:05执行，A股列表之后）。
+
+    调用 datasource.fetch_indexlist_to_db()：问财取指数全集（沪深/行业/主题）
+    + 宽基种子，iFinD 实时行情补价格，写入 ifind_indexlist 表。
+    """
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    # 交易日判断：周一到周五
+    if now.weekday() >= 5:
+        return "非交易日，跳过"
+
+    n = datasource.fetch_indexlist_to_db()
+    if n > 0:
+        return f"{now.strftime('%Y-%m-%d')} 指数列表同步完成：{n} 条"
+    else:
+        return "指数列表同步失败（可能iFinD限流或凭证问题）"
+
+
 def job_ifind_realtime_sync(**_ignored) -> str:
     """iFinD 实时行情快照同步（盘中每15分钟执行）。
 
@@ -615,6 +635,8 @@ JOBS = {
                                    "params": {"pool_name": "自选股", "days": 7}}},
     "ifind_stocklist_sync": {"name": "📋 iFinD A股列表同步（每日）", "func": job_ifind_stocklist_sync,
                              "default": {"enabled": False, "hour": 9, "minute": 0, "params": {}}},
+    "ifind_indexlist_sync": {"name": "📉 iFinD 指数列表同步（每日）", "func": job_ifind_indexlist_sync,
+                             "default": {"enabled": False, "hour": 9, "minute": 5, "params": {}}},
     "ifind_realtime_sync": {"name": "📊 iFinD 实时快照同步（盘中）", "func": job_ifind_realtime_sync,
                             "default": {"enabled": False, "hour": 0, "minute": 0,
                                         "params": {},

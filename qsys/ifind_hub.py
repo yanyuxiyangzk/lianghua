@@ -4,8 +4,7 @@
 打开页面即按默认参数自动查一次，参数收进折叠面板；字段名中文化，
 字段说明折叠面板保留英文代码对照（方便按官方文档查指标）。
 
-通道：SDK（账号密码，进程内单例会话）优先；SDK 未装/限流(-9)自动落
-HTTP API 通道（refresh_token 鉴权，不占会话数）——见 datasource.py。
+通道：HTTP API（refresh_token 鉴权、不占会话数）为主；HTTP 失败自动落 SDK（账号密码，进程内单例会话）——见 datasource.py _sdk_or_http。
 SDK：iFinDPy 不在 PyPI 且非 pip 包——官方 tar.gz 放 qsys/ifind_sdk/ 后
      重新 build qsys 镜像即自动装入（解压 /opt/iFinD + .pth）。
 """
@@ -49,7 +48,7 @@ FIELD_CN = {
     "pe": "市盈率", "pb": "市净率", "totalShares": "总股本",
     "floatShares": "流通股本", "marketValue": "总市值",
     # 基本面指标（ths_ 前缀是同花顺指标代码，可输进"指标"框查询）
-    "ths_pe_ttm_stock": "市盈率TTM", "ths_pb_stock": "市净率",
+    "ths_pe_stock": "市盈率(参数2=静态,3=动态)", "ths_pe_ttm_stock": "市盈率TTM", "ths_pb_stock": "市净率",
     "ths_ps_ttm_stock": "市销率TTM", "ths_pcf_ocf_ttm_stock": "市现率TTM",
     "ths_market_value_stock": "总市值", "ths_float_market_value_stock": "流通市值",
     "ths_total_share_stock": "总股本", "ths_float_share_stock": "流通股本",

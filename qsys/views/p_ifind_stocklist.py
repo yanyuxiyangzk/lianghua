@@ -23,7 +23,7 @@ STOCK_COLS = [
     ("amount", "成交额(万)", lambda v: f"{v/1e4:.2f}" if v and pd.notna(v) else "-"),
     ("_float_shares_display", "流通股(万)", lambda v: f"{v/1e4:.2f}" if v and pd.notna(v) else "-"),
     ("_float_mv_display", "流通市值(亿)", lambda v: f"{v/1e8:.2f}" if v and pd.notna(v) else "-"),
-    ("pe_ttm", "市盈率(TTM)", "{:.2f}"),
+    ("pe_ttm", "市盈率", "{:.2f}"),
 ]
 
 # 计算列：涨跌 = price - prev_close
@@ -40,7 +40,7 @@ MARKET_TABS = [
     ("全部股票", lambda df: df),
     ("上证A股", lambda df: df[df["code"].str.startswith("SH6") & ~df["code"].str.startswith("SH688")]),
     ("深证A股", lambda df: df[df["code"].str.startswith(("SZ0", "SZ3")) & ~df["code"].str.startswith("SZ3")]),
-    ("京证A股", lambda df: df[df["code"].str.startswith(("BJ4", "BJ8"))]),
+    ("京证A股", lambda df: df[df["code"].str.startswith("BJ")]),
     ("创业板", lambda df: df[df["code"].str.startswith("SZ3")]),
     ("科创板", lambda df: df[df["code"].str.startswith("SH688")]),
 ]

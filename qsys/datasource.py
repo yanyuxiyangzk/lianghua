@@ -84,6 +84,11 @@ def _conn():
         quantity_ratio REAL, amplitude REAL,
         pe_ttm REAL, pb REAL, total_mv REAL, float_mv REAL,
         float_shares REAL, total_shares REAL, fetched_at TEXT);
+    CREATE TABLE IF NOT EXISTS ifind_indexlist(
+        code TEXT PRIMARY KEY, name TEXT, market TEXT, category TEXT,
+        price REAL, prev_close REAL, open REAL, high REAL, low REAL,
+        change_pct REAL, volume REAL, amount REAL, amplitude REAL,
+        fetched_at TEXT);
     CREATE TABLE IF NOT EXISTS ifind_realtime(
         code TEXT NOT NULL, datetime TEXT NOT NULL,
         price REAL, prev_close REAL, open REAL, high REAL, low REAL,
@@ -319,10 +324,10 @@ def _ths_login() -> bool:
         errcode = getattr(ret, "errorcode", -1)
     if errcode not in (0, -201):
         _THS["logged_in"] = False
-        # -9 会话超限：冷却 10 分钟（频繁重试会延长服务端锁定）；
+        # -9 会话超限：冷却 10 分钟（与上方注释/提示一致；不频繁重试以免延续服务端锁定）；
         # -1010 账户登出：不冷却，下次调用自动重试；
         # 其余错误 1 分钟
-        _THS["cooldown_until"] = time.time() + (7200 if errcode == -9 else 0 if errcode == -1010 else 60)
+        _THS["cooldown_until"] = time.time() + (600 if errcode == -9 else 0 if errcode == -1010 else 60)
         hint = {-2: "账号或密码错误，请核对 settings.json ths_ifind 节的 account/password",
                 -9: "登录会话数超限（短时登录太频繁）。已自动冷却 10 分钟后再试；"
                     "若长时间不恢复，到 quantapi.51ifind.com 查账号状态或联系同花顺客服",
@@ -419,8 +424,9 @@ def _tables_to_df(tables):
     return pd.concat(frames, ignore_index=True) if frames else None
 
 
-# ---------------------------------------------------------------- iFinD HTTP API 备用通道
-# SDK 未装/登录限流(-9)时自动切换。refresh_token → access_token（7天有效，进程内缓存6天），
+# ---------------------------------------------------------------- iFinD HTTP API 主通道（token 鉴权）
+# refresh_token → access_token（7天有效，进程内缓存6天），不占 SDK 会话数、无登录频次限制。SDK 仅作兜底：_sdk_or_http 分发 HTTP 优先；
+# 仅日内快照等 HTTP 无等价端点的调用走 _sdk_first。端点/报文格式见官方 HTTPAPI 文档（quantapi 下载中心）。
 # 不占 SDK 会话数、无登录频次限制。端点/报文格式见官方 HTTPAPI 文档（quantapi 下载中心）。
 _THS_HTTP = {"access_token": "", "until": 0.0}
 _THS_API = "https://quantapi.51ifind.com/api/v1"
@@ -475,7 +481,18 @@ def _ths_http(endpoint: str, payload: dict):
 
 
 def _sdk_or_http(sdk_call, http_call):
-    """优先 SDK（进程内会话快）；登录类失败（未装/限流/冷却中）自动落 HTTP 通道。"""
+    """iFinD 通道分发：HTTP(token) 优先——不占 SDK 会话数、无登录限流；HTTP 异常/错误码非0 时落 SDK（SDK 登录失败也抛回上层）。"""
+    try:
+        df, res, err = http_call()
+        if err in (0, None):
+            return df, res, err
+    except Exception:
+        pass
+    return sdk_call()
+
+
+def _sdk_first(sdk_call, http_call):
+    """SDK 优先（仅日内快照等 HTTP 无等价端点的调用使用）；登录类失败落 HTTP 通道。"""
     try:
         _ths_login()
     except Exception:
@@ -585,8 +602,7 @@ def ths_snapshot(codes: list[str], indicators: str, snap_time: str = ""):
     实测：SDK 指标分号分隔；params 必填 dataType:Original；begin==end 返回空，
     必须给时间窗——单时点取 [t-2min, t]；留空=最新：先取最近 10 分钟，
     非交易时段为空则逐日回退尾盘 14:55-15:00 窗口（最多回退 5 天）。
-    HTTP 无快照端点，备用通道退化为实时行情（同一时刻最新一笔）。"""
-    ind = indicators.replace(",", ";")
+    HTTP 无快照端点（备用通道退化为实时行情），分发保持 SDK 优先（_sdk_first）。"""
     codes_s = ",".join(_to_ths_code(c) for c in codes)
 
     def http():
@@ -600,10 +616,10 @@ def ths_snapshot(codes: list[str], indicators: str, snap_time: str = ""):
             t = f"{now:%Y-%m-%d} {t}"
         end = datetime.strptime(t, "%Y-%m-%d %H:%M:%S")  # 格式错误会抛给 _go 提示
         begin = end - timedelta(minutes=2)
-        return _sdk_or_http(
+        return _sdk_first(
             lambda: ths_call("THS_SS", codes_s, ind, "dataType:Original",
                              f"{begin:%Y-%m-%d %H:%M:%S}", f"{end:%Y-%m-%d %H:%M:%S}"), http)
-    df, res, err = _sdk_or_http(
+    df, res, err = _sdk_first(
         lambda: ths_call("THS_SS", codes_s, ind, "dataType:Original",
                          f"{now - timedelta(minutes=10):%Y-%m-%d %H:%M:%S}",
                          f"{now:%Y-%m-%d %H:%M:%S}"), http)
@@ -1193,30 +1209,137 @@ def get_all_a_stocks() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def get_index_list() -> pd.DataFrame:
-    """获取主要指数列表（通过 akshare）。
+# ---------------------------------------------------------------- 指数列表（iFinD → 落库）
+# 宽基种子：问财"沪深指数"只覆盖交易所发布的指数，不含中证公司发布的规模指数
+# （沪深300/中证500 等实测问财查不到），手工兜底主要宽基。
+# 种子代码均经 iFinD real_time_quotation 实测可取数（2026-09）。
+_SEED_INDICES = [
+    ("000001.SH", "上证指数"), ("000016.SH", "上证50"), ("000010.SH", "上证180"),
+    ("000688.SH", "科创50"), ("000300.SH", "沪深300"), ("000905.SH", "中证500"),
+    ("000852.SH", "中证1000"), ("932000.CSI", "中证2000"), ("000985.CSI", "中证全指"),
+    ("000903.SH", "中证100"), ("000922.CSI", "中证红利"),
+    ("399001.SZ", "深证成指"), ("399006.SZ", "创业板指"), ("399005.SZ", "中小100"),
+    ("399106.SZ", "深证综指"), ("399330.SZ", "深证100"), ("899050.BJ", "北证50"),
+]
 
-    返回: DataFrame，包含 code, name, market 等字段
-    """
-    import akshare as ak
+# 问财指数语义查询 → 页面分类标签（SDK: THS_WCQuery / HTTP: smart_stock_picking）
+_INDEX_WC_QUERIES = [("沪深指数", "沪深指数"), ("行业指数", "行业指数"), ("主题指数", "主题指数")]
 
-    try:
-        # 使用 akshare 获取A股指数实时行情
-        df = ak.stock_zh_index_spot_em()
-        if df is None or df.empty:
-            return pd.DataFrame()
 
-        # 整理列名
-        result = pd.DataFrame({
-            "code": df["代码"],
-            "name": df["名称"],
-            "market": df["代码"].apply(lambda x: "SH" if x.startswith("0") else "SZ"),
-        })
-        return result.sort_values("code").reset_index(drop=True)
-    except Exception as e:
-        import logging
-        logging.getLogger("datasource").warning(f"获取指数列表失败: {e}")
+def _wc_index_query(query: str) -> pd.DataFrame:
+    """问财指数查询（SDK 优先，登录限流自动落 HTTP）。返回 code/name 两列。"""
+    df, _res, err = _sdk_or_http(
+        lambda: ths_call("THS_WCQuery", query, "index"),
+        lambda: _ths_http("smart_stock_picking",
+                          {"searchstring": query, "searchtype": "index"}))
+    if err not in (0, None) or df is None or not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame()
+    code_col = next((c for c in df.columns if "代码" in c or "thscode" in c.lower()), None)
+    name_col = next((c for c in df.columns if "简称" in c or "名称" in c), None)
+    if not code_col:
+        return pd.DataFrame()
+    out = pd.DataFrame({"code": df[code_col].astype(str)})
+    out["name"] = df[name_col].astype(str) if name_col else ""
+    return out
+
+
+def fetch_index_list() -> pd.DataFrame:
+    """拉取指数列表与实时行情（全 iFinD 数据源，token 鉴权无需登录，不写库）。
+
+    步骤：1) 问财三组语义查询取指数代码+名称+分类（沪深/行业/主题）
+          2) 叠加手工宽基种子（中证公司发布的规模指数问财覆盖不到）
+          3) iFinD 实时行情补价格字段（HTTP 优先，每批50只）
+    返回 DataFrame：code/name/market/category/price/.../fetched_at，
+    按 宽基→沪深→行业→主题、同类按代码 排序。
+    """
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1)+2) 指数全集：问财分类 + 宽基种子（种子覆盖同名问财条目的分类与名称）
+    # 后缀说明：SH/SZ/BJ 交易所发布、CSI 中证公司、TI 同花顺自研（行业/主题指数）
+    idx_map: dict[str, dict] = {}  # code -> {name, category}
+    for query, cat in _INDEX_WC_QUERIES:
+        try:
+            for r in _wc_index_query(query).itertuples():
+                if re.match(r"^\w+\.(SH|SZ|BJ|CSI|TI)$", r.code):
+                    idx_map.setdefault(r.code, {"name": r.name, "category": cat})
+        except Exception:
+            continue
+    for code, name in _SEED_INDICES:
+        idx_map[code] = {"name": name, "category": "宽基指数"}
+    if not idx_map:
+        return pd.DataFrame()
+
+    # 3) iFinD 实时行情（HTTP 优先；SDK 兜底）
+    codes = sorted(idx_map)
+    rq_indicators = "latest,preClose,open,high,low,changeRatio,volume,amount,amplitude"
+    rq_data: dict[str, dict] = {}
+    for i in range(0, len(codes), 50):
+        batch = ",".join(codes[i:i + 50])
+        try:
+            df_rq, _res, err = _ths_http("real_time_quotation", {
+                "codes": batch, "indicators": rq_indicators})
+            if df_rq is None or df_rq.empty:
+                df_rq, _res, err = ths_call("THS_RQ", batch, rq_indicators, "")
+            if df_rq is not None and not df_rq.empty:
+                code_col = next((c for c in df_rq.columns
+                                 if "code" in c.lower() or "代码" in c), df_rq.columns[0])
+                for _, row in df_rq.iterrows():
+                    rq_data[str(row[code_col])] = {
+                        "price": _safe_float(row.get("latest")),
+                        "prev_close": _safe_float(row.get("preClose")),
+                        "open": _safe_float(row.get("open")),
+                        "high": _safe_float(row.get("high")),
+                        "low": _safe_float(row.get("low")),
+                        "change_pct": _safe_float(row.get("changeRatio")),
+                        "volume": _safe_float(row.get("volume")),
+                        "amount": _safe_float(row.get("amount")),
+                        "amplitude": _safe_float(row.get("amplitude")),
+                    }
+        except Exception:
+            continue
+
+    rows = []
+    for code, meta in idx_map.items():
+        rq = rq_data.get(code, {})
+        rows.append({
+            "code": code, "name": meta["name"], "market": code.split(".")[-1],
+            "category": meta["category"],
+            "price": rq.get("price"), "prev_close": rq.get("prev_close"),
+            "open": rq.get("open"), "high": rq.get("high"), "low": rq.get("low"),
+            "change_pct": rq.get("change_pct"), "volume": rq.get("volume"),
+            "amount": rq.get("amount"), "amplitude": rq.get("amplitude"),
+            "fetched_at": now})
+    df = pd.DataFrame(rows)
+    cat_order = {"宽基指数": 0, "沪深指数": 1, "行业指数": 2, "主题指数": 3}
+    return df.sort_values(
+        by=["category", "code"],
+        key=lambda s: s.map(cat_order) if s.name == "category" else s
+    ).reset_index(drop=True)
+
+
+def fetch_indexlist_to_db() -> int:
+    """指数列表落库（⏰定时任务 ifind_indexlist_sync 用；页面本身直调 fetch_index_list）。"""
+    df = fetch_index_list()
+    if df.empty:
+        return 0
+    cols = ["code", "name", "market", "category", "price", "prev_close", "open",
+            "high", "low", "change_pct", "volume", "amount", "amplitude", "fetched_at"]
+    with _qconn() as c:
+        c.executemany(
+            "INSERT OR REPLACE INTO ifind_indexlist"
+            "(code,name,market,category,price,prev_close,open,high,low,change_pct,"
+            "volume,amount,amplitude,fetched_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            list(df[cols].itertuples(index=False, name=None)))
+    return len(df)
+
+
+def get_indexlist_from_db() -> pd.DataFrame:
+    """从 ifind_indexlist 表读取指数列表（宽基 → 沪深 → 行业 → 主题，同类按代码）。"""
+    with _qconn() as c:
+        return pd.read_sql_query(
+            "SELECT * FROM ifind_indexlist ORDER BY"
+            " CASE category WHEN '宽基指数' THEN 0 WHEN '沪深指数' THEN 1"
+            " WHEN '行业指数' THEN 2 WHEN '主题指数' THEN 3 ELSE 4 END, code", c)
 
 
 # ---------------------------------------------------------------- 北交所股票列表（腾讯 API 补充）
@@ -1276,11 +1399,11 @@ def fetch_stocklist_to_db() -> int:
     """拉取全市场A股数据并写入 ifind_stocklist 表（全部使用 iFinD 数据源）。
 
     步骤：
-    1. iFinD HTTP API 获取全量代码+名称列表
-    2. iFinD HTTP API 获取基本面（PE/PB/总市值，每批50只）
+    1. iFinD 获取全量代码+名称列表（stock_list → SDK WCQuery → HTTP 问财；北交所单独问财"北交所股票"）
+    2. iFinD 获取基本面（动态PE/PB/总市值，每批50只；流通股本仅 SDK 通道支持）
     3. iFinD HTTP API 获取实时行情（现价/涨跌/成交/换手/量比等，每批50只）
-    4. 从 akshare 缓存获取流通股本，计算流通市值
-    5. 合并写入 ifind_stocklist 表
+    4. 流通股本/市值：只用 iFinD（SDK 通道），限流期间为空，页面 fallback 总股本（也是 iFinD 数据）
+    5. 合并写入 ifind_stocklist 表（全同花顺 iFinD 数据，不用腾讯/akshare）
     返回写入行数。
     """
     import re as _re
@@ -1291,29 +1414,97 @@ def fetch_stocklist_to_db() -> int:
         m = _re.match(r"(\d{6})\.([A-Z]{2})", c.strip())
         return f"{m.group(2)}{m.group(1)}" if m else c.strip()
 
-    # 1) iFinD HTTP API 获取全量代码列表
+    # 1) 获取全量代码列表：三条路依次尝试
+    #    a. HTTP stock_list 端点（部分账号无此端点，404）
+    #    b. SDK THS_WCQuery（需登录，-9 限流时不可用）
+    #    c. HTTP 问财 smart_stock_picking（不占会话数，token 鉴权，实测可用）
     all_codes_raw = []
     all_names = {}
     all_codes = []
+
+    def _parse_list_df(df_wc):
+        nonlocal all_codes_raw, all_names, all_codes
+        code_col = next((c for c in df_wc.columns if "代码" in c or "code" in c.lower()), df_wc.columns[0])
+        name_col = next((c for c in df_wc.columns if "简称" in c or "名称" in c or "name" in c.lower()), None)
+        all_codes_raw = df_wc[code_col].astype(str).tolist()
+        if name_col:
+            all_names = dict(zip(df_wc[code_col].astype(str), df_wc[name_col].astype(str)))
+        all_codes = [_norm(c) for c in all_codes_raw]
+
+    def _ok(df_wc, err):
+        return err in (0, None) and isinstance(df_wc, pd.DataFrame) and not df_wc.empty
+
     try:
         df_wc, _res, err = _ths_http("stock_list", {"indicator": "all", "params": ""})
-        if err not in (0, None) or df_wc is None or not isinstance(df_wc, pd.DataFrame) or df_wc.empty:
-            # 回退到 SDK
+        if _ok(df_wc, err):
+            _parse_list_df(df_wc)
+    except Exception:
+        pass
+    if not all_codes:
+        try:
             df_wc, _res, err = ths_call("THS_WCQuery", "全部A股", "stock")
-        if err not in (0, None) or df_wc is None or not isinstance(df_wc, pd.DataFrame) or df_wc.empty:
-            pass  # iFinD 不可用，跳过，后续仍补充 BJ
-        else:
-            code_col = next((c for c in df_wc.columns if "代码" in c or "code" in c.lower()), df_wc.columns[0])
-            name_col = next((c for c in df_wc.columns if "简称" in c or "名称" in c or "name" in c.lower()), None)
-            all_codes_raw = df_wc[code_col].astype(str).tolist()
-            if name_col:
-                all_names = dict(zip(df_wc[code_col].astype(str), df_wc[name_col].astype(str)))
-            all_codes = [_norm(c) for c in all_codes_raw]
+            if _ok(df_wc, err):
+                _parse_list_df(df_wc)
+        except Exception:
+            pass
+    if not all_codes:
+        try:
+            df_wc, _res, err = _ths_http("smart_stock_picking",
+                                         {"searchstring": "全部A股", "searchtype": "stock"})
+            if _ok(df_wc, err):
+                _parse_list_df(df_wc)
+        except Exception:
+            pass
+
+    # 1+) 北交所股票：问财补充（同花顺 iFinD 源；"全部A股"问财只含沪深（实测 5214 只，不含 BJ）
+    #     北交所 2025 年切换 920xxx 新代码段：iFinD 对新格式全支持（920002.BJ 实测 RQ/BD 可用）
+    #     旧 43x/83x/87x 旧代码 iFinD 已不支持（-4001）——统一用新代码段落库
+    try:
+        df_bj, _res, err = _sdk_or_http(
+            lambda: ths_call("THS_WCQuery", "北交所股票", "stock"),
+            lambda: _ths_http("smart_stock_picking",
+                              {"searchstring": "北交所股票", "searchtype": "stock"}))
+        if _ok(df_bj, err):
+            bj_code_col = next((c for c in df_bj.columns if "代码" in c or "code" in c.lower()), df_bj.columns[0])
+            bj_name_col = next((c for c in df_bj.columns if "简称" in c or "名称" in c or "name" in c.lower()), None)
+            bj_raw = df_bj[bj_code_col].astype(str).tolist()
+            all_codes_raw += bj_raw
+            if bj_name_col:
+                all_names.update(dict(zip(df_bj[bj_code_col].astype(str), df_bj[bj_name_col].astype(str))))
+            all_codes += [_norm(c) for c in bj_raw]
     except Exception:
         pass
 
+    # 1++) 问财取 市盈率(pe)/流通a股/a股市值（不含限售股）——同花顺终端口径（实测 301688 与终端 39.18 一致）
+    #      新股 iFinD BD 接口不计算 PE/流通股本（实测全为 None），问财覆盖新股+全市场，一个调用搞定
+    wc_ind: dict[str, dict] = {}
+    for wc_query in ["全部A股，市盈率，流通股本，流通市值", "北交所股票，市盈率，流通股本，流通市值"]:
+        try:
+            df_wc2, _res, err = _sdk_or_http(
+                lambda q=wc_query: ths_call("THS_WCQuery", q, "stock"),
+                lambda q=wc_query: _ths_http("smart_stock_picking",
+                                             {"searchstring": q, "searchtype": "stock"}))
+            if err in (0, None) and isinstance(df_wc2, pd.DataFrame) and not df_wc2.empty:
+                code_col = next((c for c in df_wc2.columns if "代码" in c or "code" in c.lower()), None)
+                pe_col = next((c for c in df_wc2.columns if str(c).startswith("市盈率")), None)
+                fs_col = next((c for c in df_wc2.columns if str(c).startswith(("流通a股", "流通A股"))), None)
+                fm_col = next((c for c in df_wc2.columns if "不含限售股" in str(c) or str(c).startswith("a股市值")), None)
+                if code_col:
+                    for _, row in df_wc2.iterrows():
+                        code2 = _norm(str(row[code_col]))
+                        wc_ind[code2] = {
+                            "pe": _safe_float(row.get(pe_col)) if pe_col else None,
+                            "float_shares": _safe_float(row.get(fs_col)) if fs_col else None,
+                            "float_mv": _safe_float(row.get(fm_col)) if fm_col else None,
+                        }
+        except Exception:
+            continue
+
     # 2) iFinD THS_BD 基本面指标（逐指标调用，每批50只）
-    bd_indicator_list = ["ths_pe_ttm_stock", "ths_pb_stock", "ths_market_value_stock"]
+    #    ths_pe_stock 第二参数选口径：2=静态 3=动态（PE 主源是问财，这里动态口径仅作兜底）
+    today_dash = datetime.now().strftime("%Y-%m-%d")
+    today_compact = today_dash.replace("-", "")
+    bd_indicator_list = ["ths_pe_stock", "ths_pb_stock", "ths_market_value_stock"]
     bd_data: dict[str, dict] = {}
     batch_size = 50
 
@@ -1322,12 +1513,16 @@ def fetch_stocklist_to_db() -> int:
         codes_s = ",".join(batch_codes)
         batch_result: dict[str, dict] = {}
         for ind in bd_indicator_list:
+            if ind == "ths_pe_stock":
+                sdk_params, http_params = f"{today_dash},3", [today_compact, "3"]
+            else:
+                sdk_params, http_params = "", []
             try:
                 df_bd, _res, err = _sdk_or_http(
-                    lambda c=codes_s, ii=ind: ths_call("THS_BD", c, ii, ""),
-                    lambda ii=ind: _ths_http("basic_data_service", {
+                    lambda c=codes_s, ii=ind, p=sdk_params: ths_call("THS_BD", c, ii, p),
+                    lambda ii=ind, p=http_params: _ths_http("basic_data_service", {
                         "codes": codes_s,
-                        "indipara": [{"indicator": ii, "indiparams": []}]}))
+                        "indipara": [{"indicator": ii, "indiparams": p}]}))
                 if df_bd is not None and not df_bd.empty:
                     bd_code_col = next((c for c in df_bd.columns
                                         if "code" in c.lower() or "代码" in c or "thscode" in c.lower()),
@@ -1349,8 +1544,9 @@ def fetch_stocklist_to_db() -> int:
     #    SDK字段: latest,preClose,open,high,low,change,changeRatio,volume,amount,
     #             turnoverRatio,quantityRatio,amplitude,priceSpeed
     #    HTTP字段(补充): totalShares, totalCapital（floatCapital暂不可用）
+    #    注意：HTTP 端量比字段名是 vol_ratio（quantityRatio 会被静默丢弃，priceSpeed/speed 也不支持）
     rq_sdk_indicators = "latest,preClose,open,high,low,change,changeRatio,volume,amount,turnoverRatio,quantityRatio,amplitude"
-    rq_http_indicators = "latest,preClose,open,high,low,change,changeRatio,volume,amount,turnoverRatio,quantityRatio,amplitude,totalShares,totalCapital"
+    rq_http_indicators = "latest,preClose,open,high,low,change,changeRatio,volume,amount,turnoverRatio,vol_ratio,amplitude,totalShares,totalCapital"
     rq_data: dict[str, dict] = {}
 
     for i in range(0, len(all_codes), batch_size):
@@ -1390,11 +1586,11 @@ def fetch_stocklist_to_db() -> int:
             pass
 
     # 4) 合并写入
-    bj_count = 0
+    #    流通股本/市值：只用 iFinD（ths_float_share_stock 仅 SDK 通道支持；HTTP 端实测 -4210 不支持，SDK 恢复后自动生效，SDK 限流期间流通列为空（页面 fallback 显示总股本，也是 iFinD 数据，不用腾讯兜底——保持全同花顺数据
     with _qconn() as c:
         vals = []
         for code, raw_code in zip(all_codes, all_codes_raw):
-            market = "SH" if code.startswith("6") else "SZ" if code.startswith(("0", "3")) else "BJ"
+            market = code[:2] if code[:2] in ("SH", "SZ", "BJ") else "BJ"
             name = all_names.get(raw_code, "")
             rq = rq_data.get(code, {})
             bd = bd_data.get(code, {})
@@ -1407,23 +1603,19 @@ def fetch_stocklist_to_db() -> int:
             amplitude = rq.get("amplitude")
             if amplitude is None and high and low and prev_close:
                 amplitude = round((high - low) / prev_close * 100, 2)
-            # 流通市值：优先用API返回值，否则从akshare流通股本计算
-            float_mv = rq.get("float_mv")
-            float_shares = rq.get("float_shares")
+            # 市盈率/流通股本/流通市值：问财（同花顺终端口径，实测 301688 与终端 39.18 一致）优先，iFinD BD 兜底
+            wc = wc_ind.get(code, {})
+            pe = wc.get("pe") if wc.get("pe") is not None else bd.get("ths_pe_stock")
+            float_shares = wc.get("float_shares") or rq.get("float_shares")
+            float_mv = wc.get("float_mv") or rq.get("float_mv")
             if float_mv is None and float_shares and price:
                 float_mv = round(float_shares * price, 2)
-            elif float_mv is None:
-                # 从 akshare 缓存的流通股本计算
-                outstanding = get_latest_outstanding(code)
-                if outstanding and price:
-                    float_mv = round(outstanding * price, 2)
-                    float_shares = outstanding
             vals.append((
                 code, name, market,
                 price, prev_close, rq.get("open"), high, low,
                 change_pct, rq.get("volume"), rq.get("amount"), rq.get("turnover"),
                 rq.get("quantity_ratio"), amplitude,
-                bd.get("ths_pe_ttm_stock"), bd.get("ths_pb_stock"),
+                pe, bd.get("ths_pb_stock"),
                 rq.get("total_mv") or bd.get("ths_market_value_stock"),
                 float_mv,
                 float_shares,
@@ -1437,35 +1629,10 @@ def fetch_stocklist_to_db() -> int:
             "float_shares,total_shares,fetched_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             vals)
 
-        # 补充北交所股票（iFinD 不包含 BJ，从腾讯 API 扫描）
-        existing_codes = {r[0] for r in c.execute("SELECT code FROM ifind_stocklist").fetchall()}
-        try:
-            bj_stocks = fetch_bj_stocklist_from_tencent()
-            bj_vals = []
-            for s in bj_stocks:
-                if s["code"] not in existing_codes:
-                    bj_vals.append((
-                        s["code"], s["name"], "BJ",
-                        s.get("price"), s.get("prev_close"), s.get("open"),
-                        s.get("high"), s.get("low"),
-                        s.get("change_pct"), s.get("volume"), s.get("amount"),
-                        s.get("turnover"), None, None,
-                        s.get("pe_ttm"), None,
-                        s.get("total_mv"), s.get("float_mv"),
-                        None, None, now,
-                    ))
-            if bj_vals:
-                c.executemany(
-                    "INSERT OR REPLACE INTO ifind_stocklist"
-                    "(code,name,market,price,prev_close,open,high,low,change_pct,"
-                    "volume,amount,turnover,quantity_ratio,amplitude,pe_ttm,pb,total_mv,float_mv,"
-                    "float_shares,total_shares,fetched_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    bj_vals)
-                bj_count = len(bj_vals)
-        except Exception:
-            pass
+        # 清理腾讯扫描时代的旧格式北交所代码（BJ43x/83x/87x 旧代码段，iFinD 已不支持）——北交所数据改为 iFinD 问财"北交所股票"（920xxx 新代码段）
+        c.execute("DELETE FROM ifind_stocklist WHERE market='BJ' AND code NOT LIKE 'BJ9%'")
 
-    return len(vals) + bj_count
+    return len(vals)
 
 
 def _safe_float(v):
@@ -1501,20 +1668,28 @@ def fetch_realtime_to_db() -> int:
     all_codes_raw = [r[0] for r in rows]
 
     # 2) 获取上一次快照的价格（用于计算涨速）
+    #    涨速=本次快照价/上一快照价-1。上一快照超过 40 分钟（跨日/任务中断后首轮）不计算——
+    #    否则涨速会变成跨日跳空幅度，严重失真（实测踩坑 2026-09）
     prev_prices: dict[str, float] = {}
     with _qconn() as c:
-        cursor = c.execute("""
-            SELECT code, price FROM ifind_realtime 
-            WHERE datetime = (SELECT MAX(datetime) FROM ifind_realtime)
-        """)
-        for row in cursor.fetchall():
-            if row[1] is not None:
-                prev_prices[row[0]] = row[1]
+        latest_dt_row = c.execute("SELECT MAX(datetime) FROM ifind_realtime").fetchone()
+        latest_dt = latest_dt_row[0] if latest_dt_row else None
+        if latest_dt:
+            try:
+                age_sec = (datetime.now() - datetime.strptime(latest_dt, "%Y-%m-%d %H:%M:%S")).total_seconds()
+            except Exception:
+                age_sec = 999999
+            if age_sec <= 2400:  # 40 分钟内的连续采集序列才算涨速
+                cursor = c.execute("SELECT code, price FROM ifind_realtime WHERE datetime = ?", (latest_dt,))
+                for row in cursor.fetchall():
+                    if row[1] is not None:
+                        prev_prices[row[0]] = row[1]
 
     # 3) iFinD THS_RQ 实时行情（分批，每批50只）
-    # SDK只支持基础字段，HTTP API额外支持totalShares/totalCapital/pe_ttm（floatCapital暂不可用）
+    # SDK只支持基础字段，HTTP API额外支持totalShares/totalCapital（floatCapital暂不可用）
+    # 注：不再取 pe_ttm——RQ 的 pe_ttm 是 TTM 口径，会覆盖每日同步的动态PE（ths_pe_stock,3）
     rq_sdk_indicators = "latest,preClose,open,high,low,change,changeRatio,volume,amount,turnoverRatio,quantityRatio,amplitude"
-    rq_http_indicators = "latest,preClose,open,high,low,change,changeRatio,volume,amount,turnoverRatio,vol_ratio,amplitude,totalShares,totalCapital,pe_ttm"
+    rq_http_indicators = "latest,preClose,open,high,low,change,changeRatio,volume,amount,turnoverRatio,vol_ratio,amplitude,totalShares,totalCapital"
     batch_size = 50
     rq_data: dict[str, dict] = {}
 
@@ -1573,20 +1748,12 @@ def fetch_realtime_to_db() -> int:
                         "float_shares": None,  # HTTP API 暂不支持
                         "float_mv": _safe_float(row.get("floatCapital")),
                         "speed": speed,
-                        "pe_ttm": _safe_float(row.get("pe_ttm")),
                     }
         except Exception:
             pass
 
-    # 4) 用腾讯 API 补充流通市值（iFinD HTTP API 不支持 floatCapital）
-    try:
-        tx_float = fetch_tencent_float_mv(all_codes_raw)
-        for code, rq in rq_data.items():
-            if rq.get("float_mv") is None and code in tx_float:
-                rq["float_mv"] = tx_float[code].get("float_mv")
-                rq["float_shares"] = tx_float[code].get("float_shares")
-    except Exception:
-        pass
+    # 4) 流通股本/市值：不再用腾讯补充（保持全同花顺数据一致性，用户要求 2026-09）
+    #    iFinD HTTP 端不支持 floatCapital（实测静默丢弃），流通列在 SDK 恢复前为空
 
     # 5) 写入 ifind_realtime 表（使用事务包裹）
     with _qconn() as c:
@@ -1607,14 +1774,14 @@ def fetch_realtime_to_db() -> int:
                     rq.get("volume"), rq.get("amount"), rq.get("turnover"),
                     rq.get("quantity_ratio"), rq.get("amplitude"),
                     rq.get("float_shares"), rq.get("float_mv"),
-                    rq.get("speed"), rq.get("pe_ttm"),
+                    rq.get("speed"),
                 ))
         if vals:
             c.executemany(
                 "INSERT OR REPLACE INTO ifind_realtime"
                 "(code,datetime,price,prev_close,open,high,low,change_pct,"
-                "volume,amount,turnover,quantity_ratio,amplitude,float_shares,float_mv,speed,pe_ttm)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "volume,amount,turnover,quantity_ratio,amplitude,float_shares,float_mv,speed)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 vals)
     return len(vals)
 
@@ -1706,12 +1873,14 @@ def get_stocklist_from_db() -> pd.DataFrame:
     with _qconn() as c:
         df = pd.read_sql_query("SELECT * FROM ifind_stocklist ORDER BY code", c)
         # 用 ifind_realtime 最新快照覆盖价格类和实时字段
+        # 注：不覆盖 pe_ttm——ifind_realtime 不再写 PE（RQ 的 pe_ttm 是 TTM 口径），
+        #     PE 统一用每日同步的动态 PE（ths_pe_stock,3，与同花顺终端口径一致）
         if not df.empty:
             rt = pd.read_sql_query(
                 """SELECT code, price, prev_close, open, high, low,
                           change_pct, volume, amount, turnover,
                           quantity_ratio, amplitude, float_shares, float_mv,
-                          pe_ttm, speed
+                          speed
                    FROM ifind_realtime
                    WHERE datetime = (SELECT MAX(datetime) FROM ifind_realtime)""",
                 c,
@@ -1723,7 +1892,7 @@ def get_stocklist_from_db() -> pd.DataFrame:
                 price_cols = [
                     "price", "prev_close", "open", "high", "low",
                     "change_pct", "volume", "amount", "turnover",
-                    "quantity_ratio", "amplitude", "pe_ttm", "speed",
+                    "quantity_ratio", "amplitude", "speed",
                 ]
                 rt_indexed = rt.set_index("code")
                 for col in price_cols:

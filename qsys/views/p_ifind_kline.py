@@ -244,7 +244,11 @@ def render():
                       label_visibility="collapsed")
 
     with st.spinner(f"加载 {code} {period}K线…"):
-        df = _load_kline(code, period)
+        try:
+            df = _load_kline(code, period)
+        except Exception as e:
+            st.warning(f"{code} {period} 数据获取失败：{e}（可稍后重试或换周期）")
+            return
     if df.empty:
         st.warning(f"{code} {period} 数据获取失败（非交易时段/接口限流/代码不支持）")
         return

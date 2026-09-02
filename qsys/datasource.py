@@ -481,14 +481,21 @@ def _ths_http(endpoint: str, payload: dict):
 
 
 def _sdk_or_http(sdk_call, http_call):
-    """iFinD 通道分发：HTTP(token) 优先——不占 SDK 会话数、无登录限流；HTTP 异常/错误码非0 时落 SDK（SDK 登录失败也抛回上层）。"""
+    """iFinD 通道分发：HTTP(token) 优先——不占 SDK 会话数、无登录限流；HTTP 异常/错误码非0 时落 SDK。
+    SDK 也不可用（限流冷却等）时返回 HTTP 侧（可能为空的）结果，**不再向外抛限流异常**——
+    页面统一按"取数失败"提示，而不是被异常带崩（2026-09 踩坑：HTTP 瞬时失败→SDK 冷却异常把页面打崩）。"""
+    http_res = (None, None, -1)
     try:
         df, res, err = http_call()
         if err in (0, None):
             return df, res, err
+        http_res = (df, res, err)
     except Exception:
         pass
-    return sdk_call()
+    try:
+        return sdk_call()
+    except Exception:
+        return http_res
 
 
 def _sdk_first(sdk_call, http_call):

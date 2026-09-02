@@ -53,10 +53,10 @@ SORT_OPTIONS = {
 
 
 def render():
-    st.title("📋 个股行情")
+    st.title("📋 行情")
     ifind_hub.header()
 
-    tab_stock, tab_index = st.tabs(["📈 A股列表", "📊 指数列表"])
+    tab_stock, tab_index = st.tabs(["📈 A股市场", "📊 A股指数"])
 
     with tab_stock:
         _render_stock_list()

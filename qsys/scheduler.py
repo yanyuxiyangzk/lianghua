@@ -141,8 +141,21 @@ def compute_pack_picks(pk: dict, codes: list[str], end: str, top_n: int):
             if not code:
                 dropped.append(fname)
                 continue
-            df = sig.run_factor_code(code, fname, codes, end)
-            s = df.iloc[:, 0]
+            if code.startswith("# sexpr:"):
+                # 树因子进程内向量直算（和 le_factor_eval 同款快速路径，~0.1s/个；
+                # 避开 run_factor_code 的子进程——慢且会因子代码缺陷挂起，2026-09 实测把扫描拖死）
+                try:
+                    from loopengine.tree import build_field_frames, evaluate_tree, parse
+
+                    tree = parse(code.split("\n", 1)[0][len("# sexpr: "):])
+                    s = evaluate_tree(tree, build_field_frames(panel)).stack().rename(fname)
+                    s.index = s.index.set_names(["datetime", "instrument"])
+                except Exception:
+                    df = sig.run_factor_code(code, fname, codes, end)
+                    s = df.iloc[:, 0]
+            else:
+                df = sig.run_factor_code(code, fname, codes, end)
+                s = df.iloc[:, 0]
         f_series[fname] = s
         weights[fname] = (f["weight"], f["direction"])
     if not weights:
@@ -182,8 +195,21 @@ def compute_pack_picks(pk: dict, codes: list[str], end: str, top_n: int):
     return picks, note, weights, f_series
 
 
+def _satellite_pack_name(packs: dict) -> str | None:
+    """卫星轨策略包：含 ev_ 事件因子最多的包；其次名字含 涨停/事件 的包。"""
+    best, best_n = None, 0
+    for n, pk in packs.items():
+        k = sum(1 for f in pk.get("factors", []) if str(f["name"]).startswith("ev_"))
+        if k > best_n:
+            best, best_n = n, k
+    if best:
+        return best
+    return next((n for n in packs if "涨停" in n or "事件" in n), None)
+
+
 def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "") -> str:
-    """板块/池任务：综合打分输出 Top-N。pack 为空时自动选用 OOS 胜率最高的策略包。"""
+    """板块/池任务：综合打分输出 Top-N。pack 为空时自动选用 OOS 胜率最高的策略包。
+    主包扫完后顺带扫卫星包（涨停轨），今日执行页两条轨每天都有当天名单。"""
     end = get_last_trade_day()
     import library
     packs = library.list_strategies()
@@ -235,7 +261,23 @@ def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "")
                          method=(pk.get("method") if pk else "默认组合"), filters=(pk.get("filters", []) if pk else []),
                          factors=fcfg, final_scores=picks, pack_name=(pack or None),
                          oos_winrate=oos, trade_date=end)
-    return f"{end} {pool_name} 扫描完成：Top{top_n} 已出（{note}）"
+
+    # 卫星包顺带扫描：给「博涨停」轨出每日名单（今日执行页卫星轨按包名读取）
+    sat_msg = ""
+    try:
+        sat_name = _satellite_pack_name(packs)
+        if sat_name and sat_name != pack:
+            spk = packs[sat_name]
+            scodes = pools.get(spk["pool_name"]) or codes
+            spicks, _sn, _sw, _sf = compute_pack_picks(spk, scodes, end, int(spk["top_n"]))
+            experience.save_pick(source="sched_satellite_scan", pool_name=spk["pool_name"],
+                                 top_n=int(spk["top_n"]), method=spk.get("method"),
+                                 filters=spk.get("filters", []), factors=spk["factors"],
+                                 final_scores=spicks, pack_name=sat_name, trade_date=end)
+            sat_msg = f" · 卫星包「{sat_name}」Top{len(spicks)}"
+    except Exception as e:
+        sat_msg = f" · 卫星包扫描失败({e})"
+    return f"{end} {pool_name} 扫描完成：Top{top_n} 已出（{note}）{sat_msg}"
 
 
 def job_outcome_backfill() -> str:

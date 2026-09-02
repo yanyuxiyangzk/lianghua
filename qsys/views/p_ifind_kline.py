@@ -17,6 +17,11 @@ import streamlit as st
 
 import datasource
 
+try:
+    from streamlit_autorefresh import st_autorefresh
+except ImportError:
+    st_autorefresh = None
+
 UP, DOWN = "#e54545", "#26a69a"  # 红涨绿跌（A股配色）
 MA_WINDOWS = [(5, "#f5c542"), (10, "#4fc3f7"), (20, "#ba68c8"), (60, "#9e9e9e")]
 
@@ -242,6 +247,17 @@ def render():
 
     period = st.radio("周期", PERIODS, index=1, horizontal=True,
                       label_visibility="collapsed")
+
+    # 自动刷新开关：开启后每30秒重新调 iFinD 取数（K线/分时图表实时更新）
+    _ar1, _ar2 = st.columns([4, 1])
+    with _ar2:
+        _auto = st.toggle("自动刷新(30s)", value=False, key="kline_auto")
+    if _auto:
+        if st_autorefresh:
+            st_autorefresh(interval=30_000, key="kline_autorefresh")
+            st.caption(f"⏱ 每 30 秒自动刷新中 · 数据取数于 {datetime.now():%H:%M:%S}")
+        else:
+            st.warning("未安装 streamlit-autorefresh，无法自动刷新")
 
     with st.spinner(f"加载 {code} {period}K线…"):
         try:

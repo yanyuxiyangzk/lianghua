@@ -281,61 +281,105 @@ def _render_stock_list():
 
 
 def _render_index_list():
-    st.subheader("主要指数")
+    """渲染A股指数（iFinD 定时落库 → 读库展示，默认查询 + 20条/页分页）"""
+    db_df = datasource.get_indexlist_from_db()
 
-    with st.expander("⚙️ 查询参数", expanded=False):
-        c1, c2 = st.columns(2)
-        with c1:
-            codes = st.text_input(
-                "指数代码（逗号分隔）",
-                "000001.SH,399001.SZ,399006.SZ,000300.SH,000905.SH,000852.SH,000016.SH,000688.SH",
-                key="index_codes",
-            )
-        with c2:
-            indicators = st.text_input(
-                "返回字段",
-                "latest,preClose,open,high,low,change,changeRatio,volume,amount,turnoverRatio",
-                key="index_indicators",
-            )
-
-        if st.button("查询指数列表", key="index_go"):
-            try:
-                code_list = [c.strip() for c in codes.split(",") if c.strip()]
-                result = datasource.ths_realtime(code_list, indicators)
-                st.session_state["ifind_res_index_list"] = result
-                st.session_state["ifind_ts_index_list"] = pd.Timestamp.now()
-            except Exception as e:
-                st.error(f"查询失败：{e}")
-
-    res = st.session_state.get("ifind_res_index_list")
-    ts = st.session_state.get("ifind_ts_index_list")
-
-    if res is None:
-        st.info("点击「查询指数列表」开始查询")
+    # 数据库为空时提示
+    if db_df.empty:
+        st.info("数据库中暂无指数数据，请点击「🔄 同步数据」按钮首次拉取。")
+        if st.button("🔄 同步数据", type="primary", key="index_sync_first"):
+            with st.spinner("正在通过 iFinD 同步指数数据（约30秒）…"):
+                n = datasource.fetch_indexlist_to_db()
+            st.success(f"同步完成：{n} 条指数")
+            st.rerun()
         return
 
-    if not isinstance(res, tuple) or len(res) < 3:
-        st.warning("结果格式异常")
-        return
+    # 搜索 + 分类 + 同步（搜索框默认空）
+    c1, c2, c3 = st.columns([2, 1.5, 1])
+    with c1:
+        keyword = st.text_input("搜索代码/名称", "", key="index_kw", label_visibility="collapsed",
+                                placeholder="输入指数代码或名称关键字…")
+    with c2:
+        cats = ["全部"] + [x for x in ["宽基指数", "沪深指数", "行业指数", "主题指数"]
+                           if x in set(db_df["category"].dropna())]
+        cat_filter = st.selectbox("分类筛选", cats, key="index_cat", label_visibility="collapsed")
+    with c3:
+        if st.button("🔄 同步数据", key="index_sync"):
+            with st.spinner("正在通过 iFinD 同步指数数据（约30秒）…"):
+                n = datasource.fetch_indexlist_to_db()
+            st.success(f"同步完成：{n} 条指数")
+            st.rerun()
 
-    df, _raw, err = res
-    if err not in (0, None):
-        st.error(f"查询失败，错误码：{err}")
-        return
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        st.warning("查询成功但返回为空")
-        return
+    # 应用筛选
+    df = db_df.copy()
+    if keyword:
+        mask = df["code"].str.contains(keyword, case=False, na=False) | \
+               df["name"].str.contains(keyword, case=False, na=False)
+        df = df[mask]
+    if cat_filter != "全部":
+        df = df[df["category"] == cat_filter]
 
-    st.caption(f"共 {len(df)} 条记录 · 数据源：同花顺 iFinD"
-               + (f" · 查询于 {ts:%H:%M:%S}" if ts else ""))
-    st.dataframe(df, use_container_width=True, height=600)
+    fetched_at = db_df["fetched_at"].max() if "fetched_at" in db_df.columns else ""
+    st.caption(f"共 {len(df)} 个指数 · 数据源：同花顺 iFinD（HTTP 优先）· 更新于 {fetched_at}")
 
+    # 分页（20条/页，与 A股市场 tab 同款）
+    INDEX_PAGE_SIZE = 20
+    total = len(df)
+    total_pages = max(1, math.ceil(total / INDEX_PAGE_SIZE))
+
+    page_key = "page_index"
+    if page_key not in st.session_state:
+        st.session_state[page_key] = 0
+    page = st.session_state[page_key]
+    if page >= total_pages:
+        page = total_pages - 1
+        st.session_state[page_key] = page
+
+    start = page * INDEX_PAGE_SIZE
+    page_df = df.iloc[start:start + INDEX_PAGE_SIZE]
+
+    # 格式化显示
+    display_df = pd.DataFrame()
+    display_df["代码"] = page_df["code"].values
+    display_df["名称"] = page_df["name"].values
+    display_df["分类"] = page_df["category"].values
+    display_df["最新价"] = [f"{v:.3f}" if pd.notna(v) else "" for v in page_df["price"]]
+    display_df["涨跌幅(%)"] = [f"{v:+.2f}" if pd.notna(v) else "" for v in page_df["change_pct"]]
+    display_df["成交额(亿)"] = [f"{v/1e8:.1f}" if pd.notna(v) else "" for v in page_df["amount"]]
+    display_df.insert(0, "序号", range(start + 1, start + 1 + len(display_df)))
+
+    st.dataframe(display_df, use_container_width=True, hide_index=True,
+                 height=35 * (len(display_df) + 1) + 3)
+
+    # 分页导航
+    nav1, nav2, nav3, nav4, nav5 = st.columns([1, 1, 2, 1, 1])
+    with nav1:
+        if st.button("◀ 上一页", key="prev_index", disabled=(page <= 0)):
+            st.session_state[page_key] = page - 1
+            st.rerun()
+    with nav2:
+        if st.button("下一页 ▶", key="next_index", disabled=(page >= total_pages - 1)):
+            st.session_state[page_key] = page + 1
+            st.rerun()
+    with nav3:
+        st.caption(f"共 {total} 个指数 · 第 {page + 1}/{total_pages} 页 · 每页 {INDEX_PAGE_SIZE} 条")
+    with nav4:
+        jump = st.number_input("跳转", min_value=1, max_value=total_pages,
+                               value=page + 1, key="jump_index",
+                               label_visibility="collapsed")
+    with nav5:
+        if st.button("跳转", key="go_index"):
+            st.session_state[page_key] = jump - 1
+            st.rerun()
+
+    # 导出当前筛选结果（全部，非单页）
     csv = df.to_csv(index=False, encoding="utf-8-sig")
     st.download_button(
-        label="📥 导出CSV",
+        label=f"📥 导出指数CSV（{total}条）",
         data=csv,
-        file_name=f"指数列表_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
+        file_name=f"A股指数_{pd.Timestamp.now().strftime('%Y%m%d')}.csv",
         mime="text/csv",
+        key="dl_index",
     )
 
 

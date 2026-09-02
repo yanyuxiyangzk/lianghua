@@ -3,11 +3,10 @@
 页面分区（st.navigation）：
   我的:    🎯 今日执行（每天只看这页）/ 📚 实战成绩 / 📋 选股列表
   行情:    📈 股票行情 / 🕯️ 自选K线 / 📉 专业K线
-  📡 iFinD数据中心: ⚡实时行情 / 📅历史行情 / ⏱️高频行情 / 📸日内快照
-           / 🏛️板块行情 / 🏢基本面数据 / 🌐板块资金流 / ✨特色数据
+  📡 iFinD数据中心: 📋行情（A股市场/A股指数，落库读库）/ 🌐板块资金流
            / 📰舆情/新闻（iFinD公告 + DeepSeek 舆情摘要）
            / 📖接口文档（官方文档内嵌）/ 🗄数据仓库（所有落库表总览+浏览）
-           （每个子页只展示对应数据；SDK+HTTP 双通道，见 ifind_hub.py）
+           （原 实时行情/历史行情/高频行情/日内快照/基本面数据/特色数据 已下线，文件保留）
   专业区:  🧩 选股组合 / 🔬 个股分析 / 🧮 因子策略库 / 🪄 选股工作台 / 📈 模拟交易
            / 🧬 进化看板 / 📊 回测浏览 / ⏰ 定时任务（调参研究用，平时不用看）
   系统:    ⚙️ 设置（数据源切换/缓存/状态/说明）
@@ -50,15 +49,10 @@ pages = {
         st.Page("views/p_sectorflow.py", title="板块资金流", icon="🌐", url_path="sectorflow"),
     ],
     # iFinD 数据中心：独立菜单板块，每个子页只展示对应数据（逻辑在 ifind_hub.py）
+    # （实时行情/历史行情/高频行情/日内快照/基本面数据/特色数据 已下线——被「行情」页覆盖或用不到，页面文件保留在 views/ 可随时恢复）
     "📡 iFinD数据中心": [
         st.Page("views/p_ifind_stocklist.py", title="行情", icon="📋", url_path="ifind-stocklist"),
-        st.Page("views/p_ifind_realtime.py", title="实时行情", icon="⚡", url_path="ifind-realtime"),
-        st.Page("views/p_ifind_history.py", title="历史行情", icon="📅", url_path="ifind-history"),
-        st.Page("views/p_ifind_highfreq.py", title="高频行情", icon="⏱️", url_path="ifind-highfreq"),
-        st.Page("views/p_ifind_snapshot.py", title="日内快照", icon="📸", url_path="ifind-snapshot"),
-        st.Page("views/p_ifind_basic.py", title="基本面数据", icon="🏢", url_path="ifind-basic"),
         st.Page("views/p_ifind_sectorflow.py", title="板块资金流", icon="🌐", url_path="ifind-sectorflow"),
-        st.Page("views/p_ifind_feature.py", title="特色数据", icon="✨", url_path="ifind-feature"),
         st.Page("views/p_newsense.py", title="舆情/新闻", icon="📰", url_path="newsense"),
         st.Page("views/p_ifind_doc.py", title="接口文档", icon="📖", url_path="ifind-doc"),
         st.Page("views/p_warehouse.py", title="数据仓库", icon="🗄", url_path="ifind-warehouse"),

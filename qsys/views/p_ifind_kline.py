@@ -238,20 +238,25 @@ def _indicator_frame(df: pd.DataFrame, name: str) -> pd.DataFrame:
 _IND_COLORS = ["#f5c542", "#4fc3f7", "#ba68c8"]
 
 
-def _kline_fig(df: pd.DataFrame, title: str, indicator: str | None = None,
+def _kline_fig(df: pd.DataFrame, title: str, indicators: list[str] | None = None,
                show_boll: bool = False,
                factor_series: pd.Series | None = None, factor_name: str = "") -> go.Figure:
     d = df.copy()
     for w, _c in MA_WINDOWS:
         d[f"ma{w}"] = d["close"].rolling(w).mean()
 
-    has_ind = indicator in ("MACD", "KDJ", "RSI")
-    ind_df = _indicator_frame(df, indicator) if has_ind else pd.DataFrame()
-    has_ind = has_ind and not ind_df.empty
+    # 副图指标可多选：每个选中的指标占独立一行（BOLL 叠加在主图）
+    ind_frames: list[tuple[str, pd.DataFrame]] = []
+    for name in (indicators or []):
+        f = _indicator_frame(df, name)
+        if not f.empty:
+            ind_frames.append((name, f))
     has_fac = factor_series is not None and not factor_series.empty
-    nrows = 2 + int(has_ind) + int(has_fac)
+    nrows = 2 + len(ind_frames) + int(has_fac)
     heights = {2: [0.78, 0.22], 3: [0.60, 0.20, 0.20],
-               4: [0.52, 0.16, 0.16, 0.16]}[nrows]
+               4: [0.52, 0.16, 0.16, 0.16],
+               5: [0.46, 0.135, 0.135, 0.135, 0.135],
+               6: [0.40, 0.12, 0.12, 0.12, 0.12, 0.12]}[nrows]
     fig = make_subplots(rows=nrows, cols=1, shared_xaxes=True,
                         row_heights=heights, vertical_spacing=0.02)
 
@@ -276,31 +281,33 @@ def _kline_fig(df: pd.DataFrame, title: str, indicator: str | None = None,
     fig.add_trace(go.Bar(x=d.index, y=d["volume"], name="VOL",
                          marker_color=colors, opacity=0.85), row=2, col=1)
 
-    if has_ind:
-        ind_row = 3
-        if indicator == "MACD":
+    for r_idx, (ind_name, ind_df) in enumerate(ind_frames):
+        row = 3 + r_idx
+        if ind_name == "MACD":
             hist_colors = [UP if v >= 0 else DOWN for v in ind_df["MACD"].fillna(0)]
             fig.add_trace(go.Bar(x=d.index, y=ind_df["MACD"], name="MACD",
-                                 marker_color=hist_colors), row=ind_row, col=1)
+                                 marker_color=hist_colors), row=row, col=1)
             for ci, col in enumerate(["DIF", "DEA"]):
                 fig.add_trace(go.Scatter(x=d.index, y=ind_df[col], name=col,
                                          line=dict(width=1.1, color=_IND_COLORS[ci])),
-                              row=ind_row, col=1)
+                              row=row, col=1)
         else:
             for ci, col in enumerate(ind_df.columns):
                 fig.add_trace(go.Scatter(x=d.index, y=ind_df[col], name=col,
                                          line=dict(width=1.1, color=_IND_COLORS[ci % 3])),
-                              row=ind_row, col=1)
+                              row=row, col=1)
+        fig.update_yaxes(title_text=ind_name, row=row, col=1)
 
     if has_fac:
         fac_row = nrows
         fs = factor_series.reindex(d.index)
         fig.add_trace(go.Scatter(x=d.index, y=fs, name=f"因子:{factor_name}",
                                  line=dict(width=1.3, color="#00bcd4")), row=fac_row, col=1)
+        fig.update_yaxes(title_text="因子", row=fac_row, col=1)
 
     fig.update_layout(
         title=dict(text=title, font=dict(size=13)),
-        height={2: 680, 3: 760, 4: 840}[nrows], hovermode="x unified",
+        height={2: 680, 3: 760, 4: 840, 5: 920, 6: 1000}[nrows], hovermode="x unified",
         xaxis_rangeslider_visible=False,
         legend=dict(orientation="h", yanchor="bottom", y=1.01, font=dict(size=11)),
         margin=dict(l=10, r=10, t=40, b=10),
@@ -352,12 +359,12 @@ def render():
     # 右上功能区：副图指标 / BOLL / 自动刷新
     _ar1, _ar2, _ar3 = st.columns([2, 1, 1])
     with _ar1:
-        ind_sel = st.selectbox("副图指标", ["无", "MACD", "KDJ", "RSI"], key="kline_ind")
+        indicators = st.multiselect("副图指标（可多选，选几个出几行）",
+                                    ["MACD", "KDJ", "RSI"], default=[], key="kline_ind")
     with _ar2:
         show_boll = st.checkbox("BOLL 布林带", value=False, key="kline_boll")
     with _ar3:
         _auto = st.toggle("自动刷新(30s)", value=False, key="kline_auto")
-    indicator = None if ind_sel == "无" else ind_sel
 
     # 演化因子叠加（loopengine 树因子，仅日K）：搜索 + 选择
     _f1, _f2 = st.columns([1, 2])
@@ -404,7 +411,7 @@ def render():
                         width="stretch")
     else:
         st.plotly_chart(_kline_fig(df, f"{name} {code} {period}（前复权）",
-                                   indicator=indicator, show_boll=show_boll,
+                                   indicators=indicators, show_boll=show_boll,
                                    factor_series=factor_series, factor_name=factor_name),
                         width="stretch")
     st.caption(f"数据范围: {df.index[0]:%Y-%m-%d %H:%M} ~ {df.index[-1]:%Y-%m-%d %H:%M}，"

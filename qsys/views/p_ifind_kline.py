@@ -179,10 +179,27 @@ def _load_kline(code: str, period: str) -> pd.DataFrame:
 # ---------------------------------------------------------------- 演化因子（loopengine 树因子求值叠加）
 @st.cache_data(ttl=300, show_spinner=False)
 def _load_factor_registry() -> pd.DataFrame:
-    """loopengine 演化因子注册表（2.7万+，全部为树因子可直接求值）。"""
+    """loopengine 演化因子注册表 + 最新评分卡胜率（默认 5日胜率 降序，无评分卡排最后）。"""
+    import json
     import library
     reg = library.get_factor_registry()
-    return reg[reg["engine"] == "loopengine"][["name", "family", "code"]]
+    le = reg[reg["engine"] == "loopengine"][["name", "family", "code"]].copy()
+    try:
+        with datasource._qconn() as c:
+            sc = pd.read_sql_query(
+                "SELECT name, winrates, icir FROM factor_scorecards sc1"
+                " WHERE updated_at = (SELECT MAX(updated_at) FROM factor_scorecards sc2"
+                "                     WHERE sc2.name = sc1.name)", c)
+        def _wr5(j):
+            try:
+                return float(json.loads(j).get("5日胜率"))
+            except Exception:
+                return None
+        sc["wr5"] = sc["winrates"].map(_wr5)
+        le = le.merge(sc[["name", "wr5", "icir"]], on="name", how="left")
+    except Exception:
+        le["wr5"] = None
+    return le.sort_values("wr5", ascending=False, na_position="last").reset_index(drop=True)
 
 
 def _factor_choices(kw: str, limit: int = 200) -> list[str]:
@@ -192,23 +209,80 @@ def _factor_choices(kw: str, limit: int = 200) -> list[str]:
     return facs["name"].head(limit).tolist()
 
 
+def _factor_label(name: str) -> str:
+    facs = _load_factor_registry()
+    row = facs[facs["name"] == name]
+    if row.empty:
+        return name
+    wr = row.iloc[0].get("wr5")
+    return f"{name}（5日胜率 {wr:.0%}）" if pd.notna(wr) else f"{name}（无评分）"
+
+
 def _factor_code_by_name(name: str) -> str:
     facs = _load_factor_registry()
     row = facs[facs["name"] == name]
     return str(row.iloc[0]["code"]) if not row.empty else ""
 
 
-def _eval_factor_daily(code_ifind: str, factor_code: str, df_daily: pd.DataFrame) -> pd.Series:
-    """在日K数据上求 loopengine 树因子值（单票），返回 datetime 索引 Series。"""
-    from loopengine.tree import build_field_frames, evaluate_tree, parse
+def _daily_panel(code_ifind: str, df_daily: pd.DataFrame) -> pd.DataFrame:
+    """日K帧 → qlib 版式单票面板（instrument, datetime 多级索引，$ 前缀列）。"""
     p = df_daily.rename(columns={"open": "$open", "high": "$high", "low": "$low",
                                  "close": "$close", "volume": "$volume",
                                  "amount": "$amount"}).reset_index()
     p["instrument"] = to_db_code(code_ifind)
-    panel = p.set_index(["instrument", "datetime"])
+    return p.set_index(["instrument", "datetime"])
+
+
+def _eval_factor_daily(code_ifind: str, factor_code: str, df_daily: pd.DataFrame) -> pd.Series:
+    """在日K数据上求 loopengine 树因子值（单票），返回 datetime 索引 Series。"""
+    from loopengine.tree import build_field_frames, evaluate_tree, parse
+    panel = _daily_panel(code_ifind, df_daily)
     sexpr = factor_code.split("\n", 1)[0][len("# sexpr: "):]
     vals = evaluate_tree(parse(sexpr), build_field_frames(panel))
     return vals.iloc[:, 0].rename("factor")
+
+
+# ---------------------------------------------------------------- 策略包（综合分时序叠加）
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_packs() -> dict:
+    """系统策略包（因子+权重+方向）。"""
+    import library
+    return library.list_strategies()
+
+
+def _eval_pack_daily(code_ifind: str, pack: dict, df_daily: pd.DataFrame) -> pd.Series:
+    """策略包综合分（单票时序）：各因子时序 z-score 后按 权重×方向 合成。
+    树因子进程内向量求值；非树因子回退 signals.run_factor_code。"""
+    import signals as sig
+    panel = _daily_panel(code_ifind, df_daily)
+    db_code = to_db_code(code_ifind)
+    comp = None
+    for f in pack.get("factors", []):
+        kind, fname = f.get("kind"), f.get("name")
+        w, direction = f.get("weight", 1.0), f.get("direction", 1)
+        try:
+            if kind == "builtin":
+                s = sig.compute_builtin(panel, fname)
+                s = s.xs(db_code, level="instrument")
+            else:
+                code = _factor_code_by_name(fname)
+                if code.startswith("# sexpr:"):
+                    s = _eval_factor_daily(code_ifind, code, df_daily)
+                elif code:
+                    df_f = sig.run_factor_code(code, fname, [db_code],
+                                               df_daily.index[-1].strftime("%Y-%m-%d"))
+                    s = df_f.iloc[:, 0]
+                    if isinstance(s.index, pd.MultiIndex):
+                        s = s.xs(db_code, level="instrument")
+                else:
+                    continue
+            if s is None or s.dropna().empty:
+                continue
+            z = (s - s.mean()) / (s.std() + 1e-12)  # 时序标准化
+            comp = z * (w * direction) if comp is None else comp + z * (w * direction)
+        except Exception:
+            continue
+    return comp.dropna() if comp is not None else pd.Series(dtype=float)
 
 
 # ---------------------------------------------------------------- 图表
@@ -366,14 +440,18 @@ def render():
     with _ar3:
         _auto = st.toggle("自动刷新(30s)", value=False, key="kline_auto")
 
-    # 演化因子叠加（loopengine 树因子，仅日K）：搜索 + 选择
-    _f1, _f2 = st.columns([1, 2])
+    # 演化因子/策略叠加（仅日K）：搜索 + 因子（高胜率优先）+ 策略包
+    _f1, _f2, _f3 = st.columns([1, 2, 1.5])
     with _f1:
         fac_kw = st.text_input("演化因子搜索", key="kline_fac_kw",
-                               placeholder="关键字筛选因子（如 跳空/动量）")
+                               placeholder="关键字筛选（如 跳空/动量）")
     with _f2:
         fac_opts = ["（不叠加）"] + _factor_choices(fac_kw)
-        fac_sel = st.selectbox("RD-Agent 演化因子叠加（仅日K）", fac_opts, key="kline_fac")
+        fac_sel = st.selectbox("演化因子（高胜率优先）", fac_opts,
+                               format_func=_factor_label, key="kline_fac")
+    with _f3:
+        pack_opts = ["（不选策略）"] + list(_load_packs().keys())
+        pack_sel = st.selectbox("策略包叠加（综合分）", pack_opts, key="kline_pack")
 
     # 自动刷新开关：开启后每30秒重新调 iFinD 取数（K线/分时图表实时更新）
     if _auto:
@@ -393,9 +471,20 @@ def render():
         st.warning(f"{code} {period} 数据获取失败（非交易时段/接口限流/代码不支持）")
         return
 
-    # 演化因子求值（仅日K）
+    # 演化因子/策略求值（仅日K；策略包优先于单因子）
     factor_series, factor_name = None, ""
-    if fac_sel != "（不叠加）":
+    if pack_sel != "（不选策略）":
+        if period == "日K":
+            try:
+                factor_series = _eval_pack_daily(code, _load_packs()[pack_sel], df)
+                factor_name = f"策略:{pack_sel}"
+                if factor_series.empty:
+                    st.caption(f"⚠️ 策略包 {pack_sel} 的因子均无法求值")
+            except Exception as e:
+                st.caption(f"⚠️ 策略包 {pack_sel} 求值失败：{e}")
+        else:
+            st.caption("💡 策略包叠加仅支持日K周期")
+    elif fac_sel != "（不叠加）":
         if period == "日K":
             try:
                 factor_series = _eval_factor_daily(code, _factor_code_by_name(fac_sel), df)

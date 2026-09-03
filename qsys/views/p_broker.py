@@ -43,7 +43,7 @@ def render():
     with tab_pos:
         poss = broker.get_positions()
         if poss.empty:
-            st.info("暂无持仓。去「🛒 买入」下单，或等每日名单盘中自动开仓（见今日执行页）。")
+            st.info("柜台暂无持仓。去「🛒 买入」下单。")
         else:
             show = pd.DataFrame({
                 "代码": poss["code"], "名称": poss["name"],
@@ -55,6 +55,28 @@ def render():
                 "今日盈亏": poss["今日盈亏"].map(lambda x: f"{x:+,.0f}" if pd.notna(x) else "-"),
             })
             st.dataframe(show, hide_index=True, width='stretch')
+
+        # 自动跟踪持仓（每日名单盘中自动开仓，不占柜台资金）
+        st.markdown("#### 🤖 自动跟踪持仓（每日选股名单自动开仓，不占柜台资金）")
+        try:
+            import experience
+            autos = experience.get_open_positions()
+        except Exception:
+            autos = pd.DataFrame()
+        if autos.empty:
+            st.caption("暂无自动持仓——每日名单在盘中 9:30 起按快照价自动开仓")
+        else:
+            show_a = pd.DataFrame({
+                "代码": autos["code"], "名称": autos["name"],
+                "买入日期": autos["buy_date"],
+                "买入时间": autos["buy_ts"],
+                "买入价": autos["buy_price"].round(2),
+                "最新价": autos["最新价"].round(2),
+                "浮动盈亏": autos["浮动盈亏%"].map(lambda x: f"{x:+.2f}%" if pd.notna(x) else "-"),
+                "持有(交易日)": autos["持有交易日"],
+                "来源": autos["pack_name"].fillna(autos["source"]),
+            })
+            st.dataframe(show_a, hide_index=True, width='stretch')
 
     # ---------------------------------------------------------------- 买入
     with tab_buy:

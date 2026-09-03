@@ -23,7 +23,7 @@ def _pnl(v) -> str:
 
 
 def render():
-    st.title("💹 普通交易（模拟柜台）")
+    st.title("💹 资金账号（模拟柜台）")
 
     acc = broker.get_account()
 
@@ -68,7 +68,6 @@ def render():
         else:
             show_a = pd.DataFrame({
                 "代码": autos["code"], "名称": autos["name"],
-                "买入日期": autos["buy_date"],
                 "买入时间": autos["buy_ts"],
                 "买入价": autos["buy_price"].round(2),
                 "最新价": autos["最新价"].round(2),

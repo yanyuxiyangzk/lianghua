@@ -234,7 +234,6 @@ def render():
         else:
             show = pd.DataFrame({
                 "代码": opens["code"], "名称": opens["name"],
-                "买入日期": opens["buy_date"],
                 "买入时间": opens["buy_ts"],
                 "买入价": opens["buy_price"].round(2),
                 "最新价": opens["最新价"].round(2),

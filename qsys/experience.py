@@ -8,6 +8,7 @@
 """
 
 import json
+import re
 import sqlite3
 import hashlib
 from datetime import datetime
@@ -630,16 +631,22 @@ def position_fill_check(today: str) -> str:
                 continue
             if cur <= p["limit_price"]:  # 现价触及限价 → 成交（取更优价）
                 fill = min(cur, float(p["limit_price"]))
-                # 按轨道预算整手配股（100股整数倍）
+                # 按轨道预算整手配股，走柜台真实买入（扣可用资金、T+1冻结）
                 top_n = c.execute("SELECT top_n FROM picks WHERE id=?",
                                   (int(p["pick_id"]),)).fetchone()
                 per = _budget_per_stock(p["source"], top_n[0] if top_n else 10)
                 shares = int(per // fill // 100 * 100)
                 if shares <= 0:
-                    shares = 100  # 预算不足一手时保底一手
+                    continue  # 预算买不起一手就不开（实盘如此：100股整手是硬约束）
+                import broker
+                msg = broker.place_order(p["code"], "buy", None, shares)
+                if "已成交" not in msg:
+                    continue  # 柜台资金不足等 → 留挂（收盘仍未成交自动失效）
+                m = re.search(r"@ ([\d.]+)", msg)
+                fill = float(m.group(1)) if m else fill
                 c.execute("UPDATE positions SET status='open', buy_price=?, buy_ts=?,"
                           " shares=?, buy_amount=? WHERE id=?",
-                          (round(fill, 4), now, shares, round(shares * fill, 2), int(p["id"])))
+                          (fill, now, shares, round(shares * fill, 2), int(p["id"])))
                 n_fill += 1
     parts = []
     if n_fill:
@@ -692,6 +699,11 @@ def position_close_check(today: str) -> str:
                 if hd >= r["hold_days"]:
                     reason, sell_price = "到期", cur
             if reason:
+                # 走柜台真实卖出（回笼资金、T+1 可卖校验）
+                import broker
+                msg = broker.place_order(p["code"], "sell", None, int(p["shares"] or 0))
+                if "已成交" not in msg:
+                    continue  # 卖出失败（如可卖不足）→ 保持持仓，下个周期再试
                 pnl = sell_price / entry - 1 - r["cost"]  # 扣往返成本
                 c.execute("UPDATE positions SET status='closed', sell_date=?, sell_price=?,"
                           " sell_ts=?, sell_reason=?, pnl_pct=?, hold_days=?, closed_at=?"

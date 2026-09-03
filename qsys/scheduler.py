@@ -332,6 +332,7 @@ def job_position_track(**_ignored) -> str:
     """持仓跟踪（盘中每5分钟）：名单挂限价委托 → 触及成交开仓 → 持仓止盈/止损/到期平仓（T+1）。
 
     流程贴近实盘：委托（参考价=名单价）→ 现价触及才成交 → 买入日当天不卖（T+1）。
+    手动持仓同样随实盘价滚动止盈/止损自动卖出。
     """
     from zoneinfo import ZoneInfo
 
@@ -347,10 +348,12 @@ def job_position_track(**_ignored) -> str:
     m1 = experience.position_open_from_picks(latest[0], today) if latest else "无名单"
     m_fill = experience.position_fill_check(today)
     m2 = experience.position_close_check(today)
-    # 顺带撮合模拟柜台的挂单（限价单价格触及即成交）
+    # 顺带撮合模拟柜台的挂单（限价单价格触及即成交）+ 手动持仓止盈/止损自动卖出
     import broker
     n_fill = broker.fill_pending_orders()
-    parts = [m1, m_fill, m2] + ([f"挂单成交 {n_fill} 笔"] if n_fill else [])
+    n_stop = broker.check_stop_exits()
+    parts = [m1, m_fill, m2] + ([f"挂单成交 {n_fill} 笔"] if n_fill else []) \
+        + ([f"手动止盈止损 {n_stop} 笔"] if n_stop else [])
     return "；".join(p for p in parts if p)
 
 

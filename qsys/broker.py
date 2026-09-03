@@ -20,22 +20,29 @@ INIT_CASH = 100000.0
 FEE_RATE = 0.00025      # 佣金万 2.5
 FEE_MIN = 5.0           # 佣金最低 5 元
 TAX_RATE = 0.0005       # 印花税 0.05%（卖出）
+TP_RATE = 0.15          # 手动持仓默认止盈 +15%
+SL_RATE = 0.08          # 手动持仓默认止损 -8%
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS broker_account (
     key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS broker_positions (
-    code TEXT PRIMARY KEY, name TEXT, shares INTEGER, sellable INTEGER,
-    cost REAL, last_buy_date TEXT, updated_at TEXT);
+    code TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'manual', name TEXT,
+    shares INTEGER DEFAULT 0, sellable INTEGER DEFAULT 0, today_bought INTEGER DEFAULT 0,
+    cost REAL, last_buy_date TEXT, updated_at TEXT,
+    tp_price REAL, sl_price REAL,
+    PRIMARY KEY (code, source));
 CREATE TABLE IF NOT EXISTS broker_orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     date TEXT, ts TEXT, code TEXT, name TEXT, side TEXT,
     price REAL, shares INTEGER, status TEXT,
-    filled_price REAL, filled_ts TEXT, cancel_ts TEXT);
+    filled_price REAL, filled_ts TEXT, cancel_ts TEXT,
+    source TEXT DEFAULT 'manual');
 CREATE TABLE IF NOT EXISTS broker_fills (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     order_id INTEGER, date TEXT, ts TEXT, code TEXT, name TEXT, side TEXT,
-    price REAL, shares INTEGER, amount REAL, fee REAL, tax REAL);
+    price REAL, shares INTEGER, amount REAL, fee REAL, tax REAL,
+    source TEXT DEFAULT 'manual');
 CREATE TABLE IF NOT EXISTS broker_cashflows (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT, type TEXT, amount REAL, balance REAL, note TEXT);
@@ -45,7 +52,36 @@ CREATE TABLE IF NOT EXISTS broker_cashflows (
 def _conn():
     c = sqlite3.connect(DB_PATH)
     c.executescript(_SCHEMA)
+    _migrate(c)
     return c
+
+
+def _migrate(c):
+    """老库迁移：broker_positions 拆 (code, source) 双源（手动/AI）+ 止盈止损价。"""
+    cols = [r[1] for r in c.execute("PRAGMA table_info(broker_positions)")]
+    if "source" in cols and "tp_price" in cols and "today_bought" in cols:
+        return
+    c.execute("""CREATE TABLE IF NOT EXISTS broker_positions_mig (
+        code TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'manual', name TEXT,
+        shares INTEGER DEFAULT 0, sellable INTEGER DEFAULT 0, today_bought INTEGER DEFAULT 0,
+        cost REAL, last_buy_date TEXT, updated_at TEXT,
+        tp_price REAL, sl_price REAL, PRIMARY KEY (code, source))""")
+    c.execute("""INSERT OR IGNORE INTO broker_positions_mig
+        (code, source, name, shares, sellable, today_bought, cost, last_buy_date, updated_at)
+        SELECT b.code,
+               CASE WHEN EXISTS (SELECT 1 FROM positions p
+                                 WHERE p.code=b.code AND p.status IN ('open','pending'))
+                    THEN 'ai' ELSE 'manual' END,
+               b.name, b.shares, b.sellable, 0, b.cost, b.last_buy_date, b.updated_at
+        FROM broker_positions b""")
+    c.execute("DROP TABLE broker_positions")
+    c.execute("ALTER TABLE broker_positions_mig RENAME TO broker_positions")
+    ocols = [r[1] for r in c.execute("PRAGMA table_info(broker_orders)")]
+    if "source" not in ocols:
+        c.execute("ALTER TABLE broker_orders ADD COLUMN source TEXT DEFAULT 'manual'")
+    fcols = [r[1] for r in c.execute("PRAGMA table_info(broker_fills)")]
+    if "source" not in fcols:
+        c.execute("ALTER TABLE broker_fills ADD COLUMN source TEXT DEFAULT 'manual'")
 
 
 def _today() -> str:
@@ -92,7 +128,7 @@ def _settle_today():
         last = r[0] if r else ""
         if last >= _today():
             return
-        c.execute("UPDATE broker_positions SET sellable = shares")
+        c.execute("UPDATE broker_positions SET sellable = shares, today_bought = 0")
         c.execute("INSERT OR REPLACE INTO broker_account (key, value) VALUES ('settle_date', ?)",
                   (_today(),))
 
@@ -125,8 +161,10 @@ def get_name(code: str) -> str:
 
 
 # ---------------------------------------------------------------- 委托/成交
-def place_order(code: str, side: str, price: float | None, shares: int) -> str:
-    """下单。side: buy/sell。price 空或 0 = 市价单。返回消息。"""
+def place_order(code: str, side: str, price: float | None, shares: int,
+                source: str = "manual") -> str:
+    """下单。side: buy/sell。price 空或 0 = 市价单。返回消息。
+    source: manual=手动买入页下单；ai=每日名单自动开仓（类型列区分）。"""
     _init_account()
     _settle_today()
     code = code.strip().upper()
@@ -143,7 +181,8 @@ def place_order(code: str, side: str, price: float | None, shares: int) -> str:
 
     with _conn() as c:
         if side == "sell":
-            pos = c.execute("SELECT sellable FROM broker_positions WHERE code=?", (code,)).fetchone()
+            pos = c.execute("SELECT sellable FROM broker_positions WHERE code=? AND source=?",
+                            (code, source)).fetchone()
             if not pos or pos[0] < shares:
                 return f"可卖数量不足（可卖 {pos[0] if pos else 0} 股，T+1：当日买入不可当日卖出）"
         # 市价单立即成交检查现金
@@ -155,9 +194,9 @@ def place_order(code: str, side: str, price: float | None, shares: int) -> str:
             if _get_cash() < need:
                 return f"可用资金不足（约需 {need:,.2f} 元，含佣金）"
         cur_o = c.execute(
-            "INSERT INTO broker_orders (date, ts, code, name, side, price, shares, status)"
-            " VALUES (?,?,?,?,?,?,?, '已报')",
-            (_today(), _now(), code, name, side, price or 0, shares)).lastrowid
+            "INSERT INTO broker_orders (date, ts, code, name, side, price, shares, status, source)"
+            " VALUES (?,?,?,?,?,?,?, '已报', ?)",
+            (_today(), _now(), code, name, side, price or 0, shares, source)).lastrowid
         if fill_now:
             if cur is None:
                 c.execute("UPDATE broker_orders SET status='已撤', cancel_ts=? WHERE id=?",
@@ -169,44 +208,54 @@ def place_order(code: str, side: str, price: float | None, shares: int) -> str:
 
 
 def _fill(c, order_id: int, fill_price: float):
-    o = c.execute("SELECT code, name, side, shares FROM broker_orders WHERE id=?",
-                  (order_id,)).fetchone()
+    o = c.execute("SELECT code, name, side, shares, COALESCE(source,'manual')"
+                  " FROM broker_orders WHERE id=?", (order_id,)).fetchone()
     if not o:
         return
-    code, name, side, shares = o
+    code, name, side, shares, source = o
     amount = fill_price * shares
     fee = max(FEE_MIN, amount * FEE_RATE)
     tax = amount * TAX_RATE if side == "sell" else 0.0
+    tag = "AI" if source == "ai" else "手动"
     cash = float(c.execute("SELECT value FROM broker_account WHERE key='cash'").fetchone()[0])
     if side == "buy":
         cash -= (amount + fee)
         c.execute("UPDATE broker_account SET value=? WHERE key='cash'", (str(round(cash, 2)),))
-        pos = c.execute("SELECT shares, sellable, cost FROM broker_positions WHERE code=?",
-                        (code,)).fetchone()
+        pos = c.execute("SELECT shares, sellable, today_bought, cost FROM broker_positions"
+                        " WHERE code=? AND source=?", (code, source)).fetchone()
         if pos:
             new_shares = pos[0] + shares
-            new_cost = (pos[2] * pos[0] + amount) / new_shares
-            c.execute("UPDATE broker_positions SET shares=?, cost=?, last_buy_date=?,"
-                      " updated_at=? WHERE code=?",
-                      (new_shares, round(new_cost, 4), _today(), _now(), code))
+            new_cost = (pos[3] * pos[0] + amount) / new_shares
+            c.execute("UPDATE broker_positions SET shares=?, today_bought=?, cost=?,"
+                      " tp_price=?, sl_price=?, last_buy_date=?, updated_at=?"
+                      " WHERE code=? AND source=?",
+                      (new_shares, pos[2] + shares, round(new_cost, 4),
+                       round(new_cost * (1 + TP_RATE), 4), round(new_cost * (1 - SL_RATE), 4),
+                       _today(), _now(), code, source))
         else:
-            c.execute("INSERT INTO broker_positions (code, name, shares, sellable, cost,"
-                      " last_buy_date, updated_at) VALUES (?,?,?,0,?,?,?)",
-                      (code, name, shares, round(fill_price, 4), _today(), _now()))
-        _cashflow(c, "买入", -(amount + fee), f"买入 {name or code} {shares}股@{fill_price:.2f}")
+            c.execute("INSERT INTO broker_positions (code, source, name, shares, sellable,"
+                      " today_bought, cost, last_buy_date, updated_at, tp_price, sl_price)"
+                      " VALUES (?,?,?,?,0,?,?,?,?,?,?)",
+                      (code, source, name, shares, shares, round(fill_price, 4), _today(), _now(),
+                       round(fill_price * (1 + TP_RATE), 4),
+                       round(fill_price * (1 - SL_RATE), 4)))
+        _cashflow(c, "买入", -(amount + fee),
+                  f"[{tag}]买入 {name or code} {shares}股@{fill_price:.2f}")
     else:
         cash += (amount - fee - tax)
         c.execute("UPDATE broker_account SET value=? WHERE key='cash'", (str(round(cash, 2)),))
         c.execute("UPDATE broker_positions SET shares = shares - ?, sellable = sellable - ?,"
-                  " updated_at=? WHERE code=?", (shares, shares, _now(), code))
-        c.execute("DELETE FROM broker_positions WHERE code=? AND shares <= 0", (code,))
-        _cashflow(c, "卖出", amount - fee - tax, f"卖出 {name or code} {shares}股@{fill_price:.2f}")
+                  " updated_at=? WHERE code=? AND source=?", (shares, shares, _now(), code, source))
+        c.execute("DELETE FROM broker_positions WHERE code=? AND source=? AND shares <= 0",
+                  (code, source))
+        _cashflow(c, "卖出", amount - fee - tax,
+                  f"[{tag}]卖出 {name or code} {shares}股@{fill_price:.2f}")
     c.execute("UPDATE broker_orders SET status='已成', filled_price=?, filled_ts=? WHERE id=?",
               (round(fill_price, 4), _now(), order_id))
     c.execute("INSERT INTO broker_fills (order_id, date, ts, code, name, side, price, shares,"
-              " amount, fee, tax) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+              " amount, fee, tax, source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
               (order_id, _today(), _now(), code, name, side, fill_price, shares,
-               round(amount, 2), round(fee, 2), round(tax, 2)))
+               round(amount, 2), round(fee, 2), round(tax, 2), source))
 
 
 def fill_pending_orders() -> int:
@@ -237,6 +286,33 @@ def fill_pending_orders() -> int:
                 _fill(c, oid, cur)
                 n += 1
         return n
+
+
+def check_stop_exits() -> int:
+    """盘中自动止盈/止损（手动持仓）：实盘价触及止盈价/止损价即自动卖出（T+1 可卖校验）。"""
+    _init_account()
+    _settle_today()
+    with _conn() as c:
+        rows = pd.read_sql(
+            "SELECT * FROM broker_positions WHERE source='manual' AND shares > 0", c)
+    if rows.empty:
+        return 0
+    prices = _latest_prices(list(rows["code"]))
+    n = 0
+    for _, r in rows.iterrows():
+        if int(r["sellable"] or 0) <= 0:
+            continue  # T+1：当日买入不可卖
+        pr = prices.get(r["code"])
+        cur = pr[0] if pr else None
+        if not cur or not r["cost"]:
+            continue
+        tp = r["tp_price"] if r["tp_price"] else r["cost"] * (1 + TP_RATE)
+        sl = r["sl_price"] if r["sl_price"] else r["cost"] * (1 - SL_RATE)
+        if cur >= tp or cur <= sl:
+            msg = place_order(r["code"], "sell", None, int(r["sellable"]), source="manual")
+            if "已成交" in msg:
+                n += 1
+    return n
 
 
 def cancel_order(order_id: int) -> str:
@@ -286,6 +362,7 @@ def get_positions() -> pd.DataFrame:
     df["市值"] = df["最新价"].fillna(df["cost"]) * df["shares"]
     df["持仓盈亏"] = (df["最新价"].fillna(df["cost"]) - df["cost"]) * df["shares"]
     df["今日盈亏"] = (df["最新价"].fillna(df["昨收"]) - df["昨收"]) * df["shares"]
+    df["盈亏%"] = (df["最新价"].fillna(df["cost"]) / df["cost"] - 1) * 100
     return df
 
 

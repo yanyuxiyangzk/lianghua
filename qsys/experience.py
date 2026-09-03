@@ -639,7 +639,7 @@ def position_fill_check(today: str) -> str:
                 if shares <= 0:
                     continue  # 预算买不起一手就不开（实盘如此：100股整手是硬约束）
                 import broker
-                msg = broker.place_order(p["code"], "buy", None, shares)
+                msg = broker.place_order(p["code"], "buy", None, shares, source="ai")
                 if "已成交" not in msg:
                     continue  # 柜台资金不足等 → 留挂（收盘仍未成交自动失效）
                 m = re.search(r"@ ([\d.]+)", msg)
@@ -701,7 +701,8 @@ def position_close_check(today: str) -> str:
             if reason:
                 # 走柜台真实卖出（回笼资金、T+1 可卖校验）
                 import broker
-                msg = broker.place_order(p["code"], "sell", None, int(p["shares"] or 0))
+                msg = broker.place_order(p["code"], "sell", None, int(p["shares"] or 0),
+                                         source="ai")
                 if "已成交" not in msg:
                     continue  # 卖出失败（如可卖不足）→ 保持持仓，下个周期再试
                 pnl = sell_price / entry - 1 - r["cost"]  # 扣往返成本
@@ -715,18 +716,62 @@ def position_close_check(today: str) -> str:
 
 
 def get_open_positions() -> pd.DataFrame:
-    """当前持仓（open）+ 最新快照价 + 浮动盈亏（% 和 金额元）。"""
+    """当前持仓（open）+ 最新快照价 + 浮动盈亏（% 和 金额元）+ 可卖/止盈止损价。"""
     with _conn() as c:
         df = pd.read_sql("SELECT * FROM positions WHERE status='open' ORDER BY id DESC", c)
     if df.empty:
         return df
+    today = datetime.now().strftime("%Y-%m-%d")
     prices = _latest_prices(list(df["code"]))
     df["最新价"] = df["code"].map(lambda x: (prices.get(x) or (None,))[0])
     df["浮动盈亏%"] = (df["最新价"] / df["buy_price"] - 1) * 100
     df["浮动盈亏额"] = (df["最新价"] - df["buy_price"]) * df["shares"].fillna(0)
     df["持有交易日"] = df["buy_date"].map(
-        lambda d: _trade_days_between(str(d), datetime.now().strftime("%Y-%m-%d")))
+        lambda d: _trade_days_between(str(d), today))
+    df["可卖(股)"] = df.apply(
+        lambda r: int(r["shares"] or 0) if str(r["buy_date"]) < today else 0, axis=1)
+    df["止盈价"] = (df["buy_price"] * (1 + DEFAULT_RULES["take_profit"])).round(2)
+    df["止损价"] = (df["buy_price"] * (1 + DEFAULT_RULES["stop_loss"])).round(2)
     return df
+
+
+def manual_sell(position_id: int, shares: int) -> str:
+    """手动卖出 AI 自动持仓：走柜台真实卖出（回笼资金、T+1 校验），成功后平仓/减仓记录。"""
+    import broker
+    today = datetime.now().strftime("%Y-%m-%d")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with _conn() as c:
+        df = pd.read_sql("SELECT * FROM positions WHERE id=? AND status='open'",
+                         c, params=(int(position_id),))
+    if df.empty:
+        return "持仓不存在或已平仓"
+    p = df.iloc[0]
+    shares = int(shares)
+    held = int(p["shares"] or 0)
+    if shares <= 0 or shares > held:
+        return "卖出数量超出持仓"
+    if str(p["buy_date"]) >= today:
+        return "T+1：当日买入不可当日卖出"
+    msg = broker.place_order(str(p["code"]), "sell", None, shares, source="ai")
+    if "已成交" not in msg:
+        return msg
+    m = re.search(r"@ ([\d.]+)", msg)
+    fill = float(m.group(1)) if m else None
+    with _conn() as c:
+        if shares >= held:
+            pnl = (round(fill / p["buy_price"] - 1 - DEFAULT_RULES["cost"], 6)
+                   if fill and p["buy_price"] else None)
+            c.execute("UPDATE positions SET status='closed', sell_date=?, sell_price=?,"
+                      " sell_ts=?, sell_reason='手动卖出', pnl_pct=?, hold_days=?, closed_at=?"
+                      " WHERE id=?",
+                      (today, fill, now, pnl,
+                       _trade_days_between(str(p["buy_date"]), today), now, int(position_id)))
+        else:
+            c.execute("UPDATE positions SET shares=?, buy_amount=? WHERE id=?",
+                      (held - shares,
+                       round(float(p["buy_amount"] or 0) - shares * fill, 2) if fill else None,
+                       int(position_id)))
+    return f"已成交：卖出 {p['code']} {shares}股 @ {fill:.2f}"
 
 
 def get_position_history(limit: int = 100) -> pd.DataFrame:

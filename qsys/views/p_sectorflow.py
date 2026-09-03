@@ -1,12 +1,14 @@
-"""🌐 板块资金流 — 行业板块 / 概念板块 / 地域板块分类展示 + 板块轮动图。
+"""🌐 板块资金流 — 概念板块 / 同花顺板块 / 地域板块 / 证监会板块分类展示 + 板块轮动图。
 
 数据源：
-  - 行业板块：同花顺行业板块 summary（90 板块，含净流入/涨跌幅/成交额/领涨股）
   - 概念板块：同花顺概念板块 list（375 概念）+ 概念指数历史（轮动图）
-  - 地域板块：暂无公开 API，预留占位
+  - 同花顺板块：同花顺行业板块 summary（90 板块，含净流入/涨跌幅/成交额/领涨股）
+  - 地域板块：同花顺地域板块（33 地域，含净流入/涨跌幅/成交额/领涨股）
+  - 证监会板块：同花顺证监会行业板块（19 板块，含涨跌幅/成交额/领涨股）
   - 轮动热力图：行业板块指数历史（stock_board_industry_index_ths）
 """
 
+import re
 import time
 from datetime import datetime, timedelta
 
@@ -19,7 +21,7 @@ import ifind_hub
 
 # ---------------------------------------------------------------- 数据获取（缓存） ----------------------------------------------------------------
 
-@st.cache_data(ttl=600, show_spinner="加载行业板块数据…")
+@st.cache_data(ttl=600, show_spinner="加载同花顺行业板块数据…")
 def _fetch_industry_summary() -> pd.DataFrame:
     """同花顺行业板块实时行情（90 板块）。"""
     import akshare as ak
@@ -82,6 +84,77 @@ def _fetch_concept_members(name: str) -> pd.DataFrame:
         return df if df is not None else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
+
+
+def _parse_10jqka_table(url: str) -> pd.DataFrame:
+    """通用：解析同花顺页面 HTML 表格。"""
+    import requests
+    try:
+        r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
+        r.encoding = "gbk"
+        html = r.text
+        table_start = html.find("<table")
+        if table_start < 0:
+            return pd.DataFrame()
+        table_end = html.find("</table>", table_start) + 8
+        table_html = html[table_start:table_end]
+        # 表头
+        ths = re.findall(r"<th[^>]*>(.*?)</th>", table_html, re.S)
+        headers = [re.sub(r"<[^>]+>", "", th).strip() for th in ths]
+        # 数据行
+        rows = re.findall(r"<tr[^>]*>(.*?)</tr>", table_html, re.S)
+        data = []
+        for row in rows:
+            tds = re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)
+            texts = [re.sub(r"<[^>]+>", "", td).strip() for td in tds]
+            if texts and len(texts) >= len(headers):
+                data.append(texts[: len(headers)])
+        if not data:
+            return pd.DataFrame()
+        return pd.DataFrame(data, columns=headers)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=600, show_spinner="加载地域板块数据…")
+def _fetch_regional() -> pd.DataFrame:
+    """同花顺地域板块（33 地域，含净流入/涨跌幅/成交额/领涨股）。"""
+    df = _parse_10jqka_table("https://q.10jqka.com.cn/dy/")
+    if df.empty:
+        return df
+    # 统一列名
+    rename = {
+        "涨跌幅(%)": "涨跌幅", "总成交量（万手）": "总成交量",
+        "总成交额（亿元）": "总成交额", "净流入（亿元）": "净流入",
+    }
+    df.rename(columns=rename, inplace=True)
+    # 数值化
+    for col in ["涨跌幅", "总成交额", "净流入", "均价", "最新价"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ["上涨家数", "下跌家数"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    return df
+
+
+@st.cache_data(ttl=600, show_spinner="加载证监会板块数据…")
+def _fetch_csrc() -> pd.DataFrame:
+    """同花顺证监会行业板块（19 板块，含涨跌幅/成交额/领涨股）。"""
+    df = _parse_10jqka_table("https://q.10jqka.com.cn/zjhhy/")
+    if df.empty:
+        return df
+    rename = {
+        "总成交量（万手）": "总成交量", "总成交额（亿元）": "总成交额",
+    }
+    df.rename(columns=rename, inplace=True)
+    for col in ["涨跌幅", "总成交额", "最新价"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    for col in ["公司家数", "上涨家数", "下跌家数"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+    return df
 
 
 # ---------------------------------------------------------------- 通用渲染 ----------------------------------------------------------------
@@ -158,28 +231,26 @@ def _cum_flow_chart(daily_flow: pd.DataFrame, name: str, key: str = ""):
 
 def render():
     st.title("🌐 板块资金流")
-    st.caption("数据源：同花顺行业/概念板块 · 净流入为代理指标 · 行业板块日刷新，概念板块指数日更新")
+    st.caption("数据源：同花顺行业/概念/地域/证监会板块 · 净流入为代理指标 · 行业板块日刷新，概念板块指数日更新")
     ifind_hub.header()
 
-    t_con, t_ths, t_reg = st.tabs(["💡 概念板块", "📊 同花顺板块", "🗺️ 地域板块"])
+    t_con, t_ths, t_reg, t_csrc = st.tabs(["💡 概念板块", "📊 同花顺板块", "🗺️ 地域板块", "🏛️ 证监会板块"])
 
-    # ==================== 💡 概念板块 ====================
     with t_con:
         _render_concept()
-
-    # ==================== 📊 同花顺板块 ====================
     with t_ths:
         _render_ths_industry()
-
-    # ==================== 🗺️ 地域板块 ====================
     with t_reg:
         _render_regional()
+    with t_csrc:
+        _render_csrc()
 
     with st.expander("📖 数据口径说明"):
         st.markdown(
             "- **概念板块**：同花顺 375 个概念板块名称 + 概念指数历史 K 线（轮动对比）\n"
             "- **同花顺板块**：同花顺 90 个行业板块实时行情（净流入/涨跌幅/成交额/领涨股）+ 行业指数轮动\n"
-            "- **地域板块**：暂无公开 API（预留）\n"
+            "- **地域板块**：同花顺 33 个地域板块实时行情（净流入/涨跌幅/成交额/领涨股）\n"
+            "- **证监会板块**：同花顺 19 个证监会行业分类板块（涨跌幅/成交额/领涨股）\n"
             "- 真实主力资金流向属 L2 数据，以上净流入为代理指标")
 
 
@@ -194,7 +265,6 @@ def _render_ths_industry():
 
     with t1:
         st.markdown(f"**同花顺 90 行业板块 · 实时资金流**（{datetime.now():%Y-%m-%d %H:%M}）")
-        # 排序
         sort_options = ["净流入", "涨跌幅", "总成交额", "上涨家数"]
         sort_col = st.radio("排序", sort_options, horizontal=True, key="ind_sort")
         ascending = sort_col == "下跌家数"
@@ -210,7 +280,6 @@ def _render_ths_industry():
                            file_name=f"industry_flow_{datetime.now():%Y%m%d}.csv",
                            key="ind_dl")
 
-        # 资金流入/流出 TOP20
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("**资金净流入 TOP15**")
@@ -224,15 +293,12 @@ def _render_ths_industry():
         st.markdown("**行业板块轮动热力图**（红=上涨 绿=下跌；颜色漂移=轮动）")
         period = st.radio("回看天数", [10, 20, 30, 60], index=1, horizontal=True, key="ind_rot_period")
 
-        # 加载行业板块历史数据做热力图
-        # 取净流入最大的 N 个行业
         top_sectors = df.nlargest(20, "净流入")["板块"].tolist()
         selected = st.multiselect("选择板块（默认净流入 TOP20）", df["板块"].tolist(),
                                   default=top_sectors[:10], key="ind_rot_sel")
         if not selected:
             selected = top_sectors[:10]
 
-        # 逐个加载历史指数
         all_hist = {}
         prog = st.progress(0, text="加载板块历史数据…")
         for i, name in enumerate(selected):
@@ -243,7 +309,6 @@ def _render_ths_industry():
         prog.empty()
 
         if all_hist:
-            # 构建涨跌幅 pivot
             chg_data = {}
             for name, hist in all_hist.items():
                 s = hist.set_index("日期")["收盘价"].pct_change().dropna() * 100
@@ -253,7 +318,6 @@ def _render_ths_industry():
                 chg_df = chg_df.tail(period)
                 _rotation_heatmap(chg_df.T, title=f"行业板块轮动（近{period}交易日）", key="ind_heatmap")
 
-            # 相对强弱
             st.markdown("**相对强弱指数（期初=100）**")
             rs_data = {}
             for name, hist in all_hist.items():
@@ -283,11 +347,8 @@ def _render_ths_industry():
             c3.metric("总成交额", f"{row['总成交额']:.2f}亿")
             c4.metric("涨/跌", f"{row['上涨家数']}/{row['下跌家数']}")
 
-            # 板块资金流历史
             hist = _fetch_industry_index(sel, days=60)
             if not hist.empty:
-                daily_flow = hist.set_index("日期")["成交额"].pct_change().dropna() * 0  # placeholder
-                # 用收盘价变化作为资金流代理
                 close = hist.set_index("日期")["收盘价"]
                 daily_chg = close.pct_change().dropna() * 100
                 fig = go.Figure()
@@ -297,7 +358,6 @@ def _render_ths_industry():
                                   height=250, margin=dict(l=10, r=10, t=10, b=10))
                 st.plotly_chart(fig, width="stretch")
 
-            # 成分股
             try:
                 import akshare as ak
                 cons = ak.stock_board_industry_cons_em(symbol=sel)
@@ -318,7 +378,6 @@ def _render_concept():
             st.warning("概念板块数据加载失败，请稍后重试")
             return
         st.markdown(f"**同花顺 {len(df)} 个概念板块**")
-        # 搜索过滤
         q = st.text_input("🔍 搜索概念", placeholder="输入关键词如 AI、芯片、新能源…", key="con_search")
         filtered = df
         if q:
@@ -346,11 +405,10 @@ def _render_concept():
                 hist = _fetch_concept_index(name, days=period)
                 if not hist.empty:
                     indices[name] = hist.set_index("日期")["收盘价"]
-                time.sleep(0.3)  # 避免请求过快
+                time.sleep(0.3)
             prog.empty()
 
             if indices:
-                # 走势对比（归一化）
                 st.markdown("**走势对比（期初=100）**")
                 fig = go.Figure()
                 for name, s in indices.items():
@@ -362,7 +420,6 @@ def _render_concept():
                                   height=380, margin=dict(l=10, r=10, t=10, b=10), legend=dict(orientation="h"))
                 st.plotly_chart(fig, width="stretch")
 
-                # 轮动热力图
                 st.markdown("**概念轮动热力图**")
                 chg_data = {}
                 for name, s in indices.items():
@@ -375,16 +432,112 @@ def _render_concept():
 
 
 def _render_regional():
-    """🗺️ 地域板块（占位）。"""
-    st.info("地域板块数据暂未接入（同花顺/东财公开 API 暂无地域板块实时资金流接口）。")
-    st.markdown("""
-    **可替代方案：**
-    - 东财地域板块行情（`stock_board_region_name_em`，东财连接不稳定）
-    - 手工维护地域-股票映射表，结合快照计算资金流
-    - 接入 iFinD 地域板块报表（需开通权限）
+    """🗺️ 地域板块：资金排行 + 轮动热力图。"""
+    df = _fetch_regional()
+    if df.empty:
+        st.warning("地域板块数据加载失败，请稍后重试")
+        return
 
-    当前可用的板块分类：**行业板块**（90 个，含资金流）和 **概念板块**（375 个，含指数走势）。
-    """)
+    t1, t2 = st.tabs(["💰 资金排行", "📊 轮动热力图"])
+
+    with t1:
+        st.markdown(f"**同花顺 {len(df)} 个地域板块 · 实时资金流**（{datetime.now():%Y-%m-%d %H:%M}）")
+        sort_options = ["净流入", "涨跌幅", "总成交额", "上涨家数"]
+        sort_col = st.radio("排序", sort_options, horizontal=True, key="reg_sort")
+        d = df.sort_values(sort_col, ascending=False).reset_index(drop=True)
+        d.insert(0, "排名", range(1, len(d) + 1))
+        show_cols = ["排名", "板块", "涨跌幅", "总成交额", "净流入", "上涨家数", "下跌家数", "领涨股"]
+        show = d[[c for c in show_cols if c in d.columns]]
+        st.dataframe(show, width="stretch", hide_index=True, height=min(32 * (len(show) + 1) + 3, 620))
+
+        st.download_button(f"📥 导出CSV（{len(d)}行）",
+                           d.to_csv(index=False, encoding="utf-8-sig"),
+                           file_name=f"regional_flow_{datetime.now():%Y%m%d}.csv",
+                           key="reg_dl")
+
+        # 净流入 TOP / BOTTOM
+        has_flow = "净流入" in df.columns and df["净流入"].notna().any()
+        if has_flow:
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**净流入 TOP10**")
+                _flow_bar(df, "板块", "净流入", top_n=10, key="reg_flow_in")
+            with c2:
+                st.markdown("**净流出 TOP10**")
+                top_out = df.nsmallest(10, "净流入").sort_values("净流入", ascending=False)
+                _flow_bar(top_out, "板块", "净流入", top_n=10, key="reg_flow_out")
+        else:
+            st.info("地域板块暂无净流入数据")
+
+    with t2:
+        st.markdown("**地域板块涨跌幅分布**")
+        d_sorted = df.sort_values("涨跌幅", ascending=True)
+        colors = [_signed_color(v) for v in d_sorted["涨跌幅"]]
+        fig = go.Figure(go.Bar(
+            x=d_sorted["涨跌幅"], y=d_sorted["板块"], orientation="h",
+            marker_color=colors,
+            text=[f"{v:+.2f}%" for v in d_sorted["涨跌幅"]],
+            textposition="outside", textfont=dict(size=10)))
+        fig.update_layout(
+            height=max(400, 22 * len(d_sorted) + 80),
+            margin=dict(l=10, r=10, t=10, b=10),
+            template="plotly_dark", paper_bgcolor="#101010", plot_bgcolor="#101010",
+            xaxis=dict(title="涨跌幅(%)", gridcolor="#333"),
+            yaxis=dict(gridcolor="#333", automargin=True),
+            title="地域板块涨跌幅排行")
+        st.plotly_chart(fig, width="stretch")
+
+
+def _render_csrc():
+    """🏛️ 证监会板块：涨跌幅排行 + 成交额分布。"""
+    df = _fetch_csrc()
+    if df.empty:
+        st.warning("证监会板块数据加载失败，请稍后重试")
+        return
+
+    st.markdown(f"**同花顺 {len(df)} 个证监会行业板块**（{datetime.now():%Y-%m-%d %H:%M}）")
+
+    show_cols = ["板块", "公司家数", "涨跌幅", "总成交额", "上涨家数", "下跌家数", "领涨股"]
+    show = df[[c for c in show_cols if c in df.columns]]
+    st.dataframe(show, width="stretch", hide_index=True, height=min(32 * (len(show) + 1) + 3, 500))
+
+    st.download_button(f"📥 导出CSV（{len(df)}行）",
+                       df.to_csv(index=False, encoding="utf-8-sig"),
+                       file_name=f"csrc_flow_{datetime.now():%Y%m%d}.csv",
+                       key="csrc_dl")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**涨跌幅排行**")
+        d_sorted = df.sort_values("涨跌幅", ascending=True)
+        colors = [_signed_color(v) for v in d_sorted["涨跌幅"]]
+        fig = go.Figure(go.Bar(
+            x=d_sorted["涨跌幅"], y=d_sorted["板块"], orientation="h",
+            marker_color=colors,
+            text=[f"{v:+.2f}%" for v in d_sorted["涨跌幅"]],
+            textposition="outside", textfont=dict(size=10)))
+        fig.update_layout(
+            height=max(350, 22 * len(d_sorted) + 80),
+            margin=dict(l=10, r=10, t=10, b=10),
+            template="plotly_dark", paper_bgcolor="#101010", plot_bgcolor="#101010",
+            xaxis=dict(title="涨跌幅(%)", gridcolor="#333"),
+            yaxis=dict(gridcolor="#333", automargin=True))
+        st.plotly_chart(fig, width="stretch")
+    with c2:
+        st.markdown("**成交额分布**")
+        d_sorted = df.sort_values("总成交额", ascending=True)
+        fig = go.Figure(go.Bar(
+            x=d_sorted["总成交额"], y=d_sorted["板块"], orientation="h",
+            marker_color="#42a5f5",
+            text=[f"{v:.1f}" for v in d_sorted["总成交额"]],
+            textposition="outside", textfont=dict(size=10)))
+        fig.update_layout(
+            height=max(350, 22 * len(d_sorted) + 80),
+            margin=dict(l=10, r=10, t=10, b=10),
+            template="plotly_dark", paper_bgcolor="#101010", plot_bgcolor="#101010",
+            xaxis=dict(title="总成交额(亿)", gridcolor="#333"),
+            yaxis=dict(gridcolor="#333", automargin=True))
+        st.plotly_chart(fig, width="stretch")
 
 
 render()

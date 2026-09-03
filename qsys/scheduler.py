@@ -9,6 +9,7 @@
 import json
 import tarfile
 import tempfile
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
@@ -646,7 +647,7 @@ def job_ifind_cleanup(**_ignored) -> str:
 
 
 def job_le_factor_eval(batch: int = 60, pool_name: str = "沪深300") -> str:
-    """LoopEngine 因子滚动体检（每晚）：族配额优先取一批出评分卡。
+    """LoopEngine 因子滚动体检（每晚一批）：族配额优先取一批出评分卡。
 
     演化引擎日产出数百因子，全量体检不现实；每晚一批滚动覆盖：已评估覆盖越少的
     机制族越优先，族内按最久未评估轮询（因子会衰减）。
@@ -721,6 +722,30 @@ def job_le_factor_eval(batch: int = 60, pool_name: str = "沪深300") -> str:
             f"/{len(reg[reg['engine']=='loopengine'])}")
 
 
+def job_fundflow_sync(pool_name: str = "自选股", **_ignored) -> str:
+    """个股资金流每日入库：自选股近30日日资金流 + 当日分时资金流。"""
+    codes = load_watchlist() if pool_name == "自选股" else (all_pools().get(pool_name) or [])
+    if not codes:
+        return f"{pool_name} 为空，跳过"
+    n_daily = n_intra = 0
+    failed = []
+    for code in codes:
+        try:
+            n_daily += datasource.fetch_stock_fundflow_daily(code, limit=30)
+        except Exception:
+            failed.append(code)
+        try:
+            n_intra += datasource.fetch_stock_fundflow_intraday(code)
+        except Exception:
+            if code not in failed:
+                failed.append(code)
+        time.sleep(0.3)
+    msg = f"资金流入库：{len(codes)} 只 · 日线 {n_daily} 行 · 分时 {n_intra} 行"
+    if failed:
+        msg += f" · 失败 {len(failed)} 只（{','.join(failed[:5])}{'…' if len(failed) > 5 else ''}）"
+    return msg
+
+
 # ---------------------------------------------------------------- 调度器
 JOBS = {
     "update_data": {"name": "📥 每日数据更新", "func": job_update_data,
@@ -789,6 +814,9 @@ JOBS = {
     "event_mine": {"name": "🧬 事件定向挖因子（涨停等）", "func": job_event_mine,
                    "default": {"enabled": False, "hour": 22, "minute": 30,
                                "params": {"kind": "涨停", "batch": 30, "horizon": 5}}},
+    "fundflow_sync": {"name": "💰 个股资金流入库（盘后）", "func": job_fundflow_sync,
+                      "default": {"enabled": False, "hour": 16, "minute": 10,
+                                  "params": {"pool_name": "自选股"}}},
 }
 
 

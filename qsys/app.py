@@ -46,6 +46,7 @@ pages = {
         st.Page("views/p_kline.py", title="自选K线", icon="🕯️", url_path="kline"),
         st.Page("views/p_kpro.py", title="专业K线", icon="📉", url_path="kpro"),
         st.Page("views/p_sectorflow.py", title="板块资金流", icon="🌐", url_path="sectorflow"),
+        st.Page("views/p_stock_fundflow.py", title="个股资金流", icon="💰", url_path="fundflow"),
     ],
     # iFinD 数据中心：独立菜单板块，每个子页只展示对应数据（逻辑在 ifind_hub.py）
     # （实时行情/历史行情/高频行情/日内快照/基本面数据/特色数据 已下线——被「行情」页覆盖或用不到，页面文件保留在 views/ 可随时恢复）

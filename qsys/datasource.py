@@ -2037,3 +2037,143 @@ def get_stocklist_from_db() -> pd.DataFrame:
                         mask = mapped.notna()
                         df.loc[mask, col] = mapped[mask]
     return df
+
+
+# ---------------------------------------------------------------- 个股资金流（东财 API → market.db） ----------------------------------------------------------------
+_FUND_FLOW_SCHEMA = """
+CREATE TABLE IF NOT EXISTS stock_fundflow_daily(
+    code TEXT NOT NULL, date TEXT NOT NULL,
+    main_net REAL, main_pct REAL,
+    super_net REAL, super_pct REAL,
+    big_net REAL, big_pct REAL,
+    mid_net REAL, mid_pct REAL,
+    small_net REAL, small_pct REAL,
+    fetched_at TEXT,
+    PRIMARY KEY(code, date));
+CREATE TABLE IF NOT EXISTS stock_fundflow_intraday(
+    code TEXT NOT NULL, datetime TEXT NOT NULL,
+    main_net REAL, small_net REAL, mid_net REAL, big_net REAL, super_net REAL,
+    fetched_at TEXT,
+    PRIMARY KEY(code, datetime));
+CREATE INDEX IF NOT EXISTS idx_fundflow_daily_code ON stock_fundflow_daily(code);
+"""
+
+
+def _ensure_fundflow_db():
+    with _conn() as c:
+        c.executescript(_FUND_FLOW_SCHEMA)
+
+
+def _to_em_secid(code: str) -> str:
+    """SH600519 → 1.600519; SZ000001 → 0.000001（东财 secid 格式）。"""
+    m = re.match(r"^([A-Za-z]{2})(\d{6})$", code)
+    if not m:
+        return f"1.{code}"
+    prefix = "1" if m.group(1).upper() == "SH" else "0"
+    return f"{prefix}.{m.group(2)}"
+
+
+def fetch_stock_fundflow_daily(code: str, limit: int = 60) -> int:
+    """从东财 push2his 拉取个股近 N 日主力/大单/中单/小单资金流向，写入 stock_fundflow_daily。"""
+    import requests as _req
+    _ensure_fundflow_db()
+    secid = _to_em_secid(code)
+    url = (f"https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get?"
+           f"secid={secid}&fields1=f1,f2,f3,f7"
+           f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65"
+           f"&lmt={limit}")
+    r = _req.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://data.eastmoney.com"})
+    data = r.json().get("data") or {}
+    klines = data.get("klines") or []
+    if not klines:
+        return 0
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = []
+    for line in klines:
+        parts = line.split(",")
+        if len(parts) < 11:
+            continue
+        date = parts[0]
+        main, small, mid, big, super_ = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])
+        main_pct = float(parts[6])
+        super_pct = float(parts[7]) if len(parts) > 7 else 0
+        big_pct = float(parts[8]) if len(parts) > 8 else 0
+        mid_pct = float(parts[9]) if len(parts) > 9 else 0
+        small_pct = float(parts[10]) if len(parts) > 10 else 0
+        rows.append((code, date, main, main_pct, super_, super_pct, big, big_pct, mid, mid_pct, small, small_pct, now))
+    with _conn() as c:
+        c.executemany(
+            "INSERT OR REPLACE INTO stock_fundflow_daily"
+            "(code,date,main_net,main_pct,super_net,super_pct,big_net,big_pct,mid_net,mid_pct,small_net,small_pct,fetched_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+    return len(rows)
+
+
+def fetch_stock_fundflow_intraday(code: str) -> int:
+    """从东财 push2 拉取个股今日分时资金流（约 240 条），写入 stock_fundflow_intraday。"""
+    import requests as _req
+    _ensure_fundflow_db()
+    secid = _to_em_secid(code)
+    url = (f"https://push2.eastmoney.com/api/qt/stock/fflow/kline/get?"
+           f"secid={secid}&fields1=f1,f2,f3,f7"
+           f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65"
+           f"&klt=1&lmt=0")
+    r = _req.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://data.eastmoney.com"})
+    data = r.json().get("data") or {}
+    klines = data.get("klines") or []
+    if not klines:
+        return 0
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = []
+    for line in klines:
+        parts = line.split(",")
+        if len(parts) < 6:
+            continue
+        dt = parts[0]
+        main, small, mid, big, super_ = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])
+        rows.append((code, dt, main, small, mid, big, super_, now))
+    with _conn() as c:
+        c.executemany(
+            "INSERT OR REPLACE INTO stock_fundflow_intraday"
+            "(code,datetime,main_net,small_net,mid_net,big_net,super_net,fetched_at)"
+            " VALUES (?,?,?,?,?,?,?,?)", rows)
+    return len(rows)
+
+
+def get_fundflow_daily(code: str, days: int = 30) -> pd.DataFrame:
+    """读取个股近 N 日资金流向（本地库优先，不足自动补拉）。"""
+    _ensure_fundflow_db()
+    with _conn() as c:
+        df = pd.read_sql(
+            "SELECT * FROM stock_fundflow_daily WHERE code=? ORDER BY date DESC LIMIT ?",
+            c, params=(code, days))
+    if len(df) < days:
+        try:
+            fetch_stock_fundflow_daily(code, limit=days + 10)
+            with _conn() as c:
+                df = pd.read_sql(
+                    "SELECT * FROM stock_fundflow_daily WHERE code=? ORDER BY date DESC LIMIT ?",
+                    c, params=(code, days))
+        except Exception:
+            pass
+    return df.sort_values("date") if not df.empty else df
+
+
+def get_fundflow_intraday(code: str) -> pd.DataFrame:
+    """读取个股今日分时资金流（本地库优先，不足自动补拉）。"""
+    _ensure_fundflow_db()
+    today = datetime.now().strftime("%Y-%m-%d")
+    with _conn() as c:
+        df = pd.read_sql(
+            "SELECT * FROM stock_fundflow_intraday WHERE code=? AND datetime LIKE ? ORDER BY datetime",
+            c, params=(code, f"{today}%"))
+    if df.empty:
+        try:
+            fetch_stock_fundflow_intraday(code)
+            with _conn() as c:
+                df = pd.read_sql(
+                    "SELECT * FROM stock_fundflow_intraday WHERE code=? AND datetime LIKE ? ORDER BY datetime",
+                    c, params=(code, f"{today}%"))
+        except Exception:
+            pass
+    return df

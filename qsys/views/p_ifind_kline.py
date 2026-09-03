@@ -513,14 +513,11 @@ def render():
     with _ar3:
         _auto = st.toggle("自动刷新(30s)", value=False, key="kline_auto")
 
-    # 演化因子/策略叠加（仅日K）：搜索 + 因子（高胜率优先）+ 策略包
-    _f1, _f2, _f3 = st.columns([1, 2, 1.5])
-    with _f1:
-        fac_kw = st.text_input("演化因子搜索", key="kline_fac_kw",
-                               placeholder="关键字筛选（如 跳空/动量）")
+    # 演化因子/策略叠加（仅日K）：单个可搜索下拉（点开可输入关键字过滤，高胜率优先）
+    _f2, _f3 = st.columns([2, 1.5])
     with _f2:
-        fac_opts = ["（不叠加）"] + _factor_choices(fac_kw)
-        fac_sel = st.selectbox("演化因子（高胜率优先）", fac_opts,
+        fac_opts = ["（不叠加）"] + _factor_choices("", limit=1000)
+        fac_sel = st.selectbox("演化因子（高胜率优先，点开可输入关键字搜索）", fac_opts,
                                format_func=_factor_label, key="kline_fac")
     with _f3:
         pack_opts = ["（不选策略）"] + list(_load_packs().keys())

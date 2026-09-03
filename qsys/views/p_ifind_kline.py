@@ -268,20 +268,27 @@ def _load_factor_registry() -> pd.DataFrame:
     return le.sort_values("wr5", ascending=False, na_position="last").reset_index(drop=True)
 
 
-def _factor_choices(kw: str, limit: int = 200) -> list[str]:
+def _factor_choices(kw: str, limit: int = 80) -> list[str]:
     facs = _load_factor_registry()
     if kw.strip():
         facs = facs[facs["name"].str.contains(kw.strip(), na=False)]
     return facs["name"].head(limit).tolist()
 
 
-def _factor_label(name: str) -> str:
+@st.cache_data(ttl=300, show_spinner=False)
+def _factor_label_map() -> dict:
+    """因子名 → 显示标签（含胜率），一次构建，format_func 里 O(1) 查询——
+    否则下拉每个选项都全表过滤一次（201 选项 × 2.8万行扫描，实测拖慢渲染）。"""
     facs = _load_factor_registry()
-    row = facs[facs["name"] == name]
-    if row.empty:
-        return name
-    wr = row.iloc[0].get("wr5")
-    return f"{name}（5日胜率 {wr:.0%}）" if pd.notna(wr) else f"{name}（无评分）"
+    out = {}
+    for r in facs.itertuples():
+        wr = getattr(r, "wr5", None)
+        out[r.name] = f"{r.name}（5日胜率 {wr:.0%}）" if pd.notna(wr) else f"{r.name}（无评分）"
+    return out
+
+
+def _factor_label(name: str) -> str:
+    return _factor_label_map().get(name, name)
 
 
 def _factor_code_by_name(name: str) -> str:

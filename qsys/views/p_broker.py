@@ -43,7 +43,7 @@ def render():
     with tab_pos:
         poss = broker.get_positions()
         if poss.empty:
-            st.info("柜台暂无持仓。去「🛒 买入」下单。")
+            st.info("柜台手动持仓暂无（你手动买入的会出现在这里）——每日名单自动开仓的持仓在下方「🤖 自动跟踪持仓」")
         else:
             show = pd.DataFrame({
                 "代码": poss["code"], "名称": poss["name"],

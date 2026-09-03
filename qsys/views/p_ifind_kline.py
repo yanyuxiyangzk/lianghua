@@ -179,14 +179,19 @@ def _norm_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
 
 def _load_kline(code: str, period: str) -> pd.DataFrame:
     today = datetime.now()
+    db_code = to_db_code(code)
     if period == "分时":
-        # 当日 1 分钟（非交易日回退 3 天）
+        # 当日 1 分钟：本地库读穿（缺数才线上补抓落库），非交易日回退 3 天
         for back in range(4):
             d = today - timedelta(days=back)
-            df, _, err = datasource.ths_highfreq(
-                code, "open,high,low,close,volume",
-                f"{d:%Y-%m-%d} 09:25:00", f"{d:%Y-%m-%d} 15:05:00", "1min")
-            df = _norm_ohlcv(df)
+            day = f"{d:%Y-%m-%d}"
+            df = datasource.get_minute_from_db(db_code, day)
+            if df.empty:
+                try:
+                    datasource.fetch_minute_to_db(db_code, day)  # 线上补抓落库
+                    df = datasource.get_minute_from_db(db_code, day)
+                except Exception:
+                    pass
             if not df.empty:
                 return df
         return pd.DataFrame()
@@ -204,14 +209,37 @@ def _load_kline(code: str, period: str) -> pd.DataFrame:
             start, today.strftime("%Y-%m-%d"),
             params=f"Interval:{iv},CPS:2,Fill:Omit")  # CPS:2 前复权
         return _norm_ohlcv(df)
-    # 分钟K
+    # 分钟K：本地 1 分钟线（读穿缓存）聚合
+    # 只回抓最近 3 天（防首次打开就补抓十天打满 iFinD）；更早的由每日盘中 minute_sync 逐步积累
     n = period.replace("分", "")
     span = 2 if n == "1" else (3 if n == "5" else 10)
-    start = (today - timedelta(days=span)).strftime("%Y-%m-%d 09:00:00")
-    df, _, err = datasource.ths_highfreq(
-        code, "open,high,low,close,volume", start,
-        today.strftime("%Y-%m-%d 15:05:00"), f"{n}min")
-    return _norm_ohlcv(df)
+    frames = []
+    for back in range(span + 2):  # 多回看2天兜底周末/缺数
+        d = today - timedelta(days=back)
+        if d.weekday() >= 5:
+            continue
+        day = f"{d:%Y-%m-%d}"
+        df = datasource.get_minute_from_db(db_code, day)
+        if df.empty and back <= 2:  # 只有近3天缺数才线上补抓
+            try:
+                datasource.fetch_minute_to_db(db_code, day)
+                df = datasource.get_minute_from_db(db_code, day)
+            except Exception:
+                pass
+        if not df.empty:
+            frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    big = pd.concat(frames).sort_index()
+    if n == "1":
+        return big
+    g = big.resample(f"{n}min")
+    out = pd.DataFrame({
+        "open": g["open"].first(), "high": g["high"].max(), "low": g["low"].min(),
+        "close": g["close"].last(), "volume": g["volume"].sum(),
+        "amount": g["amount"].sum(),
+    }).dropna(subset=["open", "close"])
+    return out
 
 
 # ---------------------------------------------------------------- 演化因子（loopengine 树因子求值叠加）

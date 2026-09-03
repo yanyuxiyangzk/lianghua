@@ -357,6 +357,39 @@ def job_position_track(**_ignored) -> str:
     return "；".join(p for p in parts if p)
 
 
+def job_minute_sync(**_ignored) -> str:
+    """盘中分钟线同步（每5分钟）：自选股+当前持仓+今日名单的 1 分钟线落库（ifind_minute 表）。
+    页面分时/分钟K 直接读本地库，不再每次直连 iFinD。"""
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5:
+        return "非交易日，跳过"
+    if not ("0930" <= now.strftime("%H%M") <= "1505"):
+        return "非交易时段，跳过"
+
+    import experience
+    today = now.strftime("%Y-%m-%d")
+    codes = set(load_watchlist())
+    with experience._conn() as c:
+        for r in c.execute("SELECT code FROM positions WHERE status IN ('open','pending')").fetchall():
+            codes.add(r[0])
+    latest = experience.list_pick_dates(limit=1)
+    if latest:
+        for r in experience.picks_on_date(latest[0]).itertuples():
+            for it in experience.pick_items_detail(int(r.id)).itertuples():
+                codes.add(it.code)
+    n_rows = n_ok = 0
+    for code in codes:
+        try:
+            n = datasource.fetch_minute_to_db(code, today)
+            n_rows += n
+            n_ok += 1 if n else 0
+        except Exception:
+            continue
+    return f"{now.strftime('%H:%M')} 分钟线同步：{n_ok}/{len(codes)} 只 · 写入 {n_rows} 行"
+
+
 def job_trade_simulate() -> str:
     """模拟交易回填：对经验库新名单按默认规则（止盈15%/止损-8%/持有20日）逐笔模拟平仓。"""
     import experience
@@ -744,6 +777,10 @@ JOBS = {
                        "default": {"enabled": False, "hour": 0, "minute": 0,
                                    "params": {"interval_sec": 300},
                                    "trigger": "interval"}},
+    "minute_sync": {"name": "⏱ 分钟线同步（盘中）", "func": job_minute_sync,
+                    "default": {"enabled": False, "hour": 0, "minute": 0,
+                                "params": {"interval_sec": 300},
+                                "trigger": "interval"}},
     "auction_confirm": {"name": "🔔 竞价确认（09:26 对最新名单）", "func": job_auction_confirm,
                         "default": {"enabled": False, "hour": 9, "minute": 26, "params": {}}},
     "le_factor_eval": {"name": "🧪 LoopEngine 因子滚动体检（每晚一批）", "func": job_le_factor_eval,

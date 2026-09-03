@@ -119,6 +119,10 @@ def _conn():
         quantity_ratio REAL, amplitude REAL,
         float_shares REAL, float_mv REAL,
         PRIMARY KEY(code, datetime));
+    CREATE TABLE IF NOT EXISTS ifind_minute(
+        code TEXT NOT NULL, datetime TEXT NOT NULL,
+        open REAL, high REAL, low REAL, close REAL, volume REAL, amount REAL,
+        PRIMARY KEY(code, datetime));
     CREATE TABLE IF NOT EXISTS ifind_config(
         key TEXT PRIMARY KEY,
         value TEXT,
@@ -1397,6 +1401,46 @@ def fetch_indexlist_to_db() -> int:
     return len(df)
 
 
+# ---------------------------------------------------------------- 分钟线落库（分时/分钟K 页面读库）
+def fetch_minute_to_db(code: str, day: str = "") -> int:
+    """THS_HF 拉取 code 在 day（YYYY-MM-DD）的 1 分钟线写入 ifind_minute 表，返回行数。
+
+    code 用库内格式（SH600519 / BJ920002）；day 缺省为今天。盘后抓当天全天，盘中抓到当前。
+    """
+    day = day or datetime.now().strftime("%Y-%m-%d")
+    df, _res, err = ths_highfreq(_to_ths_code(code), "open,high,low,close,volume,amount",
+                                 f"{day} 09:25:00", f"{day} 15:05:00", "1min")
+    if err not in (0, None) or df is None or df.empty:
+        return 0
+    d = df.copy()
+    d.columns = [str(c).strip().lower() for c in d.columns]
+    tcol = next((c for c in ("time", "datetime", "date") if c in d.columns), None)
+    if not tcol:
+        return 0
+    d["datetime"] = pd.to_datetime(d[tcol]).dt.strftime("%Y-%m-%d %H:%M:%S")
+    d["amount"] = d["amount"] if "amount" in d.columns else d["close"] * d["volume"]
+    vals = [(code, r.datetime, r.open, r.high, r.low, r.close, r.volume, r.amount)
+            for r in d.itertuples()]
+    with _qconn() as c:
+        c.executemany(
+            "INSERT OR REPLACE INTO ifind_minute"
+            "(code,datetime,open,high,low,close,volume,amount) VALUES (?,?,?,?,?,?,?,?)", vals)
+    return len(vals)
+
+
+def get_minute_from_db(code: str, day: str) -> pd.DataFrame:
+    """读本地 1 分钟线（datetime 索引 + ohlcv 列）。"""
+    with _qconn() as c:
+        df = pd.read_sql(
+            "SELECT datetime, open, high, low, close, volume, amount FROM ifind_minute"
+            " WHERE code=? AND datetime LIKE ? ORDER BY datetime",
+            c, params=(code, f"{day}%"))
+    if df.empty:
+        return df
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    return df.set_index("datetime")
+
+
 def get_indexlist_from_db() -> pd.DataFrame:
     """从 ifind_indexlist 表读取指数列表（宽基 → 沪深 → 行业 → 主题，同类按代码）。"""
     with _qconn() as c:
@@ -1880,6 +1924,7 @@ def cleanup_old_data(retention_days: dict = None):
     if retention_days is None:
         retention_days = {
             "ifind_realtime": 7,
+            "ifind_minute": 7,
             "market_daily": 15,
             "ifind_basic_daily": 15,
             "ifind_announcements": 7,
@@ -1890,7 +1935,7 @@ def cleanup_old_data(retention_days: dict = None):
             if table == "ifind_announcements":
                 cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
                 c.execute(f"DELETE FROM {table} WHERE ctime < ?", (cutoff,))
-            elif table == "ifind_realtime":
+            elif table in ("ifind_realtime", "ifind_minute"):
                 cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
                 c.execute(f"DELETE FROM {table} WHERE datetime < ?", (cutoff,))
             elif table in ("market_daily", "ifind_basic_daily"):

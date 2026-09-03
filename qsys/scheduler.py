@@ -328,6 +328,28 @@ def job_top5_composite() -> str:
     return f"Top5复合：IC={r['IC']} 夏普={r['sharpe']} 年化超额={r['年化超额']:.1%} | {members}"
 
 
+def job_position_track(**_ignored) -> str:
+    """持仓跟踪（盘中每5分钟）：最新名单触发开仓 + 持仓止盈/止损/到期平仓（T+1）。
+
+    开仓：最新交易日名单（两条轨）→ 当前快照价买入（竞价回避的跳过）。
+    平仓：买入日次一交易日起，盘中触发 止盈+15%/止损-8%/到期20日 即按触发价平仓。
+    """
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5:
+        return "非交易日，跳过"
+    if not ("0930" <= now.strftime("%H%M") <= "1500"):
+        return "非交易时段，跳过"
+
+    import experience
+    today = now.strftime("%Y-%m-%d")
+    latest = experience.list_pick_dates(limit=1)
+    m1 = experience.position_open_from_picks(latest[0], today) if latest else "无名单"
+    m2 = experience.position_close_check(today)
+    return f"{m1}；{m2}"
+
+
 def job_trade_simulate() -> str:
     """模拟交易回填：对经验库新名单按默认规则（止盈15%/止损-8%/持有20日）逐笔模拟平仓。"""
     import experience
@@ -711,6 +733,10 @@ JOBS = {
                        "default": {"enabled": False, "hour": 18, "minute": 20, "params": {}}},
     "trade_simulate": {"name": "📈 模拟交易回填（每日）", "func": job_trade_simulate,
                        "default": {"enabled": False, "hour": 20, "minute": 5, "params": {}}},
+    "position_track": {"name": "📦 持仓跟踪（盘中开平仓）", "func": job_position_track,
+                       "default": {"enabled": False, "hour": 0, "minute": 0,
+                                   "params": {"interval_sec": 300},
+                                   "trigger": "interval"}},
     "auction_confirm": {"name": "🔔 竞价确认（09:26 对最新名单）", "func": job_auction_confirm,
                         "default": {"enabled": False, "hour": 9, "minute": 26, "params": {}}},
     "le_factor_eval": {"name": "🧪 LoopEngine 因子滚动体检（每晚一批）", "func": job_le_factor_eval,

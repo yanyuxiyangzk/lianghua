@@ -35,6 +35,20 @@ CREATE TABLE IF NOT EXISTS trades (
 );
 """
 
+_POSITIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL, name TEXT,
+    buy_date TEXT NOT NULL, buy_price REAL, buy_ts TEXT,
+    pick_id INTEGER, source TEXT, pack_name TEXT,
+    status TEXT DEFAULT 'open',
+    sell_date TEXT, sell_price REAL, sell_ts TEXT, sell_reason TEXT,
+    pnl_pct REAL, hold_days INTEGER,
+    created_at TEXT, closed_at TEXT,
+    UNIQUE(code, buy_date, source)
+);
+"""
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS picks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -63,6 +77,7 @@ def _conn():
     c = sqlite3.connect(DB_PATH)
     c.executescript(_SCHEMA)
     c.executescript(_TRADES_SCHEMA)
+    c.executescript(_POSITIONS_SCHEMA)
     # 迁移：picks 增加数据来源字段（老库无此列则补上）
     cols = [r[1] for r in c.execute("PRAGMA table_info(picks)")]
     if "data_source" not in cols:
@@ -475,3 +490,167 @@ def export_experience_report(out_path: Path | None = None) -> Path:
               "> 仅作方向参考。该报告可由 RD-Agent 的 fin_factor_report 场景作为先验知识读取。"]
     out_path.write_text("\n".join(lines))
     return out_path
+
+
+# ---------------------------------------------------------------- 持仓跟踪（盘中触发开平仓，T+1）
+def _latest_prices(codes: list[str]) -> dict:
+    """ifind_realtime 最新一批快照 {code: (price, open, prev_close)}。"""
+    import datasource
+    if not codes:
+        return {}
+    with datasource._qconn() as c:
+        df = pd.read_sql(
+            f"SELECT code, price, open, prev_close FROM ifind_realtime"
+            f" WHERE datetime=(SELECT MAX(datetime) FROM ifind_realtime)"
+            f" AND code IN ({','.join('?' * len(codes))})", c, params=codes)
+    return {r.code: (r.price, r.open, r.prev_close) for r in df.itertuples()}
+
+
+def _position_names(codes: list[str]) -> dict:
+    import datasource
+    if not codes:
+        return {}
+    try:
+        with datasource._qconn() as c:
+            return dict(c.execute(
+                f"SELECT code, name FROM ifind_stocklist"
+                f" WHERE code IN ({','.join('?' * len(codes))})", codes).fetchall())
+    except Exception:
+        return {}
+
+
+def _trade_days_between(d0: str, d1: str) -> int:
+    """两个日期间隔的交易日数（日历在库内则用交易日历，否则按工作日估算）。"""
+    cal = _calendar()
+    if d0 in cal and d1 in cal:
+        return cal.index(d1) - cal.index(d0)
+    d, n = pd.Timestamp(d0), 0
+    while d.strftime("%Y-%m-%d") < d1 and n < 60:
+        d += pd.Timedelta(days=1)
+        if d.weekday() < 5:
+            n += 1
+    return n
+
+
+def position_open_from_picks(trade_date: str, today: str) -> str:
+    """盘中触发开仓：对 trade_date 的名单按当前快照价开仓（T+1 语义：名单次日执行）。
+
+    - 竞价确认"回避"（低开>2%/无量承接）的股票自动跳过
+    - 幂等：同一股票同一来源同日只开一次（UNIQUE(code, buy_date, source)）
+    """
+    from common import SIGNALS_DIR
+    picks = picks_on_date(trade_date)
+    if picks.empty:
+        return "无名单可开仓"
+    # 竞价回避名单
+    avoid: set = set()
+    af = SIGNALS_DIR / f"auction_{today}.parquet"
+    if af.exists():
+        try:
+            adf = pd.read_parquet(af)
+            if "竞价结论" in adf.columns:
+                avoid = set(adf[adf["竞价结论"] == "回避"]["code"])
+        except Exception:
+            pass
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    n_new = 0
+    with _conn() as c:
+        for r in picks.itertuples():
+            items = pick_items_detail(int(r.id))
+            if items.empty:
+                continue
+            codes = list(items["code"])
+            prices = _latest_prices(codes)
+            names = _position_names(codes)
+            for it in items.itertuples():
+                if it.code in avoid:
+                    continue
+                pr = prices.get(it.code)
+                price = (pr[0] or pr[1]) if pr else None  # 最新价，无则用今开
+                if not price:
+                    continue
+                cur = c.execute(
+                    "INSERT OR IGNORE INTO positions"
+                    "(code, name, buy_date, buy_price, buy_ts, pick_id, source, pack_name,"
+                    " status, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,'open',?)",
+                    (it.code, names.get(it.code, ""), today, float(price), now,
+                     int(r.id), r.source, r.pack_name, now))
+                n_new += cur.rowcount
+    return f"开仓触发：新增 {n_new} 笔持仓" if n_new else "开仓触发：无新增（已开或竞价回避）"
+
+
+def position_close_check(today: str) -> str:
+    """盘中检查持仓：止盈/止损/到期平仓（T+1：买入日当天不卖）。
+    价格取 ifind_realtime 最新快照；触发止盈/止损按触发价成交，到期按现价成交。"""
+    r = DEFAULT_RULES
+    with _conn() as c:
+        opens = pd.read_sql("SELECT * FROM positions WHERE status='open'", c)
+    if opens.empty:
+        return "无持仓"
+    prices = _latest_prices(list(opens["code"]))
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    n_close = 0
+    with _conn() as c:
+        for _, p in opens.iterrows():
+            if str(p["buy_date"]) >= today:
+                continue  # T+1：买入日当天不卖
+            pr = prices.get(p["code"])
+            cur = pr[0] if pr and pr[0] else None
+            if not cur:
+                continue
+            entry = p["buy_price"]
+            tp, sl = entry * (1 + r["take_profit"]), entry * (1 + r["stop_loss"])
+            reason, sell_price = None, None
+            if cur >= tp:
+                reason, sell_price = "止盈", tp
+            elif cur <= sl:
+                reason, sell_price = "止损", sl
+            else:
+                hd = _trade_days_between(str(p["buy_date"]), today)
+                if hd >= r["hold_days"]:
+                    reason, sell_price = "到期", cur
+            if reason:
+                pnl = sell_price / entry - 1 - r["cost"]  # 扣往返成本
+                c.execute("UPDATE positions SET status='closed', sell_date=?, sell_price=?,"
+                          " sell_ts=?, sell_reason=?, pnl_pct=?, hold_days=?, closed_at=?"
+                          " WHERE id=?",
+                          (today, round(float(sell_price), 4), now, reason, round(pnl, 6),
+                           _trade_days_between(str(p["buy_date"]), today), now, int(p["id"])))
+                n_close += 1
+    return f"平仓 {n_close} 笔" if n_close else "持仓检查：无触发"
+
+
+def get_open_positions() -> pd.DataFrame:
+    """当前持仓（open）+ 最新快照价 + 浮动盈亏。"""
+    with _conn() as c:
+        df = pd.read_sql("SELECT * FROM positions WHERE status='open' ORDER BY id DESC", c)
+    if df.empty:
+        return df
+    prices = _latest_prices(list(df["code"]))
+    df["最新价"] = df["code"].map(lambda x: (prices.get(x) or (None,))[0])
+    df["浮动盈亏%"] = (df["最新价"] / df["buy_price"] - 1) * 100
+    df["持有交易日"] = df["buy_date"].map(
+        lambda d: _trade_days_between(str(d), datetime.now().strftime("%Y-%m-%d")))
+    return df
+
+
+def get_position_history(limit: int = 100) -> pd.DataFrame:
+    """已平仓持仓（新→旧）。"""
+    with _conn() as c:
+        return pd.read_sql(
+            "SELECT * FROM positions WHERE status='closed' ORDER BY id DESC LIMIT ?",
+            c, params=(limit,))
+
+
+def position_stats() -> dict:
+    """持仓汇总：胜率/平均收益率/累计收益率（按已平仓）+ 当前持仓数。"""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT COUNT(*), AVG(pnl_pct), SUM(pnl_pct),"
+            " SUM(CASE WHEN pnl_pct>0 THEN 1 ELSE 0 END) FROM positions WHERE status='closed'"
+        ).fetchone()
+        n_open = c.execute("SELECT COUNT(*) FROM positions WHERE status='open'").fetchone()[0]
+    n, avg, total, wins = row
+    return {"已平仓": n or 0, "胜率": (wins / n if n else None),
+            "平均收益率": avg, "累计收益率": total, "当前持仓": n_open}

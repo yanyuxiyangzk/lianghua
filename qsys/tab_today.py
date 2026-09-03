@@ -219,6 +219,48 @@ def render():
     _render_track("🎲", "卫星轨 · 博涨停（仓位小头，建议 ≤2 成，亏了不伤筋骨）",
                   sat_name, _pick_for(sat_name), "sat", "卫星轨资金")
 
+    # ---------------------------------------------------------------- 持仓（盘中触发开平仓，T+1）
+    def _render_positions():
+        st.markdown("---")
+        st.markdown("### 📦 当前持仓")
+        st.caption("盘中自动开仓（名单次日 9:30 起按快照价触发，竞价回避自动跳过）"
+                   " · 止盈+15% / 止损-8% / 满20交易日自动平仓 · T+1（买入日当天不卖）")
+        try:
+            opens = experience.get_open_positions()
+        except Exception:
+            opens = pd.DataFrame()
+        if opens.empty:
+            st.caption("暂无持仓——盘中每 5 分钟检查名单触发开仓")
+        else:
+            show = pd.DataFrame({
+                "代码": opens["code"], "名称": opens["name"],
+                "买入日": opens["buy_date"], "买入价": opens["buy_price"].round(2),
+                "最新价": opens["最新价"].round(2),
+                "浮动盈亏": opens["浮动盈亏%"].map(lambda x: f"{x:+.2f}%" if pd.notna(x) else "-"),
+                "持有(交易日)": opens["持有交易日"],
+                "来源": opens["pack_name"].fillna(opens["source"]),
+            })
+            st.dataframe(show, hide_index=True, width='stretch')
+
+        stats = experience.position_stats()
+        hist = experience.get_position_history(50)
+        if not hist.empty:
+            st.markdown("### 📜 持仓历史（已平仓）")
+            win = f"{stats['胜率']:.0%}" if stats.get("胜率") is not None else "-"
+            avg = f"{stats['平均收益率']:+.2%}" if stats.get("平均收益率") is not None else "-"
+            total = f"{stats['累计收益率']:+.2%}" if stats.get("累计收益率") is not None else "-"
+            st.markdown(f"**已平仓 {stats['已平仓']} 笔 · 胜率 {win} · 平均收益率 {avg} · 累计收益率 {total}**")
+            show_h = pd.DataFrame({
+                "代码": hist["code"], "名称": hist["name"],
+                "买入日": hist["buy_date"], "买入价": hist["buy_price"].round(2),
+                "卖出日": hist["sell_date"], "卖出价": hist["sell_price"].round(2),
+                "收益率": hist["pnl_pct"].map(lambda x: f"{x:+.2%}" if pd.notna(x) else "-"),
+                "平仓原因": hist["sell_reason"], "持有(交易日)": hist["hold_days"],
+            })
+            st.dataframe(show_h, hide_index=True, width='stretch')
+
+    _render_positions()
+
     # ---------------------------------------------------------------- 昨日执行回顾（T+1：昨日名单今开买入，逐股收益率+胜率）
     def _render_yesterday_review():
         dates = experience.list_pick_dates(limit=5)

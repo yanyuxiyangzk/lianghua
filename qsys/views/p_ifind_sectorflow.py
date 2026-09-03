@@ -4,6 +4,7 @@
 一次查询返回全量板块数据（行业板块 410 / 概念板块若干），带 [日期] 后缀的列名归一化。
 """
 
+import math
 import re
 
 import pandas as pd
@@ -11,6 +12,8 @@ import streamlit as st
 
 import datasource
 import ifind_hub
+
+PAGE_SIZE = 20
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -37,16 +40,55 @@ def _wc(query: str) -> pd.DataFrame:
     return df
 
 
-def _show(df: pd.DataFrame, caption: str, sort_col: str = None, export_name: str = "板块"):
+def _show(df: pd.DataFrame, caption: str, sort_col: str = None, export_name: str = "板块",
+          page_key: str = "pg"):
     if df.empty:
         st.warning("查询成功但返回为空（非交易时段/接口限流），可稍后刷新重试")
         return
     if sort_col and sort_col in df.columns:
         df = df.sort_values(sort_col, ascending=False, na_position="last")
     st.caption(caption + f" · 共 {len(df)} 个板块")
-    st.dataframe(df, use_container_width=True, height=600, hide_index=True)
+
+    # 分页（20条/页）
+    total = len(df)
+    total_pages = max(1, math.ceil(total / PAGE_SIZE))
+    pk = f"page_{page_key}"
+    if pk not in st.session_state:
+        st.session_state[pk] = 0
+    page = st.session_state[pk]
+    if page >= total_pages:
+        page = total_pages - 1
+        st.session_state[pk] = page
+
+    start = page * PAGE_SIZE
+    page_df = df.iloc[start:start + PAGE_SIZE]
+    st.dataframe(page_df, use_container_width=True, hide_index=True,
+                 height=35 * (len(page_df) + 1) + 3)
+
+    # 分页导航
+    nav1, nav2, nav3, nav4, nav5 = st.columns([1, 1, 2, 1, 1])
+    with nav1:
+        if st.button("◀ 上一页", key=f"prev_{page_key}", disabled=(page <= 0)):
+            st.session_state[pk] = page - 1
+            st.rerun()
+    with nav2:
+        if st.button("下一页 ▶", key=f"next_{page_key}", disabled=(page >= total_pages - 1)):
+            st.session_state[pk] = page + 1
+            st.rerun()
+    with nav3:
+        st.caption(f"共 {total} 个板块 · 第 {page + 1}/{total_pages} 页 · 每页 {PAGE_SIZE} 条")
+    with nav4:
+        jump = st.number_input("跳转", min_value=1, max_value=total_pages,
+                               value=page + 1, key=f"jump_{page_key}",
+                               label_visibility="collapsed")
+    with nav5:
+        if st.button("跳转", key=f"go_{page_key}"):
+            st.session_state[pk] = jump - 1
+            st.rerun()
+
     st.download_button("📥 导出CSV", df.to_csv(index=False, encoding="utf-8-sig"),
-                       file_name=f"{export_name}_{pd.Timestamp.now():%Y%m%d}.csv", mime="text/csv")
+                       file_name=f"{export_name}_{pd.Timestamp.now():%Y%m%d}.csv",
+                       mime="text/csv", key=f"dl_{page_key}")
 
 
 def render():
@@ -78,7 +120,7 @@ def _render_flow():
             df = df.drop(columns=["主力净流入(元)"])
             df["主力净流入(亿)"] = df["主力净流入(亿)"].round(2)
         st.markdown(f"**{label}**")
-        _show(df, "数据源：同花顺问财 · 主力资金流向", "主力净流入(亿)", f"板块资金流向_{label}")
+        _show(df, "数据源：同花顺问财 · 主力资金流向", "主力净流入(亿)", f"板块资金流向_{label}", page_key=f"flow_{label}")
 
 
 def _render_sector():
@@ -101,7 +143,7 @@ def _render_sector():
         df = df.drop(columns=["成交额(元)"])
     if "涨跌幅" in df.columns:
         df["涨跌幅"] = df["涨跌幅"].round(2)
-    _show(df, f"数据源：同花顺问财 · {kind}", "涨跌幅", f"板块行情_{kind}")
+    _show(df, f"数据源：同花顺问财 · {kind}", "涨跌幅", f"板块行情_{kind}", page_key=f"sector_{kind}")
 
 
 def _render_turnover():
@@ -122,7 +164,7 @@ def _render_turnover():
     df = df[keep].rename(columns={"指数代码": "板块代码", "指数简称": "板块",
                                   ret_col: f"{span}涨跌幅(%)" if ret_col else ""})
     _show(df, f"数据源：同花顺问财 · {kind}{span}区间涨跌幅排名", f"{span}涨跌幅(%)",
-          f"板块轮动_{kind}_{span}")
+          f"板块轮动_{kind}_{span}", page_key=f"turnover_{kind}_{span}")
 
 
 render()

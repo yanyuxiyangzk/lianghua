@@ -329,10 +329,9 @@ def job_top5_composite() -> str:
 
 
 def job_position_track(**_ignored) -> str:
-    """持仓跟踪（盘中每5分钟）：最新名单触发开仓 + 持仓止盈/止损/到期平仓（T+1）。
+    """持仓跟踪（盘中每5分钟）：名单挂限价委托 → 触及成交开仓 → 持仓止盈/止损/到期平仓（T+1）。
 
-    开仓：最新交易日名单（两条轨）→ 当前快照价买入（竞价回避的跳过）。
-    平仓：买入日次一交易日起，盘中触发 止盈+15%/止损-8%/到期20日 即按触发价平仓。
+    流程贴近实盘：委托（参考价=名单价）→ 现价触及才成交 → 买入日当天不卖（T+1）。
     """
     from zoneinfo import ZoneInfo
 
@@ -346,12 +345,13 @@ def job_position_track(**_ignored) -> str:
     today = now.strftime("%Y-%m-%d")
     latest = experience.list_pick_dates(limit=1)
     m1 = experience.position_open_from_picks(latest[0], today) if latest else "无名单"
+    m_fill = experience.position_fill_check(today)
     m2 = experience.position_close_check(today)
     # 顺带撮合模拟柜台的挂单（限价单价格触及即成交）
     import broker
     n_fill = broker.fill_pending_orders()
-    m3 = f"挂单成交 {n_fill} 笔" if n_fill else ""
-    return f"{m1}；{m2}{'；' + m3 if m3 else ''}"
+    parts = [m1, m_fill, m2] + ([f"挂单成交 {n_fill} 笔"] if n_fill else [])
+    return "；".join(p for p in parts if p)
 
 
 def job_trade_simulate() -> str:

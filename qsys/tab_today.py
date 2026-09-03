@@ -219,18 +219,19 @@ def render():
     _render_track("🎲", "卫星轨 · 博涨停（仓位小头，建议 ≤2 成，亏了不伤筋骨）",
                   sat_name, _pick_for(sat_name), "sat", "卫星轨资金")
 
-    # ---------------------------------------------------------------- 持仓（盘中触发开平仓，T+1）
+    # ---------------------------------------------------------------- 持仓（限价委托 → 触及成交 → T+1 平仓）
     def _render_positions():
         st.markdown("---")
         st.markdown("### 📦 当前持仓")
-        st.caption("盘中自动开仓（名单次日 9:30 起按快照价触发，竞价回避自动跳过）"
-                   " · 止盈+15% / 止损-8% / 满20交易日自动平仓 · T+1（买入日当天不卖）")
+        st.caption("名单次日挂**限价委托**（限价=名单参考价）→ 现价触及才成交开仓"
+                   " · 止盈+15% / 止损-8% / 满20交易日自动平仓 · T+1（成交日当天不卖）"
+                   " · 当日未成交委托收盘自动失效")
         try:
             opens = experience.get_open_positions()
         except Exception:
             opens = pd.DataFrame()
         if opens.empty:
-            st.caption("暂无持仓——盘中每 5 分钟检查名单触发开仓")
+            st.caption("暂无持仓——现价触及委托价才成交开仓")
         else:
             show = pd.DataFrame({
                 "代码": opens["code"], "名称": opens["name"],
@@ -242,6 +243,22 @@ def render():
                 "来源": opens["pack_name"].fillna(opens["source"]),
             })
             st.dataframe(show, hide_index=True, width='stretch')
+
+        # 已挂单待成交（限价委托）
+        try:
+            pends = experience.get_pending_positions()
+        except Exception:
+            pends = pd.DataFrame()
+        if not pends.empty:
+            st.markdown("**📋 已挂单待成交（限价委托）**")
+            show_p = pd.DataFrame({
+                "代码": pends["code"], "名称": pends["name"],
+                "委托时间": pends["buy_ts"],
+                "委托价": pends["limit_price"].round(2),
+                "最新价": pends["最新价"].round(2),
+                "来源": pends["pack_name"].fillna(pends["source"]),
+            })
+            st.dataframe(show_p, hide_index=True, width='stretch')
 
         stats = experience.position_stats()
         hist = experience.get_position_history(50)

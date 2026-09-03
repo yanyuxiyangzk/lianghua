@@ -82,6 +82,10 @@ def _conn():
     cols = [r[1] for r in c.execute("PRAGMA table_info(picks)")]
     if "data_source" not in cols:
         c.execute("ALTER TABLE picks ADD COLUMN data_source TEXT DEFAULT 'qlib_local'")
+    # 迁移：positions 增加限价字段（委托买入用，老库无此列则补上）
+    pcols = [r[1] for r in c.execute("PRAGMA table_info(positions)")]
+    if "limit_price" not in pcols:
+        c.execute("ALTER TABLE positions ADD COLUMN limit_price REAL")
     return c
 
 
@@ -533,15 +537,16 @@ def _trade_days_between(d0: str, d1: str) -> int:
 
 
 def position_open_from_picks(trade_date: str, today: str) -> str:
-    """盘中触发开仓：对 trade_date 的名单按当前快照价开仓（T+1 语义：名单次日执行）。
+    """盘中委托买入：对名单挂限价单（限价 = 名单参考买入价 = 扫描日收盘价）。
 
-    - 竞价确认"回避"（低开>2%/无量承接）的股票自动跳过
-    - 幂等：同一股票同一来源同日只开一次（UNIQUE(code, buy_date, source)）
+    遵守真实交易规则：挂出委托（pending）后不立即成交，现价 ≤ 限价才触发成交（开仓）；
+    当日收盘仍未成交的委托自动失效（次日不再补）。竞价确认"回避"的股票跳过。
+    幂等：同一股票同一来源同日只挂一单（UNIQUE(code, buy_date, source)）。
     """
     from common import SIGNALS_DIR
     picks = picks_on_date(trade_date)
     if picks.empty:
-        return "无名单可开仓"
+        return "无名单可委托"
     # 竞价回避名单
     avoid: set = set()
     af = SIGNALS_DIR / f"auction_{today}.parquet"
@@ -560,24 +565,82 @@ def position_open_from_picks(trade_date: str, today: str) -> str:
             if items.empty:
                 continue
             codes = list(items["code"])
-            prices = _latest_prices(codes)
             names = _position_names(codes)
+            # 参考买入价 = 扫描日收盘价（名单生成时的价格）
+            ref_prices = {}
+            try:
+                import datasource
+                with datasource._qconn() as dc:
+                    for row in dc.execute(
+                            f"SELECT code, price FROM ifind_stocklist"
+                            f" WHERE code IN ({','.join('?' * len(codes))})", codes):
+                        if row[1]:
+                            ref_prices[row[0]] = row[1]
+            except Exception:
+                pass
             for it in items.itertuples():
                 if it.code in avoid:
                     continue
-                pr = prices.get(it.code)
-                price = (pr[0] or pr[1]) if pr else None  # 最新价，无则用今开
-                if not price:
+                limit = ref_prices.get(it.code)
+                if not limit:
                     continue
                 cur = c.execute(
                     "INSERT OR IGNORE INTO positions"
                     "(code, name, buy_date, buy_price, buy_ts, pick_id, source, pack_name,"
-                    " status, created_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,'open',?)",
-                    (it.code, names.get(it.code, ""), today, float(price), now,
-                     int(r.id), r.source, r.pack_name, now))
+                    " status, limit_price, created_at)"
+                    " VALUES (?,?,?,NULL,?,?,?,?, 'pending', ?, ?)",
+                    (it.code, names.get(it.code, ""), today, now,
+                     int(r.id), r.source, r.pack_name, float(limit), now))
                 n_new += cur.rowcount
-    return f"开仓触发：新增 {n_new} 笔持仓" if n_new else "开仓触发：无新增（已开或竞价回避）"
+    return f"委托挂单：新增 {n_new} 笔限价单" if n_new else "委托挂单：无新增（已挂或竞价回避）"
+
+
+def position_fill_check(today: str) -> str:
+    """盘中撮合：pending 限价单现价触及即成交开仓（成交于限价或更优价）；
+    隔夜未成交挂单自动失效（当日委托当日有效）。"""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_hm = datetime.now().strftime("%H%M")
+    with _conn() as c:
+        pend = pd.read_sql("SELECT * FROM positions WHERE status='pending'", c)
+    if pend.empty:
+        return "无挂单"
+    prices = _latest_prices(list(pend["code"]))
+    n_fill = n_expire = 0
+    with _conn() as c:
+        for _, p in pend.iterrows():
+            # 隔夜挂单 / 当日收盘(15:00)后 → 失效
+            if str(p["buy_date"]) < today or (str(p["buy_date"]) == today and now_hm >= "1500"):
+                c.execute("UPDATE positions SET status='expired', closed_at=? WHERE id=?",
+                          (now, int(p["id"])))
+                n_expire += 1
+                continue
+            pr = prices.get(p["code"])
+            cur = pr[0] if pr else None
+            if cur is None or not p["limit_price"]:
+                continue
+            if cur <= p["limit_price"]:  # 现价触及限价 → 成交（取更优价）
+                fill = min(cur, float(p["limit_price"]))
+                c.execute("UPDATE positions SET status='open', buy_price=?, buy_ts=? WHERE id=?",
+                          (round(fill, 4), now, int(p["id"])))
+                n_fill += 1
+    parts = []
+    if n_fill:
+        parts.append(f"成交开仓 {n_fill} 笔")
+    if n_expire:
+        parts.append(f"失效撤单 {n_expire} 笔")
+    return "；".join(parts) if parts else "挂单无触发"
+
+
+def get_pending_positions() -> pd.DataFrame:
+    """已挂单待成交（限价委托）。"""
+    with _conn() as c:
+        df = pd.read_sql(
+            "SELECT * FROM positions WHERE status='pending' ORDER BY id DESC", c)
+    if df.empty:
+        return df
+    prices = _latest_prices(list(df["code"]))
+    df["最新价"] = df["code"].map(lambda x: (prices.get(x) or (None,))[0])
+    return df
 
 
 def position_close_check(today: str) -> str:

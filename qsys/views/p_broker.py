@@ -195,7 +195,7 @@ def render():
                              "side": "方向", "price": "限价", "shares": "数量", "status": "状态",
                              "filled_price": "成交价", "filled_ts": "成交时间"})
                 show["方向"] = show["方向"].map({"buy": "买入", "sell": "卖出"})
-                show["类型"] = show["类型"].map({"ai": "AI买入", "manual": "手动买入"}).fillna("手动买入")
+                show["类型"] = show["类型"].map({"ai": "AI", "manual": "手动"}).fillna("手动")
                 st.dataframe(show, hide_index=True, width='stretch')
         with q2:
             fills = broker.list_fills(today_only=True)
@@ -208,7 +208,7 @@ def render():
                              "side": "方向", "price": "成交价", "shares": "数量", "amount": "成交金额",
                              "fee": "佣金", "tax": "印花税"})
                 show["方向"] = show["方向"].map({"buy": "买入", "sell": "卖出"})
-                show["类型"] = show["类型"].map({"ai": "AI买入", "manual": "手动买入"}).fillna("手动买入")
+                show["类型"] = show["类型"].map({"ai": "AI", "manual": "手动"}).fillna("手动")
                 st.dataframe(show, hide_index=True, width='stretch')
         with q3:
             flows = broker.list_cashflows()

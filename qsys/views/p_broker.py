@@ -90,7 +90,8 @@ def render():
             sellable = poss[poss["sellable"] > 0]
             if sellable.empty:
                 st.info("持仓均为当日买入（T+1，次日可卖）")
-            _order_form("sell", sellable)
+            else:
+                _order_form("sell", sellable)
 
     # ---------------------------------------------------------------- 撤单
     with tab_cancel:

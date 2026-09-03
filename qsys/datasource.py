@@ -1925,7 +1925,8 @@ def cleanup_old_data(retention_days: dict = None):
         retention_days = {
             "ifind_realtime": 7,
             "ifind_minute": 7,
-            "market_daily": 15,
+            # market_daily 是K线历史库，长期保留（15天会删没K线历史，2026-09 踩坑险删）
+            "market_daily": 36500,
             "ifind_basic_daily": 15,
             "ifind_announcements": 7,
         }

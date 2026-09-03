@@ -347,7 +347,11 @@ def job_position_track(**_ignored) -> str:
     latest = experience.list_pick_dates(limit=1)
     m1 = experience.position_open_from_picks(latest[0], today) if latest else "无名单"
     m2 = experience.position_close_check(today)
-    return f"{m1}；{m2}"
+    # 顺带撮合模拟柜台的挂单（限价单价格触及即成交）
+    import broker
+    n_fill = broker.fill_pending_orders()
+    m3 = f"挂单成交 {n_fill} 笔" if n_fill else ""
+    return f"{m1}；{m2}{'；' + m3 if m3 else ''}"
 
 
 def job_trade_simulate() -> str:

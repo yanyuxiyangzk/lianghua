@@ -78,14 +78,14 @@ def _conn():
     c.executescript(_SCHEMA)
     c.executescript(_TRADES_SCHEMA)
     c.executescript(_POSITIONS_SCHEMA)
-    # 迁移：picks 增加数据来源字段（老库无此列则补上）
-    cols = [r[1] for r in c.execute("PRAGMA table_info(picks)")]
-    if "data_source" not in cols:
-        c.execute("ALTER TABLE picks ADD COLUMN data_source TEXT DEFAULT 'qlib_local'")
     # 迁移：positions 增加限价字段（委托买入用，老库无此列则补上）
     pcols = [r[1] for r in c.execute("PRAGMA table_info(positions)")]
     if "limit_price" not in pcols:
         c.execute("ALTER TABLE positions ADD COLUMN limit_price REAL")
+    if "shares" not in pcols:
+        c.execute("ALTER TABLE positions ADD COLUMN shares INTEGER")  # 成交股数（100股整手）
+    if "buy_amount" not in pcols:
+        c.execute("ALTER TABLE positions ADD COLUMN buy_amount REAL")  # 买入金额 = 股数×成交价
     return c
 
 
@@ -595,8 +595,18 @@ def position_open_from_picks(trade_date: str, today: str) -> str:
     return f"委托挂单：新增 {n_new} 笔限价单" if n_new else "委托挂单：无新增（已挂或竞价回避）"
 
 
+# 每轨虚拟资金（等分买入）：主轨 7 万 / 卫星轨 2 万（对应今日执行页"主轨7成/卫星2成"的仓位约定）
+TRACK_BUDGET = {"sched_satellite_scan": 20000.0}
+
+
+def _budget_per_stock(source: str, top_n: int) -> float:
+    """每股预算 = 轨道虚拟资金 / 名单只数。"""
+    budget = TRACK_BUDGET.get(source, 70000.0)
+    return budget / max(int(top_n or 10), 1)
+
+
 def position_fill_check(today: str) -> str:
-    """盘中撮合：pending 限价单现价触及即成交开仓（成交于限价或更优价）；
+    """盘中撮合：pending 限价单现价触及即成交开仓（成交于限价或更优价，按预算整手配股）；
     隔夜未成交挂单自动失效（当日委托当日有效）。"""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     now_hm = datetime.now().strftime("%H%M")
@@ -620,8 +630,16 @@ def position_fill_check(today: str) -> str:
                 continue
             if cur <= p["limit_price"]:  # 现价触及限价 → 成交（取更优价）
                 fill = min(cur, float(p["limit_price"]))
-                c.execute("UPDATE positions SET status='open', buy_price=?, buy_ts=? WHERE id=?",
-                          (round(fill, 4), now, int(p["id"])))
+                # 按轨道预算整手配股（100股整数倍）
+                top_n = c.execute("SELECT top_n FROM picks WHERE id=?",
+                                  (int(p["pick_id"]),)).fetchone()
+                per = _budget_per_stock(p["source"], top_n[0] if top_n else 10)
+                shares = int(per // fill // 100 * 100)
+                if shares <= 0:
+                    shares = 100  # 预算不足一手时保底一手
+                c.execute("UPDATE positions SET status='open', buy_price=?, buy_ts=?,"
+                          " shares=?, buy_amount=? WHERE id=?",
+                          (round(fill, 4), now, shares, round(shares * fill, 2), int(p["id"])))
                 n_fill += 1
     parts = []
     if n_fill:
@@ -685,7 +703,7 @@ def position_close_check(today: str) -> str:
 
 
 def get_open_positions() -> pd.DataFrame:
-    """当前持仓（open）+ 最新快照价 + 浮动盈亏。"""
+    """当前持仓（open）+ 最新快照价 + 浮动盈亏（% 和 金额元）。"""
     with _conn() as c:
         df = pd.read_sql("SELECT * FROM positions WHERE status='open' ORDER BY id DESC", c)
     if df.empty:
@@ -693,6 +711,7 @@ def get_open_positions() -> pd.DataFrame:
     prices = _latest_prices(list(df["code"]))
     df["最新价"] = df["code"].map(lambda x: (prices.get(x) or (None,))[0])
     df["浮动盈亏%"] = (df["最新价"] / df["buy_price"] - 1) * 100
+    df["浮动盈亏额"] = (df["最新价"] - df["buy_price"]) * df["shares"].fillna(0)
     df["持有交易日"] = df["buy_date"].map(
         lambda d: _trade_days_between(str(d), datetime.now().strftime("%Y-%m-%d")))
     return df

@@ -70,8 +70,11 @@ def render():
                 "代码": autos["code"], "名称": autos["name"],
                 "买入时间": autos["buy_ts"],
                 "买入价": autos["buy_price"].round(2),
+                "持股(股)": autos["shares"],
+                "买入金额": autos["buy_amount"].map(lambda x: f"{x:,.0f}" if pd.notna(x) else "-"),
                 "最新价": autos["最新价"].round(2),
                 "浮动盈亏": autos["浮动盈亏%"].map(lambda x: f"{x:+.2f}%" if pd.notna(x) else "-"),
+                "盈亏(元)": autos["浮动盈亏额"].map(lambda x: f"{x:+,.0f}" if pd.notna(x) else "-"),
                 "持有(交易日)": autos["持有交易日"],
                 "来源": autos["pack_name"].fillna(autos["source"]),
             })

@@ -237,8 +237,11 @@ def render():
                 "代码": opens["code"], "名称": opens["name"],
                 "买入时间": opens["buy_ts"],
                 "买入价": opens["buy_price"].round(2),
+                "持股(股)": opens["shares"],
+                "买入金额": opens["buy_amount"].map(lambda x: f"{x:,.0f}" if pd.notna(x) else "-"),
                 "最新价": opens["最新价"].round(2),
                 "浮动盈亏": opens["浮动盈亏%"].map(lambda x: f"{x:+.2f}%" if pd.notna(x) else "-"),
+                "盈亏(元)": opens["浮动盈亏额"].map(lambda x: f"{x:+,.0f}" if pd.notna(x) else "-"),
                 "持有(交易日)": opens["持有交易日"],
                 "来源": opens["pack_name"].fillna(opens["source"]),
             })

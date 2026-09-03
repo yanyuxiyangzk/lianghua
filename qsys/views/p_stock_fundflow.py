@@ -1,8 +1,7 @@
-"""💰 个股资金流向 — 今日分时资金流 / 近20日主力净流入 / 资金流排名 / 异动雷达。
+"""💰 个股资金流向 — 今日分时资金流 / 近20日主力净流入 / 异动雷达。
 
 数据源：
   - 东财 push2his（个股日资金流）/ push2（分时资金流）
-  - 同花顺 10jqka（全市场资金流排名）
   - 本地库 stock_fundflow_daily / stock_fundflow_intraday 表
 """
 
@@ -85,7 +84,7 @@ def _detect_anomalies(df_daily: pd.DataFrame) -> list[dict]:
 
 def render():
     st.title("💰 个股资金流向")
-    st.caption("数据源：东财（日资金流/分时资金流）· 同花顺（排名）· 盘后自动入库")
+    st.caption("数据源：东财（日资金流/分时资金流）· 盘后自动入库")
     ifind_hub.header()
 
     # 股票选择
@@ -120,7 +119,7 @@ def render():
         st.subheader(code)
 
     # Tab 布局
-    t1, t2, t3, t4 = st.tabs(["📈 今日分时资金流", "📊 近20日主力净流入", "🏆 资金流排名", "🔔 异动雷达"])
+    t1, t2, t3 = st.tabs(["📈 今日分时资金流", "📊 近20日主力净流入", "🔔 异动雷达"])
 
     with t1:
         st.markdown("**今日分时资金流**（主力/大单/中单/小单净流入，元）")
@@ -205,58 +204,6 @@ def render():
             st.dataframe(show, width="stretch", hide_index=True, height=min(32 * (len(show) + 1) + 3, 400))
 
     with t3:
-        st.markdown("**全市场个股资金流排名**（当日）")
-        st.info("排名数据来自同花顺公开页面，受反爬限制可能加载失败")
-        ranking = st.radio("排序方式", ["净额降序", "流入降序", "大单流入降序"], horizontal=True, key="ff_rank_sort")
-        with st.spinner("加载排名数据…（约需15秒）"):
-            try:
-                import requests, re as _re
-                url = "https://data.10jqka.com.cn/funds/ggzjl/field/zdf/order/desc/page/1/ajax/1/free/1/"
-                r = requests.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0"})
-                r.encoding = "gbk"
-                html = r.text
-                if "<table" not in html:
-                    st.warning("同花顺排名数据被反爬拦截，请稍后重试")
-                else:
-                    t = html.find("<table")
-                    te = html.find("</table>", t) + 8
-                    ths = _re.findall(r"<th[^>]*>(.*?)</th>", html[t:te], re.S)
-                    headers = [_re.sub(r"<[^>]+>", "", th).strip() for th in ths]
-                    tds = _re.findall(r"<td[^>]*>(.*?)</td>", html[t:te], _re.S)
-                    ncols = len(headers)
-                    rows_data = []
-                    for i in range(len(tds) // ncols):
-                        cells = [_re.sub(r"<[^>]+>", "", tds[i * ncols + j]).strip() for j in range(ncols)]
-                        def _parse(s):
-                            s = s.strip().replace(",", "")
-                            if "亿" in s:
-                                return float(s.replace("亿", "")) * 1e8
-                            if "万" in s:
-                                return float(s.replace("万", "")) * 1e4
-                            try:
-                                return float(s)
-                            except ValueError:
-                                return 0
-                        rows_data.append({
-                            "排名": cells[0], "代码": cells[1], "名称": cells[2],
-                            "最新价": cells[3], "涨跌幅": cells[4],
-                            "流入(元)": _parse(cells[6]), "流出(元)": _parse(cells[7]),
-                            "净额(元)": _parse(cells[8]), "成交额(元)": _parse(cells[9]),
-                            "大单流入(元)": _parse(cells[10]) if len(cells) > 10 else 0,
-                        })
-                    df_rank = pd.DataFrame(rows_data)
-                    if ranking == "净额降序":
-                        df_rank = df_rank.sort_values("净额(元)", ascending=False)
-                    elif ranking == "流入降序":
-                        df_rank = df_rank.sort_values("流入(元)", ascending=False)
-                    else:
-                        df_rank = df_rank.sort_values("大单流入(元)", ascending=False)
-                    df_rank["排名"] = range(1, len(df_rank) + 1)
-                    st.dataframe(df_rank, width="stretch", hide_index=True, height=500)
-            except Exception as e:
-                st.warning(f"排名加载失败：{e}")
-
-    with t4:
         st.markdown("**异动雷达**")
         with st.spinner("分析资金流异常信号…"):
             df_alert = datasource.get_fundflow_daily(code, days=20)

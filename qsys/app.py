@@ -55,6 +55,7 @@ pages = {
         st.Page("views/p_ifind_kline.py", title="股价K线", icon="📈", url_path="ifind-kline"),
         st.Page("views/p_ifind_lhb.py", title="龙虎榜", icon="🐉", url_path="ifind-lhb"),
         st.Page("views/p_ifind_announce.py", title="公告信息", icon="📜", url_path="ifind-announce"),
+        st.Page("views/p_ifind_fundflow.py", title="资金流向", icon="💰", url_path="ifind-fundflow"),
 
         st.Page("views/p_newsense.py", title="舆情/新闻", icon="📰", url_path="newsense"),
         st.Page("views/p_ifind_doc.py", title="接口文档", icon="📖", url_path="ifind-doc"),

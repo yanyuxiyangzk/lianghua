@@ -723,6 +723,32 @@ def ths_wcquery(query: str, domain: str = "stock"):
                           {"searchstring": query, "searchtype": domain}))
 
 
+def ths_dr_report(report_id: str, params: str, columns: str):
+    """专题报表（HTTP: api/v1/data_pool 优先 / SDK: THS_DR）。龙虎榜等专题数据用。
+
+    report_id 形如 p04669（每日交易龙虎榜数据）/ p04674（证券营业部交易龙虎榜统计）；
+    params 形如 'edate=20260902' 或 'edate=20260902;sbyy=日涨幅偏离值达7%的证券'（键值对）；
+    columns 形如 'p04669_f001,p04669_f002'（逗号分隔，自动补 :Y）。
+    返回 DataFrame 优先用接口 outParams 的中文名命名（无中文名保留字段代码）。
+    """
+    colopt = ",".join(f"{c.strip()}:Y" for c in columns.split(",") if c.strip())
+    fpara = dict(kv.split("=", 1) for kv in (params or "").split(";") if "=" in kv)
+
+    def http():
+        res = _ths_http("data_pool", {"reportname": report_id, "functionpara": fpara,
+                                      "outputpara": colopt})
+        df, r, err = res
+        if df is not None and not df.empty:
+            cn = (r.get("outParams") or {})
+            df = df.rename(columns={c: cn[c] for c in df.columns
+                                    if cn.get(c) and cn[c] != c})
+        return df, r, err
+
+    return _sdk_or_http(
+        lambda: ths_call("THS_DR", report_id, params, colopt),
+        http)
+
+
 def ths_trade_dates(exchange: str = "SSE", start: str = "", end: str = ""):
     """交易日历（SDK: THS_Date_Query / HTTP: get_trade_dates）。exchange: SSE/SZSE。"""
     start = start or f"{datetime.now().year}-01-01"

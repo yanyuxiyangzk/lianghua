@@ -3,7 +3,7 @@
 - 头部：名称/代码 + 最新价/涨跌/涨跌幅 + 高低开/市值/流通/市盈/量比/换手/成交额
   （ifind_stocklist 档案 + ifind_realtime 最新快照覆盖）
 - 周期：分时 / 日K / 周K / 月K / 季K / 年K / 120分 / 60分 / 30分 / 15分 / 1分
-  （THS_HQ 日周月季年K · THS_HF 分钟K与分时，HTTP 优先 / SDK 兜底）
+  （日/周/月/季/年K 读本地 market_daily·读穿缓存，缺数自动补抓落库；分时/分钟K 线上直取 THS_HF）
 - 从「行情」页点击股票/指数行跳转（session_state["kline_code"] 带入代码）
 """
 
@@ -128,6 +128,40 @@ def _render_header(code: str, info: dict):
 
 
 # ---------------------------------------------------------------- K线数据
+def _local_daily(code: str, start: str, end: str) -> pd.DataFrame:
+    """本地 market_daily（source='ths_ifind'）读穿缓存：区间缺数时自动爬取落库，
+    之后都从本地库展示（不重复打 iFinD）。返回 datetime 索引 ohlcv 帧。"""
+    db_code = to_db_code(code)
+    with datasource._conn() as c:
+        have = c.execute("SELECT MIN(date), MAX(date), COUNT(*) FROM market_daily"
+                         " WHERE source='ths_ifind' AND code=?", (db_code,)).fetchone()
+    if not (have and have[2] > 0 and have[0] <= start and have[1] >= end):
+        try:
+            datasource._ths_fetch_daily(db_code, start, end)  # 抓取并落库（INSERT OR REPLACE）
+        except Exception:
+            pass  # 抓取失败 → 返回空，由调用方回退线上直取
+    with datasource._conn() as c:
+        df = pd.read_sql(
+            "SELECT date, open, high, low, close, volume, amount FROM market_daily"
+            " WHERE source='ths_ifind' AND code=? AND date BETWEEN ? AND ? ORDER BY date",
+            c, params=(db_code, start, end))
+    if df.empty:
+        return pd.DataFrame()
+    df["datetime"] = pd.to_datetime(df["date"])
+    return df.drop(columns=["date"]).set_index("datetime")
+
+
+def _resample_period(df: pd.DataFrame, iv: str) -> pd.DataFrame:
+    """日线 → 周/月/季/年K（A股周K以周五收盘为界）。"""
+    rules = {"W": "W-FRI", "M": "ME", "Q": "QE", "Y": "YE"}
+    g = df.resample(rules[iv])
+    return pd.DataFrame({
+        "open": g["open"].first(), "high": g["high"].max(),
+        "low": g["low"].min(), "close": g["close"].last(),
+        "volume": g["volume"].sum(), "amount": g["amount"].sum(),
+    }).dropna(subset=["open", "close"])
+
+
 def _norm_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     """iFinD 返回帧统一成 datetime 索引 + open/high/low/close/volume/amount 列。"""
     if df is None or df.empty:
@@ -157,10 +191,14 @@ def _load_kline(code: str, period: str) -> pd.DataFrame:
                 return df
         return pd.DataFrame()
     if period.endswith("K"):
+        # 日/周/月/季/年K：优先本地库（读穿缓存），本地缺失才回退线上前复权直取
         iv = {"日K": "D", "周K": "W", "月K": "M", "季K": "Q", "年K": "Y"}[period]
         days = {"日K": 400, "周K": 365 * 3, "月K": 365 * 10,
                 "季K": 365 * 20, "年K": 365 * 40}[period]
         start = (today - timedelta(days=days)).strftime("%Y-%m-%d")
+        local = _local_daily(code, start, today.strftime("%Y-%m-%d"))
+        if not local.empty:
+            return local if iv == "D" else _resample_period(local, iv)
         df, _, err = datasource.ths_history(
             [code], "open,high,low,close,volume,amount",
             start, today.strftime("%Y-%m-%d"),
@@ -498,14 +536,21 @@ def render():
     if period == "分时":
         st.plotly_chart(_fenshi_fig(df, f"{name} {code} 分时", info.get("prev_close")),
                         width="stretch")
-    else:
-        st.plotly_chart(_kline_fig(df, f"{name} {code} {period}（前复权）",
+        src_txt = "THS_HF 高频"
+    elif period.endswith("K"):
+        st.plotly_chart(_kline_fig(df, f"{name} {code} {period}（本地库·不复权）",
                                    indicators=indicators, show_boll=show_boll,
                                    factor_series=factor_series, factor_name=factor_name),
                         width="stretch")
+        src_txt = "本地 market_daily（ths_ifind 每日盘后入库，缺数自动补抓）· 不复权"
+    else:
+        st.plotly_chart(_kline_fig(df, f"{name} {code} {period}",
+                                   indicators=indicators, show_boll=show_boll,
+                                   factor_series=factor_series, factor_name=factor_name),
+                        width="stretch")
+        src_txt = "THS_HF 高频"
     st.caption(f"数据范围: {df.index[0]:%Y-%m-%d %H:%M} ~ {df.index[-1]:%Y-%m-%d %H:%M}，"
-               f"共 {len(df)} 根 · 数据源：同花顺 iFinD（"
-               f"{'THS_HF 高频' if period == '分时' or period.endswith('分') else 'THS_HQ 历史行情'}）")
+               f"共 {len(df)} 根 · 数据源：同花顺 iFinD（{src_txt}）")
 
 
 render()

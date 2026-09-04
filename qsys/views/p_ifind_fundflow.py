@@ -73,8 +73,13 @@ def _fetch_fundflow_ranking() -> pd.DataFrame:
     if df.empty:
         return df
     # 统一列名
-    rename = {"涨跌幅": "涨跌幅%"}
+    # 页面表头会随同花顺版本/反爬响应变化，统一常见别名。
+    rename = {"涨跌幅": "涨跌幅%", "股票名称": "名称", "股票代码": "代码",
+              "净流入": "净额(元)", "主力净流入": "净额(元)"}
     df.rename(columns=rename, inplace=True)
+    if "名称" not in df.columns:
+        # 至少保证图表有可用的分类轴，避免表头变化导致页面崩溃。
+        df["名称"] = df.get("代码", pd.Series(df.index, index=df.index)).astype(str)
     # 数值化
     for col in ["最新价", "涨跌幅%", "换手率"]:
         if col in df.columns:
@@ -82,6 +87,9 @@ def _fetch_fundflow_ranking() -> pd.DataFrame:
     for col in ["流入资金(元)", "流出资金(元)", "净额(元)", "成交额(元)", "大单流入(元)"]:
         if col in df.columns:
             df[col] = df[col].apply(_parse_money)
+        else:
+            # 保持下游排序/图表稳定；缺失列通常意味着页面被改版或拦截。
+            df[col] = 0.0
     return df
 
 
@@ -112,7 +120,11 @@ def render():
         if df.empty:
             st.warning("同花顺排名数据加载失败（反爬拦截），请稍后重试")
         else:
-            sort_options = ["净额(元)", "流入资金(元)", "大单流入(元)", "成交额(元)"]
+            sort_options = [c for c in ["净额(元)", "流入资金(元)", "大单流入(元)", "成交额(元)"] if c in df.columns]
+            if not sort_options:
+                st.warning(f"资金流数据表头无法识别，实际列：{', '.join(map(str, df.columns))}")
+                st.dataframe(df, width="stretch", hide_index=True)
+                st.stop()
             sort_col = st.radio("排序", sort_options, horizontal=True, key="ths_ff_sort")
             d = df.sort_values(sort_col, ascending=False).reset_index(drop=True)
             d.insert(0, "排名", range(1, len(d) + 1))

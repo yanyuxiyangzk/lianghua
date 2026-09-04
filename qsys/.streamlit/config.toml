@@ -1,0 +1,12 @@
+# 主题：基础浅色 + 自定义深色（与量化驾驶舱同款配色）
+# Streamlit 1.61 原生支持双主题切换：前端把选择存在浏览器 localStorage
+# （stActiveTheme-<path>-v2），[theme.dark] 配色会原生应用到所有内建组件
+# （dataframe/输入框/按钮/侧栏等），无需 CSS 硬改。
+[theme]
+base = "light"
+
+[theme.dark]
+primaryColor = "#2678ff"          # 驾驶舱 C_BLUE
+backgroundColor = "#081018"       # 驾驶舱背景渐变起点
+secondaryBackgroundColor = "#101923"
+textColor = "#f3f7fb"

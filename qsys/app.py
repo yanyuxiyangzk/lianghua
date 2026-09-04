@@ -20,6 +20,11 @@ import streamlit as st
 st.set_page_config(page_title="QSYS · QuantSys 看板", layout="wide", page_icon="📈",
                    initial_sidebar_state="expanded")
 
+# 全局主题（浅色/深色）：注入 CSS + 切换 data-theme，全页面生效
+import theme as _app_theme
+
+_app_theme.apply()
+
 # 调度器随服务启动即初始化（不再等访问定时任务页才拉起——否则容器重建后定时任务全部停摆）
 from scheduler import get_scheduler as _get_scheduler
 
@@ -36,6 +41,7 @@ st.markdown(
 
 pages = {
     "我的": [
+        st.Page("views/p_dash.py", title="量化驾驶舱", icon="🚀", url_path="dash"),
         st.Page("views/p_desk.py", title="今日执行", icon="🎯", url_path="today"),
         st.Page("views/p_broker.py", title="资金账号", icon="💹", url_path="broker"),
     ],
@@ -73,8 +79,22 @@ pages = {
     ],
     "系统": [
         st.Page("views/p_settings.py", title="设置", icon="⚙️", url_path="settings"),
+        st.Page("views/p_admin_users.py", title="用户管理", icon="👥", url_path="admin-users"),
+        st.Page("views/p_admin_roles.py", title="角色管理", icon="🎭", url_path="admin-roles"),
+        st.Page("views/p_admin_menus.py", title="菜单管理", icon="📑", url_path="admin-menus"),
+        st.Page("views/p_admin_orgs.py", title="组织管理", icon="🏢", url_path="admin-orgs"),
     ],
 }
+
+# 侧栏顶部：主题切换（放在 st.navigation 之前 → 渲染在导航菜单上方）
+with st.sidebar:
+    cur_theme = _app_theme.get_theme()
+    theme_sel = st.radio("🎨 主题", ["浅色 ☀️", "深色 🌙"],
+                         index=0 if cur_theme == "light" else 1,
+                         horizontal=True, key="theme_radio")
+    if (theme_sel == "深色 🌙") != (cur_theme == "dark"):
+        _app_theme.set_theme("dark" if theme_sel == "深色 🌙" else "light")
+        st.rerun()
 
 nav = st.navigation(pages, expanded=True)   # 菜单分区默认全部展开
 with st.sidebar:

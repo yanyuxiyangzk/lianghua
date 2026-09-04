@@ -2,8 +2,8 @@
 
 页面分区（st.navigation）：
   我的:    🎯 今日执行（每天只看这页）/ 📚 实战成绩 / 📋 选股列表
-  行情:    📈 股票行情 / 🕯️ 自选K线 / 📉 专业K线
-  📡 iFinD数据中心: 📋行情（A股市场/A股指数，落库读库）/ 🌐板块资金流
+  市场数据: 📈 股票行情 / 🕯️ 自选K线 / 📉 专业K线
+  📡 iFinD数据: 📋行情（A股市场/A股指数，落库读库）/ 🌐板块资金流
            / 📰舆情/新闻（iFinD公告 + DeepSeek 舆情摘要）
            / 📖接口文档（官方文档内嵌）/ 🗄数据仓库（所有落库表总览+浏览）
            （原 实时行情/历史行情/高频行情/日内快照/基本面数据/特色数据 已下线，文件保留）
@@ -39,7 +39,7 @@ pages = {
         st.Page("views/p_desk.py", title="今日执行", icon="🎯", url_path="today"),
         st.Page("views/p_broker.py", title="资金账号", icon="💹", url_path="broker"),
     ],
-    "行情": [
+    "市场数据": [
         st.Page("views/p_quotes.py", title="股票行情", icon="📈", url_path="quotes"),
         st.Page("views/p_stocklist.py", title="股票/指数列表", icon="📋", url_path="stocklist"),
         st.Page("views/p_sector.py", title="板块行情", icon="🏛️", url_path="sector"),
@@ -50,9 +50,9 @@ pages = {
     ],
     # iFinD 数据中心：独立菜单板块，每个子页只展示对应数据（逻辑在 ifind_hub.py）
     # （实时行情/历史行情/高频行情/日内快照/基本面数据/特色数据 已下线——被「行情」页覆盖或用不到，页面文件保留在 views/ 可随时恢复）
-    "📡 iFinD数据中心": [
+    "📡 iFinD数据": [
         st.Page("views/p_ifind_stocklist.py", title="行情", icon="📋", url_path="ifind-stocklist"),
-        st.Page("views/p_ifind_kline.py", title="股价K线", icon="📈", url_path="ifind-kline"),
+        st.Page("views/p_ifind_kline.py", title="K线数据", icon="📈", url_path="ifind-kline"),
         st.Page("views/p_ifind_lhb.py", title="龙虎榜", icon="🐉", url_path="ifind-lhb"),
         st.Page("views/p_ifind_announce.py", title="公告信息", icon="📜", url_path="ifind-announce"),
         st.Page("views/p_ifind_fundflow.py", title="资金流向", icon="💰", url_path="ifind-fundflow"),

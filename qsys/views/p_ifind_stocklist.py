@@ -274,7 +274,7 @@ def _render_stock_list():
                 elif _pend and _pend[0] == label and _pend[1] != page:
                     st.session_state.pop(_pk, None)  # 翻页后清空待跳转状态
             if label == "全部股票":
-                st.caption("💡 单击选中行，**双击**（再点一次同一行）跳转到该股的「📈 股价K线」页")
+                st.caption("💡 单击选中行，**双击**（再点一次同一行）跳转到该股的「📈 K线数据」页")
 
             # 分页导航（数据下方）
             nav1, nav2, nav3, nav4, nav5 = st.columns([1, 1, 2, 1, 1])
@@ -404,7 +404,7 @@ def _render_index_list():
             st.switch_page("views/p_ifind_kline.py")
         elif _ipend:
             st.session_state.pop(_ipk, None)
-    st.caption("💡 单击选中行，**双击**（再点一次同一行）跳转到该指数的「📈 股价K线」页")
+    st.caption("💡 单击选中行，**双击**（再点一次同一行）跳转到该指数的「📈 K线数据」页")
 
     # 分页导航
     nav1, nav2, nav3, nav4, nav5 = st.columns([1, 1, 2, 1, 1])

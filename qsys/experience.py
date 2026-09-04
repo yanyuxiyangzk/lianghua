@@ -670,7 +670,11 @@ def get_pending_positions() -> pd.DataFrame:
 
 def position_close_check(today: str) -> str:
     """盘中检查持仓：止盈/止损/到期平仓（T+1：买入日当天不卖）。
-    价格取 ifind_realtime 最新快照；触发止盈/止损按触发价成交，到期按现价成交。"""
+
+    价格取 ifind_realtime 最新快照；触发后走柜台市价卖出，盈亏按实际成交价
+    记账（不按触发价）；卖出前做双账本校验（经验库 open 股数 vs 柜台 ai 持仓
+    股数，不一致则跳过该代码并计入消息，避免账本漂移后卖错数量）。
+    """
     r = DEFAULT_RULES
     with _conn() as c:
         opens = pd.read_sql("SELECT * FROM positions WHERE status='open'", c)
@@ -678,41 +682,61 @@ def position_close_check(today: str) -> str:
         return "无持仓"
     prices = _latest_prices(list(opens["code"]))
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    n_close = 0
+    # 双账本一致性：柜台 ai 股数 应等于 经验库同代码 open 股数合计
+    import broker
+    try:
+        bposs = broker.get_positions()
+        broker_shares = {p["code"]: int(p["shares"] or 0)
+                         for _, p in bposs.iterrows() if (p["source"] or "") == "ai"}
+    except Exception:
+        broker_shares = {}
+    open_sum = opens.groupby("code")["shares"].sum()
+    n_close = n_skip = 0
     with _conn() as c:
         for _, p in opens.iterrows():
             if str(p["buy_date"]) >= today:
                 continue  # T+1：买入日当天不卖
-            pr = prices.get(p["code"])
+            code = str(p["code"])
+            bs = broker_shares.get(code, 0)
+            es = int(open_sum.get(code) or 0)
+            if broker_shares and bs != es:
+                n_skip += 1
+                continue  # 两本账对不上：跳过，不盲卖
+            pr = prices.get(code)
             cur = pr[0] if pr and pr[0] else None
             if not cur:
                 continue
             entry = p["buy_price"]
             tp, sl = entry * (1 + r["take_profit"]), entry * (1 + r["stop_loss"])
-            reason, sell_price = None, None
+            reason = None
             if cur >= tp:
-                reason, sell_price = "止盈", tp
+                reason = "止盈"
             elif cur <= sl:
-                reason, sell_price = "止损", sl
+                reason = "止损"
             else:
                 hd = _trade_days_between(str(p["buy_date"]), today)
                 if hd >= r["hold_days"]:
-                    reason, sell_price = "到期", cur
+                    reason = "到期"
             if reason:
-                # 走柜台真实卖出（回笼资金、T+1 可卖校验）
-                import broker
-                msg = broker.place_order(p["code"], "sell", None, int(p["shares"] or 0),
+                # 走柜台真实卖出（回笼资金、T+1 可卖校验），盈亏按实际成交价记账
+                msg = broker.place_order(code, "sell", None, int(p["shares"] or 0),
                                          source="ai")
                 if "已成交" not in msg:
                     continue  # 卖出失败（如可卖不足）→ 保持持仓，下个周期再试
-                pnl = sell_price / entry - 1 - r["cost"]  # 扣往返成本
+                m = re.search(r"@ ([\d.]+)", msg)
+                fill = float(m.group(1)) if m else None
+                pnl = (round(fill / entry - 1 - r["cost"], 6)
+                       if fill and entry else None)  # 扣往返成本
                 c.execute("UPDATE positions SET status='closed', sell_date=?, sell_price=?,"
                           " sell_ts=?, sell_reason=?, pnl_pct=?, hold_days=?, closed_at=?"
                           " WHERE id=?",
-                          (today, round(float(sell_price), 4), now, reason, round(pnl, 6),
+                          (today, fill, now, reason, pnl,
                            _trade_days_between(str(p["buy_date"]), today), now, int(p["id"])))
                 n_close += 1
-    return f"平仓 {n_close} 笔" if n_close else "持仓检查：无触发"
+    parts = [f"平仓 {n_close} 笔"] if n_close else ["持仓检查：无触发"]
+    if n_skip:
+        parts.append(f"账本不一致跳过 {n_skip} 笔（经验库与柜台股数对不上）")
+    return "；".join(parts)
 
 
 def get_open_positions() -> pd.DataFrame:

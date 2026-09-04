@@ -340,7 +340,9 @@ def job_position_track(**_ignored) -> str:
     now = datetime.now(ZoneInfo(TZ))
     if now.weekday() >= 5:
         return "非交易日，跳过"
-    if not ("0930" <= now.strftime("%H%M") <= "1500"):
+    # 窗口放宽到 15:05：保证收盘后至少命中一次 tick，
+    # 当日未成交限价单在 15:00 后及时标失效（position_fill_check 内部判定）
+    if not ("0930" <= now.strftime("%H%M") <= "1505"):
         return "非交易时段，跳过"
 
     import experience

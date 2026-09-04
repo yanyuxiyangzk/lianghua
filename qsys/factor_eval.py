@@ -8,6 +8,7 @@
 """
 
 import hashlib
+import random
 from pathlib import Path
 
 import numpy as np
@@ -524,6 +525,133 @@ def greedy_combo(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
                         "OOS扣费胜率": f"{round_best[0]:.0%}",
                         "平均净超额": f"{round_best[1]:+.2%}"})
     return {"selected": selected, "history": pd.DataFrame(history), "wf": best_wf}
+
+
+# ---------------------------------------------------------------- MMR 组合选择
+# 质量加权 + 相关性惩罚 + 概率采样：高胜率/高ICIR 因子入选概率大，但会因与已选
+# 因子高度相关而被压低概率——"选出一系列"互有差异又互补的因子组合。
+def quality_scores(scorecard: pd.DataFrame, win_col: str = "5日胜率") -> pd.Series:
+    """因子质量分（非负）：胜率超额 + ICIR 归一。
+
+    q = 2×max(胜率-0.5, 0) + |ICIR|/max|ICIR|　→ 范围约 [0, 2]
+    胜率列不存在时退回 Top组胜率；分数只用于 softmax 相对概率，量纲无关紧要。
+    """
+    sc = scorecard.set_index("因子")
+    win_col = win_col if win_col in sc.columns else "Top组胜率"
+    win = pd.to_numeric(sc[win_col], errors="coerce").fillna(0.5)
+    icir = pd.to_numeric(sc["ICIR"], errors="coerce").abs().fillna(0.0)
+    max_icir = float(icir.max()) if (icir > 0).any() else 1.0
+    return (win - 0.5).clip(lower=0) * 2.0 + icir / max_icir
+
+
+def _softmax_probs(scores: np.ndarray, tau: float) -> np.ndarray:
+    """数值稳定 softmax。tau 越大越均匀，越小越逼近"必选最高分"。"""
+    z = (scores - scores.max()) / max(tau, 1e-6)
+    e = np.exp(z)
+    return e / e.sum()
+
+
+def _mmr_sample(scores: pd.Series, corr: pd.DataFrame, k_max: int,
+                tau: float, lam: float, rng: random.Random) -> list[str]:
+    """单组 MMR 采样：softmax(质量分) 选第一个，之后每选一个就把其余因子的
+    分数减去 lam × 与已选因子的最大 |IC 相关|，再 softmax 抽下一个。
+
+    返回选中的因子名列表（分数全为非正 或 选满 k_max 时停止）。
+    """
+    remain = [n for n in scores.index if n in corr.columns]
+    cur = scores.copy()
+    selected: list[str] = []
+    for _ in range(k_max):
+        if not remain:
+            break
+        vals = np.array([cur[n] for n in remain], dtype=float)
+        if np.nanmax(vals) <= 0:
+            break
+        probs = _softmax_probs(np.nan_to_num(vals), tau)
+        pick = rng.choices(remain, weights=probs, k=1)[0]
+        selected.append(pick)
+        remain.remove(pick)
+        for n in remain:
+            c = max((abs(corr.loc[n, j]) for j in selected
+                     if j in corr.columns and pd.notna(corr.loc[n, j])), default=0.0)
+            cur[n] = float(scores[n]) - lam * c
+    return selected
+
+
+def mmr_combo(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method: str,
+              top_n: int, candidates: list[str], scorecard: pd.DataFrame | None = None,
+              corr: pd.DataFrame | None = None, k_max: int = 5, tau: float = 0.2,
+              lam: float = 1.0, num_samples: int = 12,
+              fwd_days: int = MAIN_FWD, step: int = STEP_DAYS, cost: float = 0.0025,
+              min_points: int = 8, buffer_n: int = 0, seed: int = 42) -> dict:
+    """MMR 迭代采样选因子组合：软最大化采样（胜率/ICIR 高的入选概率大）+
+    相关性软惩罚（与已选因子越像概率越低），采样多组后各自 walk-forward 验证，
+    取 OOS 扣费胜率最高（并列比平均净超额）的一组；贪心结果作为保底候选之一。
+
+    与 greedy_combo 同输入输出形态（selected/history/wf），另加 samples（采样组数）。
+    scorecard/corr 缺任一即退化为 greedy_combo。
+    """
+    # 退化路径：缺评分卡/相关性矩阵，或候选太少，直接贪心
+    if scorecard is None or corr is None or len(candidates) < 2:
+        g = greedy_combo(factor_vals, panel, method, top_n, candidates,
+                         fwd_days=fwd_days, step=step, cost=cost,
+                         min_points=min_points, buffer_n=buffer_n)
+        g["samples"] = 1
+        return g
+    vals_norm = {n: _norm(factor_vals[n].dropna()) for n in candidates
+                 if n in factor_vals and not factor_vals[n].dropna().empty}
+    avail = [n for n in candidates if n in vals_norm]
+    if len(avail) < 2:
+        g = greedy_combo(factor_vals, panel, method, top_n, avail,
+                         fwd_days=fwd_days, step=step, cost=cost,
+                         min_points=min_points, buffer_n=buffer_n)
+        g["samples"] = 1
+        return g
+
+    # 胜率列：按持有期映射到体检表的多周期胜率列
+    h_label = next((lab for lab, d in WIN_HORIZONS.items() if d == fwd_days), "5日")
+    q = quality_scores(scorecard, win_col=f"{h_label}胜率")
+    q = q.reindex(avail).fillna(0.0)
+    fwd = forward_returns(panel, fwd_days)
+    ic_full = {n: ic_series(vals_norm[n], fwd) for n in avail}
+
+    def _eval(names: list[str]):
+        wf = walk_forward({n: vals_norm[n] for n in names}, panel, method, top_n,
+                          step=step, fwd_days=fwd_days, cost=cost,
+                          buffer_n=buffer_n, ic_full=ic_full, min_factors=1)
+        if wf.empty or len(wf) < min_points or "优化组合扣费超额" not in wf:
+            return None, wf
+        net = wf["优化组合扣费超额"]
+        return (float((net > 0).mean()), float(net.mean())), wf
+
+    rng = random.Random(seed)
+    combos: list[list[str]] = []
+    g = greedy_combo(factor_vals, panel, method, top_n, candidates,
+                     fwd_days=fwd_days, step=step, cost=cost,
+                     min_points=min_points, buffer_n=buffer_n)
+    if g.get("selected"):
+        combos.append(list(g["selected"]))  # 贪心结果保底参与竞争
+    for _ in range(num_samples):
+        sel = _mmr_sample(q, corr, min(k_max, len(avail)), tau, lam, rng)
+        if len(sel) >= 1 and sel not in combos:
+            combos.append(sel)
+
+    memo: dict[tuple, tuple] = {}
+    best_names, best_obj, best_wf = None, (-1.0, -9e9), pd.DataFrame()
+    eval_rows = []
+    for names in combos:
+        key = tuple(names)
+        if key not in memo:
+            memo[key] = _eval(list(names))
+        obj, wf = memo[key]
+        eval_rows.append({"组合": " + ".join(names), "因子数": len(names),
+                          "OOS扣费胜率": f"{obj[0]:.0%}" if obj else "评估失败",
+                          "平均净超额": f"{obj[1]:+.2%}" if obj else "-"})
+        if obj and obj > best_obj:
+            best_obj, best_names, best_wf = obj, list(names), wf
+    history = pd.DataFrame(eval_rows)
+    return {"selected": best_names or [], "history": history, "wf": best_wf,
+            "samples": len(combos), "obj": best_obj}
 
 
 # ---------------------------------------------------------------- 事件研究（事件前兆因子挖掘）

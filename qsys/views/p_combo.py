@@ -64,6 +64,17 @@ with c3:
 with c4:
     method = st.selectbox("加权方法", ["ICIR加权", "等权", "胜率加权", "均值方差"], key="pc_method")
 
+c5, c6 = st.columns([1.4, 1])
+with c5:
+    algo = st.selectbox("组包算法", ["MMR采样（胜率概率×相关性惩罚）", "贪心搜索"],
+                        key="pc_algo",
+                        help="MMR：高胜率因子大概率入选，但与已选因子相关性高的会被压低概率，"
+                             "多组采样后按 OOS 成绩取最优（贪心结果参与竞争保底）；"
+                             "贪心：逐个试加，OOS 扣费胜率不再提升即停")
+with c6:
+    k_max = st.slider("目标因子数", 2, 8, 5, key="pc_kmax",
+                      help="MMR 采样每组抽取的因子数量上限（贪心自动停，不适用此值）")
+
 codes = pools.get(pool_name) or []
 if len(codes) < 30:
     st.warning("股票池太小（<30 只），截面统计没有意义。")
@@ -99,17 +110,26 @@ if st.button("🤖 自动组建因子组合", type="primary", key="pc_build"):
         fvals = {n: fe.get_factor_values(facs[n], codes, end) for n in kept}
         panel = sig.get_panel_cached(codes, end, 800, source="qlib_local")
         hdays = fe.WIN_HORIZONS.get(hold_h, fe.MAIN_FWD)
-        reco = fe.greedy_combo(fvals, panel, method, top_n, kept,
-                               fwd_days=hdays, step=max(1, min(fe.STEP_DAYS, hdays)),
-                               buffer_n=(top_n if hold_h == "1日" else 0))
+        step = max(1, min(fe.STEP_DAYS, hdays))
+        buffer_n = top_n if hold_h == "1日" else 0
+        if algo.startswith("MMR"):
+            bar.write(f"③ MMR 采样（{len(kept)} 候选 × 目标 {k_max} 因子 × 12 组，贪心保底竞争）…")
+            reco = fe.mmr_combo(fvals, panel, method, top_n, kept, scorecard=valid,
+                                corr=corr, k_max=k_max, fwd_days=hdays, step=step,
+                                buffer_n=buffer_n)
+        else:
+            bar.write(f"③ 贪心搜索（{len(kept)} 候选 × walk-forward）…")
+            reco = fe.greedy_combo(fvals, panel, method, top_n, kept,
+                                   fwd_days=hdays, step=step, buffer_n=buffer_n)
         out = {"selected": reco["selected"], "history": reco["history"], "wf": reco["wf"],
-               "hold_h": hold_h, "top_n": top_n, "method": method, "pool": pool_name}
+               "hold_h": hold_h, "top_n": top_n, "method": method, "pool": pool_name,
+               "algo": algo, "samples": reco.get("samples")}
         if reco["selected"]:
             sel_fvals = {n: fvals[n] for n in reco["selected"]}
             weights = fe.compute_weights(valid, method, reco["selected"],
                                          win_col=f"{hold_h}胜率")
             is_bt = fe.static_backtest(sel_fvals, panel, weights, top_n, upto=None,
-                                       fwd_days=hdays, step=max(1, min(fe.STEP_DAYS, hdays)))
+                                       fwd_days=hdays, step=step)
             out["weights"] = weights
             out["is_bt"] = is_bt
             out["facs"] = {n: facs[n] for n in reco["selected"]}
@@ -125,14 +145,16 @@ if st.button("🤖 自动组建因子组合", type="primary", key="pc_build"):
 auto = st.session_state.get("pc_auto")
 if auto and auto.get("selected"):
     if not auto.get("selected"):
-        st.warning("贪心搜索没有找到可用组合（候选因子样本外数据不足）。")
+        st.warning("没有找到可用组合（候选因子样本外数据不足）。")
     sel = auto["selected"]
-    st.markdown(f"**推荐因子组合（{len(sel)} 个）**："
+    algo_note = f"（{auto.get('algo','')} · 采样 {auto.get('samples','?')} 组）" \
+        if auto.get("algo", "").startswith("MMR") else ""
+    st.markdown(f"**推荐因子组合（{len(sel)} 个）**{algo_note}："
                 + " → ".join(f"`{sig.plain_factor_name(n)}`" for n in sel))
     h = auto.get("history")
     if h is not None and not h.empty:
         st.dataframe(h, width='stretch', hide_index=True, height=180)
-    if len(sel) <= 1:
+    if len(sel) <= 1 and not auto.get("algo", "").startswith("MMR"):
         st.info(f"💡 只选出 1 个因子**不是 bug**：在 {auto.get('hold_h')} 口径下，往 `"
             f"{sig.plain_factor_name(sel[0])}` 里加任何候选因子都会拉低样本外扣费胜率，"
             "贪心就停在了这里。1 日口径换手成本极高，单一最强因子常常就是最优解；"

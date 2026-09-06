@@ -8,7 +8,10 @@
            / 📖接口文档（官方文档内嵌）/ 🗄数据仓库（所有落库表总览+浏览）
            （原 实时行情/历史行情/高频行情/日内快照/基本面数据/特色数据 已下线，文件保留）
   专业区:  🧩 选股组合 / 🔬 个股分析 / 🧮 因子策略库 / 🪄 选股工作台 / 📈 模拟交易
-           / 🧬 进化看板 / 📊 回测浏览 / ⏰ 定时任务（调参研究用，平时不用看）
+           / 📊 回测浏览（调参研究用，平时不用看）
+  监控面板: 🧬 LoopEngine演化 / ⚙️ LoopEngine控制 / 🚧 硬闸门诊断
+           / 🔬 因子详情 / 📈 体检统计 / 📉 Walk-Forward衰减
+           / 🧬 进化看板 / ⏰ 定时任务（全流程监控）
   系统:    ⚙️ 设置（数据源切换/缓存/状态/说明）
 
 注意：页面文件放在 views/ 而非 pages/ —— pages/ 是 Streamlit 旧版自动发现
@@ -29,6 +32,8 @@ _app_theme.apply()
 from scheduler import get_scheduler as _get_scheduler
 
 _get_scheduler()
+
+# SSE 服务器不在此启动——在 entrypoint.sh 的调度器进程中启动（共享 event_bus 进程内存）
 
 # 全局：禁用 Streamlit 重跑时对"过期元素"的变暗遮罩（白纱层）。
 # 老内容保持可见且可点击，直到新内容到达——局部无感刷新的关键补丁。
@@ -73,8 +78,18 @@ pages = {
         st.Page("views/p_factorlib.py", title="因子策略库", icon="🧮", url_path="factorlib"),
         st.Page("views/p_picker.py", title="选股工作台", icon="🪄", url_path="picker"),
         st.Page("views/p_trades.py", title="模拟交易", icon="📈", url_path="trades"),
-        st.Page("views/p_evo.py", title="进化看板", icon="🧬", url_path="evo"),
         st.Page("views/p_backtest.py", title="回测浏览", icon="📊", url_path="backtest"),
+    ],
+    "监控面板": [
+        st.Page("views/p_workflow.py", title="全流程工作流", icon="🔗", url_path="workflow"),
+        st.Page("views/p_le_realtime.py", title="实时事件流", icon="⚡", url_path="le-realtime"),
+        st.Page("views/p_le_monitor.py", title="LoopEngine演化", icon="🧬", url_path="le-monitor"),
+        st.Page("views/p_loopengine.py", title="LoopEngine控制", icon="⚙️", url_path="loopengine"),
+        st.Page("views/p_gate_detail.py", title="硬闸门诊断", icon="🚧", url_path="gate-detail"),
+        st.Page("views/p_factor_detail.py", title="因子详情", icon="🔬", url_path="factor-detail"),
+        st.Page("views/p_factor_stats.py", title="体检统计", icon="📈", url_path="factor-stats"),
+        st.Page("views/p_wf_detail.py", title="Walk-Forward衰减", icon="📉", url_path="wf-detail"),
+        st.Page("views/p_evo.py", title="进化看板", icon="🧬", url_path="evo"),
         st.Page("views/p_sched.py", title="定时任务", icon="⏰", url_path="sched"),
     ],
     "系统": [

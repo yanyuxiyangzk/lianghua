@@ -7,6 +7,9 @@
 口径：5 日换仓、Top10% 多头、超额=Top组均值−池均值、单边千一成本（在超额里扣）。
 """
 
+import json
+from datetime import datetime
+
 import numpy as np
 import pandas as pd
 
@@ -78,7 +81,9 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
             return 0.0, 0.0
         return float(xy.mean() * 252), _sharpe(xy)
 
-    for year, tag in [(2025, "2025"), (2026, "2026")]:
+    now_year = datetime.now().year
+    for year in range(now_year - 1, now_year + 1):
+        tag = str(year)
         exc, shp = _year_stats(year)
         metrics[f"超额{tag}"] = round(exc, 4)
         metrics[f"夏普{tag}"] = round(shp, 2)
@@ -115,6 +120,28 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
         reasons.append(f"IC相关 {max_corr:.2f} ≥ {GATE['CORR_MAX']}")
 
     return {"pass": len(reasons) == 0, "reasons": reasons, "metrics": metrics}
+
+
+def log_gate_detail(factor_name: str, gate_date: str, result: dict, pool_name: str = "沪深300"):
+    """将闸门评估明细写入 gate_detail_log 表。"""
+    import logging
+    import library
+    try:
+        with library._lconn() as c:
+            c.execute(
+                "INSERT INTO gate_detail_log "
+                "(factor_name, gate_date, pool_name, metrics, passed, fail_reasons, created_at) "
+                "VALUES (?,?,?,?,?,?,?)"
+                " ON CONFLICT(factor_name, gate_date, pool_name) DO UPDATE SET"
+                " metrics=excluded.metrics, passed=excluded.passed,"
+                " fail_reasons=excluded.fail_reasons, created_at=excluded.created_at",
+                (factor_name, gate_date, pool_name,
+                 json.dumps(result.get("metrics", {}), ensure_ascii=False),
+                 1 if result.get("pass") else 0,
+                 json.dumps(result.get("reasons", []), ensure_ascii=False),
+                 datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    except Exception as e:
+        logging.warning("[gates] log_gate_detail failed: %s", e)
 
 
 def factor_hash(text: str) -> str:

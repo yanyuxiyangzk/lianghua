@@ -306,6 +306,23 @@ def job_loopengine(batch: int = 30, **_ignored) -> str:
             f"LLM否决{r.get('llm_rejected', 0)} · 重复{r['dup']} · FSA拦截{r['frozen']} · 入库{r['passed']} {r['new'][:3]}")
 
 
+def job_multitype_mine(batch_per_type: int = 15, pool_name: str = "沪深300",
+                       factor_types: str = "", **_ignored) -> str:
+    """多类型因子挖掘：遍历量价/资金流/板块轮动/指数/盘口异动/龙虎榜。
+    factor_types 为空时挖掘全部类型，逗号分隔指定子集。"""
+    from loopengine.engine import LoopEngine, DEFAULT_FACTOR_TYPES
+
+    eng = LoopEngine(pool_name)
+    types = [t.strip() for t in factor_types.split(",") if t.strip()] if factor_types else None
+    result = eng.run_multi_type_round(batch_per_type=batch_per_type, factor_types=types)
+    rounds = result.get("rounds", {})
+    parts = []
+    for ft, r in rounds.items():
+        parts.append(f"{ft}:{r['passed']}个")
+    return (f"多类型挖掘完成 · 类型={','.join(result.get('types_mined', []))} · "
+            f"{' · '.join(parts)}")
+
+
 def job_event_mine(kind: str = "涨停", batch: int = 30, horizon: int = 5,
                    pool_name: str = "沪深300", **_ignored) -> str:
     """事件定向挖因子：围绕「涨停/大涨/跌停/创新高」做事件目标演化，
@@ -796,6 +813,10 @@ JOBS = {
                    "default": {"enabled": False, "hour": 0, "minute": 0,
                                "params": {"batch": 30, "interval_sec": 300},
                                "trigger": "interval"}},
+    "multitype_mine": {"name": "🌐 多类型因子挖掘（资金流/板块/龙虎榜/盘口/指数）",
+                       "func": job_multitype_mine,
+                       "default": {"enabled": False, "hour": 1, "minute": 0,
+                                   "params": {"batch_per_type": 15, "factor_types": ""}}},
     "top5_composite": {"name": "🏆 Top5 复合因子（每日合成）", "func": job_top5_composite,
                        "default": {"enabled": False, "hour": 18, "minute": 20, "params": {}}},
     "trade_simulate": {"name": "📈 模拟交易回填（每日）", "func": job_trade_simulate,
@@ -849,7 +870,10 @@ class SchedulerManager:
     def _apply_state(self):
         state = self._state()
         for key, cfg in state.items():
-            self.sched.remove_job(key) if self.sched.get_job(key) else None
+            try:
+                self.sched.remove_job(key)
+            except Exception:
+                pass
             if not cfg["enabled"]:
                 continue
             if cfg.get("trigger") == "interval":
@@ -864,18 +888,34 @@ class SchedulerManager:
     # ---- 运行与记录 ----
     def _run(self, key: str):
         cfg = self._state()[key]
+        t0 = time.time()
         try:
             msg = JOBS[key]["func"](**cfg.get("params", {}))
             ok, detail = True, msg
         except Exception as e:
             ok, detail = False, f"{e}"
             traceback.print_exc()
+        dur_ms = int((time.time() - t0) * 1000)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         last = load_json(SCHED_LAST_FILE, {})
-        last[key] = {"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "ok": ok, "msg": detail}
+        last[key] = {"time": now, "ok": ok, "msg": detail}
         save_json(SCHED_LAST_FILE, last)
         hist = Path(SCHED_LAST_FILE).parent / "scheduler_history.jsonl"
         with hist.open("a") as f:
             f.write(json.dumps({"job": key, **last[key]}, ensure_ascii=False) + "\n")
+            f.flush()
+        # 落库 sched_exec_log
+        try:
+            import library
+            with library._lconn() as c:
+                c.execute(
+                    "INSERT INTO sched_exec_log (job_key,job_name,started_at,finished_at,"
+                    "duration_ms,success,message,params,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (key, JOBS[key]["name"], now, now, dur_ms, 1 if ok else 0,
+                     detail if isinstance(detail, str) else str(detail),
+                     json.dumps(cfg.get("params", {}), ensure_ascii=False), now))
+        except Exception as e:
+            logging.warning("[scheduler] sched_exec_log insert failed for %s: %s", key, e)
 
     # ---- 对外 API ----
     def view(self) -> dict:

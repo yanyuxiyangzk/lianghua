@@ -4,15 +4,45 @@
   - 树以 S 表达式为规范形式：sub(ma(overnight,20),delta(ma(overnight,20),5))
   - 求值用 datetime×instrument 帧（列向量化，单因子 <100ms）
   - 通过因子发射与 daily_pv.h5 兼容的 python 代码 → 直接进既有因子体系
+  - 支持多类型因子：量价/资金流/板块轮动/龙虎榜/盘口异动/指数
 """
 
 import re
 
-# ---------------------------------------------------------------- 字段（由面板派生）
+# ---------------------------------------------------------------- 基础量价字段（原有）
 FIELDS = ["open", "high", "low", "close", "volume", "amount", "vwap",
           "overnight", "amplitude", "upper_shadow", "lower_shadow", "hl_ratio", "body_ratio"]
 WINDOWS = [3, 5, 10, 15, 20, 30, 40, 60, 90, 120, 150, 200]
 MAX_DEPTH = 6
+
+# ---------------------------------------------------------------- 多类型因子字段定义
+# 每种 factor_type 对应的字段列表（与 FIELDS 合并使用）
+TYPE_FIELDS = {
+    "资金流": ["main_net_pct", "super_net_pct", "big_net_pct", "small_net_pct",
+              "net_inflow_ratio", "main_small_spread"],
+    "板块轮动": ["sector_momentum", "sector_net_flow", "sector_breadth",
+                "sector_rank", "sector_amount_ratio"],
+    "龙虎榜": ["lhb_net_buy", "lhb_inst_ratio", "lhb_hot_count",
+              "lhb_win_rate", "lhb_consecutive"],
+    "盘口异动": ["bid_ask_ratio", "outer_inner_ratio", "quantity_ratio_dev",
+                "tick_vol_ratio", "bid_ask_spread"],
+    "指数": ["idx_beta", "idx_rs", "idx_vol_ratio", "idx_corr", "idx_alpha"],
+}
+
+# 因子类型 → 默认机制族映射（用于新类型因子的族分类）
+TYPE_FAMILY_MAP = {
+    "资金流": "资金流",
+    "板块轮动": "板块轮动",
+    "龙虎榜": "龙虎榜",
+    "盘口异动": "盘口异动",
+    "指数": "指数",
+}
+
+# 所有可用字段（基础 + 当前类型）
+def all_fields(factor_type: str = "量价") -> list[str]:
+    """返回指定因子类型的完整字段列表。"""
+    extra = TYPE_FIELDS.get(factor_type, [])
+    return FIELDS + extra
 
 # 算子表：name: (arity, windowed, dim_out)
 OPS = {
@@ -24,6 +54,9 @@ OPS = {
     "ts_rank": (1, True, "rank"), "decay_linear": (1, True, "keep"),
     "std": (1, True, "keep"), "skew": (1, True, "keep"),
     "delta": (1, True, "keep"), "roc": (1, True, "keep"),
+    # 新增算子：EMA、Z-score 标准化、资金流加速度
+    "ema": (1, True, "keep"),
+    "zscore": (1, True, "rank"),
 }
 
 
@@ -65,9 +98,10 @@ class Node:
 
 
 # ---------------------------------------------------------------- S 表达式解析
-def parse(s: str):
-    """解析 S 表达式为树；失败返回 None。"""
+def parse(s: str, factor_type: str = "量价"):
+    """解析 S 表达式为树；失败返回 None。factor_type 决定哪些字段名合法。"""
     s = s.strip()
+    valid_fields = all_fields(factor_type)
     toks = re.findall(r"[A-Za-z_][A-Za-z0-9_]*|\d+|[(),]", s)
     pos = [0]
 
@@ -83,7 +117,7 @@ def parse(s: str):
 
     def parse_node():
         tok = eat()
-        if tok in FIELDS:
+        if tok in valid_fields:
             return Leaf(tok)
         if tok not in OPS:
             raise ValueError(f"未知符号 {tok}")
@@ -112,13 +146,15 @@ def parse(s: str):
 
 
 # ---------------------------------------------------------------- 求值（datetime×instrument 帧，列向量化）
-def build_field_frames(panel):
-    """面板 → 字段帧 dict。panel 为 (instrument, datetime) 索引。"""
+def build_field_frames(panel, extra_frames: dict | None = None):
+    """面板 → 字段帧 dict。panel 为 (instrument, datetime) 索引。
+    extra_frames: 可选的额外字段帧 dict（资金流/板块/龙虎榜/盘口/指数等），
+                  与基础量价帧合并。"""
     p = panel.unstack("instrument")
     pc = p["$close"].shift(1)
     oc_max = p[["$open", "$close"]].max(axis=1)
     oc_min = p[["$open", "$close"]].min(axis=1)
-    return {
+    frames = {
         "open": p["$open"], "high": p["$high"], "low": p["$low"], "close": p["$close"],
         "volume": p["$volume"], "amount": p["$amount"],
         "vwap": p["$amount"] / (p["$volume"] + 1e-12),
@@ -129,6 +165,9 @@ def build_field_frames(panel):
         "hl_ratio": p["$high"] / (p["$low"] + 1e-12),
         "body_ratio": (p["$close"] - p["$open"]) / (p["$high"] - p["$low"] + 1e-12),
     }
+    if extra_frames:
+        frames.update(extra_frames)
+    return frames
 
 
 def evaluate_tree(tree, frames):
@@ -172,6 +211,12 @@ def evaluate_tree(tree, frames):
             return args[0].pct_change(w)
         if op == "corr":
             return args[0].rolling(w).corr(args[1])
+        if op == "ema":
+            return args[0].ewm(span=w, adjust=False).mean()
+        if op == "zscore":
+            m = args[0].rolling(w).mean()
+            s = args[0].rolling(w).std()
+            return (args[0] - m) / (s + 1e-12)
         raise ValueError(f"未知算子 {op}")
 
     return ev(tree)
@@ -225,6 +270,11 @@ def _ev(t):
     if op == 'delta': return a[0].diff(w)
     if op == 'roc': return a[0].pct_change(w)
     if op == 'corr': return a[0].rolling(w).corr(a[1])
+    if op == 'ema': return a[0].ewm(span=w, adjust=False).mean()
+    if op == 'zscore':
+        _m = a[0].rolling(w).mean()
+        _s = a[0].rolling(w).std()
+        return (a[0] - _m) / (_s + 1e-12)
     raise ValueError(op)
 
 TREE = {sexpr!r}

@@ -9,6 +9,7 @@
 """
 
 import json
+import logging
 from datetime import datetime
 from pathlib import Path
 
@@ -23,7 +24,8 @@ CREATE TABLE IF NOT EXISTS factor_registry (
     kind TEXT NOT NULL,           -- evolved / builtin
     code TEXT,                    -- 进化因子代码
     trace TEXT, round INTEGER, decision INTEGER,
-    first_seen TEXT
+    first_seen TEXT,
+    factor_type TEXT DEFAULT '量价'  -- 量价/资金流/板块轮动/龙虎榜/盘口异动/指数
 );
 CREATE TABLE IF NOT EXISTS factor_scorecards (
     name TEXT NOT NULL, pool_name TEXT NOT NULL, eval_date TEXT NOT NULL,
@@ -61,6 +63,53 @@ CREATE TABLE IF NOT EXISTS combo_strategies (
     packs TEXT,                   -- JSON array：成员策略包名
     created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS sched_exec_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_key TEXT NOT NULL,
+    job_name TEXT,
+    started_at TEXT,
+    finished_at TEXT,
+    duration_ms INTEGER,
+    success INTEGER,
+    message TEXT,
+    params TEXT,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sched_job_time ON sched_exec_log(job_key, started_at);
+CREATE TABLE IF NOT EXISTS gate_detail_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    factor_name TEXT NOT NULL,
+    gate_date TEXT NOT NULL,
+    pool_name TEXT DEFAULT '沪深300',
+    metrics TEXT NOT NULL,
+    passed INTEGER NOT NULL,
+    fail_reasons TEXT,
+    created_at TEXT,
+    UNIQUE(factor_name, gate_date, pool_name)
+);
+CREATE INDEX IF NOT EXISTS idx_gate_factor_date ON gate_detail_log(factor_name, gate_date);
+CREATE TABLE IF NOT EXISTS walk_forward_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    trade_date TEXT NOT NULL,
+    pool_name TEXT,
+    method TEXT,
+    top_n INTEGER,
+    fwd_days INTEGER,
+    cost REAL,
+    opt_return REAL,
+    opt_excess REAL,
+    opt_turnover REAL,
+    opt_net_excess REAL,
+    eq_return REAL,
+    eq_excess REAL,
+    eq_turnover REAL,
+    eq_net_excess REAL,
+    pool_median REAL,
+    active_factors TEXT,
+    created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_wf_run ON walk_forward_log(run_id, trade_date);
 """
 
 _PACKS_JSON = DATA_DIR / "packs.json"
@@ -73,7 +122,7 @@ def _lconn():
     # 迁移：factor_registry 加骨架/机制族/闸门列
     cols = [r[1] for r in c.execute("PRAGMA table_info(factor_registry)")]
     for col, ddl in [("skeleton", "TEXT"), ("family", "TEXT"), ("gate_status", "INTEGER"),
-                     ("engine", "TEXT DEFAULT 'rdagent'")]:
+                     ("engine", "TEXT DEFAULT 'rdagent'"), ("factor_type", "TEXT DEFAULT '量价'")]:
         if col not in cols:
             c.execute(f"ALTER TABLE factor_registry ADD COLUMN {col} {ddl}")
     # 迁移：factor_scorecards 加多周期胜率 JSON（1/5/20/60/120 日）
@@ -87,6 +136,10 @@ def _lconn():
     # 迁移：strategies 加样本内胜率（🎯今日选股的过拟合信号灯用）
     if "is_winrate" not in st_cols:
         c.execute("ALTER TABLE strategies ADD COLUMN is_winrate TEXT")
+    # 迁移：存量因子 factor_type 回填（NULL → 基于名称/family 推断）
+    _backfill_factor_type(c)
+    # 迁移：sched_exec_log 从 JSONL 导入历史数据
+    _migrate_sched_history(c)
     _migrate(c)
     return c
 
@@ -94,48 +147,131 @@ def _lconn():
 _migrated = False
 
 
+def _backfill_factor_type(c):
+    """存量因子 factor_type 回填：NULL → 基于名称/family 推断类型。"""
+    rows = c.execute("SELECT name, family FROM factor_registry WHERE factor_type IS NULL").fetchall()
+    if not rows:
+        return
+    for name, fam in rows:
+        ft = "量价"  # 默认
+        low = (name or "").lower()
+        fam_low = (fam or "").lower()
+        if any(k in low or k in fam_low for k in ["lhb", "dragon", "龙虎榜"]):
+            ft = "龙虎榜"
+        elif any(k in low or k in fam_low for k in ["sector", "板块", "breadth", "rotation"]):
+            ft = "板块轮动"
+        elif any(k in low or k in fam_low for k in ["idx", "benchmark", "beta", "alpha", "relative_strength"]):
+            ft = "指数"
+        elif any(k in low or k in fam_low for k in ["bid_ask", "tick", "orderbook", "quantity_ratio", "outer_inner", "盘口"]):
+            ft = "盘口异动"
+        elif any(k in low or k in fam_low for k in ["main_net", "super_net", "big_net", "small_net",
+                                                      "fundflow", "inflow", "资金流",
+                                                      "cmf", "mfi", "obv", "adosc", "bop"]):
+            ft = "资金流"
+        elif fam and fam in ("资金流", "板块轮动", "龙虎榜", "盘口异动", "指数"):
+            ft = fam
+        c.execute("UPDATE factor_registry SET factor_type=? WHERE name=? AND factor_type IS NULL",
+                  (ft, name))
+
+
+def _migrate_sched_history(c):
+    """一次性把 scheduler_history.jsonl 导入 sched_exec_log 表。"""
+    hist_file = DATA_DIR / "scheduler_history.jsonl"
+    if not hist_file.exists():
+        return
+    n = c.execute("SELECT COUNT(*) FROM sched_exec_log").fetchone()[0]
+    if n > 0:
+        return  # 已导入过
+    JOBS_NAME = {
+        "update_data": "每日数据更新", "ifind_daily_sync": "iFinD日线入库",
+        "ifind_calendar": "iFinD交易日历", "ifind_basic_daily": "iFinD基本面",
+        "ifind_announce": "iFinD公告", "ifind_stocklist_sync": "A股列表同步",
+        "ifind_indexlist_sync": "指数列表同步", "ifind_realtime_sync": "实时快照",
+        "ifind_cleanup": "过期数据清理", "watchlist_signals": "个股信号",
+        "pool_scan": "板块/池扫描Top-N", "outcome_backfill": "战果回填",
+        "gate_check": "硬闸门筛查", "quote_collect": "行情快照采集",
+        "sector_flow_collect": "板块资金流采集", "loopengine": "LoopEngine演化",
+        "multitype_mine": "多类型因子挖掘", "top5_composite": "Top5复合因子",
+        "trade_simulate": "模拟交易回填", "position_track": "持仓跟踪",
+        "minute_sync": "分钟线同步", "auction_confirm": "竞价确认",
+        "le_factor_eval": "LoopEngine因子体检", "event_mine": "事件定向挖掘",
+        "fundflow_sync": "个股资金流入库",
+    }
+    rows = []
+    with hist_file.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                item = json.loads(line)
+                job = item.get("job", "")
+                time_str = item.get("time", "")
+                ok = item.get("ok", False)
+                msg = item.get("msg", "")
+                rows.append((job, JOBS_NAME.get(job, job), time_str, time_str, 0,
+                             1 if ok else 0, msg if isinstance(msg, str) else str(msg), None, time_str))
+            except Exception:
+                continue
+    if rows:
+        try:
+            c.execute("BEGIN")
+            c.executemany(
+                "INSERT INTO sched_exec_log (job_key,job_name,started_at,finished_at,"
+                "duration_ms,success,message,params,created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                rows)
+            c.execute("COMMIT")
+            print(f"[sched_exec_log] migrated {len(rows)} rows from history")
+        except Exception as e:
+            c.execute("ROLLBACK")
+            logging.warning("[library] _migrate_sched_history failed: %s", e)
+
+
 def _migrate(c):
     """一次性把 packs.json / factor_cards parquet 导入库。"""
     global _migrated
     if _migrated:
         return
-    _migrated = True
-    n = c.execute("SELECT COUNT(*) FROM strategies").fetchone()[0]
-    if n == 0 and _PACKS_JSON.exists():
-        packs = load_json(_PACKS_JSON, {})
-        for name, pk in packs.items():
-            c.execute(
-                "INSERT OR REPLACE INTO strategies (name, pool_name, top_n, method, filters, factors, oos_winrate, updated_at)"
-                " VALUES (?,?,?,?,?,?,?,?)",
-                (name, pk.get("pool_name"), pk.get("top_n"), pk.get("method"),
-                 json.dumps(pk.get("filters", []), ensure_ascii=False),
-                 json.dumps(pk.get("factors", []), ensure_ascii=False),
-                 pk.get("oos_winrate"), pk.get("updated")))
-    # factor_cards/*.parquet → factor_scorecards（文件名：<pool>_<eval_date>.parquet）
-    n2 = c.execute("SELECT COUNT(*) FROM factor_scorecards").fetchone()[0]
-    if n2 == 0 and _CARD_DIR.exists():
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        for f in _CARD_DIR.glob("*.parquet"):
-            try:
-                pool, eval_date = f.stem.rsplit("_", 1)
-                card = pd.read_parquet(f)
-                rows = []
-                for _, r in card.iterrows():
-                    rows.append((r["因子"], pool, eval_date, r.get("来源"),
-                                 _f(r.get("IC均值")), _f(r.get("ICIR")), _f(r.get("IC胜率")),
-                                 _f(r.get("Top组胜率")), str(r.get("建议方向", "")),
-                                 int(r.get("天数", 0) or 0), now))
-                c.executemany(
-                    "INSERT OR REPLACE INTO factor_scorecards (name, pool_name, eval_date, kind,"
-                    " ic_mean, icir, ic_winrate, top_winrate, direction, days, updated_at)"
-                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
-            except Exception:
-                continue
+    try:
+        n = c.execute("SELECT COUNT(*) FROM strategies").fetchone()[0]
+        if n == 0 and _PACKS_JSON.exists():
+            packs = load_json(_PACKS_JSON, {})
+            for name, pk in packs.items():
+                c.execute(
+                    "INSERT OR REPLACE INTO strategies (name, pool_name, top_n, method, filters, factors, oos_winrate, updated_at)"
+                    " VALUES (?,?,?,?,?,?,?,?)",
+                    (name, pk.get("pool_name"), pk.get("top_n"), pk.get("method"),
+                     json.dumps(pk.get("filters", []), ensure_ascii=False),
+                     json.dumps(pk.get("factors", []), ensure_ascii=False),
+                     pk.get("oos_winrate"), pk.get("updated")))
+        # factor_cards/*.parquet → factor_scorecards（文件名：<pool>_<eval_date>.parquet）
+        n2 = c.execute("SELECT COUNT(*) FROM factor_scorecards").fetchone()[0]
+        if n2 == 0 and _CARD_DIR.exists():
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            for f in _CARD_DIR.glob("*.parquet"):
+                try:
+                    pool, eval_date = f.stem.rsplit("_", 1)
+                    card = pd.read_parquet(f)
+                    rows = []
+                    for _, r in card.iterrows():
+                        rows.append((r["因子"], pool, eval_date, r.get("来源"),
+                                     _f(r.get("IC均值")), _f(r.get("ICIR")), _f(r.get("IC胜率")),
+                                     _f(r.get("Top组胜率")), str(r.get("建议方向", "")),
+                                     int(r.get("天数", 0) or 0), now))
+                    c.executemany(
+                        "INSERT OR REPLACE INTO factor_scorecards (name, pool_name, eval_date, kind,"
+                        " ic_mean, icir, ic_winrate, top_winrate, direction, days, updated_at)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
+                except Exception:
+                    continue
+        _migrated = True
+    except Exception as e:
+        logging.warning("[library] _migrate failed (will retry): %s", e)
 
 
 # ---------------------------------------------------------------- 因子注册表
 def sync_factor_registry(factors: list[dict]):
-    """同步因子注册表（自动提取骨架/机制族）。factors: [{name, kind, code?, trace?, round?, decision?}]"""
+    """同步因子注册表（自动提取骨架/机制族）。factors: [{name, kind, code?, trace?, round?, decision?, factor_type?}]"""
     import structure
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -143,16 +279,18 @@ def sync_factor_registry(factors: list[dict]):
         for f in factors:
             sk = structure.extract_skeleton(f["name"], f.get("code"))
             fam = structure.assign_family(f["name"], sk)
+            ft = f.get("factor_type", "量价")
             c.execute(
                 "INSERT INTO factor_registry (name, kind, code, trace, round, decision, first_seen,"
-                " skeleton, family, engine)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?)"
+                " skeleton, family, engine, factor_type)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(name) DO UPDATE SET code=excluded.code, trace=excluded.trace,"
                 "   round=excluded.round, decision=excluded.decision,"
-                "   skeleton=excluded.skeleton, family=excluded.family",
+                "   skeleton=excluded.skeleton, family=excluded.family,"
+                "   factor_type=excluded.factor_type",
                 (f["name"], f["kind"], f.get("code"), f.get("trace"),
                  f.get("round"), int(f["decision"]) if f.get("decision") is not None else None, now,
-                 sk, fam, f.get("engine", "rdagent")))
+                 sk, fam, f.get("engine", "rdagent"), ft))
 
 
 def get_factor_registry() -> pd.DataFrame:

@@ -1,0 +1,110 @@
+/* QuantSys Dashboard · 深色金融终端主题
+   在 Streamlit 页面中通过 st.markdown(<style>...</style>, unsafe_allow_html=True) 注入 */
+:root {
+  --qs-bg: #080c12;
+  --qs-surface: #111b26;
+  --qs-card: #172332;
+  --qs-border: #243548;
+  --qs-text: #e9f0f7;
+  --qs-muted: #8191a3;
+  --qs-blue: #3b82f6;
+  --qs-up: #f04444;
+  --qs-down: #28d7a0;
+  --qs-warn: #f2b84b;
+}
+
+/* 页面背景与主内容 */
+.stApp { background: var(--qs-bg); color: var(--qs-text); }
+[data-testid="stAppViewContainer"] { background: var(--qs-bg); }
+[data-testid="stHeader"] { background: transparent; }
+.block-container { max-width: 1500px; padding: 2rem 2.5rem 3rem; }
+
+/* 侧边栏 */
+[data-testid="stSidebar"] {
+  background: #0b141e;
+  border-right: 1px solid var(--qs-border);
+}
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p {
+  color: var(--qs-muted);
+}
+[data-testid="stSidebarNav"] a {
+  border-radius: 8px;
+  margin: 4px 10px;
+  color: #9aaabd;
+  transition: background .2s ease, color .2s ease;
+}
+[data-testid="stSidebarNav"] a:hover,
+[data-testid="stSidebarNav"] a[aria-current="page"] {
+  background: #1d3b67;
+  color: #fff;
+}
+
+/* 标题 */
+h1, h2, h3 { color: var(--qs-text) !important; letter-spacing: .01em; }
+h1 { font-size: 1.8rem !important; }
+h2 { font-size: 1.35rem !important; }
+.qs-muted, small, [data-testid="stCaptionContainer"] {
+  color: var(--qs-muted) !important;
+}
+
+/* 指标卡：外层 st.container(border=True) 建议配合使用 */
+[data-testid="stMetric"] {
+  background: linear-gradient(180deg, #172332, #101923);
+  border: 1px solid var(--qs-border);
+  border-radius: 11px;
+  padding: 1rem 1.2rem;
+  box-shadow: 0 8px 22px rgba(0,0,0,.16);
+}
+[data-testid="stMetricLabel"] { color: var(--qs-muted) !important; }
+[data-testid="stMetricValue"] { color: var(--qs-text); font-size: 1.8rem; font-weight: 700; }
+[data-testid="stMetricDelta"] svg { display: none; }
+
+/* 通用卡片 */
+.qs-card {
+  background: var(--qs-surface);
+  border: 1px solid var(--qs-border);
+  border-radius: 11px;
+  padding: 1.1rem 1.25rem;
+  box-shadow: 0 10px 26px rgba(0,0,0,.14);
+}
+
+/* Tab、按钮、输入框 */
+[data-baseweb="tab-list"] { gap: .35rem; border-bottom: 1px solid var(--qs-border); }
+[data-baseweb="tab"] { color: var(--qs-muted); padding: .65rem 1rem; }
+[aria-selected="true"] { color: #fff !important; border-bottom-color: var(--qs-blue) !important; }
+.stButton > button, .stDownloadButton > button {
+  border: 1px solid #2e5fa8;
+  border-radius: 7px;
+  background: #216fe9;
+  color: #fff;
+  transition: filter .2s ease, transform .2s ease;
+}
+.stButton > button:hover, .stDownloadButton > button:hover { filter: brightness(1.15); transform: translateY(-1px); }
+[data-baseweb="input"], [data-baseweb="select"] > div {
+  background: #111b26; border-color: var(--qs-border); color: var(--qs-text);
+}
+
+/* 数据表格 */
+[data-testid="stDataFrame"] {
+  border: 1px solid var(--qs-border);
+  border-radius: 9px;
+  overflow: hidden;
+}
+[data-testid="stDataFrame"] th { background: #172332 !important; color: #9fb0c2 !important; }
+[data-testid="stDataFrame"] td { background: #111b26 !important; color: #e9f0f7 !important; }
+
+/* 状态颜色：在 HTML 文本上加对应 class */
+.qs-up { color: var(--qs-up) !important; }
+.qs-down { color: var(--qs-down) !important; }
+.qs-warn { color: var(--qs-warn) !important; }
+.qs-live::before {
+  content: ""; display: inline-block; width: 7px; height: 7px; margin-right: 6px;
+  border-radius: 50%; background: var(--qs-down); animation: qs-pulse 1.2s infinite;
+}
+@keyframes qs-pulse { 50% { box-shadow: 0 0 0 6px rgba(40,215,160,.12); } }
+
+/* 小屏幕 */
+@media (max-width: 900px) {
+  .block-container { padding: 1rem; }
+  [data-testid="stMetricValue"] { font-size: 1.35rem; }
+}

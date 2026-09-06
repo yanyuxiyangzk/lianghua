@@ -39,7 +39,7 @@ def extract_skeleton(name: str, code: str | None = None) -> str:
     return f"{ops_sig}@{fields_sig}"
 
 
-# ---------------------------------------------------------------- 机制族（13 族）
+# ---------------------------------------------------------------- 机制族（18 族）
 MECHANISM_FAMILIES = {
     "跳空": ["gap", "overnight", "alpha041"],
     "振幅": ["amplitude", "hl_ratio", "atr", "parkinson", "garman", "range", "stddev"],
@@ -51,9 +51,15 @@ MECHANISM_FAMILIES = {
     "流动性": ["amihud", "turnover", "volume_std", "vol_ratio", "volume_ratio"],
     "趋势均线": ["ma_bullish", "dema", "tema", "kama", "wma", "midpoint", "tsf", "plus_di", "minus_di", "adxr"],
     "价格位置": ["price_pos", "dist_from", "midpoint"],
-    "资金流": ["cmf", "mfi", "obv", "adosc", "ad_slope", "amount_ratio", "bop"],
+    "资金流": ["cmf", "mfi", "obv", "adosc", "ad_slope", "amount_ratio", "bop",
+              "main_net", "super_net", "big_net", "small_net", "fundflow", "inflow"],
     "统计": ["beta", "var"],
     "形态": ["engulfing", "body_ratio", "doji"],
+    # 新增：多类型因子族
+    "板块轮动": ["sector", "industry", "breadth", "rotation"],
+    "龙虎榜": ["lhb", "dragon", "inst_trade", "hot_dept"],
+    "盘口异动": ["bid_ask", "tick", "orderbook", "quantity_ratio", "outer_inner"],
+    "指数": ["idx", "benchmark", "beta", "alpha", "relative_strength"],
 }
 
 

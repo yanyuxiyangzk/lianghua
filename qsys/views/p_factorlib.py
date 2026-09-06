@@ -50,9 +50,10 @@ def _paginate(df: pd.DataFrame, key: str, sizes=(50, 100, 200)) -> tuple:
 # ---------------------------------------------------------------- 因子详情
 def _render_factor_detail(pick: str, pool_name: str, row: pd.Series, reg_map: dict):
     cat = row.get("类别", "")
+    ft = row.get("因子类型", "量价")
     st.markdown(f"#### 🔬 {pick}")
     st.markdown(_metrics_html({
-        "类别": cat, "来源": row["来源"], "建议方向": row["建议方向"],
+        "因子类型": ft, "类别": cat, "来源": row["来源"], "建议方向": row["建议方向"],
         "IC均值": f"{row['IC均值']:.4f}" if pd.notna(row["IC均值"]) else "—",
         "ICIR": f"{row['ICIR']:.3f}" if pd.notna(row["ICIR"]) else "—",
         "IC胜率": f"{row['IC胜率']:.1%}" if pd.notna(row["IC胜率"]) else "—",
@@ -197,7 +198,7 @@ def render():
 
     view_all = st.toggle("📚 显示全部注册因子（含未体检）", value=False, key="fl_all")
     if view_all:
-        f1, f2, f3 = st.columns([1, 1, 2])
+        f1, f2, f3, f4 = st.columns([1, 1, 1, 2])
         with f1:
             fams = ["全部"] + sorted(registry["family"].dropna().unique().tolist()) if not registry.empty else ["全部"]
             fam_sel = st.selectbox("机制族", fams, key="fl_fam")
@@ -205,17 +206,22 @@ def render():
             srcs = ["全部", "loopengine", "rdagent", "builtin", "tech"]
             src_sel = st.selectbox("来源引擎", srcs, key="fl_src")
         with f3:
+            ftypes = ["全部"] + sorted(registry["factor_type"].dropna().unique().tolist()) if not registry.empty and "factor_type" in registry.columns else ["全部"]
+            ft_sel = st.selectbox("因子类型", ftypes, key="fl_ft")
+        with f4:
             kw = st.text_input("搜索因子名", "", key="fl_kw")
         reg_show = registry.copy()
         if fam_sel != "全部":
             reg_show = reg_show[reg_show["family"] == fam_sel]
         if src_sel != "全部":
             reg_show = reg_show[reg_show["engine"] == src_sel]
+        if ft_sel != "全部" and "factor_type" in reg_show.columns:
+            reg_show = reg_show[reg_show["factor_type"] == ft_sel]
         if kw.strip():
             reg_show = reg_show[reg_show["name"].str.contains(kw.strip(), case=False)]
         reg_show["闸门"] = reg_show["gate_status"].map({1: "收益✅", 0: "❌", 2: "事件✅"}).fillna("未测")
-        disp_all = reg_show[["name", "family", "engine", "闸门", "first_seen"]].rename(
-            columns={"name": "因子", "family": "机制族", "engine": "来源", "first_seen": "入库时间"})
+        disp_all = reg_show[["name", "family", "factor_type", "engine", "闸门", "first_seen"]].rename(
+            columns={"name": "因子", "family": "机制族", "factor_type": "因子类型", "engine": "来源", "first_seen": "入库时间"})
         st.caption(f"命中 {len(disp_all)} 个")
         all_page, _, all_ph = _paginate(disp_all, "fl_all_pg")
         (all_ph or st).dataframe(all_page, width='stretch', height=380, hide_index=True)
@@ -232,6 +238,13 @@ def render():
         st.info(f"暂无「{pool_name}」的因子体检数据。到 🪄选股组合 页点「开始/刷新体检」生成。")
     else:
         show = card.copy()
+        # 因子类型筛选
+        ft_map = registry.set_index("name")["factor_type"].to_dict() if "factor_type" in registry.columns else {}
+        show["_factor_type"] = show["因子"].map(lambda n: ft_map.get(n) or "量价")
+        ftypes = ["全部"] + sorted(show["_factor_type"].unique().tolist())
+        ft_filter = st.selectbox("📂 因子类型筛选", ftypes, key="fl_ft_filter")
+        if ft_filter != "全部":
+            show = show[show["_factor_type"] == ft_filter]
         kw_card = st.text_input("🔍 搜索因子名", "", key="fl_card_kw")
         if kw_card.strip():
             show = show[show["因子"].str.contains(kw_card.strip(), case=False)]
@@ -243,12 +256,11 @@ def render():
         show["用于策略"] = show["因子"].map(lambda n: "、".join(usage.get(n, [])) or "—")
         _src_map = {"evolved": "进化", "builtin": "内置", "tech": "技术指标", "loopengine": "演化引擎"}
         show["来源"] = show["来源"].map(lambda k: _src_map.get(k, k))
-        show["类别"] = show.apply(
-            lambda r: sig.NAME2CAT.get(r["因子"], "RD-Agent进化" if r["来源"] == "进化"
-                                       else ("经典量价" if r["来源"] == "内置" else "摆动指标")), axis=1)
+        show["因子类型"] = show["_factor_type"]
+        show["类别"] = show["因子"].map(lambda n: sig.NAME2CAT.get(n, "量价"))
         reg_gate = registry.set_index("name")["gate_status"].to_dict() if "gate_status" in registry.columns else {}
         show["硬闸门"] = show["因子"].map(lambda n: {1: "✅", 0: "❌"}.get(reg_gate.get(n), "未测"))
-        disp = show[["因子", "类别", "来源", "IC均值", "ICIR", "IC胜率", "Top组胜率", "硬闸门", "实战胜率", "建议方向", "用于策略"]].copy()
+        disp = show[["因子", "因子类型", "类别", "来源", "IC均值", "ICIR", "IC胜率", "Top组胜率", "硬闸门", "实战胜率", "建议方向", "用于策略"]].copy()
         for c in ["IC均值", "ICIR"]:
             disp[c] = disp[c].map(lambda x: f"{x:.4f}" if pd.notna(x) else "—")
         for c in ["IC胜率", "Top组胜率", "实战胜率"]:

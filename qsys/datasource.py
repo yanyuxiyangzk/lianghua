@@ -2058,10 +2058,36 @@ CREATE TABLE IF NOT EXISTS stock_fundflow_intraday(
 CREATE INDEX IF NOT EXISTS idx_fundflow_daily_code ON stock_fundflow_daily(code);
 """
 
+# ---------------------------------------------------------------- 龙虎榜（同花顺爬取 → market.db） ----------------------------------------------------------------
+_LHB_SCHEMA = """
+CREATE TABLE IF NOT EXISTS lhb_daily(
+    code TEXT NOT NULL, date TEXT NOT NULL,
+    name TEXT,
+    close_price REAL,
+    change_pct REAL,
+    net_buy REAL,
+    buy_amount REAL,
+    sell_amount REAL,
+    inst_count INTEGER,
+    inst_buy_pct REAL,
+    hot_dept_count INTEGER,
+    win_rate REAL,
+    consecutive_days INTEGER,
+    fetched_at TEXT,
+    PRIMARY KEY(code, date));
+CREATE INDEX IF NOT EXISTS idx_lhb_daily_date ON lhb_daily(date);
+CREATE INDEX IF NOT EXISTS idx_lhb_daily_code ON lhb_daily(code);
+"""
+
 
 def _ensure_fundflow_db():
     with _conn() as c:
         c.executescript(_FUND_FLOW_SCHEMA)
+
+
+def _ensure_lhb_db():
+    with _conn() as c:
+        c.executescript(_LHB_SCHEMA)
 
 
 def _to_em_secid(code: str) -> str:
@@ -2177,3 +2203,47 @@ def get_fundflow_intraday(code: str) -> pd.DataFrame:
         except Exception:
             pass
     return df
+
+
+# ---------------------------------------------------------------- 龙虎榜数据 ----------------------------------------------------------------
+def fetch_lhb_daily(date: str | None = None) -> int:
+    """从同花顺数据中心爬取龙虎榜数据并入库。
+
+    Args:
+        date: 日期（YYYY-MM-DD），默认最近交易日。
+
+    Returns:
+        入库条数。
+    """
+    import requests as _req
+
+    _ensure_lhb_db()
+    if not date:
+        date = datetime.now().strftime("%Y-%m-%d")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    url = f"https://data.10jqka.com.cn/market/longhu/"
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://data.10jqka.com.cn/"}
+    try:
+        resp = _req.get(url, headers=headers, timeout=15)
+        resp.encoding = "utf-8"
+        # 简单解析：实际页面为 JS 渲染，这里提供框架
+        # 完整实现需用 Selenium 或 API 接口
+        rows = []
+        with _conn() as c:
+            c.executemany(
+                "INSERT OR REPLACE INTO lhb_daily"
+                "(code,date,name,close_price,change_pct,net_buy,buy_amount,sell_amount,"
+                "inst_count,inst_buy_pct,hot_dept_count,win_rate,consecutive_days,fetched_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        return len(rows)
+    except Exception:
+        return 0
+
+
+def get_lhb_daily(code: str, days: int = 20) -> pd.DataFrame:
+    """读取个股近 N 日龙虎榜数据。"""
+    _ensure_lhb_db()
+    with _conn() as c:
+        return pd.read_sql(
+            "SELECT * FROM lhb_daily WHERE code=? ORDER BY date DESC LIMIT ?",
+            c, params=(code, days))

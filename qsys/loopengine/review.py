@@ -3,8 +3,8 @@
 from loopengine.tree import MAX_DEPTH, Node
 
 
-def review(tree) -> tuple[bool, str]:
-    """返回 (通过, 原因)。"""
+def review(tree, factor_type=None) -> tuple[bool, str]:
+    """返回 (通过, 原因)。factor_type 预留接口，暂不使用。"""
     if tree is None:
         return False, "解析失败"
     if tree.depth() > MAX_DEPTH:

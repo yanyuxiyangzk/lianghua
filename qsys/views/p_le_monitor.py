@@ -87,6 +87,36 @@ def _load_registry_stats():
         return pd.DataFrame()
 
 
+@st.cache_data(ttl=30)
+def _load_mo_scores(limit=10):
+    """多目标评分 Top 因子（含风险指标 + 衰减状态）。"""
+    import library
+    try:
+        with library._lconn() as c:
+            df = pd.read_sql(
+                "SELECT name, family, multi_objective_score, max_drawdown, sharpe, sortino, calmar, "
+                "       COALESCE(decay_status, '-') AS decay_status, decay_rate "
+                "FROM factor_registry WHERE engine='loopengine' AND gate_status=1 "
+                "AND multi_objective_score IS NOT NULL "
+                "ORDER BY multi_objective_score DESC LIMIT ?", c, params=(limit,))
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=30)
+def _load_decay_stats():
+    """因子衰减状态分布。"""
+    import library
+    try:
+        with library._lconn() as c:
+            df = pd.read_sql(
+                "SELECT decay_status, COUNT(*) AS cnt FROM factor_decay GROUP BY decay_status", c)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
 def _load_console_log(n_lines=200, only_err=False):
     try:
         size = LOG_FILE.stat().st_size
@@ -289,6 +319,41 @@ def _render_field_chart(state, key_prefix=""):
         st.plotly_chart(fig, width="stretch", key=f"field_{key_prefix}")
 
 
+def _render_mo_and_decay(key_prefix=""):
+    """多目标评分 Top 因子 + 衰减状态分布。"""
+    mo = _load_mo_scores()
+    st.markdown("### 多目标评分 Top 因子（IC+风险+收益平衡）")
+    if mo.empty:
+        st.info("暂无多目标评分数据（等待因子入库时计算）")
+    else:
+        show = mo.rename(columns={
+            "name": "因子", "family": "族", "multi_objective_score": "综合评分",
+            "max_drawdown": "最大回撤", "sharpe": "夏普", "sortino": "索提诺",
+            "calmar": "卡玛", "decay_status": "衰减状态", "decay_rate": "衰减率"})
+        st.dataframe(show, width="stretch", hide_index=True,
+                     column_config={
+                         "综合评分": st.column_config.ProgressColumn(min_value=0.0, max_value=1.0, format="%.3f"),
+                         "最大回撤": st.column_config.NumberColumn(format="%.1%%"),
+                         "夏普": st.column_config.NumberColumn(format="%.2f"),
+                         "索提诺": st.column_config.NumberColumn(format="%.2f"),
+                         "卡玛": st.column_config.NumberColumn(format="%.2f"),
+                         "衰减率": st.column_config.NumberColumn(format="%.2f")},
+                     key=f"mo_table_{key_prefix}")
+
+    dec = _load_decay_stats()
+    st.markdown("### 因子衰减状态分布")
+    if dec.empty:
+        st.info("暂无衰减检测数据")
+    else:
+        label_map = {"normal": "正常", "mild": "轻度", "moderate": "中度",
+                     "severe": "重度", "insufficient_data": "数据不足", "error": "错误"}
+        dec["状态"] = dec["decay_status"].map(label_map).fillna(dec["decay_status"])
+        fig = px.pie(dec, names="状态", values="cnt", hole=0.45,
+                     color_discrete_sequence=px.colors.qualitative.Set2)
+        fig.update_layout(height=320, margin=dict(l=20, r=20, t=30, b=20))
+        st.plotly_chart(fig, width="stretch", key=f"decay_{key_prefix}")
+
+
 # ---------- 主页面 ----------
 def render():
     st.markdown("## 🧬 LoopEngine 演化监控")
@@ -321,6 +386,7 @@ def render():
         _render_funnel_chart("tab1")
         _render_family_chart("tab1")
         _render_field_chart(state, "tab1")
+        _render_mo_and_decay("tab1")
 
     with tab_gate:
         _render_gate_log()

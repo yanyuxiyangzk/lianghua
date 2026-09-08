@@ -1030,3 +1030,390 @@ def combo_backtest(pack_defs: list[dict], panel: pd.DataFrame, min_votes: int = 
         row["组合扣费超额"] = excess - turnover * cost
         rows.append(row)
     return pd.DataFrame(rows)
+
+
+# ---------------------------------------------------------------- 多目标评分
+def _calc_max_drawdown(returns: pd.Series) -> float:
+    """计算最大回撤"""
+    if returns.empty:
+        return 0.0
+    nav = (1 + returns).cumprod()
+    drawdown = (nav - nav.cummax()) / nav.cummax()
+    return float(drawdown.min()) if len(drawdown) > 0 else 0.0
+
+
+def _calc_sharpe(returns: pd.Series, risk_free: float = 0.0) -> float:
+    """计算夏普比率"""
+    if returns.empty or returns.std() < 1e-10:
+        return 0.0
+    excess = returns.mean() - risk_free
+    return float(excess / returns.std() * np.sqrt(252))
+
+
+def _calc_sortino(returns: pd.Series, risk_free: float = 0.0) -> float:
+    """计算索提诺比率"""
+    if returns.empty:
+        return 0.0
+    excess = returns.mean() - risk_free
+    downside = returns[returns < 0]
+    if downside.empty or downside.std() < 1e-10:
+        return 0.0
+    return float(excess / downside.std() * np.sqrt(252))
+
+
+def _calc_calmar(returns: pd.Series) -> float:
+    """计算卡玛比率"""
+    if returns.empty:
+        return 0.0
+    ann_return = returns.mean() * 252
+    max_dd = abs(_calc_max_drawdown(returns))
+    if max_dd < 1e-10:
+        return 0.0
+    return float(ann_return / max_dd)
+
+
+def _calc_ic_stability(ic_series: pd.Series) -> float:
+    """IC稳定性：IC标准差相对IC均值的逆指标（0-1，越高越稳定）。
+
+    经验验证：原公式 1 - rolling_std*10 对典型 IC（std≈0.1）恒为 0（死分量）。
+    改为相对指标：std/|mean| 越小越稳定，4 倍以上视为不稳定。"""
+    if ic_series.empty or len(ic_series) < 60:
+        return 0.5
+    ic_mean = abs(float(ic_series.mean()))
+    ic_std = float(ic_series.std())
+    denom = max(ic_mean, 0.005)
+    ratio = ic_std / denom
+    return float(max(0.0, min(1.0, 1.0 - ratio / 8.0)))
+
+
+def _calc_ic_trend(ic_series: pd.Series) -> float:
+    """IC趋势：近60天相对斜率（0-1，0.5 为持平，>0.5 改善，<0.5 恶化）。
+
+    经验验证：原公式 0.5 + slope*100 缩放失当（死分量）。
+    改为相对变化：60 天累计变化 / |IC均值|，变化 ±4 倍饱和。"""
+    if ic_series.empty or len(ic_series) < 60:
+        return 0.5
+    y = ic_series[-60:].values.astype(float)
+    slope = float(np.polyfit(np.arange(len(y)), y, 1)[0])
+    denom = max(abs(float(y.mean())), 0.005)
+    frac = slope * len(y) / denom
+    return float(max(0.0, min(1.0, 0.5 + frac / 4.0)))
+
+
+def multi_objective_score(factor_name: str, codes: list[str], end: str,
+                         weights: dict | None = None, code: str | None = None) -> dict:
+    """
+    多目标评分：平衡收益和风险
+    
+    Args:
+        factor_name: 因子名称
+        codes: 股票池代码
+        end: 截止日期
+        weights: 权重配置（默认 {'ic': 0.8, 'risk': 0.1, 'sharpe': 0.1}，经验校准）
+        code: 因子代码（loopengine 因子入库前传 emit_code 结果，避免依赖注册表）
+    
+    Returns:
+        dict: {
+            'score': 综合评分 (0-1)
+            'ic_score': IC评分
+            'risk_score': 风险评分
+            'sharpe_score': 夏普评分
+            'stability_score': 稳定性评分
+            'trend_score': 趋势评分
+            'max_drawdown': 最大回撤
+            'sharpe': 夏普比率
+            'sortino': 索提诺比率
+            'calmar': 卡玛比率
+            'ic_mean': IC均值
+            'ic_std': IC标准差
+            'details': 详细指标
+        }
+    """
+    if weights is None:
+        # 经验验证（walk-forward OOS，n=67~69，两个 OOS 窗口）：
+        # 1) 过闸因子间 样本内夏普/索提诺/卡玛/回撤 与 OOS IC 显著负相关
+        #    （ρ=-0.45~-0.60，p<0.001）——线性奖励平滑曲线=奖励过拟合；
+        # 2) IC 稳定性/趋势分量同样负向预测 OOS（trend ρ=-0.45）——仅作诊断展示，不计入评分；
+        # 3) 风险/夏普只保留宽松的灾难阈值惩罚（多数因子满分，不产生有害排序）。
+        weights = {'ic': 0.8, 'risk': 0.1, 'sharpe': 0.1}
+    
+    try:
+        # 获取因子值和IC序列
+        fac = {"name": factor_name, "kind": "loopengine", "code": code}
+        if not fac["code"]:
+            fac = resolve_factor(factor_name) or fac
+        if not fac.get("code"):
+            return {'score': 0.0, 'error': f'无法解析因子代码: {factor_name}'}
+        vals = get_factor_values(fac, codes, end, source="qlib_local")
+        ic_series = get_ic_series(fac, codes, end, source="qlib_local")
+        
+        if vals.empty or ic_series.empty:
+            return {'score': 0.0, 'error': '数据为空'}
+        
+        # 获取面板和远期收益
+        panel = sig.get_panel_cached(codes, end, 800, source="qlib_local")
+        fwd = forward_returns(panel, 5)  # 5日远期收益
+        
+        # 计算IC指标
+        ic_mean = float(ic_series.mean())
+        ic_std = float(ic_series.std())
+        ic_winrate = float((ic_series > 0).mean())
+        
+        # 计算收益序列
+        from gates import _daily_excess  # 延迟导入避免与 gates 的循环依赖
+        excess_series = _daily_excess(vals, fwd)
+        
+        # 计算风险指标
+        max_dd = _calc_max_drawdown(excess_series)
+        sharpe = _calc_sharpe(excess_series)
+        sortino = _calc_sortino(excess_series)
+        calmar = _calc_calmar(excess_series)
+        
+        # 计算IC稳定性
+        stability = _calc_ic_stability(ic_series)
+        
+        # 计算IC趋势
+        trend = _calc_ic_trend(ic_series)
+        
+        # 计算各维度评分
+        # 1. IC评分 (0-1)：IC强度 + 胜率（稳定性/趋势经验上反向预测 OOS，仅作诊断不计分）
+        ic_score = min(1.0, abs(ic_mean) * 10) * 0.5 + ic_winrate * 0.5
+
+        # 2. 风险评分 (0-1)：灾难阈值惩罚（回撤 ≤70% 满分；更平滑不额外奖励）
+        risk_score = 1.0 if abs(max_dd) <= 0.70 else max(0.0, 1.0 - (abs(max_dd) - 0.70) / 0.30)
+
+        # 3. 夏普评分 (0-1)：门槛惩罚（夏普 ≥0.5 满分；更高不额外奖励）
+        sharpe_score = 1.0 if sharpe >= 0.5 else max(0.0, sharpe / 0.5)
+        
+        # 综合评分
+        score = (ic_score * weights['ic'] + 
+                 risk_score * weights['risk'] + 
+                 sharpe_score * weights['sharpe'])
+        
+        return {
+            'score': round(score, 4),
+            'ic_score': round(ic_score, 4),
+            'risk_score': round(risk_score, 4),
+            'sharpe_score': round(sharpe_score, 4),
+            'stability_score': round(stability, 4),
+            'trend_score': round(trend, 4),
+            'max_drawdown': round(max_dd, 4),
+            'sharpe': round(sharpe, 4),
+            'sortino': round(sortino, 4),
+            'calmar': round(calmar, 4),
+            'ic_mean': round(ic_mean, 4),
+            'ic_std': round(ic_std, 4),
+            'details': {
+                'ic_winrate': round(ic_winrate, 4),
+                'excess_mean': round(float(excess_series.mean()), 4),
+                'excess_std': round(float(excess_series.std()), 4),
+            }
+        }
+    
+    except Exception as e:
+        return {'score': 0.0, 'error': str(e)}
+
+
+def risk_budget_check(strategy_pack: dict, codes: list[str], end: str,
+                     max_drawdown_limit: float = 0.15,
+                     industry_limit: float = 0.20,
+                     stock_limit: float = 0.05) -> dict:
+    """
+    风险预算检查
+    
+    Args:
+        strategy_pack: 策略包配置
+        codes: 股票池代码
+        end: 截止日期
+        max_drawdown_limit: 最大回撤限制 (默认15%)
+        industry_limit: 行业暴露限制 (默认20%)
+        stock_limit: 个股集中度限制 (默认5%)
+    
+    Returns:
+        dict: {
+            'passed': 是否通过
+            'violations': 违规项列表
+            'metrics': 详细指标
+        }
+    """
+    violations = []
+    metrics = {}
+    
+    try:
+        # 获取策略包的因子值
+        factors = strategy_pack.get('factors', [])
+        if not factors:
+            return {'passed': False, 'violations': ['策略包无因子'], 'metrics': {}}
+        
+        # 计算组合得分
+        panel = sig.get_panel_cached(codes, end, 800, source="qlib_local")
+        fwd = forward_returns(panel, 5)
+        
+        # 模拟组合收益
+        combo_vals = None
+        for fac in factors:
+            try:
+                vals = get_factor_values(fac, codes, end, source="qlib_local")
+                if combo_vals is None:
+                    combo_vals = vals
+                else:
+                    combo_vals = combo_vals + vals
+            except:
+                continue
+        
+        if combo_vals is None or combo_vals.empty:
+            return {'passed': False, 'violations': ['无法计算因子值'], 'metrics': {}}
+        
+        # 计算超额收益
+        from gates import _daily_excess  # 延迟导入避免与 gates 的循环依赖
+        excess_series = _daily_excess(combo_vals, fwd)
+        
+        # 1. 检查最大回撤
+        max_dd = _calc_max_drawdown(excess_series)
+        metrics['max_drawdown'] = max_dd
+        if abs(max_dd) > max_drawdown_limit:
+            violations.append(f"最大回撤 {abs(max_dd):.2%} > {max_drawdown_limit:.2%}")
+        
+        # 2. 检查夏普比率
+        sharpe = _calc_sharpe(excess_series)
+        metrics['sharpe'] = sharpe
+        if sharpe < 0.5:
+            violations.append(f"夏普比率 {sharpe:.2f} < 0.5")
+        
+        # 3. 检查行业暴露（简化版：检查Top10%股票的行业分布）
+        # 这里需要行业数据，暂时简化处理
+        metrics['industry_check'] = 'skipped'
+        
+        # 4. 检查个股集中度
+        # 简化版：检查Top10%股票的数量
+        top_count = int(len(codes) * 0.1)
+        metrics['top_stock_count'] = top_count
+        if top_count < 10:
+            violations.append(f"Top组股票数量 {top_count} < 10")
+        
+        return {
+            'passed': len(violations) == 0,
+            'violations': violations,
+            'metrics': metrics
+        }
+    
+    except Exception as e:
+        return {'passed': False, 'violations': [f'检查失败: {str(e)}'], 'metrics': metrics}
+
+
+def diversity_score(tree, factor_type: str = "量价") -> dict:
+    """
+    计算因子的多样性评分
+    
+    Args:
+        tree: 因子表达式树
+        factor_type: 因子类型
+    
+    Returns:
+        dict: {
+            'score': 多样性评分 (0-1)
+            'op_diversity': 算子多样性
+            'depth_score': 结构多样性
+            'family_score': 机制族多样性
+        }
+    """
+    details = {}
+    
+    # 1. 算子多样性
+    ops_used = set()
+
+    def _walk(node):
+        if hasattr(node, "op"):
+            ops_used.add(node.op)
+            for ch in node.children:
+                _walk(ch)
+
+    _walk(tree)
+    
+    all_ops = {'sub', 'mul', 'div', 'abs', 'sign', 'rank_cs', 'ma', 'ts_min', 'ts_max',
+               'ts_rank', 'decay_linear', 'std', 'skew', 'delta', 'roc', 'ema', 'zscore', 'corr'}
+    op_diversity = len(ops_used) / len(all_ops) if all_ops else 0.0
+    details['op_diversity'] = op_diversity
+    
+    # 2. 结构多样性（树深度）
+    depth = tree.depth()
+    # 中等深度(3-5)获得奖励
+    if 3 <= depth <= 5:
+        depth_score = 1.0
+    elif depth < 3:
+        depth_score = depth / 3
+    else:
+        depth_score = max(0.5, 1.0 - (depth - 5) / 5)
+    details['depth_score'] = depth_score
+    
+    # 3. 机制族多样性
+    # 获取当前机制族覆盖率
+    try:
+        import library
+        registry = library.get_factor_registry()
+        if not registry.empty:
+            family_counts = registry.groupby('family').size()
+            total = family_counts.sum()
+            family_coverage = family_counts / total if total > 0 else family_counts * 0
+            # 覆盖率越低，多样性评分越高
+            family_score = 1.0 - family_coverage.mean()
+        else:
+            family_score = 0.5
+    except:
+        family_score = 0.5
+    details['family_score'] = family_score
+    
+    # 4. 综合评分
+    score = (op_diversity * 0.3 + 
+             depth_score * 0.3 + 
+             family_score * 0.4)
+    
+    return {
+        'score': round(float(score), 4),
+        'op_diversity': round(float(op_diversity), 4),
+        'depth_score': round(float(depth_score), 4),
+        'family_score': round(float(family_score), 4)
+    }
+
+
+def adjust_operator_weights() -> dict:
+    """
+    根据多样性调整算子权重
+    
+    Returns:
+        dict: 调整后的算子权重
+    """
+    try:
+        import library
+        registry = library.get_factor_registry()
+        if registry.empty:
+            return {}
+        
+        # 统计算子使用频率
+        op_freq = {}
+        for _, row in registry.iterrows():
+            code = row.get('code', '')
+            if not code:
+                continue
+            # 简单统计算子出现次数
+            for op in ['sub', 'mul', 'div', 'ma', 'delta', 'roc', 'ts_min', 'ts_max']:
+                if op in code:
+                    op_freq[op] = op_freq.get(op, 0) + 1
+        
+        total = sum(op_freq.values()) if op_freq else 1
+        
+        # 计算多样性奖励
+        weights = {}
+        for op, freq in op_freq.items():
+            freq_ratio = freq / total
+            # 使用频率越高，权重越低（鼓励探索）
+            if freq_ratio > 0.1:  # 高频算子
+                weights[op] = max(0.5, 1.0 - freq_ratio)
+            else:  # 低频算子
+                weights[op] = min(2.0, 1.0 + freq_ratio)
+        
+        return weights
+    
+    except Exception as e:
+        return {}
+

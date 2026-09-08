@@ -25,7 +25,10 @@ CREATE TABLE IF NOT EXISTS factor_registry (
     code TEXT,                    -- 进化因子代码
     trace TEXT, round INTEGER, decision INTEGER,
     first_seen TEXT,
-    factor_type TEXT DEFAULT '量价'  -- 量价/资金流/板块轮动/龙虎榜/盘口异动/指数
+    factor_type TEXT DEFAULT '量价',  -- 量价/资金流/板块轮动/龙虎榜/盘口异动/指数
+    multi_objective_score REAL,       -- 多目标综合评分
+    max_drawdown REAL, sharpe REAL, sortino REAL, calmar REAL,
+    decay_status TEXT, decay_rate REAL  -- 因子衰减状态/衰减率
 );
 CREATE TABLE IF NOT EXISTS factor_scorecards (
     name TEXT NOT NULL, pool_name TEXT NOT NULL, eval_date TEXT NOT NULL,
@@ -131,6 +134,12 @@ def _lconn():
     cols = [r[1] for r in c.execute("PRAGMA table_info(factor_registry)")]
     for col, ddl in [("skeleton", "TEXT"), ("family", "TEXT"), ("gate_status", "INTEGER"),
                      ("engine", "TEXT DEFAULT 'rdagent'"), ("factor_type", "TEXT DEFAULT '量价'")]:
+        if col not in cols:
+            c.execute(f"ALTER TABLE factor_registry ADD COLUMN {col} {ddl}")
+    # 迁移：factor_registry 加多目标评分/风险指标/衰减状态列
+    for col, ddl in [("multi_objective_score", "REAL"), ("max_drawdown", "REAL"),
+                     ("sharpe", "REAL"), ("sortino", "REAL"), ("calmar", "REAL"),
+                     ("decay_status", "TEXT"), ("decay_rate", "REAL")]:
         if col not in cols:
             c.execute(f"ALTER TABLE factor_registry ADD COLUMN {col} {ddl}")
     # 迁移：factor_scorecards 加多周期胜率 JSON（1/5/20/60/120 日）

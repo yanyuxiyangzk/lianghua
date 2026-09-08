@@ -94,13 +94,27 @@ class LoopEngine:
     def _pick_parent(self, rng, live_boost: dict | None = None, factor_type: str = "量价"):
         """从已通过硬闸门的 loopengine 因子中选取父本。
         live_boost 非空时按族实战胜率加权；factor_type 过滤同类型因子。
-        优先按因子价值评分加权选择。"""
+        优先按因子价值评分加权选择；同时考虑多样性评分和衰减状态。"""
         # 获取因子价值评分
         value_scores = {}
         try:
             vs_df = library.factor_value_scores(factor_type=factor_type)
             if not vs_df.empty:
                 value_scores = dict(zip(vs_df["name"], vs_df["total_score"]))
+        except Exception:
+            pass
+
+        # 获取衰减状态
+        decay_status = {}
+        try:
+            with library._lconn() as c:
+                c.execute("""CREATE TABLE IF NOT EXISTS factor_decay (
+                    factor_name TEXT PRIMARY KEY, decay_status TEXT, decay_rate REAL,
+                    ic_long REAL, ic_short REAL, ic_std REAL, check_time TEXT, updated_at TEXT
+                )""")
+                rows_decay = c.execute("SELECT factor_name, decay_status, decay_rate FROM factor_decay").fetchall()
+                for r in rows_decay:
+                    decay_status[r[0]] = {'status': r[1], 'rate': r[2]}
         except Exception:
             pass
 
@@ -117,20 +131,27 @@ class LoopEngine:
                     " AND gate_status=1 ORDER BY RANDOM() LIMIT 12").fetchall()
         if not rows:
             return None
-        if live_boost or value_scores:
-            w = []
-            for r in rows:
-                base = 1.0
-                # 族实战加权
-                if live_boost:
-                    base += live_boost.get(r[1] or "", 0.0)
-                # 因子价值加权（0~1 → 0~1.5倍额外权重）
-                if value_scores:
-                    base += value_scores.get(r[2], 0.3) * 1.5
-                w.append(max(0.1, base))
-            row = rng.choices(rows, weights=w, k=1)[0]
-        else:
-            row = rows[0]
+        
+        # 计算权重
+        from loopengine.decay import adjust_factor_weight
+        w = []
+        for r in rows:
+            base = 1.0
+            # 族实战加权
+            if live_boost:
+                base += live_boost.get(r[1] or "", 0.0)
+            # 因子价值加权（0~1 → 0~1.5倍额外权重）
+            if value_scores:
+                base += value_scores.get(r[2], 0.3) * 1.5
+
+            # 衰减状态调整权重（重度衰减软惩罚至 0.2，见 decay.adjust_factor_weight）
+            decay_weight = 1.0
+            if r[2] in decay_status:
+                decay_weight = adjust_factor_weight(r[2], decay_status[r[2]]['status'])
+
+            w.append(max(0.1, base) * decay_weight)
+        
+        row = rng.choices(rows, weights=w, k=1)[0]
         if not row[0]:
             return None
         first = row[0].split("\n", 1)[0]
@@ -213,6 +234,19 @@ class LoopEngine:
         bus.push(EventType.STEP_UPDATE, step=3, name="FSA重算", status="running")
         library.fsa_recompute()
         bus.push(EventType.STEP_UPDATE, step=3, name="FSA重算", status="done")
+
+        # Step 3.5: 因子衰减检测
+        bus.push(EventType.STEP_UPDATE, step=3, name="衰减检测", status="running")
+        try:
+            from loopengine.decay import run_decay_detection
+            decay_stats = run_decay_detection(codes, end)
+            bus.push(EventType.STEP_UPDATE, step=3, name="衰减检测", status="done",
+                     decay_stats=decay_stats)
+        except Exception as e:
+            log.warning(f"衰减检测失败: {e}")
+            decay_stats = {'total': 0, 'normal': 0, 'mild': 0, 'moderate': 0, 'severe': 0}
+            bus.push(EventType.STEP_UPDATE, step=3, name="衰减检测", status="error",
+                     error=str(e))
 
         llm_review_budget = 5
         for _ in range(batch):
@@ -303,20 +337,47 @@ class LoopEngine:
                      stats_snapshot={k: v for k, v in stats.items() if k != "new"})
 
             library.record_tested(h, sexpr[:60], "loopengine", "loopengine", end, result["pass"],
-                                  result["metrics"].get("IC"))
+                                   result["metrics"].get("IC"))
             s["budget"].record(src, result["pass"])
 
-            # Step 10: 入库
+            # Step 10: 入库（含多目标评分）
             bus.push(EventType.STEP_UPDATE, step=10, name="入库", status="running")
             if result["pass"]:
                 name = fname
+                emit = emit_code(sexpr, name)
+
+                # 多目标评分
+                try:
+                    from factor_eval import multi_objective_score
+                    mo_score = multi_objective_score(name, codes, end, code=emit)
+                    result["multi_objective_score"] = mo_score.get("score", 0.0)
+                    result["risk_metrics"] = {
+                        "max_drawdown": mo_score.get("max_drawdown", 0.0),
+                        "sharpe": mo_score.get("sharpe", 0.0),
+                        "sortino": mo_score.get("sortino", 0.0),
+                        "calmar": mo_score.get("calmar", 0.0),
+                    }
+                except Exception as e:
+                    log.warning(f"多目标评分失败: {e}")
+                    result["multi_objective_score"] = 0.0
+                    result["risk_metrics"] = {}
+
                 library.sync_factor_registry([{
                     "name": name, "kind": "loopengine",
-                    "code": emit_code(sexpr, name),
-                    "engine": "loopengine", "factor_type": factor_type}])
+                    "code": emit,
+                    "engine": "loopengine", "factor_type": factor_type,
+                    "multi_objective_score": result.get("multi_objective_score", 0.0)}])
                 with library._lconn() as c:
-                    c.execute("UPDATE factor_registry SET gate_status=1, skeleton=?, family=? WHERE name=?",
-                              (sk, fam, name))
+                    c.execute("""UPDATE factor_registry 
+                        SET gate_status=1, skeleton=?, family=?, 
+                            multi_objective_score=?, max_drawdown=?, sharpe=?, sortino=?, calmar=?
+                        WHERE name=?""",
+                        (sk, fam, result.get("multi_objective_score", 0.0),
+                         result.get("risk_metrics", {}).get("max_drawdown", 0.0),
+                         result.get("risk_metrics", {}).get("sharpe", 0.0),
+                         result.get("risk_metrics", {}).get("sortino", 0.0),
+                         result.get("risk_metrics", {}).get("calmar", 0.0),
+                         name))
                 stats["passed"] += 1
                 stats["new"].append(name)
                 s["accepted"] += 1

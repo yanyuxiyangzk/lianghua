@@ -235,8 +235,228 @@ def build_scorecard(factors: list[dict], codes: list[str], end: str,
             rows.append(row)
         except Exception as e:
             rows.append({"因子": fac["name"], "来源": fac["kind"], "IC均值": np.nan,
-                         "ICIR": np.nan, "IC胜率": np.nan, "Top组胜率": np.nan,
+                         "ICIR": np.nan, "IC胜率": np.nan, "Top组_winrate": np.nan,
                          "建议方向": f"评估失败: {str(e)[:40]}", "天数": 0})
+    return pd.DataFrame(rows)
+
+
+def build_scorecard_batch(factors: list[dict], codes: list[str], end: str,
+                          source: str | None = None, train_end: str | None = None) -> pd.DataFrame:
+    """批量因子体检表：一次构建面板，批量计算所有因子的IC和胜率，避免重复IO。
+
+    P2优化：面板只构建1次，帧缓存复用，IC批量计算。
+    P4优化：跳过已有缓存的因子值。"""
+    import datasource
+    from loopengine.tree import build_field_frames, evaluate_tree, parse
+
+    source = source or "qlib_local"
+    rows = []
+
+    # 1. 一次性构建面板和帧（最大开销）
+    panel = sig.get_panel_cached(codes, end, 800, source=source)
+    if train_end:
+        panel = panel[panel.index.get_level_values("datetime") <= train_end]
+    fwds = {d: forward_returns(panel, d) for d in WIN_HORIZONS.values()}
+    frames = build_field_frames(panel)
+
+    # 2. 批量计算所有因子的值（树直算快速路径）
+    factor_values = {}
+    ck_prefix = "|".join(sorted(codes))
+    for fac in factors:
+        try:
+            code = fac.get("code") or ""
+            if not code.startswith("# sexpr: "):
+                # 非树因子回退到单因子计算
+                factor_values[fac["name"]] = get_factor_values(fac, codes, end, source=source)
+                continue
+
+            # P4: 检查缓存是否已存在
+            ck = _cache("fvals", f"{source}|{fac['name']}|{fac['kind']}|{ck_prefix}|{end}|800")
+            if ck.exists():
+                hit = sig._read_parquet_safe(ck)
+                if hit is not None:
+                    factor_values[fac["name"]] = hit.iloc[:, 0]
+                    continue
+
+            # 树直算批量计算
+            sexpr = code.split("\n", 1)[0][len("# sexpr: "):]
+            tree = parse(sexpr)
+            vals = evaluate_tree(tree, frames).stack().rename(fac["name"]).dropna()
+            vals.index = vals.index.set_names(["datetime", "instrument"])
+            vals = _norm(vals)
+            sig._write_parquet_atomic(vals.to_frame(fac["name"]), ck)
+            factor_values[fac["name"]] = vals
+        except Exception:
+            # 回退到单因子计算
+            try:
+                factor_values[fac["name"]] = get_factor_values(fac, codes, end, source=source)
+            except Exception:
+                continue
+
+    # 3. 批量计算IC和胜率
+    for fac in factors:
+        fname = fac["name"]
+        if fname not in factor_values:
+            rows.append({"因子": fname, "来源": fac["kind"], "IC均值": np.nan,
+                         "ICIR": np.nan, "IC胜率": np.nan, "Top组_winrate": np.nan,
+                         "建议方向": "计算失败", "天数": 0})
+            continue
+
+        try:
+            vals = factor_values[fname]
+            if vals.empty:
+                raise RuntimeError("因子值为空")
+
+            # 计算IC序列
+            ic = ic_series(vals, fwds[MAIN_FWD])
+            if ic.empty:
+                raise RuntimeError("IC 序列为空")
+
+            if train_end:
+                ic = ic[ic.index <= train_end]
+                vals = vals[vals.index.get_level_values("datetime") <= train_end]
+                if ic.empty or vals.empty:
+                    raise RuntimeError("预选窗内无数据")
+
+            kind_label = {"evolved": "进化", "builtin": "内置", "tech": "技术指标",
+                          "loopengine": "演化引擎"}.get(fac["kind"], fac["kind"])
+            row = {
+                "因子": fname, "来源": kind_label,
+                "IC均值": ic.mean(), "ICIR": ic.mean() / (ic.std() + 1e-12),
+                "IC胜率": (ic > 0).mean(),
+                "Top组胜率": top_group_winrate(vals, panel, fwd=fwds[MAIN_FWD]),
+                "建议方向": "正向" if ic.mean() >= 0 else "负向",
+                "天数": len(ic),
+            }
+            for label, d in WIN_HORIZONS.items():
+                row[f"{label}胜率"] = top_group_winrate(
+                    vals, panel, fwd_days=d, step=(5 if d <= 5 else STEP_DAYS), fwd=fwds[d])
+            rows.append(row)
+        except Exception as e:
+            rows.append({"因子": fname, "来源": fac["kind"], "IC均值": np.nan,
+                         "ICIR": np.nan, "IC胜率": np.nan, "Top组_winrate": np.nan,
+                         "建议方向": f"评估失败: {str(e)[:40]}", "天数": 0})
+
+    return pd.DataFrame(rows)
+
+
+def _eval_single_factor(args):
+    """单因子评估函数（用于并行执行）。"""
+    fac, vals, panel, fwds, train_end = args
+    fname = fac["name"]
+    try:
+        if vals is None or vals.empty:
+            raise RuntimeError("因子值为空")
+
+        # 计算IC序列
+        ic = ic_series(vals, fwds[MAIN_FWD])
+        if ic.empty:
+            raise RuntimeError("IC 序列为空")
+
+        if train_end:
+            ic = ic[ic.index <= train_end]
+            vals = vals[vals.index.get_level_values("datetime") <= train_end]
+            if ic.empty or vals.empty:
+                raise RuntimeError("预选窗内无数据")
+
+        kind_label = {"evolved": "进化", "builtin": "内置", "tech": "技术指标",
+                      "loopengine": "演化引擎"}.get(fac["kind"], fac["kind"])
+        row = {
+            "因子": fname, "来源": kind_label,
+            "IC均值": ic.mean(), "ICIR": ic.mean() / (ic.std() + 1e-12),
+            "IC胜率": (ic > 0).mean(),
+            "Top组胜率": top_group_winrate(vals, panel, fwd=fwds[MAIN_FWD]),
+            "建议方向": "正向" if ic.mean() >= 0 else "负向",
+            "天数": len(ic),
+        }
+        for label, d in WIN_HORIZONS.items():
+            row[f"{label}胜率"] = top_group_winrate(
+                vals, panel, fwd_days=d, step=(5 if d <= 5 else STEP_DAYS), fwd=fwds[d])
+        return row
+    except Exception as e:
+        return {"因子": fname, "来源": fac["kind"], "IC均值": np.nan,
+                "ICIR": np.nan, "IC胜率": np.nan, "Top组_winrate": np.nan,
+                "建议方向": f"评估失败: {str(e)[:40]}", "天数": 0}
+
+
+def build_scorecard_parallel(factors: list[dict], codes: list[str], end: str,
+                             source: str | None = None, train_end: str | None = None,
+                             max_workers: int = 4) -> pd.DataFrame:
+    """并行因子体检表：多进程计算IC和胜率，加速批量评估。
+
+    P2+P3优化：面板+帧只构建1次，因子值批量计算，并行评估IC和胜率。"""
+    import datasource
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from loopengine.tree import build_field_frames, evaluate_tree, parse
+
+    source = source or "qlib_local"
+
+    # 1. 一次性构建面板和帧
+    panel = sig.get_panel_cached(codes, end, 800, source=source)
+    if train_end:
+        panel = panel[panel.index.get_level_values("datetime") <= train_end]
+    fwds = {d: forward_returns(panel, d) for d in WIN_HORIZONS.values()}
+    frames = build_field_frames(panel)
+
+    # 2. 批量计算所有因子的值
+    factor_values = {}
+    ck_prefix = "|".join(sorted(codes))
+    for fac in factors:
+        try:
+            code = fac.get("code") or ""
+            if not code.startswith("# sexpr: "):
+                factor_values[fac["name"]] = get_factor_values(fac, codes, end, source=source)
+                continue
+
+            # P4: 检查缓存
+            ck = _cache("fvals", f"{source}|{fac['name']}|{fac['kind']}|{ck_prefix}|{end}|800")
+            if ck.exists():
+                hit = sig._read_parquet_safe(ck)
+                if hit is not None:
+                    factor_values[fac["name"]] = hit.iloc[:, 0]
+                    continue
+
+            # 树直算
+            sexpr = code.split("\n", 1)[0][len("# sexpr: "):]
+            tree = parse(sexpr)
+            vals = evaluate_tree(tree, frames).stack().rename(fac["name"]).dropna()
+            vals.index = vals.index.set_names(["datetime", "instrument"])
+            vals = _norm(vals)
+            sig._write_parquet_atomic(vals.to_frame(fac["name"]), ck)
+            factor_values[fac["name"]] = vals
+        except Exception:
+            try:
+                factor_values[fac["name"]] = get_factor_values(fac, codes, end, source=source)
+            except Exception:
+                continue
+
+    # 3. 并行计算IC和胜率
+    tasks = []
+    for fac in factors:
+        fname = fac["name"]
+        if fname in factor_values:
+            tasks.append((fac, factor_values[fname], panel, fwds, train_end))
+
+    rows = []
+    if max_workers > 1 and len(tasks) > 10:
+        # 并行执行
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_eval_single_factor, task): task for task in tasks}
+            for future in as_completed(futures):
+                rows.append(future.result())
+    else:
+        # 串行执行（任务少时无需并行）
+        for task in tasks:
+            rows.append(_eval_single_factor(task))
+
+    # 补充计算失败的因子
+    evaluated_names = {r["因子"] for r in rows}
+    for fac in factors:
+        if fac["name"] not in evaluated_names:
+            rows.append({"因子": fac["name"], "来源": fac["kind"], "IC均值": np.nan,
+                         "ICIR": np.nan, "IC胜率": np.nan, "Top组_winrate": np.nan,
+                         "建议方向": "计算失败", "天数": 0})
+
     return pd.DataFrame(rows)
 
 

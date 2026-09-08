@@ -1340,34 +1340,11 @@ def job_le_factor_eval(batch: int = 500, pool_name: str = "沪深300") -> str:
     train_end = trade_day_offset(end, -250)
     facs = [{"name": r["name"], "kind": "loopengine", "code": r["code"]} for _, r in picked.iterrows()]
 
-    # 树直算快速路径
-    fast_done = 0
-    try:
-        from loopengine.tree import build_field_frames, evaluate_tree, parse
-
-        panel = sig.get_panel_cached(codes, end, 800, source=datasource.get_loop_source())
-        frames = build_field_frames(panel)
-        ck_prefix = "|".join(sorted(codes))
-        for fac in facs:
-            code = fac.get("code") or ""
-            if not code.startswith("# sexpr: "):
-                continue
-            try:
-                ck = fe._cache("fvals", f"qlib_local|{fac['name']}|{fac['kind']}|{ck_prefix}|{end}|800")
-                if ck.exists():
-                    fast_done += 1
-                    continue
-                tree = parse(code.split("\n", 1)[0][len("# sexpr: "):])
-                vals = evaluate_tree(tree, frames).stack().rename("f").dropna()
-                vals.index = vals.index.set_names(["datetime", "instrument"])
-                sig._write_parquet_atomic(fe._norm(vals).to_frame(fac["name"]), ck)
-                fast_done += 1
-            except Exception:
-                continue
-    except Exception:
-        pass
-
-    card = fe.build_scorecard(facs, codes, end, train_end=train_end)
+    # P2+P3+P4: 批量计算因子值（一次构建面板，批量计算所有因子，跳过已有缓存，大批次并行）
+    if len(facs) > 50:
+        card = fe.build_scorecard_parallel(facs, codes, end, train_end=train_end, max_workers=4)
+    else:
+        card = fe.build_scorecard_batch(facs, codes, end, train_end=train_end)
     library.save_scorecard(card, pool_name, end)
     ok = card.dropna(subset=["ICIR"])
 
@@ -1375,7 +1352,7 @@ def job_le_factor_eval(batch: int = 500, pool_name: str = "沪深300") -> str:
     type_counts = picked["factor_type"].value_counts()
     type_summary = " ".join(f"{t}:{n}" for t, n in type_counts.items() if pd.notna(t))
 
-    return (f"LoopEngine 体检 {len(facs)} 个（树直算 {fast_done} · 有效 {len(ok)} 个），"
+    return (f"LoopEngine 体检 {len(facs)} 个（批量计算 · 有效 {len(ok)} 个），"
             f"类型: {type_summary or '量价'}，"
             f"累计已评估 {len(evaluated) + len(facs) - len([n for n in picked['name'] if n in evaluated])}"
             f"/{len(reg[reg['engine']=='loopengine'])}")

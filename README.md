@@ -1,154 +1,453 @@
-# 量化系统（lianghua）：RD-Agent + Qlib 进化闭环 × QSYS 看板
+# QSYS - 量化因子演化与自动交易系统
 
-## 一、总体方案
-
-```
-                        ┌──────────────────────────────────────────────┐
-                        │              docker compose                  │
-                        │                                              │
-  LLM API               │  ┌────────────────────────────┐              │
-  (DeepSeek / OpenAI)   │  │  lh-rdagent                │              │
-        ▲               │  │  RD-Agent 本体              │              │
-        │  因子假设/代码  │  │  · fin_factor 进化闭环      │              │
-        └───────────────┼─▶│  · 通过 docker.sock ────────┼──┐           │
-                        │  └────────────────────────────┘  │           │
-                        │                                  ▼           │
-                        │                     ┌─────────────────────┐  │
-                        │                     │ local_qlib 子容器    │  │
-                        │                     │ qrun conf.yaml      │  │
-                        │                     │ (Qlib 真实回测)      │  │
-                        │                     └──────────┬──────────┘  │
-                        │                                │ 写回测产物   │
-                        │  ┌────────────────────────────┼──┐           │
-                        │  │  lh-qsys (QSYS/QuantSys)   │  │           │
-                        │  │  Streamlit :8501            │◀─┘ 只读     │
-                        │  │  · 🧬 进化看板              │              │
-                        │  │  · 📊 回测浏览(mlruns)      │              │
-                        │  │  · 🕯️ 自选K线(cn_data)      │              │
-                        │  └────────────────────────────┘              │
-                        └──────────────────────────────────────────────┘
-```
-
-**职责边界（硬约束）**
-- 因子发掘、假设生成、编码、回测、反馈进化 → 全部在 **RD-Agent + Qlib** 闭环内（`lh-rdagent` + `local_qlib`）。
-- **QSYS 只读**：解析 RD-Agent 的进化日志（`log/**.pkl`）、Qlib 的回测产物（`mlruns/**/artifacts`）、行情数据（`cn_data`），不做任何因子生成/进化逻辑。
-
-## 二、目录结构
+> **从因子挖掘到实盘交易的完整闭环**：自动生成因子 → 验证评估 → 组合策略 → 自动选股 → 模拟交易 → 持续优化
 
 ```
-lianghua/
-├── docker-compose.yml          # 编排：rdagent + qsys
-├── .env                        # LLM key + 项目根路径（⚠️ 需填 key）
-├── rdagent/
-│   ├── Dockerfile              # RD-Agent 宿主侧镜像（lianghua/rdagent）
-│   └── Dockerfile.qlib         # RD-Agent 官方 qlib 执行镜像 → local_qlib:latest
-├── qsys/
-│   ├── Dockerfile              # 看板镜像（streamlit + pyqlib + rdagent）
-│   ├── app.py                  # 看板应用（三页签）
-│   └── data/watchlist.json     # 自选股
-├── scripts/
-│   ├── health.sh               # RD-Agent 环境自检（LLM/docker/端口）
-│   ├── factor.sh               # 启动因子进化闭环（前台实时日志）
-│   ├── ui.sh                   # RD-Agent 官方监控 UI → :19899
-│   └── update_data.sh          # 更新 A 股日线数据
-├── data/qlib_home/.qlib/qlib_data/cn_data/   # A股日线（全市场，每日更新源）
-├── log/                        # RD-Agent 进化日志（trace）
-└── git_ignore_folder/          # RD-Agent workspace（每轮实验 + qlib mlruns）
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          QSYS 量化系统架构                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                 │
+│   │  LoopEngine  │───▶│ Factor Eval  │───▶│ Strategy Gen │                 │
+│   │  因子演化引擎 │    │  因子评估系统  │    │  策略包生成   │                 │
+│   │              │    │              │    │              │                 │
+│   │ · 遗传算法    │    │ · IC/ICIR    │    │ · 贪心选择    │                 │
+│   │ · 多类型挖掘  │    │ · Walk-forward│    │ · 多包投票    │                 │
+│   │ · 自适应预算  │    │ · 胜率体检    │    │ · 质量门槛    │                 │
+│   └──────────────┘    └──────────────┘    └──────────────┘                 │
+│           │                  │                  │                           │
+│           ▼                  ▼                  ▼                           │
+│   ┌──────────────────────────────────────────────────────────────┐         │
+│   │                    因子库 (37,000+ 因子)                      │         │
+│   │   · gate_status: 闸门通过  · quality_score: 质量评分          │         │
+│   │   · skeleton: 骨架去重      · family: 机制族分类              │         │
+│   └──────────────────────────────────────────────────────────────┘         │
+│           │                                                                │
+│           ▼                                                                │
+│   ┌──────────────┐    ┌──────────────┐    ┌──────────────┐                │
+│   │  Pool Scan   │───▶│ Position Mgr │───▶│   Trading    │                │
+│   │  板块扫描选股  │    │  持仓管理     │    │  交易执行     │                │
+│   │              │    │              │    │              │                │
+│   │ · 多包投票    │    │ · 止盈止损    │    │ · 竞价确认    │                │
+│   │ · 行业限制    │    │ · 持仓跟踪    │    │ · 自动开平仓  │                │
+│   │ · 实时更新    │    │ · 风险控制    │    │ · 模拟回填    │                │
+│   └──────────────┘    └──────────────┘    └──────────────┘                │
+│           │                                                                │
+│           ▼                                                                │
+│   ┌──────────────────────────────────────────────────────────────┐         │
+│   │              Experience DB (经验库)                           │         │
+│   │   · picks: 选股记录  · trades: 交易记录  · outcomes: 战果    │         │
+│   │   · 失败模式库       · 策略包评分        · 因子生命周期       │         │
+│   └──────────────────────────────────────────────────────────────┘         │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-## 三、关键设计
+## 核心特性
 
-1. **docker-out-of-docker**：RD-Agent 原生就要调 Docker 跑 Qlib。本方案在 `lh-rdagent`
-   容器里挂载宿主机 `docker.sock`，并把项目目录**同路径挂载**（容器内路径 == 宿主机路径），
-   同时把容器 `HOME` 指到 `data/qlib_home`——这样 RD-Agent 为子容器生成的 bind mount
-   源路径对宿主机 dockerd 有效。这是整套方案能跑通的核心。
-2. **QLIB_DOCKER_ENABLE_GPU=False**：本机无 GPU，关闭子容器 GPU 申请。
-3. **QLIB_DOCKER_BUILD_FROM_DOCKERFILE=False**：`local_qlib:latest` 已按官方 Dockerfile
-   预构建（pytorch 2.2.1 基座 + qlib 固定 commit + catboost/xgboost/tables），避免每次启动重建。
-4. **数据**：`chenditc/investment_data` 每日发布的 A 股 qlib 日线（约 5000+ 标的，
-   2005 年至今），`update_data.sh` 可随时增量更新。
-5. **看板解析一致性**：qsys 镜像内安装与主容器**同版本**的 rdagent（0.8.0），
-   保证 `log/*.pkl` 里的 Hypothesis/Experiment 对象能正确反序列化。
-6. **LLM 双通道**：chat 用 DeepSeek 官方 API；DeepSeek 无 embedding 模型，
-   由 compose 内置的 `lh-ollama` 服务本地跑 bge-m3（1024 维，免费无配额），
-   rdagent 经内网 `http://ollama:11434` 调用。想换硅基流动在线 embedding，
-   改 `.env` 里对应注释段即可。
-7. **数据源层**（QSYS 分析/展示层）：`qsys/datasource.py` 统一管理行情来源——
-   `qlib_local`（默认，回测同源）与 `akshare`（东财日线·前复权，读穿缓存进
-   `qsys/data/market.db`，`market_daily.source` 字段 + `data_sources` 表标识出处）。
-   侧边栏可全局切换；经验库 picks 表记录每次选股的 `data_source`。
-   **边界：RD-Agent 进化/回测始终只用 qlib_local**，切换不影响闭环。
+###   因子演化引擎 (LoopEngine)
 
-## 四、使用流程
+**自动发现Alpha因子**：基于遗传算法，自动搜索、生成、验证量化因子
+
+```python
+# 示例：自动生成的因子表达式
+le_影线_5f5871 = sub(
+    decay_linear(sub(decay_linear(roc(open,200),200), sign(amount)), 200),
+    sign(delta(ts_min(ts_max(lower_shadow,120),20), 200))
+)
+```
+
+- **多类型因子挖掘**：量价、资金流、板块轮动、龙虎榜、盘口异动、指数
+- **自适应预算**：根据成功率动态调整算子权重
+- **FSA失败模式库**：自动记录失败骨架，避免重复尝试
+- **硬闸门验证**：IC/ICIR/胜率多重过滤
+
+###   因子评估系统
+
+**严格的因子验证流程**：
+
+```
+因子候选 → 闸门检查 → Walk-forward验证 → 胜率体检 → 入库评分
+   │           │              │              │          │
+   │           │              │              │          └── 5维评分
+   │           │              │              └── 1/5/20/60/120日多周期
+   │           │              └── 样本外真实表现
+   │           └── IC > 0.02, IC_winrate > 50%
+   └── 去重、骨架分类、机制族归属
+```
+
+**5维因子评分**：
+- IC得分 (30%): |IC| × IC_winrate
+- 稳定性 (25%): IC胜率
+- 一致性 (20%): Top组胜率
+- 使用度 (15%): 被策略包引用次数
+- 新鲜度 (10%): 最近更新时间
+
+###   策略包自动生成
+
+**从因子到策略的自动化流水线**：
+
+1. **因子发现**：从37,000+因子库中筛选Top因子
+2. **组合构建**：贪心选择 + MMR去冗余
+3. **Walk-forward验证**：样本外胜率 ≥ 50%
+4. **质量门槛**：OOS胜率 + 实战差距 < 25%
+5. **自动入库**：保存到strategies表
+
+**多包投票机制**：
+```python
+# Top3策略包投票
+pack1_stocks = compute_pack_picks(alpha101, codes)  # Alpha101精华
+pack2_stocks = compute_pack_picks(short5, codes)    # 短线5日
+pack3_stocks = compute_pack_picks(stable, codes)    # 稳健低波
+
+# 取至少2票的交集
+final_stocks = intersection(pack1, pack2, pack3)
+```
+
+###   自动选股与交易
+
+**完整的交易闭环**：
+
+```
+19:00  pool_scan     → 板块扫描选股（多包投票）
+19:30  auto_scan     → 自动选股（v5因子评分）
+09:26  auction_confirm → 竞价确认
+09:30+ position_track → 持仓跟踪（每5分钟）
+        │
+        ├── 开仓条件：止盈+15% / 止损-8% / 持有20天
+        └── 自动执行：无手动确认
+```
+
+**v5自动选股算法**：
+- 因子价值评分 (25%): backtest_winrate
+- 实盘胜率 (25%): Bayesian shrinkage + time decay
+- 策略包投票 (15%): 被多少策略包引用
+- 综合评分 (10%): 5维因子评分
+- 稳定性 (8%): IC胜率
+- 动量 (7%): 最近表现
+
+###   实时数据流
+
+**SSE无感刷新**：
+
+```javascript
+// 前端实时更新分时图
+const eventSource = new EventSource(`/market/events?code=${stockCode}`);
+eventSource.onmessage = (event) => {
+    const tick = JSON.parse(event.data);
+    Plotly.extendTraces('chart', {x: [[tick.time]], y: [[tick.price]]}, [0]);
+};
+```
+
+**数据源**：
+- Qlib本地数据（回测同源）
+- 腾讯API（实时行情）
+- iFinD（机构级数据）
+- SSE推送（3秒/30秒更新）
+
+###   经验学习系统
+
+**从历史中学习**：
+
+```sql
+-- 失败模式库
+failure_patterns: 101,847条记录
+  · eval_error: 8,846次（因子代码bug）
+  · overnight相关: 72.3%（隔夜风险）
+  · IC边缘失败: ~8,000次（IC在0.013-0.019）
+
+-- 策略包评分
+strategies: 20个策略包
+  · Alpha101精华_v1: OOS=86%, 实战=47% (过拟合)
+  · 短线5日_v1: OOS=58%, 实战=50% (最稳健)
+  · LE_沪深300_0908: OOS=50% (自动生成)
+```
+
+## 技术栈
+
+| 组件 | 技术 | 说明 |
+|------|------|------|
+| **因子演化** | Python + 遗传算法 | LoopEngine自适应搜索 |
+| **因子评估** | Walk-forward + IC/ICIR | 严格的样本外验证 |
+| **策略构建** | 贪心 + MMR + 多包投票 | 自动组合优化 |
+| **数据存储** | SQLite (market.db + experience.db) | 轻量级本地存储 |
+| **实时推送** | SSE (Server-Sent Events) | 无感刷新分时图 |
+| **前端展示** | Streamlit + Plotly | 交互式可视化 |
+| **定时调度** | APScheduler | 3进程并行调度 |
+| **容器化** | Docker | 一键部署 |
+
+## 快速开始
+
+### 1. 环境准备
 
 ```bash
-# 0. 一次性：.env 里已配好 DeepSeek（chat）+ 本地 ollama bge-m3（embedding，随 compose 自启）
-docker compose up -d          # 启动 lh-rdagent + lh-qsys + lh-ollama
+# 克隆项目
+git clone https://github.com/yanyuxiyangzk/lianghua.git
+cd lianghua
 
-# 1. 自检（LLM 连通性 + docker）——当前已全部通过
-./scripts/health.sh
-
-# 2. 启动因子进化闭环（Ctrl+C 可中断；支持 --loop-n/--all-duration）
-./scripts/factor.sh
-
-# 3. 看板
-#    QSYS:         http://localhost:8501   （进化看板 / 回测浏览 / 自选K线）
-#    RD-Agent 官方UI: ./scripts/ui.sh  → http://localhost:19899
-
-# 4. 数据更新（建议每周）
-./scripts/update_data.sh
-
-# 5. 磁盘清理（默认 dry-run 预览，确认后加 -y；详见 ./scripts/cleanup.sh -h）
-./scripts/cleanup.sh           # 预览:旧假设工作区 + 因子执行缓存 + 循环日志
-./scripts/cleanup.sh -y        # 执行(各保留 7 天;不会动会话检查点与 qlib 数据)
+# 配置环境变量（需要DeepSeek API Key）
+cp .env.example .env
+# 编辑 .env 填入 API Key
 ```
 
-## 五、调参入口（.env 追加，按需）
+### 2. 启动系统
 
-| 变量 | 默认 | 说明 |
-|---|---|---|
-| `QLIB_FACTOR_EVOLVING_N` | 10 | 每轮因子进化的迭代次数 |
-| `QLIB_FACTOR_MODEL` | — | 换评估模型等，见 `rdagent/app/qlib_rd_loop/conf.py` |
-| `QLIB_DOCKER_RUNNING_TIMEOUT_PERIOD` | 3600 | 单次回测超时（秒） |
-| `FACTOR_CODER_*` | — | 编码器行为，如 `coder_use_cache` |
+```bash
+# 启动所有服务
+docker compose up -d
 
-完整可配项：`docker compose exec rdagent python -c "from rdagent.app.qlib_rd_loop.conf import FACTOR_PROP_SETTING as s; print(s.model_fields.keys())"`
+# 查看状态
+docker compose ps
 
-## 五点五、同花顺 iFinD 接入（QSYS 分析层可选数据源）
+# 查看日志
+docker compose logs -f qsys
+```
 
-分两条独立通道，按需开通：
+### 3. 访问看板
 
-**A. iFinD API → QSYS 数据源（日线行情，让资金趋势/轮动走势每日变新）**
+| 服务 | 地址 | 说明 |
+|------|------|------|
+| **QSYS看板** | http://localhost:8501 | 主界面 |
+| **SSE服务** | http://localhost:8502 | 实时数据推送 |
+| **RD-Agent UI** | http://localhost:19899 | 因子演化监控 |
 
-1. 到 [quantapi.51ifind.com](https://quantapi.51ifind.com) 注册并开通数据接口权限，下载 **Linux 版 iFinDPy SDK**
-2. SDK 装进 qsys 容器并重建镜像（SDK 不在 PyPI，需手动放入）：
-   `docker cp iFinDPy*.whl lh-qsys:/tmp/ && docker exec lh-qsys pip install /tmp/iFinDPy*.whl`（验证后再 `docker compose build qsys` 固化）
-3. `.env` 配置凭证（三选二之一）：`THS_IFIND_ACCOUNT` + `THS_IFIND_PASSWORD`，或 `THS_IFIND_REFRESH_TOKEN`
-4. `docker compose up -d qsys` 后自检：`docker exec lh-qsys python -c "import datasource; print(datasource.ths_selftest())"`
-5. 看板 ⚙️设置页切换数据源为「同花顺 iFinD」——板块日线回填会跟随全局源（在线源首次全量回填较慢，之后逐日增量）
+### 4. 核心功能
 
-**B. iFinD MCP → Claude Code（对话式查数据，辅助开发）**
+```bash
+# 手动触发因子演化
+docker exec lh-qsys python3.11 -c "
+import sys; sys.path.insert(0, '/app')
+from loopengine.engine import LoopEngine
+engine = LoopEngine(pool_name='沪深300')
+result = engine.run_round(batch=30)
+print(result)
+"
 
-1. 到 [mcp.51ifind.com](https://mcp.51ifind.com) → 密钥管理获取 Token（无 iFinD 账号可走快查开放平台 open.kuaicha365.com，内测有免费额度）
-2. `export IFIND_AUTH_TOKEN=<你的token>`（写进 ~/.bashrc），重启 Claude Code
-3. 项目根 `.mcp.json` 已预置 `ifind-stock` 服务（StreamableHTTP，注意该端点不支持 SSE），首次会话批准即可用
+# 手动触发策略包生成
+docker exec lh-qsys python3.11 -c "
+import sys; sys.path.insert(0, '/app')
+from scheduler import job_strategy_gen
+print(job_strategy_gen())
+"
 
-## 六、常见问题
+# 手动触发选股
+docker exec lh-qsys python3.11 -c "
+import sys; sys.path.insert(0, '/app')
+from scheduler import job_pool_scan
+print(job_pool_scan())
+"
+```
 
-- **fin_factor 报 docker 权限**：确认 `docker.sock` 已挂载且宿主机当前用户可 `docker ps`。
-- **子容器找不到数据**：`data/qlib_home/.qlib/qlib_data/cn_data` 需含 `calendars/ features/ instruments/`。
-- **LLM 报错 401/404**：跑 `./scripts/health.sh` 看具体模型/embedding 连通性。
-- **看板"进化看板"为空**：第一轮因子回测完成前没有指标，属正常。
-- **log/、git_ignore_folder/、vendor/ 里文件属 root**：rdagent 容器以 root 运行所致，
-  宿主机要清理时执行 `docker compose exec rdagent chown -R 1000:1000 ${LIANGHUA_ROOT}/{log,git_ignore_folder,vendor}`。
-- **vendor/py 是 rdagent 0.8.0 的可编辑副本**（PYTHONPATH 优先于镜像 site-packages），
-  内含三处本地补丁（generate.py 的 pandas 兼容、workspace.py 的 MLFLOW_ALLOW_FILE_STORE、
-  utils.py 的因子数据 float32 降内存——防 SOTA 因子库累积撑爆 WSL2 内存被 OOM Kill），
-  升级 rdagent 版本时需同步。
-- **WSL 里删了文件但 Windows D 盘空间没回来**：WSL2 的 VHDX 只自动膨胀不自动缩。
-  步骤：① 先在 WSL 里发 TRIM（`./scripts/cleanup.sh -y` 已内置，或手动
-  `docker run --rm --privileged -v /:/host lianghua/rdagent:0.8.0 fstrim -v /host`）；
-  ② Windows 管理员 PowerShell 执行 `wsl --shutdown`，然后
-  `diskpart` → `select vdisk file="D:\WSL\Ubuntu2404\ext4.vhdx"` → `attach vdisk readonly`
-  → `compact vdisk` → `detach vdisk`（有 Hyper-V 模块也可 `Optimize-VHD -Mode Full`）。
-  ③ 重开 WSL，容器与进化循环自动恢复。
+## 系统架构
+
+### 容器架构
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Docker Compose                        │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
+│  │   lh-qsys   │  │ lh-rdagent  │  │  lh-ollama  │    │
+│  │             │  │             │  │             │    │
+│  │ · Streamlit │  │ · RD-Agent  │  │ · bge-m3    │    │
+│  │ · Scheduler │  │ · 因子演化   │  │ · Embedding │    │
+│  │ · LoopEngine│  │ · Qlib回测   │  │             │    │
+│  │ · SSE Server│  │             │  │             │    │
+│  └─────────────┘  └─────────────┘  └─────────────┘    │
+│       :8501           :19899          :11434           │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+### 数据流
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                      数据流向                            │
+├─────────────────────────────────────────────────────────┤
+│                                                         │
+│  市场数据 ──┬──▶ Qlib本地数据 ──▶ 回测引擎              │
+│             │                                          │
+│             ├──▶ 腾讯API ──▶ 实时行情 ──▶ SSE推送      │
+│             │                                          │
+│             └──▶ iFinD ──▶ 机构数据 ──▶ 分析层         │
+│                                                         │
+│  因子数据 ──┬──▶ factor_scorecards ──▶ 评分系统         │
+│             │                                          │
+│             ├──▶ factor_registry ──▶ 因子库             │
+│             │                                          │
+│             └──▶ failure_patterns ──▶ 失败模式库       │
+│                                                         │
+│  交易数据 ──┬──▶ picks ──▶ 选股记录                    │
+│             │                                          │
+│             ├──▶ trades ──▶ 交易记录                   │
+│             │                                          │
+│             └──▶ outcomes ──▶ 战果回填                 │
+│                                                         │
+└─────────────────────────────────────────────────────────┘
+```
+
+## 核心算法
+
+### 1. 因子演化 (遗传算法)
+
+```python
+# 伪代码
+while iteration < max_iterations:
+    # 1. 生成候选因子
+    candidates = generate_candidates(field_weights, momentum)
+    
+    # 2. 规则审查
+    for candidate in candidates:
+        if review(candidate):  # 语法、复杂度、重复检查
+            # 3. 硬闸门验证
+            result = evaluate_gates(candidate, panel)
+            if result['pass']:  # IC > 0.02, IC_winrate > 50%
+                # 4. 入库
+                sync_factor_registry(candidate)
+    
+    # 5. 更新字段权重
+    field_weights.boost_from_factors(accepted_factors)
+```
+
+### 2. Walk-forward验证
+
+```python
+# 样本外验证
+for t in range(est, len(days) - fwd_days, step):
+    # 估计窗：[t-est, t-fwd]
+    stats = compute_ic_stats(ic_series, est_lo, est_hi)
+    
+    # 计算权重
+    weights = compute_weights(stats, method='ICIR')
+    
+    # 应用窗：t截面打分
+    scores = composite_score(factor_vals, weights)
+    picks = scores.nlargest(top_n)
+    
+    # 记录超额收益
+    excess = returns[picks].mean() - returns.median()
+```
+
+### 3. 多包投票
+
+```python
+# 3个策略包投票
+def multi_pack_voting(packs, codes, top_n):
+    all_picks = {}
+    
+    # 每个包独立选股
+    for pack in packs:
+        picks = compute_pack_picks(pack, codes)
+        for stock in picks:
+            all_picks[stock] = all_picks.get(stock, 0) + 1
+    
+    # 取至少2票的股票
+    voted = [s for s, n in all_picks.items() if n >= 2]
+    
+    # 用最佳包的分数排序
+    best_scores = compute_pack_picks(packs[0], codes)
+    return best_scores[voted].nlargest(top_n)
+```
+
+## 配置说明
+
+### 环境变量 (.env)
+
+```bash
+# LLM配置
+DEEPSEEK_API_KEY=your_api_key
+DEEPSEEK_MODEL=deepseek-chat
+
+# 因子演化
+QLIB_FACTOR_EVOLVING_N=10
+QLIB_DOCKER_RUNNING_TIMEOUT_PERIOD=3600
+
+# 交易参数
+TAKE_PROFIT=0.15
+STOP_LOSS=-0.08
+HOLD_DAYS=20
+```
+
+### 定时任务
+
+| 任务 | 时间 | 说明 |
+|------|------|------|
+| pool_scan | 19:00 | 板块扫描选股 |
+| auto_scan | 19:30 | 自动选股 |
+| auction_confirm | 09:26 | 竞价确认 |
+| position_track | 09:30+ | 持仓跟踪（5分钟） |
+| le_factor_eval | 12:30/18:00/21:30 | 因子体检 |
+| strategy_gen | 18:30 | 策略包自动生成 |
+
+## 常见问题
+
+### Q: 如何查看因子演化日志？
+
+```bash
+# 查看实时日志
+docker compose logs -f qsys | grep "LoopEngine"
+
+# 查看历史日志
+docker exec lh-qsys cat /data/scheduler_history.jsonl
+```
+
+### Q: 如何手动触发选股？
+
+```bash
+docker exec lh-qsys python3.11 -c "
+import sys; sys.path.insert(0, '/app')
+from scheduler import job_pool_scan
+print(job_pool_scan())
+"
+```
+
+### Q: 如何查看策略包评分？
+
+```bash
+docker exec lh-qsys python3.11 -c "
+import sys; sys.path.insert(0, '/app')
+import library
+packs = library.list_strategies()
+for name, pk in packs.items():
+    print(f'{name}: OOS={pk.get(\"oos_winrate\")}, method={pk.get(\"method\")}')
+"
+```
+
+### Q: 如何查看失败模式？
+
+```bash
+docker exec lh-qsys python3.11 -c "
+import sqlite3
+c = sqlite3.connect('/data/market.db')
+rows = c.execute('''
+    SELECT pattern, COUNT(*) as cnt
+    FROM failure_patterns
+    GROUP BY pattern
+    ORDER BY cnt DESC
+    LIMIT 10
+''').fetchall()
+for pattern, cnt in rows:
+    print(f'{pattern}: {cnt}次')
+"
+```
+
+## 贡献指南
+
+欢迎贡献代码、报告问题或提出建议！
+
+1. Fork 项目
+2. 创建特性分支 (`git checkout -b feature/amazing-feature`)
+3. 提交更改 (`git commit -m 'Add amazing feature'`)
+4. 推送到分支 (`git push origin feature/amazing-feature`)
+5. 创建 Pull Request
+
+## 许可证
+
+MIT License - 详见 [LICENSE](LICENSE)
+
+---
+
+**QSYS** - 让量化交易更智能  
+*从因子到收益，全流程自动化*

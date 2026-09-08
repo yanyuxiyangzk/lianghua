@@ -1272,7 +1272,7 @@ def job_ifind_cleanup(**_ignored) -> str:
     return f"{now.strftime('%Y-%m-%d %H:%M:%S')} 过期数据清理完成"
 
 
-def job_le_factor_eval(batch: int = 60, pool_name: str = "沪深300") -> str:
+def job_le_factor_eval(batch: int = 500, pool_name: str = "沪深300") -> str:
     """LoopEngine 因子滚动体检（每晚一批）：边际价值优先取一批出评分卡。
 
     选股策略（边际价值排序）：
@@ -1306,14 +1306,14 @@ def job_le_factor_eval(batch: int = 60, pool_name: str = "沪深300") -> str:
         _eval_at=le["name"].map(lambda n: evaluated.get(n, "")),
         _ic=le["name"].map(lambda n: ic_map.get(n, 0)),
     )
-    le["_fam"] = le["family"].fillna("其他") if "family" in le.columns else "其他"
+    le["_fam"] = le["family"].fillna("其他").astype(str) if "family" in le.columns else "其他"
     uneval = le[le["_eval_at"] == ""].copy()
     if uneval.empty:
         return "所有因子已体检，跳过"
 
     # 边际价值评分：综合因子类型多样性 + IC质量 + 族覆盖
-    fam_cov = le.groupby("_fam")["_eval_at"].apply(lambda s: int((s != "").sum()))
-    fam_total = le.groupby("_fam").size()
+    fam_cov = le.groupby("_fam", dropna=False)["_eval_at"].apply(lambda s: int((s != "").sum()))
+    fam_total = le.groupby("_fam", dropna=False).size()
     # 族覆盖率越低，优先级越高（0~1，越小越优先）
     uneval["_fam_score"] = uneval["_fam"].map(
         lambda f: fam_cov.get(f, 0) / max(fam_total.get(f, 1), 1))
@@ -1535,8 +1535,11 @@ JOBS = {
                          "default": {"enabled": False, "hour": 2, "minute": 0, "params": {},
                                      "day_of_week": "sun"}},
     "le_factor_eval_noon": {"name": "🧪 LoopEngine 因子体检（午间）", "func": job_le_factor_eval,
-                            "default": {"enabled": True, "hour": 12, "minute": 30,
-                                        "params": {"batch": 300, "pool_name": "沪深300"}}},
+                             "default": {"enabled": True, "hour": 12, "minute": 30,
+                                         "params": {"batch": 300, "pool_name": "沪深300"}}},
+    "le_factor_eval_pm": {"name": "🧪 LoopEngine 因子体检（盘后）", "func": job_le_factor_eval,
+                           "default": {"enabled": True, "hour": 18, "minute": 0,
+                                       "params": {"batch": 500, "pool_name": "沪深300"}}},
 }
 
 

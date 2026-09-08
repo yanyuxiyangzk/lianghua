@@ -480,6 +480,202 @@ def _fenshi_fig(df: pd.DataFrame, title: str, prev_close: float | None) -> go.Fi
     return fig
 
 
+BG = "#101010"
+GRID = "#2a2a2a"
+UP_C = "#e54545"
+DOWN_C = "#26a69a"
+
+
+def _render_fenshi_sse(code: str, name: str, df: pd.DataFrame, prev_close: float | None):
+    """SSE 无感刷新分时图（iFinD K线页面）。"""
+    import json as _json
+
+    times = [f"{t.hour:02d}:{t.minute:02d}" for t in df.index]
+    prices = df["close"].tolist()
+    volumes = df["volume"].tolist()
+
+    prices_json = _json.dumps(prices)
+    times_json = _json.dumps(times)
+    volumes_json = _json.dumps(volumes)
+    prev = prev_close or prices[0] if prices else 10.0
+
+    html_content = f"""
+    <html>
+    <head><meta charset="utf-8"></head>
+    <body style="margin:0;padding:0;background:{BG}">
+    <div id="status" style="color:#888;font-size:12px;padding:5px 10px;font-family:monospace">⏳ 加载中...</div>
+    <div id="chart" style="width:100%;height:620px"></div>
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+    <script>
+    (function(){{
+      var prices = {prices_json};
+      var times = {times_json};
+      var volumes = {volumes_json};
+      var prevClose = {prev};
+      var code = '{code}';
+      var statusEl = document.getElementById('status');
+
+      var pMin=Math.min.apply(null,prices), pMax=Math.max.apply(null,prices);
+      var pad=(pMax-pMin)*0.05+0.01;
+
+      var trace1={{x:times, y:prices, type:'scatter', mode:'lines', name:'价格',
+                   line:{{color:'#4fc3f7',width:1.4}}}};
+      var trace2={{x:times, y:volumes, type:'bar', name:'VOL',
+                   marker_color:'#8a8a8a'}};
+
+      var layout={{
+        paper_bgcolor:'{BG}', plot_bgcolor:'{BG}',
+        height:620, margin:{{l:10,r:10,t:40,b:10}},
+        hovermode:'x unified',
+        title:'{name} {code} 分时 · SSE实时刷新',
+        legend:{{orientation:'h',yanchor:'bottom',y:1.01}},
+        xaxis:{{gridcolor:'{GRID}'}},
+        yaxis:{{gridcolor:'{GRID}',side:'left'}},
+        yaxis2:{{overlaying:'y',side:'right',title:'VOL',gridcolor:'{GRID}'}},
+        shapes:[{{type:'line',x0:0,x1:1,xref:'paper',
+                 y0:prevClose,y1:prevClose,
+                 line:{{color:'#888',width:0.8,dash:'dot'}},
+                 annotation:{{text:'昨收 '+prevClose.toFixed(2),showarrow:false,
+                            font:{{color:'#888',size:10}},yshift:10}}}}],
+        xaxis_rangeslider_visible:false
+      }};
+
+      function initChart(){{
+        if(typeof Plotly==='undefined'){{
+          statusEl.innerHTML='⏳ 加载 Plotly...';
+          setTimeout(initChart,500);
+          return;
+        }}
+        Plotly.newPlot('chart',[trace1,trace2],layout).then(function(){{
+          statusEl.innerHTML='<span style="color:#ffc107">● 等待SSE连接...</span>';
+          startSSE();
+        }});
+      }}
+
+      function startSSE(){{
+        var sseHost=window.location.hostname||'localhost';
+        var es=new EventSource('http://'+sseHost+':8502/market/events?code='+code);
+        es.onopen=function(){{
+          statusEl.innerHTML='<span style="color:#28a745">● 实时刷新中</span>';
+        }};
+        es.addEventListener('tick',function(e){{
+          var d=JSON.parse(e.data);
+          var t=d.time.substring(0,2)+':'+d.time.substring(2);
+          prices.push(d.price);
+          times.push(t);
+          volumes.push(d.minute_vol);
+
+          Plotly.extendTraces('chart',{{x:[[t]],y:[[d.price]]}},[0]);
+          Plotly.extendTraces('chart',{{x:[[t]],y:[[d.minute_vol]]}},[1]);
+
+          statusEl.innerHTML='<span style="color:#28a745">● 实时刷新中</span> | '+t+' | ¥'+d.price.toFixed(2);
+        }});
+        es.onerror=function(){{
+          statusEl.innerHTML='<span style="color:#dc3545">● 连接断开，重连中...</span>';
+        }};
+      }}
+
+      initChart();
+    }})();
+    </script>
+    </body></html>
+    """
+    st.components.v1.html(html_content, height=660, scrolling=False)
+
+
+def _render_minute_sse(code: str, name: str, period: str, df: pd.DataFrame):
+    """SSE 无感刷新分钟K线（iFinD K线页面）。"""
+    import json as _json
+
+    times = [f"{t.hour:02d}:{t.minute:02d}" for t in df.index]
+    opens = df["open"].tolist()
+    highs = df["high"].tolist()
+    lows = df["low"].tolist()
+    closes = df["close"].tolist()
+    volumes = df["volume"].tolist()
+
+    opens_json = _json.dumps(opens)
+    highs_json = _json.dumps(highs)
+    lows_json = _json.dumps(lows)
+    closes_json = _json.dumps(closes)
+    times_json = _json.dumps(times)
+    volumes_json = _json.dumps(volumes)
+
+    html_content = f"""
+    <html>
+    <head><meta charset="utf-8"></head>
+    <body style="margin:0;padding:0;background:{BG}">
+    <div id="status" style="color:#888;font-size:12px;padding:5px 10px;font-family:monospace">⏳ 加载中...</div>
+    <div id="chart" style="width:100%;height:620px"></div>
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+    <script>
+    (function(){{
+      var opens={opens_json}, highs={highs_json}, lows={lows_json}, closes={closes_json};
+      var times={times_json}, volumes={volumes_json};
+      var code='{code}', period='{period}';
+      var statusEl=document.getElementById('status');
+
+      var incColor='#e54545', decColor='#26a69a';
+      var colors=closes.map(function(c,i){{return c>=opens[i]?incColor:decColor}});
+
+      var trace1={{x:times, open:opens, high:highs, low:lows, close:closes,
+                   type:'candlestick', name:'K线',
+                   increasing:{{line:{{color:incColor}},fillcolor:incColor}},
+                   decreasing:{{line:{{color:decColor}},fillcolor:decColor}}}};
+      var trace2={{x:times, y:volumes, type:'bar', name:'VOL', marker_color:colors}};
+
+      var layout={{
+        paper_bgcolor:'{BG}', plot_bgcolor:'{BG}',
+        height:620, margin:{{l:10,r:10,t:40,b:10}},
+        hovermode:'x unified',
+        title:name+' '+code+' '+period+' · SSE实时刷新',
+        legend:{{orientation:'h',yanchor:'bottom',y:1.01}},
+        xaxis:{{gridcolor:'{GRID}'}},
+        yaxis:{{gridcolor:'{GRID}',side:'left'}},
+        yaxis2:{{overlaying:'y',side:'right',title:'VOL',gridcolor:'{GRID}'}},
+        xaxis_rangeslider_visible:false
+      }};
+
+      function initChart(){{
+        if(typeof Plotly==='undefined'){{
+          statusEl.innerHTML='⏳ 加载 Plotly...';
+          setTimeout(initChart,500);
+          return;
+        }}
+        Plotly.newPlot('chart',[trace1,trace2],layout).then(function(){{
+          statusEl.innerHTML='<span style="color:#ffc107">● 等待SSE连接...</span>';
+          startSSE();
+        }});
+      }}
+
+      function startSSE(){{
+        var sseHost=window.location.hostname||'localhost';
+        var es=new EventSource('http://'+sseHost+':8502/market/events?code='+code);
+        es.onopen=function(){{
+          statusEl.innerHTML='<span style="color:#28a745">● 实时刷新中</span>';
+        }};
+        es.addEventListener('tick',function(e){{
+          var d=JSON.parse(e.data);
+          var t=d.time.substring(0,2)+':'+d.time.substring(2);
+
+          Plotly.extendTraces('chart',{{x:[[t]],open:[[d.price]],high:[[d.price]],low:[[d.price]],close:[[d.price]]}},[0]);
+          Plotly.extendTraces('chart',{{x:[[t]],y:[[d.minute_vol]]}},[1]);
+
+          statusEl.innerHTML='<span style="color:#28a745">● 实时刷新中</span> | '+t+' | ¥'+d.price.toFixed(2);
+        }});
+        es.onerror=function(){{
+          statusEl.innerHTML='<span style="color:#dc3545">● 连接断开，重连中...</span>';
+        }};
+      }}
+
+      initChart();
+    }})();
+    </script>
+    </body></html>
+    """
+    st.components.v1.html(html_content, height=660, scrolling=False)
+
+
 # ---------------------------------------------------------------- 页面
 def render():
     # 代码输入（优先级：URL 参数 ?code=（超链接跳入）> session_state（双击跳入）> 默认）
@@ -511,7 +707,8 @@ def render():
     with _ar2:
         show_boll = st.checkbox("BOLL 布林带", value=False, key="kline_boll")
     with _ar3:
-        _auto = st.toggle("自动刷新(30s)", value=False, key="kline_auto")
+        _auto = st.toggle("实时刷新", value=False, key="kline_auto",
+                          help="开启后分时/分钟K通过SSE实时更新，无页面刷新")
 
     # 演化因子/策略叠加（仅日K）：单个可搜索下拉（点开可输入关键字过滤，高胜率优先）
     _f2, _f3 = st.columns([2, 1.5])
@@ -523,13 +720,9 @@ def render():
         pack_opts = ["（不选策略）"] + list(_load_packs().keys())
         pack_sel = st.selectbox("策略包叠加（综合分）", pack_opts, key="kline_pack")
 
-    # 自动刷新开关：开启后每30秒重新调 iFinD 取数（K线/分时图表实时更新）
-    if _auto:
-        if st_autorefresh:
-            st_autorefresh(interval=30_000, key="kline_autorefresh")
-            st.caption(f"⏱ 每 30 秒自动刷新中 · 数据取数于 {datetime.now():%H:%M:%S}")
-        else:
-            st.warning("未安装 streamlit-autorefresh，无法自动刷新")
+    # 实时刷新：分时/分钟K 用SSE无感刷新；日K等周期无实时数据
+    if _auto and period in ("分时", "1分", "5分", "15分", "30分", "60分", "120分"):
+        st.caption(f"⚡ SSE 实时刷新中 · {datetime.now():%H:%M:%S}")
 
     with st.spinner(f"加载 {code} {period}K线…"):
         try:
@@ -565,7 +758,15 @@ def render():
             st.caption("💡 演化因子叠加仅支持日K周期")
 
     name = info.get("name") or code
-    if period == "分时":
+    minute_periods = ("1分", "5分", "15分", "30分", "60分", "120分")
+    if period == "分时" and _auto:
+        _render_fenshi_sse(code, name, df, info.get("prev_close"))
+        src_txt = "THS_HF 高频 · SSE实时刷新"
+    elif period in minute_periods and _auto:
+        # 分钟K也用 SSE 无感刷新
+        _render_minute_sse(code, name, period, df)
+        src_txt = f"THS_HF 高频 · {period}K · SSE实时刷新"
+    elif period == "分时":
         st.plotly_chart(_fenshi_fig(df, f"{name} {code} 分时", info.get("prev_close")),
                         width="stretch")
         src_txt = "THS_HF 高频"

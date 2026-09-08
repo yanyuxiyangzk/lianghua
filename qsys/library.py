@@ -63,6 +63,14 @@ CREATE TABLE IF NOT EXISTS combo_strategies (
     packs TEXT,                   -- JSON array：成员策略包名
     created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS factor_usage (
+    factor_name TEXT PRIMARY KEY,
+    pick_count INTEGER DEFAULT 0,     -- 被选股使用的次数
+    trade_count INTEGER DEFAULT 0,    -- 被模拟交易使用的次数
+    last_used TEXT,                   -- 最后使用时间
+    last_pick_date TEXT,              -- 最后被选股日期
+    updated_at TEXT
+);
 CREATE TABLE IF NOT EXISTS sched_exec_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     job_key TEXT NOT NULL,
@@ -439,17 +447,46 @@ def tested_stats() -> dict:
 
 # ---------------------------------------------------------------- P2：FSA 与失败模式
 def fsa_recompute(threshold: float = 0.15, variant_cap: int = 3) -> pd.DataFrame:
-    """按入库因子骨架频次重算 FSA 冻结名单。"""
+    """按入库因子骨架频次重算 FSA 冻结名单。
+    
+    冻结规则：
+      1. 变体数 > variant_cap (默认3)
+      2. 占比 > threshold (默认15%)
+      3. 失败次数 > 30 (新增：高频失败骨架冻结)
+    """
     with _lconn() as c:
         rows = c.execute(
             "SELECT skeleton, COUNT(*) AS n FROM factor_registry"
             " WHERE skeleton IS NOT NULL AND skeleton != '' GROUP BY skeleton").fetchall()
         total = sum(r[1] for r in rows) or 1
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # 获取失败次数（包括未注册的骨架）
+        fail_counts = {}
+        for sk, cnt in c.execute(
+            "SELECT skeleton, COUNT(*) FROM failure_patterns GROUP BY skeleton"
+        ).fetchall():
+            fail_counts[sk] = cnt
+        
+        # 收集所有需要冻结的骨架
+        all_skeletons = set()
         for sk, n in rows:
-            frozen = int((n / total) > threshold or n > variant_cap)
+            all_skeletons.add(sk)
+        for sk in fail_counts:
+            all_skeletons.add(sk)
+        
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for sk in all_skeletons:
+            # 获取注册表中的数量
+            reg_count = 0
+            for r_sk, r_n in rows:
+                if r_sk == sk:
+                    reg_count = r_n
+                    break
+            
+            fail_cnt = fail_counts.get(sk, 0)
+            frozen = int((reg_count / total) > threshold or reg_count > variant_cap or fail_cnt > 30)
             c.execute("INSERT OR REPLACE INTO fsa_status (skeleton, count, frozen, updated_at)"
-                      " VALUES (?,?,?,?)", (sk, n, frozen, now))
+                      " VALUES (?,?,?,?)", (sk, reg_count, frozen, now))
         return pd.read_sql("SELECT * FROM fsa_status ORDER BY count DESC", c)
 
 
@@ -507,3 +544,130 @@ def family_live_stats(min_n: int = 3) -> dict:
         return {f: sum(v) / len(v) for f, v in acc.items()}
     except Exception:
         return {}
+
+
+# ---------------------------------------------------------------- 因子使用追踪
+def record_factor_usage(factor_names: list[str], usage_type: str = "pick",
+                        pick_date: str = None) -> None:
+    """记录因子被使用的次数。usage_type: pick=选股, trade=模拟交易"""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with _lconn() as c:
+        for name in factor_names:
+            c.execute("""
+                INSERT INTO factor_usage (factor_name, pick_count, trade_count, last_used, last_pick_date, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(factor_name) DO UPDATE SET
+                    pick_count = pick_count + ?,
+                    trade_count = trade_count + ?,
+                    last_used = ?,
+                    last_pick_date = CASE WHEN ? > last_pick_date THEN ? ELSE last_pick_date END,
+                    updated_at = ?
+            """, (name,
+                  1 if usage_type == "pick" else 0,
+                  1 if usage_type == "trade" else 0,
+                  now, pick_date or now, now,
+                  1 if usage_type == "pick" else 0,
+                  1 if usage_type == "trade" else 0,
+                  now, pick_date or now, pick_date or now, now))
+
+
+def get_factor_usage(factor_names: list[str] = None) -> pd.DataFrame:
+    """获取因子使用统计。"""
+    with _lconn() as c:
+        if factor_names:
+            placeholders = ",".join("?" * len(factor_names))
+            return pd.read_sql(
+                f"SELECT * FROM factor_usage WHERE factor_name IN ({placeholders})",
+                c, params=factor_names)
+        return pd.read_sql("SELECT * FROM factor_usage", c)
+
+
+def factor_value_scores(factor_type: str = None, min_days: int = 5) -> pd.DataFrame:
+    """因子价值5维评分：IC质量(30%) + IC稳定性(25%) + 一致性(20%) + 使用率(15%) + 新鲜度(10%)
+    返回 DataFrame: name, factor_type, ic_score, stability_score, consistency_score,
+                     usage_score, freshness_score, total_score
+    """
+    with _lconn() as c:
+        # 获取所有活跃因子
+        where = "WHERE gate_status=1"
+        params = []
+        if factor_type:
+            where += " AND factor_type=?"
+            params.append(factor_type)
+        reg = pd.read_sql(
+            f"SELECT name, factor_type, first_seen FROM factor_registry {where}",
+            c, params=params)
+        if reg.empty:
+            return pd.DataFrame()
+
+        # 获取scorecards
+        sc = pd.read_sql(
+            "SELECT name, ic_mean, ic_winrate, top_winrate, days, eval_date "
+            "FROM factor_scorecards WHERE days >= ? ORDER BY eval_date DESC",
+            c, params=(min_days,))
+
+        # 获取使用统计
+        usage = pd.read_sql("SELECT factor_name, pick_count, trade_count FROM factor_usage", c)
+        usage_map = dict(zip(usage["factor_name"], usage["pick_count"] + usage["trade_count"])) if not usage.empty else {}
+
+        today = pd.Timestamp.now().strftime("%Y-%m-%d")
+        results = []
+
+        for _, row in reg.iterrows():
+            name = row["name"]
+            ftype = row["factor_type"] or "量价"
+            first_seen = row["first_seen"]
+
+            # 取该因子最新的scorecard
+            fsc = sc[sc["name"] == name].head(1)
+            if fsc.empty:
+                # 无scorecard，给基础分
+                ic_score = 0.3
+                stability_score = 0.3
+                consistency_score = 0.3
+            else:
+                ic_mean = abs(fsc.iloc[0]["ic_mean"] or 0)
+                ic_winrate = fsc.iloc[0]["ic_winrate"] or 0.5
+                top_winrate = fsc.iloc[0]["top_winrate"] or 0.5
+
+                # IC质量：|IC| * IC胜率
+                ic_score = min(1.0, ic_mean * 10 * 0.5 + ic_winrate * 0.5)
+
+                # IC稳定性：IC胜率接近1越稳定
+                stability_score = ic_winrate
+
+                # 一致性：Top组胜率
+                consistency_score = top_winrate
+
+            # 使用率：被选股/交易使用的次数，sigmoid归一化
+            total_usage = usage_map.get(name, 0)
+            usage_score = min(1.0, total_usage / 10)  # 10次以上满分
+
+            # 新鲜度：越近期入库的因子越新鲜
+            if first_seen:
+                days_old = (pd.Timestamp(today) - pd.Timestamp(first_seen)).days
+                freshness_score = max(0.1, 1.0 - days_old / 180)  # 180天后降到0.1
+            else:
+                freshness_score = 0.5
+
+            # 综合评分
+            total_score = (
+                ic_score * 0.30 +
+                stability_score * 0.25 +
+                consistency_score * 0.20 +
+                usage_score * 0.15 +
+                freshness_score * 0.10
+            )
+
+            results.append({
+                "name": name,
+                "factor_type": ftype,
+                "ic_score": round(ic_score, 4),
+                "stability_score": round(stability_score, 4),
+                "consistency_score": round(consistency_score, 4),
+                "usage_score": round(usage_score, 4),
+                "freshness_score": round(freshness_score, 4),
+                "total_score": round(total_score, 4),
+            })
+
+    return pd.DataFrame(results)

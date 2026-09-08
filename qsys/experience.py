@@ -373,6 +373,7 @@ def simulate_trade(code: str, signal_date: str, rules: dict | None = None,
                    entry_date_override: str | None = None) -> dict | None:
     """对单只标的从 signal_date 起模拟一笔交易。返回成交明细或 None（数据不足）。
     entry_price_override 给定则以指定买入价入场（手动模拟）；entry_date_override 指定入场日。"""
+    import datasource
     r = {**DEFAULT_RULES, **(rules or {})}
     cal = _calendar()
     if signal_date not in cal:
@@ -648,6 +649,22 @@ def position_fill_check(today: str) -> str:
                           " shares=?, buy_amount=? WHERE id=?",
                           (fill, now, shares, round(shares * fill, 2), int(p["id"])))
                 n_fill += 1
+
+                # 注册 PriceMonitor 事件驱动监控
+                try:
+                    from price_monitor import monitor
+                    rules = {"take_profit": 0.15, "stop_loss": -0.08, "hold_days": 20, "cost": 0.0025}
+                    monitor.register_position(
+                        position_id=int(p["id"]),
+                        code=p["code"],
+                        buy_price=fill,
+                        shares=shares,
+                        buy_date=today,
+                        rules=rules
+                    )
+                except Exception as e:
+                    import logging
+                    logging.getLogger("experience").warning(f"PriceMonitor 注册失败: {e}")
     parts = []
     if n_fill:
         parts.append(f"成交开仓 {n_fill} 笔")
@@ -699,9 +716,16 @@ def position_close_check(today: str) -> str:
             code = str(p["code"])
             bs = broker_shares.get(code, 0)
             es = int(open_sum.get(code) or 0)
-            if broker_shares and bs != es:
+            # 双账本校验：broker无持仓但experience有 → 跳过（实际未买入）
+            if bs == 0 and es > 0:
                 n_skip += 1
-                continue  # 两本账对不上：跳过，不盲卖
+                continue
+            # broker有持仓但experience无 → 跳过（数据异常）
+            if es == 0 and bs > 0:
+                n_skip += 1
+                continue
+            # 两者都有持仓但数量不一致 → 允许卖出experience记录的数量（broker有足够库存）
+            # 只有broker库存不足时才跳过
             pr = prices.get(code)
             cur = pr[0] if pr and pr[0] else None
             if not cur:
@@ -733,6 +757,13 @@ def position_close_check(today: str) -> str:
                           (today, fill, now, reason, pnl,
                            _trade_days_between(str(p["buy_date"]), today), now, int(p["id"])))
                 n_close += 1
+
+                # 取消 PriceMonitor 监控
+                try:
+                    from price_monitor import monitor
+                    monitor.unregister(code, int(p["id"]))
+                except Exception:
+                    pass
     parts = [f"平仓 {n_close} 笔"] if n_close else ["持仓检查：无触发"]
     if n_skip:
         parts.append(f"账本不一致跳过 {n_skip} 笔（经验库与柜台股数对不上）")

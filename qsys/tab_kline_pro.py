@@ -161,7 +161,7 @@ def _render_auction_live(code: str, hm: str):
 
 
 def _render_fenshi(code: str):
-    """分时·竞价视图入口：st.fragment 局部刷新（页面其余部分不重跑，防闪屏）。"""
+    """分时·竞价视图入口：SSE 无感刷新（页面其余部分不重跑，防闪屏）。"""
     now = _now_sh()
     hm = now.strftime("%H%M")
     is_weekday = now.weekday() < 5
@@ -170,13 +170,145 @@ def _render_fenshi(code: str):
 
     refresh_on = st.toggle("🔄 实时刷新", value=in_session, key="kp_live",
                            help="竞价时段每3秒、盘中每30秒局部刷新；非交易时段默认关闭")
-    interval = None
-    if refresh_on:
-        interval = "3s" if in_auction else ("30s" if in_session else None)
 
-    # 用 fragment 包住动态区：只有这块按 interval 重跑，整页不闪
-    body = st.fragment(_fenshi_body, run_every=interval) if interval else _fenshi_body
-    body(code, hm, in_auction, in_session, refresh_on)
+    if in_auction:
+        _render_auction_live(code, hm)
+        return
+
+    if refresh_on and in_session:
+        # SSE 无感刷新模式
+        _render_fenshi_sse(code)
+    else:
+        # 静态模式
+        _fenshi_body(code, hm, in_auction, in_session, refresh_on)
+
+
+def _render_fenshi_sse(code: str):
+    """SSE 无感刷新分时图：使用 JavaScript EventSource 实时更新。"""
+    try:
+        data = _minute_cached(code)
+    except Exception as e:
+        st.warning(f"分时数据获取失败：{e}")
+        return
+    m, prev = data["minutes"], data["prev_close"]
+    if m.empty or prev is None:
+        st.info("无当日分时数据（非交易日或停牌）。")
+        return
+    m = m.reset_index(drop=True)
+    vwap = m["cum_amount"] / (m["volume"] * 100).replace(0, np.nan)
+
+    a = m.iloc[0]
+    outstanding = datasource.get_latest_outstanding(code)
+    a_turnover = a["volume"] * 100 / outstanding * 100 if outstanding else None
+    prev_vol_shou = _prev_day_volume_shou(code, data["date"])
+    a_ratio = a["volume"] / prev_vol_shou * 100 if prev_vol_shou else None
+    st.markdown(_auction_card_html(code, data["name"], data["date"], a["price"], prev,
+                                   a["volume"], a["cum_amount"], a_turnover, a_ratio,
+                                   "竞价已成交 · 09:25:01 · SSE实时刷新中"),
+                unsafe_allow_html=True)
+
+    # 构建初始数据（JSON 安全编码）
+    import json as _json
+    x = m["time"].str[:2] + ":" + m["time"].str[2:]
+    prices = m["price"].tolist()
+    volumes = m["minute_vol"].tolist()
+    times = x.tolist()
+
+    prices_json = _json.dumps(prices)
+    times_json = _json.dumps(times)
+    volumes_json = _json.dumps(volumes)
+
+    html_content = f"""
+    <html>
+    <head><meta charset="utf-8"></head>
+    <body style="margin:0;padding:0;background:{BG}">
+    <div id="status" style="color:#888;font-size:12px;padding:5px 10px;font-family:monospace">⏳ 加载中...</div>
+    <div id="chart" style="width:100%;height:620px"></div>
+    <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+    <script>
+    (function(){{
+      var prices = {prices_json};
+      var times = {times_json};
+      var volumes = {volumes_json};
+      var prevClose = {prev};
+      var code = '{code}';
+      var statusEl = document.getElementById('status');
+
+      function calcVwap(arr){{
+        var sum=0, out=[];
+        for(var i=0;i<arr.length;i++){{sum+=arr[i];out.push(sum/(i+1));}}
+        return out;
+      }}
+      var vwap = calcVwap(prices);
+
+      var pMin=Math.min.apply(null,prices), pMax=Math.max.apply(null,prices);
+      var pad=(pMax-pMin)*0.05+0.01;
+
+      var trace1={{
+        x:times, y:prices, type:'scatter', mode:'lines',
+        name:'价格', line:{{color:'#ffffff',width:1.2}}
+      }};
+      var trace2={{
+        x:times, y:vwap, type:'scatter', mode:'lines',
+        name:'均价', line:{{color:'#ffd54f',width:1.2}}
+      }};
+
+      var layout={{
+        paper_bgcolor:'{BG}', plot_bgcolor:'{BG}',
+        height:620, margin:{{l:8,r:8,t:30,b:8}},
+        hovermode:'x unified',
+        legend:{{orientation:'h',y:1.02}},
+        xaxis:{{gridcolor:'#2a2a2a'}},
+        yaxis:{{gridcolor:'#2a2a2a',range:[pMin-pad,pMax+pad],side:'left'}},
+        yaxis2:{{overlaying:'y',side:'right',ticksuffix:'%',
+                 range:[(pMin-pad)/prevClose*100-100,(pMax+pad)/prevClose*100-100],
+                 gridcolor:'#2a2a2a'}},
+        shapes:[{{type:'line',x0:0,x1:1,xref:'paper',
+                 y0:prevClose,y1:prevClose,
+                 line:{{color:'#888',width:0.8,dash:'dot'}}}}]
+      }};
+
+      function initChart(){{
+        if(typeof Plotly==='undefined'){{
+          statusEl.innerHTML='⏳ 加载 Plotly...';
+          setTimeout(initChart,500);
+          return;
+        }}
+        Plotly.newPlot('chart',[trace1,trace2],layout).then(function(){{
+          statusEl.innerHTML='<span style="color:#ffc107">● 等待SSE连接...</span>';
+          startSSE();
+        }});
+      }}
+
+      function startSSE(){{
+        var sseHost=window.location.hostname||'localhost';
+        var es=new EventSource('http://'+sseHost+':8502/market/events?code='+code);
+        es.onopen=function(){{
+          statusEl.innerHTML='<span style="color:#28a745">● 实时刷新中</span>';
+        }};
+        es.addEventListener('tick',function(e){{
+          var d=JSON.parse(e.data);
+          var t=d.time.substring(0,2)+':'+d.time.substring(2);
+          prices.push(d.price);
+          times.push(t);
+          vwap.push(prices.reduce(function(a,b){{return a+b}},0)/prices.length);
+
+          Plotly.extendTraces('chart',{{x:[[t]],y:[[d.price]]}},[0]);
+          Plotly.extendTraces('chart',{{x:[[t]],y:[[vwap[vwap.length-1]]}},[1]);
+
+          statusEl.innerHTML='<span style="color:#28a745">● 实时刷新中</span> | '+t+' | ¥'+d.price.toFixed(2);
+        }});
+        es.onerror=function(){{
+          statusEl.innerHTML='<span style="color:#dc3545">● 连接断开，重连中...</span>';
+        }};
+      }}
+
+      initChart();
+    }})();
+    </script>
+    </body></html>
+    """
+    st.components.v1.html(html_content, height=660, scrolling=False)
 
 
 def _fenshi_body(code: str, hm: str, in_auction: bool, in_session: bool, refresh_on: bool):

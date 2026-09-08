@@ -21,13 +21,14 @@ from loopengine.tree import all_fields, build_field_frames, emit_code, evaluate_
 STATE_KEY = "loopengine"
 
 # 默认挖掘顺序：量价（主力）→ 资金流 → 板块轮动 → 指数 → 盘口异动 → 龙虎榜
-DEFAULT_FACTOR_TYPES = ["量价", "资金流", "板块轮动", "指数", "盘口异动", "龙虎榜"]
+DEFAULT_FACTOR_TYPES = ["量价", "资金流", "板块轮动", "指数", "盘口异动", "龙虎榜", "爆量抢筹"]
 
 
 class LoopEngine:
     def __init__(self, pool_name: str = "沪深300"):
         self.pool_name = pool_name
         self.state = self._load_state()
+        self._last_extra_frames = True
 
     # ---------------- 状态 ----------------
     def _load_state(self) -> dict:
@@ -67,6 +68,7 @@ class LoopEngine:
         if factor_type != "量价":
             from loopengine.extra_frames import build_extra_frames
             extra = build_extra_frames(factor_type, codes, end, lookback=800)
+        self._last_extra_frames = extra if factor_type != "量价" else True
         return panel, build_field_frames(panel, extra), codes, end
 
     # ---------------- 生成 ----------------
@@ -91,22 +93,41 @@ class LoopEngine:
 
     def _pick_parent(self, rng, live_boost: dict | None = None, factor_type: str = "量价"):
         """从已通过硬闸门的 loopengine 因子中选取父本。
-        live_boost 非空时按族实战胜率加权；factor_type 过滤同类型因子。"""
+        live_boost 非空时按族实战胜率加权；factor_type 过滤同类型因子。
+        优先按因子价值评分加权选择。"""
+        # 获取因子价值评分
+        value_scores = {}
+        try:
+            vs_df = library.factor_value_scores(factor_type=factor_type)
+            if not vs_df.empty:
+                value_scores = dict(zip(vs_df["name"], vs_df["total_score"]))
+        except Exception:
+            pass
+
         with library._lconn() as c:
             rows = c.execute(
-                "SELECT code, family FROM factor_registry WHERE engine='loopengine'"
+                "SELECT code, family, name FROM factor_registry WHERE engine='loopengine'"
                 " AND gate_status=1 AND (factor_type=? OR factor_type IS NULL)"
                 " ORDER BY RANDOM() LIMIT 12", (factor_type,)).fetchall()
         if not rows:
             # 回退到任意类型
             with library._lconn() as c:
                 rows = c.execute(
-                    "SELECT code, family FROM factor_registry WHERE engine='loopengine'"
+                    "SELECT code, family, name FROM factor_registry WHERE engine='loopengine'"
                     " AND gate_status=1 ORDER BY RANDOM() LIMIT 12").fetchall()
         if not rows:
             return None
-        if live_boost:
-            w = [1.0 + live_boost.get(r[1] or "", 0.0) for r in rows]
+        if live_boost or value_scores:
+            w = []
+            for r in rows:
+                base = 1.0
+                # 族实战加权
+                if live_boost:
+                    base += live_boost.get(r[1] or "", 0.0)
+                # 因子价值加权（0~1 → 0~1.5倍额外权重）
+                if value_scores:
+                    base += value_scores.get(r[2], 0.3) * 1.5
+                w.append(max(0.1, base))
             row = rng.choices(rows, weights=w, k=1)[0]
         else:
             row = rows[0]
@@ -153,13 +174,28 @@ class LoopEngine:
     # ---------------- 单轮 ----------------
     def run_round(self, batch: int = 30, factor_type: str = "量价") -> dict:
         """单轮挖掘：factor_type 指定因子类型（量价/资金流/板块轮动/龙虎榜/盘口异动/指数）。"""
+        s = self.state
+        rng = random.Random(s["iteration"] * 7919 + 13)
+        s["iteration"] += 1
+
+        stats = {"tested": 0, "rejected_review": 0, "llm_rejected": 0, "dup": 0, "frozen": 0, "passed": 0, "new": [],
+                 "factor_type": factor_type}
+        bus.push(EventType.ROUND_START, iteration=s["iteration"], batch=batch,
+                 factor_type=factor_type)
+
         # Step 1: 构建面板
         bus.push(EventType.STEP_UPDATE, step=1, name="构建面板", status="running")
         panel, frames, codes, end = self._frames(factor_type)
         bus.push(EventType.STEP_UPDATE, step=1, name="构建面板", status="done")
-        s = self.state
-        rng = random.Random(s["iteration"] * 7919 + 13)
-        s["iteration"] += 1
+
+        # 非量价类型：检查额外帧是否为空，为空则跳过本轮
+        if factor_type != "量价" and not self._last_extra_frames:
+            bus.push(EventType.ROUND_COMPLETE, iteration=s["iteration"],
+                     stats={**stats, "tested": 0, "passed": 0, "dup": 0, "frozen": 0},
+                     new_factors=[], skip_reason=f"{factor_type}数据源为空")
+            self._save_state()
+            return {"iteration": s["iteration"], "tested": 0, "passed": 0, "dup": 0, "frozen": 0,
+                    "new": [], "gaps": [], "proven": [], "budget": {}, "skip_reason": f"{factor_type}数据源为空"}
 
         # Step 2: 机制族引导
         bus.push(EventType.STEP_UPDATE, step=2, name="机制族引导", status="running")
@@ -178,10 +214,6 @@ class LoopEngine:
         library.fsa_recompute()
         bus.push(EventType.STEP_UPDATE, step=3, name="FSA重算", status="done")
 
-        stats = {"tested": 0, "rejected_review": 0, "llm_rejected": 0, "dup": 0, "frozen": 0, "passed": 0, "new": [],
-                 "factor_type": factor_type}
-        bus.push(EventType.ROUND_START, iteration=s["iteration"], batch=batch,
-                 factor_type=factor_type, gaps=gaps, proven=proven)
         llm_review_budget = 5
         for _ in range(batch):
             # Step 4: 生成候选

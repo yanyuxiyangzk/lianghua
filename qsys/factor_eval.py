@@ -80,10 +80,10 @@ def forward_returns(panel: pd.DataFrame, days: int) -> pd.DataFrame:
 
 
 def get_factor_values(fac: dict, codes: list[str], end: str, lookback_days: int = 800,
-                      source: str | None = None) -> pd.Series:
+                       source: str | None = None) -> pd.Series:
     """统一取因子长表 Series[(datetime, instrument)]。
 
-    fac: {"name":..., "kind": "builtin"|"evolved", "code": 进化因子代码}
+    fac: {"name":..., "kind": "builtin"|"evolved"|"loopengine", "code": 进化因子代码}
     """
     import datasource
 
@@ -103,6 +103,26 @@ def get_factor_values(fac: dict, codes: list[str], end: str, lookback_days: int 
             s = sig.compute_common(panel, fac["name"])
         else:
             s = sig.compute_tech(panel, fac["name"])
+    elif fac["kind"] == "loopengine":
+        # 树直算快速路径：避免子进程执行（~5秒/个 → ~0.02秒/个）
+        code = fac.get("code") or ""
+        if code.startswith("# sexpr: "):
+            try:
+                from loopengine.tree import build_field_frames, evaluate_tree, parse
+                panel = sig.get_panel_cached(codes, end, lookback_days, source=source)
+                frames = build_field_frames(panel)
+                sexpr = code.split("\n", 1)[0][len("# sexpr: "):]
+                tree = parse(sexpr)
+                vals = evaluate_tree(tree, frames).stack().rename(fac["name"]).dropna()
+                vals.index = vals.index.set_names(["datetime", "instrument"])
+                s = vals
+            except Exception:
+                # 回退到子进程执行
+                df = sig.run_factor_code(code, fac["name"], codes, end, lookback_days, source=source)
+                s = df.iloc[:, 0]
+        else:
+            df = sig.run_factor_code(code, fac["name"], codes, end, lookback_days, source=source)
+            s = df.iloc[:, 0]
     else:
         df = sig.run_factor_code(fac["code"], fac["name"], codes, end, lookback_days, source=source)
         s = df.iloc[:, 0]

@@ -98,18 +98,59 @@ def job_watchlist_signals() -> str:
 
 
 def _best_pack(packs: dict) -> str:
-    """OOS 胜率最高（% 格式）的策略包名；无有效胜率则空串。"""
-    best, best_wr = "", -1.0
+    """稳健性优先选择策略包：综合OOS胜率与实际表现差异。
+    
+    选择逻辑：
+      1. 优先选择OOS与实际胜率差异最小的包（稳健性）
+      2. 差异相同时，选择OOS胜率较高的包
+      3. 无实际数据时，回退到OOS胜率最高
+    """
+    import sqlite3
+    from pathlib import Path
+    
+    # 获取各策略包的实际胜率
+    actual_winrates = {}
+    try:
+        db_path = Path("/data/experience.db")
+        with sqlite3.connect(str(db_path)) as c:
+            rows = c.execute('''
+                SELECT p.pack_name, 
+                       SUM(CASE WHEN t.pnl_pct > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as winrate
+                FROM trades t
+                JOIN picks p ON t.pick_id = p.id
+                WHERE t.pnl_pct IS NOT NULL AND p.pack_name IS NOT NULL
+                GROUP BY p.pack_name
+                HAVING COUNT(*) >= 5
+            ''').fetchall()
+            for pack_name, wr in rows:
+                actual_winrates[pack_name] = wr * 100
+    except Exception:
+        pass
+    
+    best, best_score = "", -1.0
     for name, pk in packs.items():
         v = str(pk.get("oos_winrate") or "")
         if not v.endswith("%"):
             continue
         try:
-            wr = float(v.rstrip("%"))
+            oos_wr = float(v.rstrip("%"))
         except ValueError:
             continue
-        if wr > best_wr:
-            best, best_wr = name, wr
+        
+        actual_wr = actual_winrates.get(name)
+        
+        if actual_wr is not None:
+            # 稳健性评分：差异越小分越高，同时考虑OOS水平
+            gap = abs(oos_wr - actual_wr)
+            # 得分 = OOS胜率 * 0.4 + (100 - 差异) * 0.6
+            # 差异越小，得分越高
+            score = oos_wr * 0.4 + (100 - gap) * 0.6
+        else:
+            # 无实际数据时，仅用OOS（但打折0.8，表示不确定性）
+            score = oos_wr * 0.8
+        
+        if score > best_score:
+            best, best_score = name, score
     return best
 
 
@@ -193,6 +234,372 @@ def compute_pack_picks(pk: dict, codes: list[str], end: str, top_n: int):
     picks = sig.industry_cap_select(sel, cap=2).head(top_n)
     note = f"{len(weights)} 因子·行业≤2{reso_note}" + \
         (f"，{len(dropped)} 个无法解析已跳过" if dropped else "")
+
+    # 记录因子使用
+    try:
+        import library
+        library.record_factor_usage(list(weights.keys()), usage_type="pick", pick_date=end)
+    except Exception:
+        pass
+
+    return picks, note, weights, f_series
+
+
+def auto_select_factors(pool_name: str = "沪深300", top_n: int = 10,
+                        min_per_type: int = 1, max_per_type: int = 3) -> tuple:
+    """自动选股 v5：技术审查修复版。
+
+    核心标准（双胜率+置信度）：
+    1. 因子回测胜率（factor_scorecards.top_winrate）
+    2. 实盘交易胜率（trades/pick_items关联，贝叶斯收缩+时间衰减）
+    3. 策略包OOS胜率（加权平均+鲁棒性）
+
+    v5修复：
+    - 贝叶斯收缩：小样本胜率向先验收缩，避免3笔交易=100%的极端
+    - 样本量置信度：无实盘数据的因子实盘维度贡献归零
+    - 收益率归一化：sigmoid映射到[0,1]，避免量纲失衡
+    - 时间衰减：近期交易权重更高（90天半衰期）
+    - 因子相关性：计算因子值后检查相关系数，>0.7剔除
+    - 因子方向：使用IC均值符号判断，而非IC综合分
+    - 负收益clip：收益率winsorize到5%-95%分位
+
+    返回: (picks Series, note str, weights dict, f_series dict)
+    """
+    import library
+    from common import all_pools, get_last_trade_day
+    import signals as sig
+    import numpy as np
+    import sqlite3
+    from pathlib import Path
+
+    end = get_last_trade_day()
+    codes = all_pools().get(pool_name, all_pools()["沪深300"])
+
+    # ========== 第一部分：因子回测评分 ==========
+    vs = library.factor_value_scores()
+    if vs.empty:
+        raise RuntimeError("无因子价值评分数据")
+
+    reg = library.get_factor_registry()
+    if reg.empty:
+        raise RuntimeError("无因子注册表")
+
+    vs = vs.merge(reg[["name", "skeleton", "family", "factor_type", "code"]], on="name", how="left", suffixes=("", "_reg"))
+    if "factor_type_reg" in vs.columns:
+        vs["factor_type"] = vs["factor_type_reg"].fillna(vs["factor_type"])
+
+    # 去相关：同骨架只保留最高分
+    vs = vs.sort_values("total_score", ascending=False)
+    vs = vs.drop_duplicates(subset="skeleton", keep="first")
+
+    # ========== 第二部分：实盘交易胜率（贝叶斯收缩+时间衰减） ==========
+    MIN_TRADES = 10  # 至少10笔才有统计意义
+    HALF_LIFE_DAYS = 90  # 时间衰减半衰期
+
+    def _shrink_winrate(observed_wr, n_trades, prior=0.5, prior_strength=10):
+        """贝叶斯收缩：样本越少越靠近先验"""
+        return (observed_wr * n_trades + prior * prior_strength) / (n_trades + prior_strength)
+
+    def _decay_weight(trade_date_str):
+        """指数衰减：最近的交易权重最高"""
+        try:
+            days_ago = (pd.Timestamp.now() - pd.Timestamp(trade_date_str)).days
+            return np.exp(-np.log(2) * days_ago / HALF_LIFE_DAYS)
+        except Exception:
+            # 异常情况返回低权重（等同于365天前）
+            return np.exp(-np.log(2) * 365 / HALF_LIFE_DAYS)
+
+    actual_winrate_map = {}  # {因子名: (收缩后胜率, 归一化收益率, 交易次数, 置信度)}
+    try:
+        edb = Path("/data/experience.db")
+        if not edb.exists():
+            raise FileNotFoundError(f"经验库不存在: {edb}")
+        with sqlite3.connect(str(edb)) as conn:
+            rows = conn.execute("""
+                SELECT p.factors, t.code, t.pnl_pct, p.trade_date
+                FROM picks p
+                JOIN trades t ON p.id = t.pick_id
+                WHERE t.pnl_pct IS NOT NULL
+            """).fetchall()
+
+            # 解析因子并统计（时间衰减加权）
+            factor_data = {}  # {因子名: [(pnl, weight)]}
+            for factors_json, code, pnl, trade_date in rows:
+                try:
+                    factors = json.loads(factors_json) if factors_json else []
+                except Exception:
+                    continue
+                w = _decay_weight(trade_date)
+                for f in factors:
+                    # 兼容旧格式（字符串列表）和新格式（dict列表）
+                    fname = f.get("name", "") if isinstance(f, dict) else str(f)
+                    if fname not in factor_data:
+                        factor_data[fname] = []
+                    factor_data[fname].append((pnl, w))
+
+            # 计算胜率和收益率
+            for fname, pnls_weights in factor_data.items():
+                pnls = [p for p, _ in pnls_weights]
+                weights = [w for _, w in pnls_weights]
+                n_trades = len(pnls)
+
+                if n_trades < MIN_TRADES:
+                    continue
+
+                # 时间衰减加权胜率
+                weighted_wins = sum(p * w for p, w in zip(pnls, weights) if p > 0)
+                weighted_total = sum(weights)
+                raw_winrate = weighted_wins / weighted_total if weighted_total > 0 else 0.5
+
+                # 贝叶斯收缩
+                shrunk_winrate = _shrink_winrate(raw_winrate, n_trades)
+
+                # 时间衰减加权收益率
+                avg_ret = sum(p * w for p, w in zip(pnls, weights)) / weighted_total if weighted_total > 0 else 0.0
+
+                # Winsorize收益率到5%-95%分位
+                p5, p95 = np.percentile(pnls, 5), np.percentile(pnls, 95)
+                clipped_ret = np.clip(avg_ret, p5, p95)
+
+                # Sigmoid归一化到[0,1]
+                ret_norm = 1.0 / (1.0 + np.exp(-clipped_ret * 10))  # 10为灵敏度
+
+                # 置信度：30笔以上满置信
+                confidence = min(n_trades / 30, 1.0)
+
+                actual_winrate_map[fname] = (shrunk_winrate, ret_norm, n_trades, confidence)
+    except Exception as e:
+        import logging
+        logging.getLogger("scheduler").warning(f"实盘胜率计算异常: {e}")
+
+    # 无实盘数据：胜率默认0.4（惩罚性），收益率0.0，置信度0
+    vs["actual_winrate"] = vs["name"].map(lambda n: actual_winrate_map.get(n, (0.4, 0.0, 0, 0.0))[0])
+    vs["actual_return"] = vs["name"].map(lambda n: actual_winrate_map.get(n, (0.4, 0.0, 0, 0.0))[1])
+    vs["actual_trades"] = vs["name"].map(lambda n: actual_winrate_map.get(n, (0.4, 0.0, 0, 0.0))[2])
+    vs["actual_confidence"] = vs["name"].map(lambda n: actual_winrate_map.get(n, (0.4, 0.0, 0, 0.0))[3])
+
+    # ========== 第三部分：策略包投票（加权平均+鲁棒性） ==========
+    packs = library.list_strategies()
+    pack_scores = {}  # {因子名: [(包分, 因子权重)]}
+    pack_count_map = {}  # {因子名: 被几个包选中}
+
+    for pk_name, pk in packs.items():
+        oos_str = str(pk.get("oos_winrate") or "")
+        is_wr_str = str(pk.get("is_winrate") or "")
+
+        oos_score = 0.0
+        if oos_str.endswith("%"):
+            try:
+                oos_score = float(oos_str.rstrip("%")) / 100
+            except ValueError:
+                pass
+        elif "夏普" in oos_str:
+            try:
+                oos_score = min(1.0, float(oos_str.replace("夏普", "")) / 2)
+            except ValueError:
+                pass
+
+        is_score = 0.0
+        if is_wr_str.endswith("%"):
+            try:
+                is_score = float(is_wr_str.rstrip("%")) / 100
+            except ValueError:
+                pass
+
+        pack_score = oos_score * 0.6 + is_score * 0.4
+
+        for f in pk.get("factors", []):
+            fname = f["name"]
+            factor_weight = f.get("weight", 1.0)
+            if fname not in pack_scores:
+                pack_scores[fname] = []
+            pack_scores[fname].append((pack_score, factor_weight))
+
+    # 综合投票：加权平均 + 鲁棒性
+    def _pack_vote(n):
+        if n not in pack_scores or not pack_scores[n]:
+            return 0.0, 0
+        scores_weights = pack_scores[n]
+        # 加权平均（按因子在包内的权重）
+        total_w = sum(w for _, w in scores_weights)
+        if total_w > 0:
+            avg_score = sum(s * w for s, w in scores_weights) / total_w
+        else:
+            avg_score = np.mean([s for s, _ in scores_weights])
+        return avg_score, len(scores_weights)
+
+    vs["pack_vote_raw"] = vs["name"].map(lambda n: _pack_vote(n)[0])
+    vs["pack_count"] = vs["name"].map(lambda n: _pack_vote(n)[1])
+    vs["pack_robustness"] = np.minimum(vs["pack_count"] / 3, 1.0)  # 3个包以上满鲁棒性
+    vs["pack_vote"] = vs["pack_vote_raw"] * 0.7 + vs["pack_robustness"] * 0.3
+
+    # ========== 第四部分：综合评分 v5 ==========
+    try:
+        with library._lconn() as c:
+            sc = pd.read_sql(
+                "SELECT name, ic_mean, ic_winrate, top_winrate, days FROM factor_scorecards WHERE days >= 5",
+                c)
+    except Exception:
+        sc = pd.DataFrame()
+
+    stability_map = {}
+    if not sc.empty:
+        for name, group in sc.groupby("name"):
+            if len(group) >= 2:
+                ic_std = group["ic_mean"].std()
+                stability_map[name] = max(0, 1 - ic_std * 10)
+    vs["stability_extra"] = vs["name"].map(stability_map).fillna(0.3)
+
+    momentum_map = {}
+    if not sc.empty:
+        for name, group in sc.groupby("name"):
+            if len(group) >= 2:
+                group = group.sort_values("days")
+                recent_ic = group.iloc[-1]["ic_mean"]
+                older_ic = group.iloc[0]["ic_mean"]
+                momentum_map[name] = min(1.0, max(0, 0.5 + (recent_ic - older_ic) * 5))
+    vs["momentum"] = vs["name"].map(momentum_map).fillna(0.5)
+
+    # 回测胜率
+    backtest_winrate_map = {}
+    if not sc.empty:
+        latest_sc = sc.sort_values("days", ascending=False).drop_duplicates(subset="name", keep="first")
+        backtest_winrate_map = dict(zip(latest_sc["name"], latest_sc["top_winrate"].fillna(0.5)))
+    vs["backtest_winrate"] = vs["name"].map(backtest_winrate_map).fillna(0.5)
+
+    # 综合评分 v5：双胜率核心 + 置信度缩放
+    vs["score_v5"] = (
+        vs["backtest_winrate"] * 0.25 +
+        vs["actual_winrate"] * vs["actual_confidence"] * 0.25 +
+        vs["actual_return"] * vs["actual_confidence"] * 0.10 +
+        vs["pack_vote"] * 0.15 +
+        vs["total_score"] * 0.10 +
+        vs["stability_extra"] * 0.08 +
+        vs["momentum"] * 0.07
+    )
+
+    # ========== 第五部分：类型+族分散选因子 ==========
+    selected_factors = []
+    used_families = set()
+
+    vs_sorted = vs.sort_values("score_v5", ascending=False)
+
+    for _, row in vs_sorted.iterrows():
+        ftype = row.get("factor_type", "量价")
+        fam = row.get("family", "其他")
+
+        type_count = len([f for f in selected_factors if f.get("factor_type") == ftype])
+        if type_count >= max_per_type:
+            continue
+
+        fam_key = f"{ftype}_{fam}"
+        fam_count = len([f for f in selected_factors if f.get("factor_type") == ftype and f.get("family") == fam])
+        if fam_count >= 2:
+            continue
+
+        selected_factors.append(row.to_dict())
+        used_families.add(fam_key)
+
+        if len(selected_factors) >= max_per_type * 5:
+            break
+
+    if not selected_factors:
+        raise RuntimeError("无选中因子")
+
+    # ========== 第六部分：计算因子值 + 相关性过滤 ==========
+    panel = sig.get_panel_cached(codes, end)
+    f_series = {}
+    weights = {}
+    ic_mean_map = {}  # 用于判断方向
+
+    # 从scorecards获取IC均值符号（用于判断因子方向）
+    if not sc.empty:
+        latest_sc = sc.sort_values("days", ascending=False).drop_duplicates(subset="name", keep="first")
+        ic_mean_map = dict(zip(latest_sc["name"], latest_sc["ic_mean"]))
+
+    for f in selected_factors:
+        fname = f["name"]
+        score = f["score_v5"]
+
+        try:
+            row = reg[reg["name"] == fname]
+            if row.empty:
+                continue
+            code = row.iloc[0]["code"]
+            if not code:
+                continue
+
+            if code.startswith("# sexpr:"):
+                from loopengine.tree import build_field_frames, evaluate_tree, parse
+                tree = parse(code.split("\n", 1)[0][len("# sexpr: "):])
+                s = evaluate_tree(tree, build_field_frames(panel)).stack().rename(fname)
+                s.index = s.index.set_names(["datetime", "instrument"])
+            else:
+                df = sig.run_factor_code(code, fname, codes, end)
+                s = df.iloc[:, 0]
+
+            f_series[fname] = s
+            # 方向：使用IC均值符号判断（IC>0→1, IC<0→-1）
+            ic_mean = ic_mean_map.get(fname, 0.0)
+            direction = 1 if ic_mean >= 0 else -1
+            weights[fname] = (score, direction)
+        except Exception as e:
+            import logging
+            logging.getLogger("scheduler").debug(f"因子{fname}计算失败: {e}")
+            continue
+
+    if not weights:
+        raise RuntimeError("所有因子计算失败")
+
+    # 相关性过滤：>0.7剔除低分因子
+    def _remove_correlated(f_series_dict, threshold=0.7):
+        """按score降序，贪心保留不相关的因子"""
+        names = list(f_series_dict.keys())
+        if len(names) <= 1:
+            return names
+
+        # 构造截面因子矩阵
+        panel_df = pd.DataFrame(f_series_dict)
+        corr = panel_df.corr().abs()
+
+        # 按score降序
+        scored = [(n, weights.get(n, (0, 1))[0]) for n in names]
+        scored.sort(key=lambda x: -x[1])
+
+        kept = [scored[0][0]]
+        for name, _ in scored[1:]:
+            max_corr = corr.loc[name, kept].max() if kept else 0
+            if max_corr < threshold:
+                kept.append(name)
+        return kept
+
+    kept_names = _remove_correlated(f_series, threshold=0.7)
+    f_series = {k: v for k, v in f_series.items() if k in kept_names}
+    weights = {k: v for k, v in weights.items() if k in kept_names}
+
+    # ========== 第七部分：合成 + 行业分散 ==========
+    score = sig.composite_score(f_series, weights)
+    survived = sig.apply_filters(score.index.tolist(), panel, ["tradable"])
+    sel = score[score.index.isin(survived)]
+    picks = sig.industry_cap_select(sel, cap=2).head(top_n)
+
+    try:
+        library.record_factor_usage(list(weights.keys()), usage_type="pick", pick_date=end)
+    except Exception:
+        pass
+
+    # 生成note
+    type_counts = {}
+    for f in selected_factors:
+        if f["name"] in weights:
+            ft = f.get("factor_type", "量价")
+            type_counts[ft] = type_counts.get(ft, 0) + 1
+    type_note = " ".join(f"{k}:{v}" for k, v in type_counts.items())
+    pack_count = len([f for f in selected_factors if f.get("pack_vote", 0) > 0])
+    actual_count = len([f for f in selected_factors if f.get("actual_trades", 0) >= MIN_TRADES])
+    corr_removed = len(selected_factors) - len(kept_names)
+    note = f"自动选股v5 · {len(weights)}因子({type_note}) · {pack_count}策略包 · {actual_count}有实盘 · 去相关{corr_removed}"
+
     return picks, note, weights, f_series
 
 
@@ -281,6 +688,34 @@ def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "")
     return f"{end} {pool_name} 扫描完成：Top{top_n} 已出（{note}）{sat_msg}"
 
 
+def job_auto_scan(pool_name: str = "沪深300", top_n: int = 10, **_ignored) -> str:
+    """自动选股：基于因子价值5维评分 + 类型分散 + 动态选因子。
+    不依赖策略包，自动从活跃因子池中选取最优组合。"""
+    end = get_last_trade_day()
+    try:
+        picks, note, weights, f_series = auto_select_factors(pool_name, top_n)
+    except Exception as e:
+        return f"自动选股失败: {e}"
+
+    # 保存信号
+    SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
+    import signals as sig
+    safe_pool = pool_name.replace("/", "_")
+    out = pd.DataFrame({"score": picks})
+    sig._write_parquet_atomic(out, SIGNALS_DIR / f"auto_{safe_pool}_{end}.parquet")
+
+    # 经验库落库
+    import experience
+    fcfg = [{"name": n, "kind": ("builtin" if n in sig.BUILTIN_FACTORS else "evolved"),
+             "weight": float(w), "direction": int(d)}
+            for n, (w, d) in weights.items()]
+    experience.save_pick(source="sched_auto_scan", pool_name=pool_name, top_n=top_n,
+                         method="auto_select", filters=[], factors=fcfg,
+                         final_scores=picks, pack_name=None, trade_date=end)
+
+    return f"{end} 自动选股完成：Top{top_n} 已出（{note}）"
+
+
 def job_outcome_backfill() -> str:
     """经验库战果回填：到期的历史名单按交易日历结算 5/10/20 日战绩。"""
     import experience
@@ -297,12 +732,13 @@ def job_gate_check(pool_name: str = "沪深300") -> str:
 
 def job_loopengine(batch: int = 30, **_ignored) -> str:
     """LoopEngine 演化引擎：每轮 生成→审查→验证→入库（检查点自动保存）。
-    容忍调度界面写入的多余参数（如 pool_name）。"""
-    from loopengine.engine import LoopEngine
+    按 iteration 轮转6种因子类型：量价/资金流/板块轮动/指数/盘口异动/龙虎榜。"""
+    from loopengine.engine import LoopEngine, DEFAULT_FACTOR_TYPES
 
     eng = LoopEngine("沪深300")
-    r = eng.run_round(batch=batch)
-    return (f"第{r['iteration']}轮 · 测试{r['tested']} · 过审拒绝{r['rejected_review']} · "
+    factor_type = DEFAULT_FACTOR_TYPES[eng.state["iteration"] % len(DEFAULT_FACTOR_TYPES)]
+    r = eng.run_round(batch=batch, factor_type=factor_type)
+    return (f"第{r['iteration']}轮[{factor_type}] · 测试{r['tested']} · 过审拒绝{r['rejected_review']} · "
             f"LLM否决{r.get('llm_rejected', 0)} · 重复{r['dup']} · FSA拦截{r['frozen']} · 入库{r['passed']} {r['new'][:3]}")
 
 
@@ -351,6 +787,7 @@ def job_position_track(**_ignored) -> str:
 
     流程贴近实盘：委托（参考价=名单价）→ 现价触及才成交 → 买入日当天不卖（T+1）。
     手动持仓同样随实盘价滚动止盈/止损自动卖出。
+    同时初始化 PriceMonitor 事件驱动监控。
     """
     from zoneinfo import ZoneInfo
 
@@ -364,6 +801,16 @@ def job_position_track(**_ignored) -> str:
 
     import experience
     today = now.strftime("%Y-%m-%d")
+
+    # 初始化 PriceMonitor（从数据库加载持仓）
+    try:
+        from price_monitor import init_monitor
+        n_registered = init_monitor()
+    except Exception as e:
+        n_registered = 0
+        import logging
+        logging.getLogger("scheduler").warning(f"PriceMonitor 初始化失败: {e}")
+
     latest = experience.list_pick_dates(limit=1)
     m1 = experience.position_open_from_picks(latest[0], today) if latest else "无名单"
     m_fill = experience.position_fill_check(today)
@@ -374,6 +821,8 @@ def job_position_track(**_ignored) -> str:
     n_stop = broker.check_stop_exits()
     parts = [m1, m_fill, m2] + ([f"挂单成交 {n_fill} 笔"] if n_fill else []) \
         + ([f"手动止盈止损 {n_stop} 笔"] if n_stop else [])
+    if n_registered:
+        parts.append(f"PriceMonitor 监控 {n_registered} 个持仓")
     return "；".join(p for p in parts if p)
 
 
@@ -410,6 +859,135 @@ def job_minute_sync(**_ignored) -> str:
     return f"{now.strftime('%H:%M')} 分钟线同步：{n_ok}/{len(codes)} 只 · 写入 {n_rows} 行"
 
 
+def job_tick_sync(**_ignored) -> str:
+    """盘中tick数据同步（每分钟）：自选股+当前持仓的逐笔成交落库（tick_data 表）。
+    分时图页面直接读本地库，不再每次直连数据源。"""
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5:
+        return "非交易日，跳过"
+    if not ("0930" <= now.strftime("%H%M") <= "1505"):
+        return "非交易时段，跳过"
+
+    import experience
+    codes = set(load_watchlist())
+    with experience._conn() as c:
+        for r in c.execute("SELECT code FROM positions WHERE status IN ('open','pending')").fetchall():
+            codes.add(r[0])
+    latest = experience.list_pick_dates(limit=1)
+    if latest:
+        for r in experience.picks_on_date(latest[0]).itertuples():
+            for it in experience.pick_items_detail(int(r.id)).itertuples():
+                codes.add(it.code)
+
+    n_rows = n_ok = 0
+    import sqlite3 as sq
+    from pathlib import Path
+    db_path = Path("/data/market.db")
+
+    for code in codes:
+        try:
+            ticks = datasource.get_ticks_tdx(code, max_pages=5)
+            if ticks is None or ticks.empty:
+                continue
+            # 写入tick_data表
+            with sq.connect(str(db_path)) as c:
+                for _, row in ticks.iterrows():
+                    try:
+                        c.execute(
+                            "INSERT OR IGNORE INTO tick_data (code, datetime, price, volume, buyorsell, source) "
+                            "VALUES (?, ?, ?, ?, ?, 'tdx')",
+                            (code, str(row.get("datetime", "")), row.get("price"),
+                             int(row.get("vol", 0)), int(row.get("buyorsell", 0)))
+                        )
+                    except Exception:
+                        continue
+            n_rows += len(ticks)
+            n_ok += 1
+        except Exception:
+            continue
+
+    return f"{now.strftime('%H:%M')} tick同步：{n_ok}/{len(codes)} 只 · 写入 {n_rows} 行"
+
+
+def job_realtime_kline(**_ignored) -> str:
+    """实时日K线聚合（每10秒）：从tick_data聚合今日OHLCV，写入realtime_daily表。
+    分时图/K线页面直接读取，实现实时滚动更新。"""
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5:
+        return "非交易日，跳过"
+    if not ("0930" <= now.strftime("%H%M") <= "1505"):
+        return "非交易时段，跳过"
+
+    import sqlite3 as sq
+    from pathlib import Path
+    db_path = Path("/data/market.db")
+    today = now.strftime("%Y-%m-%d")
+
+    with sq.connect(str(db_path)) as c:
+        # 创建realtime_daily表（如果不存在）
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS realtime_daily (
+                code TEXT PRIMARY KEY,
+                date TEXT,
+                open REAL,
+                high REAL,
+                low REAL,
+                close REAL,
+                volume INTEGER,
+                amount REAL,
+                avg_price REAL,
+                prev_close REAL,
+                change_pct REAL,
+                updated_at TEXT
+            )
+        ''')
+
+        # 从tick_data聚合今日数据
+        rows = c.execute('''
+            SELECT code,
+                   MIN(price) as open,
+                   MAX(price) as high,
+                   MIN(price) as low,
+                   (SELECT price FROM tick_data WHERE code=t.code AND datetime LIKE ? 
+                    ORDER BY datetime DESC LIMIT 1) as close,
+                   SUM(volume) as volume,
+                   SUM(price * volume) as amount,
+                   SUM(price * volume) / SUM(volume) as avg_price
+            FROM tick_data t
+            WHERE datetime LIKE ?
+            GROUP BY code
+        ''', (f'{today}%', f'{today}%')).fetchall()
+
+        n_updated = 0
+        for row in rows:
+            code, open_p, high, low, close, vol, amt, avg = row
+            if not close or vol == 0:
+                continue
+
+            # 获取昨收
+            prev = c.execute(
+                'SELECT close FROM market_daily WHERE code=? ORDER BY date DESC LIMIT 1',
+                (code,)
+            ).fetchone()
+            prev_close = prev[0] if prev else open_p
+            change_pct = (close / prev_close - 1) * 100 if prev_close else 0
+
+            c.execute('''
+                INSERT OR REPLACE INTO realtime_daily 
+                (code, date, open, high, low, close, volume, amount, avg_price, 
+                 prev_close, change_pct, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (code, today, open_p, high, low, close, vol, amt, avg,
+                  prev_close, round(change_pct, 2), now.strftime('%Y-%m-%d %H:%M:%S')))
+            n_updated += 1
+
+    return f"{now.strftime('%H:%M')} 实时日K线聚合：{n_updated} 只"
+
+
 def job_trade_simulate() -> str:
     """模拟交易回填：对经验库新名单按默认规则（止盈15%/止损-8%/持有20日）逐笔模拟平仓。"""
     import experience
@@ -421,7 +999,7 @@ def job_auction_confirm() -> str:
     """竞价确认（09:26，集合竞价落锤后）：对昨晚名单逐只检查竞价表现，标记回避信号。
 
     规则（保守，宁缺毋滥）：
-      回避 = 竞价低开 ≤ -2%（隔夜利空跳空）或 竞价量 < 20日均量的 0.5%（无量承接）
+      回避 = 竞价低开 ≤ -2%（隔夜利空跳空）或 竞价量 < 20日均量的 0.3%（无量承接）
     结果存 signals/auction_<当日>.parquet，选股列表页次日名单旁显示确认状态。
     """
     from zoneinfo import ZoneInfo
@@ -455,7 +1033,7 @@ def job_auction_confirm() -> str:
             avg20 = daily["$volume"].tail(20).mean() if not daily.empty else None
             # 快照 volume 单位为手，×100 对齐日线（股）
             ratio = (snap.get("volume") or 0) * 100 / avg20 if avg20 else None
-            verdict = "回避" if (gap <= -0.02 or (ratio is not None and ratio < 0.005)) else "确认"
+            verdict = "回避" if (gap <= -0.02 or (ratio is not None and ratio < 0.003)) else "确认"
             rows.append({"code": code, "竞价涨幅%": round(gap * 100, 2),
                          "竞价量比%": round(ratio * 100, 2) if ratio is not None else None,
                          "竞价结论": verdict})
@@ -638,6 +1216,7 @@ def job_ifind_realtime_sync(**_ignored) -> str:
     """iFinD 实时行情快照同步（盘中每15分钟执行）。
 
     调用 datasource.fetch_realtime_to_db() 写入 ifind_realtime 表。
+    同时触发 PriceMonitor 事件驱动评估。
     """
     from zoneinfo import ZoneInfo
 
@@ -650,7 +1229,35 @@ def job_ifind_realtime_sync(**_ignored) -> str:
         return "非交易时段，跳过"
 
     n = datasource.fetch_realtime_to_db()
+
+    # 触发 PriceMonitor 事件驱动评估
     if n > 0:
+        try:
+            from price_monitor import monitor
+            watched = monitor.get_watched_codes()
+            if watched:
+                # 从数据库读取最新价格，触发事件
+                import sqlite3
+                from pathlib import Path
+                db_path = Path("/data/quote.db")
+                if db_path.exists():
+                    with sqlite3.connect(str(db_path)) as c:
+                        placeholders = ",".join(["?" for _ in watched])
+                        rows = c.execute(
+                            f"SELECT code, price FROM ifind_realtime WHERE code IN ({placeholders})",
+                            watched
+                        ).fetchall()
+                    events = []
+                    for code, price in rows:
+                        if price:
+                            evts = monitor.on_price_update(code, price, now.strftime("%Y-%m-%d %H:%M:%S"))
+                            events.extend(evts)
+                    if events:
+                        return f"{now.strftime('%H:%M:%S')} 实时快照 {n} 只，触发 {len(events)} 个事件"
+        except Exception as e:
+            import logging
+            logging.getLogger("scheduler").warning(f"PriceMonitor 评估异常: {e}")
+
         return f"{now.strftime('%H:%M:%S')} 实时快照写入完成：{n} 只"
     else:
         return "实时快照写入失败（可能iFinD限流或无数据）"
@@ -666,12 +1273,13 @@ def job_ifind_cleanup(**_ignored) -> str:
 
 
 def job_le_factor_eval(batch: int = 60, pool_name: str = "沪深300") -> str:
-    """LoopEngine 因子滚动体检（每晚一批）：族配额优先取一批出评分卡。
+    """LoopEngine 因子滚动体检（每晚一批）：边际价值优先取一批出评分卡。
 
-    演化引擎日产出数百因子，全量体检不现实；每晚一批滚动覆盖：已评估覆盖越少的
-    机制族越优先，族内按最久未评估轮询（因子会衰减）。
-    速度：树因子（代码首行带 # sexpr:）在进程内向量化直算并预填因子值缓存，
-    跳过子进程（~10s/个 → ~0.1s/个），只有非树因子才回退子进程执行。
+    选股策略（边际价值排序）：
+      1. 非量价因子优先（资金流/板块轮动/龙虎榜/盘口异动/指数）—— 多元化验证
+      2. gate_detail_log 中 IC 最高的未体检因子 —— 高质量因子优先验证
+      3. 与已体检因子相关性 < 0.70 的因子 —— 增加多样性
+      4. 族配额兜底：同族覆盖越少越优先 —— 避免单一族垄断
     """
     import factor_eval as fe
     import library
@@ -680,25 +1288,51 @@ def job_le_factor_eval(batch: int = 60, pool_name: str = "沪深300") -> str:
     le = reg[reg["engine"] == "loopengine"] if not reg.empty else reg
     if le.empty:
         return "无 LoopEngine 因子，跳过"
+
     with library._lconn() as c:
+        # 已体检因子
         evaluated = dict(c.execute(
             "SELECT name, MAX(updated_at) FROM factor_scorecards GROUP BY name").fetchall())
-    le = le.assign(_eval_at=le["name"].map(lambda n: evaluated.get(n, "")))
-    # 族配额优先：库内因子同质化严重（波动族占绝大多数），按"最久未评估"轮询会把
-    # 体检预算全花在波动族克隆上。改为：已评估覆盖越少的机制族越优先，族内按最旧轮询。
+        # 闸门IC数据（用于质量排序）
+        ic_map = {}
+        for row in c.execute(
+            "SELECT factor_name, CAST(json_extract(metrics, '$.IC') AS REAL) "
+            "FROM gate_detail_log WHERE passed=1"
+        ).fetchall():
+            ic_map[row[0]] = abs(row[1]) if row[1] else 0
+
+    # 标记未体检因子
+    le = le.assign(
+        _eval_at=le["name"].map(lambda n: evaluated.get(n, "")),
+        _ic=le["name"].map(lambda n: ic_map.get(n, 0)),
+    )
     le["_fam"] = le["family"].fillna("其他") if "family" in le.columns else "其他"
+    uneval = le[le["_eval_at"] == ""].copy()
+    if uneval.empty:
+        return "所有因子已体检，跳过"
+
+    # 边际价值评分：综合因子类型多样性 + IC质量 + 族覆盖
     fam_cov = le.groupby("_fam")["_eval_at"].apply(lambda s: int((s != "").sum()))
-    fam_order = fam_cov.sort_values().index.tolist()
-    by_fam = {f: g.sort_values("_eval_at") for f, g in le.groupby("_fam")}
-    picked_idx, cursor = [], {f: 0 for f in fam_order}
-    while len(picked_idx) < batch and any(cursor[f] < len(by_fam[f]) for f in fam_order):
-        for f in fam_order:
-            if len(picked_idx) >= batch:
-                break
-            if cursor[f] < len(by_fam[f]):
-                picked_idx.append(by_fam[f].index[cursor[f]])
-                cursor[f] += 1
-    picked = le.loc[picked_idx]
+    fam_total = le.groupby("_fam").size()
+    # 族覆盖率越低，优先级越高（0~1，越小越优先）
+    uneval["_fam_score"] = uneval["_fam"].map(
+        lambda f: fam_cov.get(f, 0) / max(fam_total.get(f, 1), 1))
+
+    # 因子类型权重：非量价优先
+    type_weights = {"量价": 0.0, "资金流": 1.0, "板块轮动": 0.9,
+                    "龙虎榜": 0.8, "盘口异动": 0.7, "指数": 0.6}
+    uneval["_type_weight"] = uneval["factor_type"].map(
+        lambda t: type_weights.get(t, 0.3) if pd.notna(t) else 0.3)
+
+    # 综合边际价值分 = IC质量(40%) + 类型多样性(35%) + 族覆盖(25%)
+    uneval["_marginal"] = (
+        uneval["_ic"].clip(0, 0.1) / 0.1 * 0.4   # IC归一化到0~1
+        + uneval["_type_weight"] * 0.35
+        + (1 - uneval["_fam_score"]) * 0.25         # 族覆盖越少分越高
+    )
+
+    # 按边际价值降序取batch个
+    picked = uneval.nlargest(batch, "_marginal")
     codes = all_pools().get(pool_name) or []
     if len(codes) < 30:
         return f"池 {pool_name} 为空，跳过"
@@ -706,7 +1340,7 @@ def job_le_factor_eval(batch: int = 60, pool_name: str = "沪深300") -> str:
     train_end = trade_day_offset(end, -250)
     facs = [{"name": r["name"], "kind": "loopengine", "code": r["code"]} for _, r in picked.iterrows()]
 
-    # 树直算快速路径：预填 get_factor_values 同款缓存，build_scorecard 随后全部命中
+    # 树直算快速路径
     fast_done = 0
     try:
         from loopengine.tree import build_field_frames, evaluate_tree, parse
@@ -729,39 +1363,82 @@ def job_le_factor_eval(batch: int = 60, pool_name: str = "沪深300") -> str:
                 sig._write_parquet_atomic(fe._norm(vals).to_frame(fac["name"]), ck)
                 fast_done += 1
             except Exception:
-                continue  # 单个失败回退 build_scorecard 的子进程路径
+                continue
     except Exception:
         pass
 
     card = fe.build_scorecard(facs, codes, end, train_end=train_end)
     library.save_scorecard(card, pool_name, end)
     ok = card.dropna(subset=["ICIR"])
+
+    # 统计边际价值分布
+    type_counts = picked["factor_type"].value_counts()
+    type_summary = " ".join(f"{t}:{n}" for t, n in type_counts.items() if pd.notna(t))
+
     return (f"LoopEngine 体检 {len(facs)} 个（树直算 {fast_done} · 有效 {len(ok)} 个），"
+            f"类型: {type_summary or '量价'}，"
             f"累计已评估 {len(evaluated) + len(facs) - len([n for n in picked['name'] if n in evaluated])}"
             f"/{len(reg[reg['engine']=='loopengine'])}")
 
 
-def job_fundflow_sync(pool_name: str = "自选股", **_ignored) -> str:
-    """个股资金流每日入库：自选股近30日日资金流 + 当日分时资金流。"""
-    codes = load_watchlist() if pool_name == "自选股" else (all_pools().get(pool_name) or [])
-    if not codes:
-        return f"{pool_name} 为空，跳过"
-    n_daily = n_intra = 0
-    failed = []
-    for code in codes:
+def job_fundflow_sync(pool_name: str = "自选股", lookback_days: int = 30, **_ignored) -> str:
+    """个股资金流每日入库（同花顺 iFinD）：按日批量获取全市场资金流数据。"""
+    now = datetime.now()
+    end = now.strftime("%Y-%m-%d")
+    # 获取最近 N 个交易日（简单推算：跳过周末）
+    dates = []
+    d = now
+    while len(dates) < lookback_days:
+        if d.weekday() < 5:  # 周一到周五
+            dates.append(d.strftime("%Y-%m-%d"))
+        d -= pd.Timedelta(days=1)
+    dates = sorted(dates)
+
+    n_total = 0
+    failed_dates = []
+    for date in dates:
         try:
-            n_daily += datasource.fetch_stock_fundflow_daily(code, limit=30)
-        except Exception:
-            failed.append(code)
+            n = datasource.fetch_fundflow_via_ths(date)
+            n_total += n
+            if n > 0:
+                time.sleep(0.5)  # 限速
+        except Exception as e:
+            failed_dates.append(date)
+            import logging
+            logging.getLogger("scheduler").warning(f"资金流入库失败 {date}: {e}")
+    msg = f"资金流入库（iFinD）：{len(dates)} 天 → {n_total} 条"
+    if failed_dates:
+        msg += f" · 失败 {len(failed_dates)} 天"
+    return msg
+
+
+def job_lhb_sync(lookback_days: int = 30, **_ignored) -> str:
+    """龙虎榜每日入库（同花顺 iFinD）：按日获取龙虎榜数据。"""
+    now = datetime.now()
+    end = now.strftime("%Y-%m-%d")
+    dates = []
+    d = now
+    while len(dates) < lookback_days:
+        if d.weekday() < 5:
+            dates.append(d.strftime("%Y-%m-%d"))
+        d -= pd.Timedelta(days=1)
+    dates = sorted(dates)
+
+    n_total = 0
+    failed_dates = []
+    for date in dates:
         try:
-            n_intra += datasource.fetch_stock_fundflow_intraday(code)
-        except Exception:
-            if code not in failed:
-                failed.append(code)
-        time.sleep(0.3)
-    msg = f"资金流入库：{len(codes)} 只 · 日线 {n_daily} 行 · 分时 {n_intra} 行"
-    if failed:
-        msg += f" · 失败 {len(failed)} 只（{','.join(failed[:5])}{'…' if len(failed) > 5 else ''}）"
+            n = datasource.fetch_lhb_via_ths(date)
+            n_total += n
+            if n > 0:
+                time.sleep(0.5)
+        except Exception as e:
+            failed_dates.append(date)
+            import logging
+            logging.getLogger("scheduler").warning(f"龙虎榜入库失败 {date}: {e}")
+    msg = f"龙虎榜入库（iFinD）：{len(dates)} 天 → {n_total} 条"
+    if failed_dates:
+        msg += f" · 失败 {len(failed_dates)} 天"
     return msg
 
 
@@ -786,7 +1463,7 @@ JOBS = {
     "ifind_indexlist_sync": {"name": "📉 iFinD 指数列表同步（每日）", "func": job_ifind_indexlist_sync,
                              "default": {"enabled": False, "hour": 9, "minute": 5, "params": {}}},
     "ifind_realtime_sync": {"name": "📊 iFinD 实时快照同步（盘中）", "func": job_ifind_realtime_sync,
-                            "default": {"enabled": False, "hour": 0, "minute": 0,
+                            "default": {"enabled": True, "hour": 9, "minute": 30,
                                         "params": {"interval_sec": 300},
                                         "trigger": "interval"}},  # interval_sec 必须放 params 里（调度器从 params 读）
     "ifind_cleanup": {"name": "🧹 iFinD 过期数据清理", "func": job_ifind_cleanup,
@@ -796,6 +1473,9 @@ JOBS = {
     "pool_scan": {"name": "🏛️ 板块/股票池扫描（Top-N）", "func": job_pool_scan,
                   "default": {"enabled": False, "hour": 19, "minute": 0,
                               "params": {"pool_name": "沪深300", "top_n": 10, "pack": ""}}},
+    "auto_scan": {"name": "🤖 自动选股（因子价值评分）", "func": job_auto_scan,
+                  "default": {"enabled": False, "hour": 19, "minute": 30,
+                              "params": {"pool_name": "沪深300", "top_n": 10}}},
     "outcome_backfill": {"name": "🎯 战果回填（经验库）", "func": job_outcome_backfill,
                          "default": {"enabled": False, "hour": 18, "minute": 45, "params": {}}},
     "gate_check": {"name": "🛡 硬闸门筛查（因子库）", "func": job_gate_check,
@@ -822,24 +1502,41 @@ JOBS = {
     "trade_simulate": {"name": "📈 模拟交易回填（每日）", "func": job_trade_simulate,
                        "default": {"enabled": False, "hour": 20, "minute": 5, "params": {}}},
     "position_track": {"name": "📦 持仓跟踪（盘中开平仓）", "func": job_position_track,
-                       "default": {"enabled": False, "hour": 0, "minute": 0,
+                       "default": {"enabled": True, "hour": 9, "minute": 30,
                                    "params": {"interval_sec": 300},
                                    "trigger": "interval"}},
     "minute_sync": {"name": "⏱ 分钟线同步（盘中）", "func": job_minute_sync,
-                    "default": {"enabled": False, "hour": 0, "minute": 0,
+                    "default": {"enabled": True, "hour": 9, "minute": 30,
                                 "params": {"interval_sec": 300},
                                 "trigger": "interval"}},
+    "tick_sync": {"name": "📈 Tick数据同步（盘中·秒级）", "func": job_tick_sync,
+                  "default": {"enabled": True, "hour": 9, "minute": 30,
+                              "params": {"interval_sec": 10},
+                              "trigger": "interval"}},
+    "realtime_kline": {"name": "📊 实时日K线聚合（盘中·秒级）", "func": job_realtime_kline,
+                       "default": {"enabled": True, "hour": 9, "minute": 30,
+                                   "params": {"interval_sec": 10},
+                                   "trigger": "interval"}},
     "auction_confirm": {"name": "🔔 竞价确认（09:26 对最新名单）", "func": job_auction_confirm,
                         "default": {"enabled": False, "hour": 9, "minute": 26, "params": {}}},
-    "le_factor_eval": {"name": "🧪 LoopEngine 因子滚动体检（每晚一批）", "func": job_le_factor_eval,
-                       "default": {"enabled": False, "hour": 21, "minute": 30,
-                                   "params": {"batch": 60, "pool_name": "沪深300"}}},
+    "le_factor_eval": {"name": "🧪 LoopEngine 因子滚动体检", "func": job_le_factor_eval,
+                       "default": {"enabled": True, "hour": 21, "minute": 30,
+                                   "params": {"batch": 500, "pool_name": "沪深300"}}},
     "event_mine": {"name": "🧬 事件定向挖因子（涨停等）", "func": job_event_mine,
                    "default": {"enabled": False, "hour": 22, "minute": 30,
                                "params": {"kind": "涨停", "batch": 30, "horizon": 5}}},
-    "fundflow_sync": {"name": "💰 个股资金流入库（盘后）", "func": job_fundflow_sync,
-                      "default": {"enabled": False, "hour": 16, "minute": 10,
-                                  "params": {"pool_name": "自选股"}}},
+    "fundflow_sync": {"name": "💰 个股资金流入库（盘后·iFinD）", "func": job_fundflow_sync,
+                      "default": {"enabled": False, "hour": 17, "minute": 45,
+                                  "params": {"pool_name": "自选股", "lookback_days": 30}}},
+    "lhb_sync": {"name": "🐉 龙虎榜入库（盘后·iFinD）", "func": job_lhb_sync,
+                 "default": {"enabled": False, "hour": 17, "minute": 50,
+                             "params": {"lookback_days": 30}}},
+    "factor_lifecycle": {"name": "♻️ 因子三层退役扫描（每周）", "func": lambda: __import__("factor_retire").scan(dry_run=False) or "退役扫描完成",
+                         "default": {"enabled": False, "hour": 2, "minute": 0, "params": {},
+                                     "day_of_week": "sun"}},
+    "le_factor_eval_noon": {"name": "🧪 LoopEngine 因子体检（午间）", "func": job_le_factor_eval,
+                            "default": {"enabled": True, "hour": 12, "minute": 30,
+                                        "params": {"batch": 300, "pool_name": "沪深300"}}},
 }
 
 
@@ -889,6 +1586,14 @@ class SchedulerManager:
     def _run(self, key: str):
         cfg = self._state()[key]
         t0 = time.time()
+        now_start = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 推送 JOB_START 事件
+        try:
+            from event_bus import bus, EventType
+            bus.push(EventType.JOB_START, job_key=key, job_name=JOBS[key]["name"],
+                     params=cfg.get("params", {}))
+        except Exception:
+            pass
         try:
             msg = JOBS[key]["func"](**cfg.get("params", {}))
             ok, detail = True, msg
@@ -897,6 +1602,14 @@ class SchedulerManager:
             traceback.print_exc()
         dur_ms = int((time.time() - t0) * 1000)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        # 推送 JOB_END 事件
+        try:
+            from event_bus import bus, EventType
+            bus.push(EventType.JOB_END, job_key=key, job_name=JOBS[key]["name"],
+                     success=ok, message=detail if isinstance(detail, str) else str(detail),
+                     duration_ms=dur_ms)
+        except Exception:
+            pass
         last = load_json(SCHED_LAST_FILE, {})
         last[key] = {"time": now, "ok": ok, "msg": detail}
         save_json(SCHED_LAST_FILE, last)

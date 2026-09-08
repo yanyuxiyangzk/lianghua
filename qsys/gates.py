@@ -60,8 +60,10 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
     """返回 {pass, reasons, metrics}。library_ics: {因子名: IC序列} 用于相关性闸门。"""
     vals = fe._norm(vals.dropna())
     if GATE["LOOKBACK_DAYS"]:
-        cutoff = vals.index.get_level_values("datetime").unique()[-GATE["LOOKBACK_DAYS"]:][0]
-        vals = vals[vals.index.get_level_values("datetime") >= cutoff]
+        unique_dates = vals.index.get_level_values("datetime").unique()
+        if len(unique_dates) >= GATE["LOOKBACK_DAYS"]:
+            cutoff = unique_dates[-GATE["LOOKBACK_DAYS"]:][0]
+            vals = vals[vals.index.get_level_values("datetime") >= cutoff]
     fwd = fe.forward_returns(panel, GATE["FWD_DAYS"])
     ic = fe.ic_series(vals, fwd)
     metrics = {}
@@ -118,6 +120,19 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
     metrics["最大IC相关"] = round(max_corr, 2)
     if max_corr >= GATE["CORR_MAX"]:
         reasons.append(f"IC相关 {max_corr:.2f} ≥ {GATE['CORR_MAX']}")
+
+    # Gate 12: OOS验证（最近20%数据作为验证集）
+    if len(ic) >= 20:
+        split_idx = int(len(ic) * 0.8)
+        ic_oos = ic.iloc[split_idx:]
+        oos_ic_mean = float(ic_oos.mean())
+        oos_ic_wr = float((ic_oos > 0).mean())
+        metrics["OOS_IC"] = round(oos_ic_mean, 4)
+        metrics["OOS_IC胜率"] = round(oos_ic_wr, 2)
+        if oos_ic_mean < 0.01:
+            reasons.append(f"OOS IC {oos_ic_mean:.4f} < 0.01")
+        if oos_ic_wr < 0.50:
+            reasons.append(f"OOS IC胜率 {oos_ic_wr:.1%} < 50%")
 
     return {"pass": len(reasons) == 0, "reasons": reasons, "metrics": metrics}
 
@@ -182,8 +197,10 @@ def evaluate_event_gates(vals: pd.Series, panel: pd.DataFrame, kind: str,
     返回 {pass, reasons, metrics}，与 evaluate_gates 同构。"""
     v = fe._norm(vals.dropna())
     if GATE["LOOKBACK_DAYS"]:
-        cutoff = v.index.get_level_values("datetime").unique()[-GATE["LOOKBACK_DAYS"]:][0]
-        v = v[v.index.get_level_values("datetime") >= cutoff]
+        unique_dates = v.index.get_level_values("datetime").unique()
+        if len(unique_dates) >= GATE["LOOKBACK_DAYS"]:
+            cutoff = unique_dates[-GATE["LOOKBACK_DAYS"]:][0]
+            v = v[v.index.get_level_values("datetime") >= cutoff]
     lab = event_labels(panel, kind, horizon)
     j = v.rename("f").to_frame().join(lab.rename("y"), how="inner").dropna()
     metrics, reasons = {}, []

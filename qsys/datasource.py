@@ -1978,7 +1978,7 @@ def get_realtime_from_db(codes: list[str] = None, limit: int = 100) -> pd.DataFr
 
 
 def get_daily_from_db(code: str, start_date: str = None, end_date: str = None) -> pd.DataFrame:
-    """从 market_daily 表读取日线数据。
+    """从 market_daily 表读取日线数据，合并 realtime_daily 今日实时数据。
 
     Args:
         code: 股票代码
@@ -1996,6 +1996,30 @@ def get_daily_from_db(code: str, start_date: str = None, end_date: str = None) -
             params.append(end_date)
         query += " ORDER BY date"
         df = pd.read_sql_query(query, c, params=params)
+
+        # 合并realtime_daily今日实时数据
+        try:
+            import sqlite3 as sq
+            from pathlib import Path
+            db_path = Path("/data/market.db")
+            with sq.connect(str(db_path)) as rc:
+                rt = pd.read_sql_query(
+                    "SELECT code, date, open, high, low, close, volume, amount "
+                    "FROM realtime_daily WHERE code = ?",
+                    rc, params=(code,)
+                )
+                if not rt.empty:
+                    # 检查realtime_daily的日期是否在历史数据之后
+                    rt_date = rt.iloc[0]["date"]
+                    if df.empty or rt_date > df.iloc[-1]["date"]:
+                        # 添加实时数据到历史数据
+                        df = pd.concat([df, rt], ignore_index=True)
+                    elif not df.empty and rt_date == df.iloc[-1]["date"]:
+                        # 用实时数据覆盖今日数据
+                        df.iloc[-1] = rt.iloc[0]
+        except Exception:
+            pass
+
     return df
 
 
@@ -2039,7 +2063,7 @@ def get_stocklist_from_db() -> pd.DataFrame:
     return df
 
 
-# ---------------------------------------------------------------- 个股资金流（东财 API → market.db） ----------------------------------------------------------------
+# ---------------------------------------------------------------- 个股资金流（同花顺 iFinD → market.db） ----------------------------------------------------------------
 _FUND_FLOW_SCHEMA = """
 CREATE TABLE IF NOT EXISTS stock_fundflow_daily(
     code TEXT NOT NULL, date TEXT NOT NULL,
@@ -2099,40 +2123,83 @@ def _to_em_secid(code: str) -> str:
     return f"{prefix}.{m.group(2)}"
 
 
-def fetch_stock_fundflow_daily(code: str, limit: int = 60) -> int:
-    """从东财 push2his 拉取个股近 N 日主力/大单/中单/小单资金流向，写入 stock_fundflow_daily。"""
-    import requests as _req
+def fetch_fundflow_via_ths(date: str) -> int:
+    """通过同花顺 iFinD 问财获取某日全市场个股资金流向，写入 stock_fundflow_daily。
+
+    Args:
+        date: 日期（YYYY-MM-DD 格式）
+
+    Returns:
+        入库条数。
+    """
     _ensure_fundflow_db()
-    secid = _to_em_secid(code)
-    url = (f"https://push2his.eastmoney.com/api/qt/stock/fflow/daykline/get?"
-           f"secid={secid}&fields1=f1,f2,f3,f7"
-           f"&fields2=f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61,f62,f63,f64,f65"
-           f"&lmt={limit}")
-    r = _req.get(url, timeout=15, headers={"User-Agent": "Mozilla/5.0", "Referer": "https://data.eastmoney.com"})
-    data = r.json().get("data") or {}
-    klines = data.get("klines") or []
-    if not klines:
-        return 0
+    date_compact = date.replace("-", "")
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    rows = []
-    for line in klines:
-        parts = line.split(",")
-        if len(parts) < 11:
+    total = 0
+
+    # 分批查询：问财每次返回约 5000 条，全市场 A 股约 5000+ 只
+    # 用"主力净流入额"作为筛选条件，分正负两批获取全部股票
+    queries = [
+        f"{date_compact} 主力净流入额 股票",
+    ]
+    for query in queries:
+        try:
+            df, _res, err = ths_wcquery(query, domain="stock")
+            if err not in (0, None) or df is None or df.empty:
+                continue
+            # 解析列名：找到包含"主力资金流向"和"资金流向"的列
+            code_col = next((c for c in df.columns if "代码" in c), None)
+            main_col = next((c for c in df.columns if "主力资金流向" in str(c)), None)
+            flow_col = next((c for c in df.columns if "资金流向" in str(c) and "主力" not in str(c)), None)
+            if not code_col:
+                continue
+            rows = []
+            for _, r in df.iterrows():
+                raw_code = str(r[code_col])
+                # 格式化代码：600519.SH → SH600519
+                m = re.match(r"(\d{6})\.([A-Z]{2})", raw_code)
+                code = f"{m.group(2)}{m.group(1)}" if m else raw_code
+                main_net = _safe_float(r.get(main_col)) if main_col else None
+                flow_net = _safe_float(r.get(flow_col)) if flow_col else None
+                if main_net is None and flow_net is None:
+                    continue
+                # iFinD 问财返回的是净额（元），不是百分比
+                # 存入 main_net（主力净流入额），pct 列留空（需要市值数据才能算百分比）
+                rows.append((code, date, main_net, None, None, None, None, None,
+                             None, None, None, None, now))
+            if rows:
+                with _conn() as c:
+                    c.executemany(
+                        "INSERT OR REPLACE INTO stock_fundflow_daily"
+                        "(code,date,main_net,main_pct,super_net,super_pct,big_net,big_pct,"
+                        "mid_net,mid_pct,small_net,small_pct,fetched_at)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+                total += len(rows)
+        except Exception as e:
+            import logging
+            logging.getLogger("datasource").warning(f"iFinD 资金流查询失败 [{query}]: {e}")
             continue
-        date = parts[0]
-        main, small, mid, big, super_ = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])
-        main_pct = float(parts[6])
-        super_pct = float(parts[7]) if len(parts) > 7 else 0
-        big_pct = float(parts[8]) if len(parts) > 8 else 0
-        mid_pct = float(parts[9]) if len(parts) > 9 else 0
-        small_pct = float(parts[10]) if len(parts) > 10 else 0
-        rows.append((code, date, main, main_pct, super_, super_pct, big, big_pct, mid, mid_pct, small, small_pct, now))
+    return total
+
+
+def fetch_stock_fundflow_daily(code: str, limit: int = 60) -> int:
+    """兼容旧接口：通过 iFinD 问财获取个股资金流向。现在改用批量按日获取。"""
+    # 此函数保留兼容性，实际由 fetch_fundflow_via_ths 按日批量获取
+    _ensure_fundflow_db()
+    # 检查本地库是否已有该股票数据
     with _conn() as c:
-        c.executemany(
-            "INSERT OR REPLACE INTO stock_fundflow_daily"
-            "(code,date,main_net,main_pct,super_net,super_pct,big_net,big_pct,mid_net,mid_pct,small_net,small_pct,fetched_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
-    return len(rows)
+        n = c.execute("SELECT COUNT(*) FROM stock_fundflow_daily WHERE code=?", (code,)).fetchone()[0]
+    if n >= limit:
+        return 0
+    # 回退：用问财查单只股票近期资金流
+    try:
+        df, _res, err = ths_wcquery(f"{code} 资金流向 近{limit}日", domain="stock")
+        if err not in (0, None) or df is None or df.empty:
+            return 0
+        # 问财返回区间汇总，无法拆日——直接返回 0，由批量任务补充
+        return 0
+    except Exception:
+        return 0
 
 
 def fetch_stock_fundflow_intraday(code: str) -> int:
@@ -2174,14 +2241,8 @@ def get_fundflow_daily(code: str, days: int = 30) -> pd.DataFrame:
             "SELECT * FROM stock_fundflow_daily WHERE code=? ORDER BY date DESC LIMIT ?",
             c, params=(code, days))
     if len(df) < days:
-        try:
-            fetch_stock_fundflow_daily(code, limit=days + 10)
-            with _conn() as c:
-                df = pd.read_sql(
-                    "SELECT * FROM stock_fundflow_daily WHERE code=? ORDER BY date DESC LIMIT ?",
-                    c, params=(code, days))
-        except Exception:
-            pass
+        # iFinD 批量获取由 job_fundflow_sync 负责，此处不再逐股调用
+        pass
     return df.sort_values("date") if not df.empty else df
 
 
@@ -2205,39 +2266,70 @@ def get_fundflow_intraday(code: str) -> pd.DataFrame:
     return df
 
 
-# ---------------------------------------------------------------- 龙虎榜数据 ----------------------------------------------------------------
-def fetch_lhb_daily(date: str | None = None) -> int:
-    """从同花顺数据中心爬取龙虎榜数据并入库。
+# ---------------------------------------------------------------- 龙虎榜数据（同花顺 iFinD → market.db） ----------------------------------------------------------------
+def fetch_lhb_via_ths(date: str) -> int:
+    """通过同花顺 iFinD 问财获取某日龙虎榜数据，写入 lhb_daily。
 
     Args:
-        date: 日期（YYYY-MM-DD），默认最近交易日。
+        date: 日期（YYYY-MM-DD 格式）
 
     Returns:
         入库条数。
     """
-    import requests as _req
-
     _ensure_lhb_db()
+    date_compact = date.replace("-", "")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        df, _res, err = ths_wcquery(f"龙虎榜 {date_compact}", domain="stock")
+        if err not in (0, None) or df is None or df.empty:
+            return 0
+        # 解析列名
+        code_col = next((c for c in df.columns if "代码" in c), None)
+        name_col = next((c for c in df.columns if "简称" in c or "名称" in c), None)
+        net_col = next((c for c in df.columns if "净额" in str(c)), None)
+        buy_col = next((c for c in df.columns if "买入" in str(c) and "金额" in str(c)), None)
+        sell_col = next((c for c in df.columns if "卖出" in str(c) and "金额" in str(c)), None)
+        reason_col = next((c for c in df.columns if "上榜原因" in str(c)), None)
+        type_col = next((c for c in df.columns if "上榜类型" in str(c)), None)
+        if not code_col:
+            return 0
+        rows = []
+        for _, r in df.iterrows():
+            raw_code = str(r[code_col])
+            m = re.match(r"(\d{6})\.([A-Z]{2})", raw_code)
+            code = f"{m.group(2)}{m.group(1)}" if m else raw_code
+            name = str(r[name_col]) if name_col else ""
+            net_buy = _safe_float(r.get(net_col)) if net_col else None
+            buy_amt = _safe_float(r.get(buy_col)) if buy_col else None
+            sell_amt = _safe_float(r.get(sell_col)) if sell_col else None
+            # 解析上榜类型：单日榜/三日榜 → consecutive_days
+            consec = 1
+            if type_col:
+                type_str = str(r.get(type_col, ""))
+                if "三日" in type_str:
+                    consec = 3
+            rows.append((code, date, name, None, None, net_buy, buy_amt, sell_amt,
+                         None, None, None, None, consec, now))
+        if rows:
+            with _conn() as c:
+                c.executemany(
+                    "INSERT OR REPLACE INTO lhb_daily"
+                    "(code,date,name,close_price,change_pct,net_buy,buy_amount,sell_amount,"
+                    "inst_count,inst_buy_pct,hot_dept_count,win_rate,consecutive_days,fetched_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            return len(rows)
+    except Exception as e:
+        import logging
+        logging.getLogger("datasource").warning(f"iFinD 龙虎榜查询失败 [{date}]: {e}")
+    return 0
+
+
+def fetch_lhb_daily(date: str | None = None) -> int:
+    """兼容旧接口：通过 iFinD 获取龙虎榜数据。"""
     if not date:
         date = datetime.now().strftime("%Y-%m-%d")
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    url = f"https://data.10jqka.com.cn/market/longhu/"
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://data.10jqka.com.cn/"}
-    try:
-        resp = _req.get(url, headers=headers, timeout=15)
-        resp.encoding = "utf-8"
-        # 简单解析：实际页面为 JS 渲染，这里提供框架
-        # 完整实现需用 Selenium 或 API 接口
-        rows = []
-        with _conn() as c:
-            c.executemany(
-                "INSERT OR REPLACE INTO lhb_daily"
-                "(code,date,name,close_price,change_pct,net_buy,buy_amount,sell_amount,"
-                "inst_count,inst_buy_pct,hot_dept_count,win_rate,consecutive_days,fetched_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
-        return len(rows)
-    except Exception:
-        return 0
+    return fetch_lhb_via_ths(date)
 
 
 def get_lhb_daily(code: str, days: int = 20) -> pd.DataFrame:

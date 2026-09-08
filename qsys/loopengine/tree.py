@@ -27,6 +27,8 @@ TYPE_FIELDS = {
     "盘口异动": ["bid_ask_ratio", "outer_inner_ratio", "quantity_ratio_dev",
                 "tick_vol_ratio", "bid_ask_spread"],
     "指数": ["idx_beta", "idx_rs", "idx_vol_ratio", "idx_corr", "idx_alpha"],
+    "爆量抢筹": ["vol_spike", "bid_pressure", "outer_dominance",
+                "accumulation_composite"],
 }
 
 # 因子类型 → 默认机制族映射（用于新类型因子的族分类）

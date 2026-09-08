@@ -24,6 +24,11 @@ class EventType(str, Enum):
     GATE_EVAL = "gate_eval"
     GATE_PASS = "gate_pass"
     ROUND_COMPLETE = "round_complete"
+    # 调度器任务生命周期
+    JOB_START = "job_start"
+    JOB_END = "job_end"
+    # 价格监控事件
+    PRICE_ALERT = "price_alert"
 
 
 class EventBus:

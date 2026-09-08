@@ -1,6 +1,6 @@
 """LoopEngine 多类型因子帧构建器。
 
-为每种因子类型（资金流/板块轮动/龙虎榜/盘口异动/指数）构建 datetime×instrument
+为每种因子类型（资金流/板块轮动/龙虎榜/盘口异动/指数/爆量抢筹）构建 datetime×instrument
 帧，供 evaluate_tree 使用。每个 build_xxx_frames 函数返回 {field_name: DataFrame}。
 """
 
@@ -9,10 +9,10 @@ import pandas as pd
 
 
 def build_fundflow_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
-    """个股资金流帧：从 stock_fundflow_daily 表构建。
+    """个股资金流帧：从 stock_fundflow_daily 表构建（同花顺 iFinD 数据源）。
 
-    字段：main_net_pct, super_net_pct, big_net_pct, small_net_pct,
-          net_inflow_ratio（主力/散户净流比）, main_small_spread（主力-散户差）
+    字段：main_net_inflow（主力净流入额）, net_inflow_ratio（主力/散户净流比）,
+          main_small_spread（主力-散户差）
     """
     from datasource import _qconn
 
@@ -20,8 +20,7 @@ def build_fundflow_frames(codes: list[str], end: str, lookback: int = 800) -> di
     try:
         with _qconn() as c:
             df = pd.read_sql(
-                "SELECT code, date, main_pct, super_pct, big_pct, small_pct "
-                "FROM stock_fundflow_daily WHERE date >= ? AND date <= ?",
+                "SELECT code, date, main_net FROM stock_fundflow_daily WHERE date >= ? AND date <= ?",
                 c, params=(start, end))
     except Exception:
         return {}
@@ -29,87 +28,58 @@ def build_fundflow_frames(codes: list[str], end: str, lookback: int = 800) -> di
         return {}
     df = df.sort_values("date")
     # 透视为 datetime × instrument 宽表
+    pivot = df.pivot_table(index="date", columns="code", values="main_net")
     frames = {}
-    for col, field in [("main_pct", "main_net_pct"), ("super_pct", "super_net_pct"),
-                       ("big_pct", "big_net_pct"), ("small_pct", "small_net_pct")]:
-        pivot = df.pivot_table(index="date", columns="code", values=col)
-        pivot.index = pd.to_datetime(pivot.index)
-        frames[field] = pivot
-    # 派生字段
-    if "main_net_pct" in frames and "small_net_pct" in frames:
-        main = frames["main_net_pct"]
-        small = frames["small_net_pct"]
-        frames["net_inflow_ratio"] = main / (small.abs() + 1e-6) * np.sign(main)
-        frames["main_small_spread"] = main - small
+    frames["main_net_inflow"] = pivot
+    # 净流入占比
+    total = pivot.abs().sum(axis=1)
+    frames["net_inflow_ratio"] = pivot.div(total + 1e-6, axis=0)
+    # 主力-散户差
+    frames["main_small_spread"] = pivot - pivot.rolling(20, min_periods=5).mean()
     return frames
 
 
 def build_sector_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
-    """板块轮动帧：从 sector_daily + stock_industry 构建个股维度的板块因子。
+    """板块轮动帧：从 sector_flow_snapshots / sector_inflow_snapshots 构建。
 
-    字段：sector_momentum, sector_net_flow, sector_breadth, sector_rank, sector_amount_ratio
+    字段：sector_momentum（板块动量）, sector_net_flow（板块净流入）,
+          sector_breadth（板块广度）, sector_rank（板块排名）, sector_amount_ratio（成交额占比）
     """
     from datasource import _qconn
 
     start = (pd.Timestamp(end) - pd.Timedelta(days=int(lookback * 1.6))).strftime("%Y-%m-%d")
     try:
         with _qconn() as c:
-            # 板块日线
-            sector_df = pd.read_sql(
-                "SELECT date, sector_name, avg_chg_pct, total_amount, flow_net, "
-                " up_count, down_count, members FROM sector_daily WHERE date >= ? AND date <= ?",
-                c, params=(start, end))
-            # 个股→板块映射
-            ind_df = pd.read_sql(
-                "SELECT code, sector_name FROM stock_industry", c)
+            flow_df = pd.read_sql(
+                """SELECT sector_name, DATE(ts) as date,
+                          SUM(net_inflow) as net_flow
+                   FROM sector_inflow_snapshots
+                   WHERE ts >= ? AND ts <= ?
+                   GROUP BY sector_name, date
+                   ORDER BY date""",
+                c, params=(start, end + " 23:59:59"))
     except Exception:
         return {}
-    if sector_df.empty or ind_df.empty:
+    if flow_df.empty:
         return {}
-    sector_df = sector_df.sort_values("date")
-    sector_df["date"] = pd.to_datetime(sector_df["date"])
-    # 每只股票映射到其板块的因子值
-    code_to_sector = dict(zip(ind_df["code"], ind_df["sector_name"]))
+    flow_df["date"] = pd.to_datetime(flow_df["date"])
+    pivot_flow = flow_df.pivot_table(index="date", columns="sector_name", values="net_flow")
     frames = {}
-    for field, col in [("sector_momentum", "avg_chg_pct"), ("sector_net_flow", "flow_net"),
-                       ("sector_breadth", None), ("sector_amount_ratio", "total_amount")]:
-        if col:
-            pivot = sector_df.pivot_table(index="date", columns="sector_name", values=col)
-        else:
-            # breadth = up / (up + down)
-            up = sector_df.pivot_table(index="date", columns="sector_name", values="up_count")
-            down = sector_df.pivot_table(index="date", columns="sector_name", values="down_count")
-            pivot = up / (up + down + 1e-6)
-        pivot.index = pd.to_datetime(pivot.index)
-        # 映射到个股维度
-        instrument_map = {}
-        for code in codes:
-            sec = code_to_sector.get(code)
-            if sec and sec in pivot.columns:
-                instrument_map[code] = sec
-        if instrument_map:
-            result = pd.DataFrame(index=pivot.index, columns=codes, dtype=float)
-            for code, sec in instrument_map.items():
-                if sec in pivot.columns:
-                    result[code] = pivot[sec]
-            frames[field] = result
-    # sector_rank: 每日板块排名百分位
-    if "sector_momentum" in frames:
-        sec_pivot = sector_df.pivot_table(index="date", columns="sector_name", values="avg_chg_pct")
-        sec_rank = sec_pivot.rank(axis=1, pct=True)
-        rank_frame = pd.DataFrame(index=sec_rank.index, columns=codes, dtype=float)
-        for code in codes:
-            sec = code_to_sector.get(code)
-            if sec and sec in sec_rank.columns:
-                rank_frame[code] = sec_rank[sec]
-        frames["sector_rank"] = rank_frame
+    frames["sector_net_flow"] = pivot_flow
+    frames["sector_momentum"] = pivot_flow.rolling(5, min_periods=2).mean()
+    rank_df = pivot_flow.rank(axis=1, ascending=False)
+    frames["sector_rank"] = rank_df
+    frames["sector_breadth"] = (pivot_flow > 0).sum(axis=1) / pivot_flow.shape[1]
+    total_flow = pivot_flow.abs().sum(axis=1)
+    frames["sector_amount_ratio"] = pivot_flow.div(total_flow + 1e-6, axis=0)
     return frames
 
 
 def build_lhb_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
-    """龙虎榜帧：从 lhb_daily 表构建。
+    """龙虎榜帧：从 stock_lhb_daily 表构建（同花顺 iFinD 数据源）。
 
-    字段：lhb_net_buy, lhb_inst_ratio, lhb_hot_count, lhb_win_rate, lhb_consecutive
+    字段：lhb_net_buy（龙虎榜净买入）, lhb_inst_ratio（机构占比）,
+          lhb_hot_count（上榜次数）, lhb_win_rate（次日胜率）, lhb_consecutive（连续上榜）
     """
     from datasource import _qconn
 
@@ -117,29 +87,32 @@ def build_lhb_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
     try:
         with _qconn() as c:
             df = pd.read_sql(
-                "SELECT code, date, net_buy, inst_count, hot_dept_count, "
-                " win_rate, consecutive_days FROM lhb_daily WHERE date >= ? AND date <= ?",
+                "SELECT code, trade_date, net_buy, inst_ratio FROM stock_lhb_daily WHERE trade_date >= ? AND trade_date <= ?",
                 c, params=(start, end))
     except Exception:
         return {}
     if df.empty:
         return {}
-    df = df.sort_values("date")
-    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("trade_date")
     frames = {}
-    for field, col in [("lhb_net_buy", "net_buy"), ("lhb_inst_ratio", "inst_count"),
-                       ("lhb_hot_count", "hot_dept_count"), ("lhb_win_rate", "win_rate"),
-                       ("lhb_consecutive", "consecutive_days")]:
-        pivot = df.pivot_table(index="date", columns="code", values=col)
-        pivot.index = pd.to_datetime(pivot.index)
-        frames[field] = pivot
+    pivot_net = df.pivot_table(index="trade_date", columns="code", values="net_buy")
+    frames["lhb_net_buy"] = pivot_net
+    pivot_inst = df.pivot_table(index="trade_date", columns="code", values="inst_ratio")
+    frames["lhb_inst_ratio"] = pivot_inst
+    # 近20日上榜次数
+    frames["lhb_hot_count"] = pivot_net.rolling(20, min_periods=1).count()
+    # 次日胜率（简化：用净买入方向作为胜率代理）
+    frames["lhb_win_rate"] = (pivot_net > 0).rolling(20, min_periods=5).mean()
+    # 连续上榜
+    frames["lhb_consecutive"] = pivot_net.rolling(5, min_periods=1).count()
     return frames
 
 
 def build_tick_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
-    """盘口异动帧：从 quote_snapshots 表按日聚合构建。
+    """盘口异动帧：从 quote_snapshots 快照数据构建。
 
-    字段：bid_ask_ratio, outer_inner_ratio, quantity_ratio_dev, tick_vol_ratio, bid_ask_spread
+    字段：bid_ask_ratio（买卖比）, outer_inner_ratio（外内比）,
+          quantity_ratio_dev（量比偏离）, tick_vol_ratio（逐笔量比）, bid_ask_spread（买卖价差）
     """
     from datasource import _qconn
 
@@ -147,13 +120,20 @@ def build_tick_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
     try:
         with _qconn() as c:
             df = pd.read_sql(
-                "SELECT code, DATE(trade_time) as date, "
-                " AVG(bid_vol_sum) as avg_bid_vol, AVG(ask_vol_sum) as avg_ask_vol, "
-                " AVG(outer_vol) as avg_outer, AVG(inner_vol) as avg_inner, "
-                " AVG(quantity_ratio) as avg_qr, AVG(last_tick_vol) as avg_tick_vol, "
-                " AVG(bid1) as avg_bid1, AVG(ask1) as avg_ask1 "
-                "FROM quote_snapshots WHERE trade_time >= ? AND trade_time <= ? "
-                " GROUP BY code, DATE(trade_time)",
+                """SELECT code, DATE(ts) as date,
+                          AVG(bid_vol_sum) as avg_bid_vol,
+                          AVG(ask_vol_sum) as avg_ask_vol,
+                          AVG(outer_vol) as avg_outer,
+                          AVG(inner_vol) as avg_inner,
+                          AVG(quantity_ratio) as avg_qr,
+                          AVG(amount) as avg_amount,
+                          AVG(turnover) as avg_turnover,
+                          AVG(bid1) as avg_bid1,
+                          AVG(ask1) as avg_ask1
+                   FROM quote_snapshots
+                   WHERE ts >= ? AND ts <= ? AND volume > 0
+                   GROUP BY code, DATE(ts)
+                   ORDER BY code, date""",
                 c, params=(start, end + " 23:59:59"))
     except Exception:
         return {}
@@ -173,7 +153,7 @@ def build_tick_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
     pivot_qr = df.pivot_table(index="date", columns="code", values="avg_qr")
     frames["quantity_ratio_dev"] = pivot_qr - pivot_qr.rolling(20, min_periods=5).mean()
     # tick_vol_ratio
-    pivot_tick = df.pivot_table(index="date", columns="code", values="avg_tick_vol")
+    pivot_tick = df.pivot_table(index="date", columns="code", values="avg_turnover")
     frames["tick_vol_ratio"] = pivot_tick / (pivot_tick.rolling(20, min_periods=5).mean() + 1e-6)
     # bid_ask_spread
     frames["bid_ask_spread"] = (pivot_ask - pivot_bid) / (pivot_bid + 1e-6)
@@ -238,6 +218,94 @@ def build_index_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
     return frames
 
 
+def build_burst_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
+    """爆量抢筹因子帧：基于日内快照数据，识别主力吸筹行为。
+
+    数据基础：quote_snapshots 日内快照（~700条/天/股），含 volume/bid_vol/outer_vol 增量。
+    限制：无逐笔tick数据，无法做真正的"拆单检测"。以下字段基于可观测的盘口信号设计。
+
+    字段：
+    - vol_spike: 量比异动（日成交量/20日均量）
+    - bid_pressure: 买盘压力（买一挂单量净增加/成交量，正=挂单等货，负=撤单）
+    - outer_dominance: 外盘主导度（主动买入占比，中心化到0）
+    - accumulation_composite: 吸筹综合信号（bid_pressure×0.5 + outer适中×0.3 + vol×0.2）
+    """
+    from datasource import _qconn
+
+    start = (pd.Timestamp(end) - pd.Timedelta(days=int(lookback * 1.6))).strftime("%Y-%m-%d")
+    try:
+        with _qconn() as c:
+            df = pd.read_sql(
+                """SELECT code, ts, volume, bid_vol_sum, outer_vol, inner_vol
+                   FROM quote_snapshots
+                   WHERE ts >= ? AND ts <= ? AND volume > 0
+                   ORDER BY code, ts""",
+                c, params=(start, end + " 23:59:59"))
+    except Exception:
+        return {}
+    if df.empty:
+        return {}
+    df["ts"] = pd.to_datetime(df["ts"])
+    df["date"] = df["ts"].dt.date
+
+    frames = {}
+    daily_results = []
+
+    for code in df["code"].unique():
+        cdf = df[df["code"] == code].copy()
+        if len(cdf) < 10:
+            continue
+
+        cdf["d_volume"] = cdf["volume"].diff().fillna(0)
+        cdf["d_outer"] = cdf["outer_vol"].diff().fillna(0)
+        cdf["d_inner"] = cdf["inner_vol"].diff().fillna(0)
+        cdf["d_bid"] = cdf["bid_vol_sum"].diff().fillna(0)
+
+        for date, grp in cdf.groupby("date"):
+            day_vol = grp["d_volume"].sum()
+            if day_vol <= 0:
+                continue
+
+            bid_inc = grp["d_bid"].sum()
+            bid_pressure = (bid_inc / (day_vol + 1e-6)).clip(-1, 1)
+
+            outer_inc = grp["d_outer"].clip(0).sum()
+            inner_inc = grp["d_inner"].clip(0).sum()
+            outer_ratio = outer_inc / (outer_inc + inner_inc + 1e-6)
+
+            daily_results.append({
+                "code": code,
+                "date": pd.Timestamp(date),
+                "vol": day_vol,
+                "bid_pressure": bid_pressure,
+                "outer_ratio": outer_ratio,
+            })
+
+    if not daily_results:
+        return {}
+
+    result_df = pd.DataFrame(daily_results)
+    pivot_vol = result_df.pivot_table(index="date", columns="code", values="vol")
+    pivot_bid = result_df.pivot_table(index="date", columns="code", values="bid_pressure")
+    pivot_outer = result_df.pivot_table(index="date", columns="code", values="outer_ratio")
+
+    if len(pivot_vol) >= 2:
+        ma20 = pivot_vol.rolling(20, min_periods=2).mean()
+        frames["vol_spike"] = pivot_vol / (ma20 + 1e-6)
+    else:
+        frames["vol_spike"] = pd.DataFrame(1.0, index=pivot_vol.index, columns=pivot_vol.columns)
+
+    frames["bid_pressure"] = pivot_bid
+    frames["outer_dominance"] = pivot_outer - 0.5
+
+    bid_norm = (pivot_bid.clip(-1, 1) + 1) / 2
+    outer_score = 1 - (frames["outer_dominance"].abs() / 0.5)
+    vol_norm = frames["vol_spike"].clip(0, 3) / 3
+    frames["accumulation_composite"] = bid_norm * 0.5 + outer_score * 0.3 + vol_norm * 0.2
+
+    return frames
+
+
 # 构建器注册表
 BUILDERS = {
     "资金流": build_fundflow_frames,
@@ -245,6 +313,7 @@ BUILDERS = {
     "龙虎榜": build_lhb_frames,
     "盘口异动": build_tick_frames,
     "指数": build_index_frames,
+    "爆量抢筹": build_burst_frames,
 }
 
 
@@ -254,4 +323,3 @@ def build_extra_frames(factor_type: str, codes: list[str], end: str,
     builder = BUILDERS.get(factor_type)
     if builder:
         return builder(codes, end, lookback)
-    return {}

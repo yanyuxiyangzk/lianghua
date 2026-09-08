@@ -98,32 +98,41 @@ def job_watchlist_signals() -> str:
 
 
 def _best_pack(packs: dict) -> str:
-    """稳健性优先选择策略包：综合OOS胜率与实际表现差异。
+    """综合评分选择策略包：实际表现优先 + 样本量置信度 + OOS验证。
     
-    选择逻辑：
-      1. 优先选择OOS与实际胜率差异最小的包（稳健性）
-      2. 差异相同时，选择OOS胜率较高的包
-      3. 无实际数据时，回退到OOS胜率最高
+    选择逻辑（P0+P1优化）：
+      1. 过滤低质量包：OOS<55% 或 gap>25% 的包不参与选择
+      2. 有实际数据：score = 实战胜率×0.5 + OOS×0.2 + 置信度×0.3
+      3. 无实际数据：score = OOS×0.7（打折表示不确定性）
+      4. 样本量置信度：min(n_trades/30, 1.0)
     """
     import sqlite3
     from pathlib import Path
     
-    # 获取各策略包的实际胜率
-    actual_winrates = {}
+    # 获取各策略包的实际胜率和交易次数
+    actual_stats = {}
     try:
         db_path = Path("/data/experience.db")
         with sqlite3.connect(str(db_path)) as c:
             rows = c.execute('''
                 SELECT p.pack_name, 
-                       SUM(CASE WHEN t.pnl_pct > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as winrate
+                       SUM(CASE WHEN t.pnl_pct > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as winrate,
+                       COUNT(*) as n_trades
                 FROM trades t
                 JOIN picks p ON t.pick_id = p.id
                 WHERE t.pnl_pct IS NOT NULL AND p.pack_name IS NOT NULL
                 GROUP BY p.pack_name
-                HAVING COUNT(*) >= 5
             ''').fetchall()
-            for pack_name, wr in rows:
-                actual_winrates[pack_name] = wr * 100
+            for pack_name, wr, n in rows:
+                # 贝叶斯收缩：小样本向50%收缩
+                prior_wr, prior_n = 0.5, 10
+                shrunk_wr = (wr * n + prior_wr * prior_n) / (n + prior_n)
+                actual_stats[pack_name] = {
+                    "winrate": wr * 100,
+                    "shrunk_wr": shrunk_wr * 100,
+                    "n_trades": n,
+                    "confidence": min(n / 30, 1.0),
+                }
     except Exception:
         pass
     
@@ -137,21 +146,90 @@ def _best_pack(packs: dict) -> str:
         except ValueError:
             continue
         
-        actual_wr = actual_winrates.get(name)
+        # P1: 质量门槛 - OOS太低或太虚的包直接排除
+        if oos_wr < 55:
+            continue
         
-        if actual_wr is not None:
-            # 稳健性评分：差异越小分越高，同时考虑OOS水平
+        stats = actual_stats.get(name)
+        
+        if stats is not None:
+            actual_wr = stats["winrate"]
+            shrunk_wr = stats["shrunk_wr"]
+            confidence = stats["confidence"]
+            n_trades = stats["n_trades"]
+            
             gap = abs(oos_wr - actual_wr)
-            # 得分 = OOS胜率 * 0.4 + (100 - 差异) * 0.6
-            # 差异越小，得分越高
-            score = oos_wr * 0.4 + (100 - gap) * 0.6
+            
+            # P1: gap过大（过拟合）直接排除
+            if gap > 25:
+                continue
+            
+            # 综合评分：实际表现为主 + OOS验证 + 样本量置信度
+            # 实战胜率用贝叶斯收缩版本（更稳定）
+            score = shrunk_wr * 0.5 + oos_wr * 0.2 + confidence * 30
         else:
-            # 无实际数据时，仅用OOS（但打折0.8，表示不确定性）
-            score = oos_wr * 0.8
+            # 无实际数据：OOS打折
+            score = oos_wr * 0.7
         
         if score > best_score:
             best, best_score = name, score
     return best
+
+
+def _top_packs(packs: dict, top_n: int = 3) -> list[tuple[str, dict]]:
+    """返回评分最高的top_n个策略包列表，用于多包投票。"""
+    import sqlite3
+    from pathlib import Path
+    
+    actual_stats = {}
+    try:
+        db_path = Path("/data/experience.db")
+        with sqlite3.connect(str(db_path)) as c:
+            rows = c.execute('''
+                SELECT p.pack_name, 
+                       SUM(CASE WHEN t.pnl_pct > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as winrate,
+                       COUNT(*) as n_trades
+                FROM trades t
+                JOIN picks p ON t.pick_id = p.id
+                WHERE t.pnl_pct IS NOT NULL AND p.pack_name IS NOT NULL
+                GROUP BY p.pack_name
+            ''').fetchall()
+            for pack_name, wr, n in rows:
+                prior_wr, prior_n = 0.5, 10
+                shrunk_wr = (wr * n + prior_wr * prior_n) / (n + prior_n)
+                actual_stats[pack_name] = {
+                    "winrate": wr * 100,
+                    "shrunk_wr": shrunk_wr * 100,
+                    "n_trades": n,
+                    "confidence": min(n / 30, 1.0),
+                }
+    except Exception:
+        pass
+    
+    scored = []
+    for name, pk in packs.items():
+        v = str(pk.get("oos_winrate") or "")
+        if not v.endswith("%"):
+            continue
+        try:
+            oos_wr = float(v.rstrip("%"))
+        except ValueError:
+            continue
+        if oos_wr < 55:
+            continue
+        
+        stats = actual_stats.get(name)
+        if stats is not None:
+            gap = abs(oos_wr - stats["winrate"])
+            if gap > 25:
+                continue
+            score = stats["shrunk_wr"] * 0.5 + oos_wr * 0.2 + stats["confidence"] * 30
+        else:
+            score = oos_wr * 0.7
+        scored.append((name, pk, score))
+    
+    scored.sort(key=lambda x: x[2], reverse=True)
+    return [(name, pk) for name, pk, _ in scored[:top_n]]
 
 
 def compute_pack_picks(pk: dict, codes: list[str], end: str, top_n: int):
@@ -621,21 +699,73 @@ def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "")
     end = get_last_trade_day()
     import library
     packs = library.list_strategies()
+    
+    # P2: 多包投票机制 - 用Top3包投票选股票
     if not pack:
-        pack = _best_pack(packs)
-    pk = packs.get(pack) if pack else None
-
+        top_list = _top_packs(packs, top_n=3)
+        if len(top_list) >= 2:
+            # 多包投票：取Top3包的交集
+            all_picks = {}
+            for pk_name, pk in top_list:
+                try:
+                    p_pool = pk.get("pool_name", "沪深300")
+                    p_top = min(int(pk.get("top_n", 10)), int(top_n))
+                    p_codes = (all_pools().get(p_pool) or all_pools().get("沪深300"))
+                    picks, _, _, _ = compute_pack_picks(pk, p_codes, end, p_top)
+                    for code in picks.index:
+                        all_picks[code] = all_picks.get(code, 0) + 1
+                except Exception:
+                    continue
+            
+            # 取至少2个包选中的股票
+            voted = [c for c, n in all_picks.items() if n >= 2]
+            if len(voted) >= top_n:
+                # 用最佳包的分数排序
+                best_pk = top_list[0][1]
+                best_pool = best_pk.get("pool_name", "沪深300")
+                best_codes = (all_pools().get(best_pool) or all_pools().get("沪深300"))
+                best_picks, pnote, weights, f_series = compute_pack_picks(best_pk, best_codes, end, top_n * 2)
+                # 只保留投票通过的股票
+                voted_scores = best_picks[best_picks.index.isin(voted)]
+                picks = voted_scores.head(top_n)
+                pack_name = f"多包投票({len(top_list)}包)"
+                note = f"多包投票 · {len(voted)}只候选 · {len(picks)}只入选（{pnote}）"
+                pk = top_list[0][1]
+            else:
+                # 投票不足，回退到最佳包
+                pack = top_list[0][0]
+                pk = top_list[0][1]
+                picks, pnote, weights, f_series = compute_pack_picks(pk, codes, end, top_n)
+                pack_name = pack
+                note = f"策略包「{pack}」（{pnote}）"
+        else:
+            pack = _best_pack(packs) if not pack else pack
+            pk = packs.get(pack) if pack else None
+            if pk:
+                picks, pnote, weights, f_series = compute_pack_picks(pk, codes, end, top_n)
+                pack_name = pack
+                note = f"策略包「{pack}」（{pnote}）"
+            else:
+                pk = None
+                pack_name = None
+    else:
+        pk = packs.get(pack) if pack else None
+        pack_name = pack
+    
     if pk:
         pool_name = pk["pool_name"]
-        # 每日自动名单以任务参数为上限(默认10只);包的 Top-N 更大时取分更高的前段
         top_n = min(int(pk["top_n"]), int(top_n))
     pools = all_pools()
     codes = pools.get(pool_name) or pools.get("沪深300")
 
-    if pk:
+    if pk and 'picks' not in locals():
+        pool_name = pk["pool_name"]
+        top_n = min(int(pk["top_n"]), int(top_n))
+        codes = (all_pools().get(pool_name) or all_pools().get("沪深300"))
         picks, pnote, weights, f_series = compute_pack_picks(pk, codes, end, top_n)
-        note = f"策略包「{pack}」（{pnote}）"
-    else:  # 默认组合：最新进化因子 + 内置三件套
+        pack_name = pack or pk.get("name", "")
+        note = f"策略包「{pack_name}」（{pnote}）"
+    elif not pk:  # 默认组合：最新进化因子 + 内置三件套
         panel = sig.get_panel_cached(codes, end)
         f_series, weights = {}, {}
         factors = _pick_evolved_factors(2)
@@ -649,6 +779,7 @@ def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "")
         score = sig.composite_score(f_series, weights)
         picks = score.head(top_n)
         note = f"默认组合（进化因子 {len(factors)} 个参与）"
+        pack_name = None
 
     out = pd.DataFrame({"score": picks})
     SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
@@ -667,7 +798,7 @@ def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "")
             oos = None
     experience.save_pick(source="sched_pool_scan", pool_name=pool_name, top_n=top_n,
                          method=(pk.get("method") if pk else "默认组合"), filters=(pk.get("filters", []) if pk else []),
-                         factors=fcfg, final_scores=picks, pack_name=(pack or None),
+                         factors=fcfg, final_scores=picks, pack_name=(pack_name or None),
                          oos_winrate=oos, trade_date=end)
 
     # 卫星包顺带扫描：给「博涨停」轨出每日名单（今日执行页卫星轨按包名读取）
@@ -1419,6 +1550,183 @@ def job_lhb_sync(lookback_days: int = 30, **_ignored) -> str:
     return msg
 
 
+# ---------------------------------------------------------------- 策略包自动生成
+def _get_top_factors_for_pack(pool_name: str, top_n: int = 15) -> list[dict]:
+    """从因子评分表取Top因子用于策略包生成（IC/ICIR/胜率综合评分）。"""
+    import sqlite3
+    from pathlib import Path
+    
+    try:
+        db_path = Path("/data/market.db")
+        with sqlite3.connect(str(db_path)) as c:
+            # 从factor_scorecards取最新评分（优先builtin因子，避免evolved因子的兼容性问题）
+            rows = c.execute('''
+                SELECT name, kind, ic_mean, icir, ic_winrate, top_winrate, direction
+                FROM factor_scorecards
+                WHERE pool_name = ? AND eval_date >= date('now', '-30 days')
+                  AND kind = '内置'
+                ORDER BY updated_at DESC
+            ''', (pool_name,)).fetchall()
+            
+            if not rows:
+                # 回退：取所有池的builtin因子
+                rows = c.execute('''
+                    SELECT name, kind, ic_mean, icir, ic_winrate, top_winrate, direction
+                    FROM factor_scorecards
+                    WHERE eval_date >= date('now', '-30 days')
+                      AND kind = '内置'
+                    ORDER BY updated_at DESC
+                ''').fetchall()
+            
+            # 按ICIR排序（绝对值）
+            factors = []
+            for name, kind, ic_mean, icir, ic_wr, top_wr, direction in rows:
+                if icir is None:
+                    continue
+                factors.append({
+                    "name": name,
+                    "kind": "builtin",
+                    "ic": abs(float(ic_mean or 0)),
+                    "icir": abs(float(icir or 0)),
+                    "ic_winrate": float(ic_wr or 0.5),
+                    "top_winrate": float(top_wr or 0.5),
+                    "direction": 1 if direction == "正向" else -1,
+                })
+            
+            # 按ICIR绝对值排序，取Top
+            factors.sort(key=lambda x: x["icir"], reverse=True)
+            
+            # 去重（同名因子取评分最高的）
+            seen = set()
+            unique = []
+            for f in factors:
+                if f["name"] not in seen:
+                    seen.add(f["name"])
+                    unique.append(f)
+            
+            return unique[:top_n]
+    except Exception:
+        return []
+
+
+def _generate_pack_candidates(pool_name: str, top_n: int = 10,
+                               methods: list[str] | None = None) -> list[dict]:
+    """生成候选策略包：贪心选因子 + Walk-forward验证（仅使用builtin因子）。"""
+    import factor_eval as fe
+    
+    if methods is None:
+        methods = ["ICIR加权", "等权", "胜率加权", "均值方差"]
+    
+    factors = _get_top_factors_for_pack(pool_name, top_n=12)
+    if len(factors) < 3:
+        return []
+    
+    codes = (all_pools().get(pool_name) or all_pools().get("沪深300"))
+    end = get_last_trade_day()
+    
+    # 获取builtin因子值
+    factor_vals = {}
+    panel = sig.get_panel_cached(codes, end)
+    for f in factors:
+        try:
+            if f["kind"] == "builtin":
+                vals = sig.compute_builtin(panel, f["name"])
+                if not vals.dropna().empty:
+                    factor_vals[f["name"]] = vals
+        except Exception:
+            continue
+    
+    if len(factor_vals) < 3:
+        return []
+    
+    candidates = []
+    for method in methods:
+        try:
+            # 直接用所有因子进行walk-forward验证（不依赖贪心选择）
+            wf = fe.walk_forward(
+                factor_vals, panel, method, top_n, fwd_days=5, step=10, min_factors=2
+            )
+            if wf.empty or "优化组合扣费超额" not in wf:
+                continue
+            
+            net = wf["优化组合扣费超额"]
+            oos_wr = float((net > 0).mean())
+            avg_excess = float(net.mean())
+            
+            # 质量门槛
+            if oos_wr < 0.55:
+                continue
+            
+            # 构建策略包定义（使用所有因子）
+            selected = list(factor_vals.keys())
+            sc = pd.DataFrame({
+                "因子": selected,
+                "IC均值": [float(factor_vals[n].mean()) for n in selected],
+                "ICIR": [1.0] * len(selected),
+                "Top组胜率": [0.5] * len(selected),
+            })
+            w = fe.compute_weights(sc, method, selected)
+            
+            pack_def = {
+                "name": f"Auto_{pool_name}_{method}_{len(candidates)+1}",
+                "pool_name": pool_name,
+                "top_n": top_n,
+                "method": method,
+                "factors": [{"name": n, "kind": "builtin", "weight": w[n][0], "direction": w[n][1]}
+                           for n in selected],
+                "weights": {n: w[n] for n in selected},
+                "filters": ["tradable"],
+                "oos_winrate": f"{oos_wr:.0%}",
+                "is_winrate": None,
+                "horizon": "5日",
+                "avg_excess": avg_excess,
+            }
+            candidates.append(pack_def)
+        except Exception:
+            continue
+    
+    return candidates
+
+
+def job_strategy_gen(pool_name: str = "沪深300", top_n: int = 10,
+                     max_packs: int = 3) -> str:
+    """策略包自动生成：每日自动发现、验证、保存新策略包。"""
+    import library
+    
+    # 生成候选包
+    candidates = _generate_pack_candidates(pool_name, top_n)
+    
+    # 按OOS胜率排序，取Top
+    candidates.sort(key=lambda x: float(x["oos_winrate"].rstrip("%")), reverse=True)
+    saved = []
+    
+    for pack_def in candidates[:max_packs]:
+        try:
+            # 检查是否已存在同名包
+            existing = library.list_strategies()
+            if pack_def["name"] in existing:
+                continue
+            
+            # 保存到strategies表
+            library.save_strategy(pack_def["name"], {
+                "pool_name": pack_def["pool_name"],
+                "top_n": pack_def["top_n"],
+                "method": pack_def["method"],
+                "factors": pack_def["factors"],
+                "filters": pack_def["filters"],
+                "oos_winrate": pack_def["oos_winrate"],
+                "is_winrate": pack_def.get("is_winrate"),
+                "horizon": pack_def.get("horizon"),
+            })
+            saved.append(f"{pack_def['name']}({pack_def['oos_winrate']})")
+        except Exception:
+            continue
+    
+    if saved:
+        return f"策略包自动生成：{len(saved)}个新包 → {', '.join(saved)}"
+    return f"策略包自动生成：无新包（候选{len(candidates)}个，均未达门槛）"
+
+
 # ---------------------------------------------------------------- 调度器
 JOBS = {
     "update_data": {"name": "📥 每日数据更新", "func": job_update_data,
@@ -1515,8 +1823,11 @@ JOBS = {
                              "default": {"enabled": True, "hour": 12, "minute": 30,
                                          "params": {"batch": 300, "pool_name": "沪深300"}}},
     "le_factor_eval_pm": {"name": "🧪 LoopEngine 因子体检（盘后）", "func": job_le_factor_eval,
-                           "default": {"enabled": True, "hour": 18, "minute": 0,
-                                       "params": {"batch": 500, "pool_name": "沪深300"}}},
+                            "default": {"enabled": True, "hour": 18, "minute": 0,
+                                        "params": {"batch": 500, "pool_name": "沪深300"}}},
+    "strategy_gen": {"name": "🧬 策略包自动生成", "func": job_strategy_gen,
+                     "default": {"enabled": False, "hour": 18, "minute": 30,
+                                 "params": {"pool_name": "沪深300", "top_n": 10, "max_packs": 3}}},
 }
 
 

@@ -340,12 +340,118 @@ class LoopEngine:
                     sexprs.append(r[0].split("\n", 1)[0][len("# sexpr: "):])
         s["field_weights"].boost_from_factors(sexprs)
         self._save_state()
+        
+        # 每轮结束后自动尝试生成策略包（如果有足够高质量因子）
+        pack_msg = self._try_generate_pack()
+        
         result = {"iteration": s["iteration"], **stats, "gaps": gaps, "proven": proven,
             "budget": {k: round(v, 2) for k, v in s["budget"].p.items()}}
+        if pack_msg:
+            result["pack_generated"] = pack_msg
         bus.push(EventType.ROUND_COMPLETE, iteration=s["iteration"],
                  stats={k: v for k, v in stats.items() if k != "new"},
-                 new_factors=stats["new"][:5])
+                 new_factors=stats["new"][:5],
+                 pack_generated=pack_msg)
         return result
+
+    def _try_generate_pack(self) -> str | None:
+        """尝试生成策略包：从已通过闸门的因子中选Top因子，构建组合并验证。"""
+        import logging
+        import signals as sig
+        from common import all_pools, get_last_trade_day
+        
+        logger = logging.getLogger("pack_gen")
+        
+        try:
+            # 检查是否有足够高质量因子（ICIR > 0.2）
+            with library._lconn() as c:
+                rows = c.execute('''
+                    SELECT name, kind FROM factor_scorecards
+                    WHERE pool_name = ? AND ABS(icir) > 0.2
+                      AND eval_date >= date('now', '-30 days')
+                      AND kind IN ('内置', '技术指标')
+                ''', (self.pool_name,)).fetchall()
+                
+                if len(rows) < 3:
+                    logger.debug(f"高质量因子不足: {len(rows)} < 3")
+                    return None  # 高质量因子不足
+                
+                factor_info = {r[0]: r[1] for r in rows[:8]}
+                logger.debug(f"因子信息: {factor_info}")
+            
+            # 获取因子值
+            codes = all_pools().get(self.pool_name) or all_pools().get("沪深300")
+            end = get_last_trade_day()
+            panel = sig.get_panel_cached(codes, end)
+            
+            factor_vals = {}
+            for name, kind in factor_info.items():
+                try:
+                    if kind == "内置":
+                        vals = sig.compute_builtin(panel, name)
+                    elif name in sig.CATALOG_NAMES:
+                        vals = sig.compute_common(panel, name)
+                    elif name in sig.TECH_INDICATORS:
+                        vals = sig.compute_tech(panel, name)
+                    else:
+                        logger.debug(f"跳过因子 {name}: 不在任何列表中")
+                        continue
+                    
+                    if not vals.dropna().empty:
+                        factor_vals[name] = vals
+                        logger.debug(f"因子 {name}: 成功 ({vals.dropna().shape[0]}行)")
+                    else:
+                        logger.debug(f"因子 {name}: 空值")
+                except Exception as e:
+                    logger.debug(f"因子 {name}: 失败 - {str(e)[:50]}")
+            
+            logger.debug(f"有效因子: {len(factor_vals)}个")
+            if len(factor_vals) < 3:
+                logger.debug(f"有效因子不足: {len(factor_vals)} < 3")
+                return None
+            
+            # Walk-forward验证
+            import factor_eval as fe
+            wf = fe.walk_forward(
+                factor_vals, panel, "等权", 10, fwd_days=5, step=10, min_factors=2
+            )
+            
+            if wf.empty or "优化组合扣费超额" not in wf:
+                logger.debug("walk-forward无结果")
+                return None
+            
+            net = wf["优化组合扣费超额"]
+            oos_wr = float((net > 0).mean())
+            logger.debug(f"OOS胜率: {oos_wr:.1%}")
+            
+            # 质量门槛
+            if oos_wr < 0.50:
+                logger.debug(f"OOS胜率不足: {oos_wr:.1%} < 50%")
+                return None
+            
+            # 构建策略包
+            selected = list(factor_vals.keys())[:5]  # 最多5个因子
+            weights = {n: (1.0 / len(selected), 1) for n in selected}
+            
+            pack_name = f"LE_{self.pool_name}_{datetime.now().strftime('%m%d')}"
+            
+            # 保存到strategies表
+            library.save_strategy(pack_name, {
+                "pool_name": self.pool_name,
+                "top_n": 10,
+                "method": "等权",
+                "factors": [{"name": n, "kind": "builtin", "weight": w, "direction": d}
+                           for n, (w, d) in weights.items()],
+                "filters": ["tradable"],
+                "oos_winrate": f"{oos_wr:.0%}",
+                "horizon": "5日",
+            })
+            
+            logger.info(f"策略包已保存: {pack_name}(OOS={oos_wr:.0%})")
+            return f"{pack_name}(OOS={oos_wr:.0%})"
+        except Exception as e:
+            logger.warning(f"策略包生成异常: {e}")
+            return None
 
     # ---------------- 多类型批量挖掘 ----------------
     def run_multi_type_round(self, batch_per_type: int = 15,

@@ -74,6 +74,18 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
     if ic_abs < GATE["IC_MIN"]:
         reasons.append(f"|IC| {ic_abs:.3f} < {GATE['IC_MIN']}")
 
+    # 多重检验校正：计算 IC 的统计显著性 p-value
+    n_days = len(ic)
+    ic_std = float(ic.std()) if len(ic) > 1 else 1.0
+    if n_days >= 10 and ic_std > 1e-12:
+        p_val = fe.ic_pvalue(float(ic.mean()), ic_std, n_days)
+        metrics["p_value"] = round(p_val, 6)
+        # 使用更严格的显著性阈值（考虑多重检验）
+        if p_val > 0.01:
+            reasons.append(f"IC p-value {p_val:.4f} > 0.01（统计不显著）")
+    else:
+        metrics["p_value"] = 1.0
+
     x = _daily_excess(vals, fwd)
     nav = (1 + x).cumprod()
 

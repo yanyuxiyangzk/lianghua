@@ -27,6 +27,74 @@ CORR_THRESHOLD = 0.7   # 去冗余相关性阈值
 WIN_HORIZONS = {"1日": 1, "5日": 5, "20日": 20, "60日": 60, "120日": 120}
 
 
+# ---------------------------------------------------------------- 多重检验校正
+def bh_fdr(pvalues: pd.Series, alpha: float = 0.05) -> pd.Series:
+    """Benjamini-Hochberg FDR 校正：返回 adjusted p-values。
+    
+    解决批量评估 N 个因子时的第一类错误膨胀问题。
+    当同时测试 1000 个因子时，即使每个因子真实 IC=0，
+    5% 显著性水平下也会有 ~50 个因子"看起来显著"。
+    FDR 校正控制的是"被拒绝的假设中假阳性的比例"。"""
+    p = pvalues.dropna().copy()
+    if p.empty:
+        return pvalues
+    n = len(p)
+    ranked = p.rank(method="first")
+    adjusted = p * n / ranked
+    adjusted = adjusted.clip(upper=1.0)
+    # 保持单调性（从最大 p 值开始）
+    adjusted = adjusted.sort_values(ascending=False).cummin()
+    return adjusted.reindex(pvalues.index)
+
+
+def ic_pvalue(ic_mean: float, ic_std: float, n_days: int) -> float:
+    """基于 IC 均值和标准差计算近似 p-value（双侧 t 检验）。
+    
+    H0: IC = 0（因子无预测能力）
+    t = IC_mean / (IC_std / sqrt(n))
+    p = 2 * (1 - CDF(|t|, df=n-1))
+    
+    使用正态近似（大样本下 t 分布趋近正态），无需 scipy。"""
+    if n_days < 10 or ic_std < 1e-12:
+        return 1.0
+    t_stat = ic_mean / (ic_std / (n_days ** 0.5))
+    # 正态分布 CDF 近似：Φ(x) ≈ 1 - φ(x)(b1*t + b2*t² + b3*t³ + b4*t⁴ + b5*t⁵)
+    # 其中 t = 1/(1+0.2316419*|x|), φ(x) = exp(-x²/2)/sqrt(2π)
+    import math
+    x = abs(t_stat)
+    t = 1.0 / (1.0 + 0.2316419 * x)
+    phi = math.exp(-x * x / 2.0) / math.sqrt(2.0 * math.pi)
+    p = phi * (0.319381530 * t - 0.356563782 * t**2 + 1.781477937 * t**3 
+               - 1.821255978 * t**4 + 1.330274429 * t**5)
+    if t_stat < 0:
+        p = 1.0 - p
+    return float(2.0 * min(p, 1.0 - p))
+
+
+def apply_fdr_correction(scorecard: pd.DataFrame, alpha: float = 0.05) -> pd.DataFrame:
+    """对因子体检表应用 FDR 校正，新增 p_value 和 q_value（校正后）列。
+    
+    只对有有效 IC 的因子计算 p-value，失败因子的 p-value 设为 1.0。
+    alpha 控制 FDR 水平（默认 5%）。"""
+    pvals = []
+    for _, row in scorecard.iterrows():
+        ic_mean = row.get("IC均值", np.nan)
+        ic_std = row.get("ICIR", np.nan)
+        n_days = row.get("天数", 0)
+        if pd.notna(ic_mean) and pd.notna(ic_std) and n_days > 0:
+            # ICIR = IC_mean / IC_std → IC_std = IC_mean / ICIR
+            ic_std_val = abs(ic_mean / ic_std) if abs(ic_std) > 1e-12 else 1.0
+            pvals.append(ic_pvalue(ic_mean, ic_std_val, n_days))
+        else:
+            pvals.append(1.0)
+    
+    scorecard = scorecard.copy()
+    scorecard["p_value"] = pvals
+    scorecard["q_value"] = bh_fdr(scorecard["p_value"], alpha)
+    scorecard["FDR显著"] = scorecard["q_value"] < alpha
+    return scorecard
+
+
 # ---------------------------------------------------------------- 基础件
 def resolve_factor(name: str, kind: str | None = None,
                    evo_map: dict | None = None, le_map: dict | None = None) -> dict | None:
@@ -337,7 +405,11 @@ def build_scorecard_batch(factors: list[dict], codes: list[str], end: str,
                          "ICIR": np.nan, "IC胜率": np.nan, "Top组_winrate": np.nan,
                          "建议方向": f"评估失败: {str(e)[:40]}", "天数": 0})
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    # 批量评估后应用 FDR 校正：解决多重比较问题
+    if len(df) > 1:
+        df = apply_fdr_correction(df)
+    return df
 
 
 def _eval_single_factor(args):

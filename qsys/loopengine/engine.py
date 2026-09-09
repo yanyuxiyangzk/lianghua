@@ -218,7 +218,8 @@ class LoopEngine:
                      stats={**stats, "tested": 0, "passed": 0, "dup": 0, "frozen": 0},
                      new_factors=[], skip_reason=f"{factor_type}数据源为空")
             self._save_state()
-            return {"iteration": s["iteration"], "tested": 0, "passed": 0, "dup": 0, "frozen": 0,
+            return {"iteration": s["iteration"], "tested": 0, "rejected_review": 0, "llm_rejected": 0,
+                    "passed": 0, "dup": 0, "frozen": 0,
                     "new": [], "gaps": [], "proven": [], "budget": {}, "skip_reason": f"{factor_type}数据源为空"}
 
         # Step 2: 机制族引导
@@ -251,7 +252,7 @@ class LoopEngine:
             bus.push(EventType.STEP_UPDATE, step=3, name="衰减检测", status="error",
                      error=str(e))
 
-        llm_review_budget = 5
+        llm_review_budget = 10
         for _ in range(batch):
             # Step 4: 生成候选
             src, tree = self._gen_candidate(rng, gaps, proven, live_boost, factor_type)
@@ -271,8 +272,8 @@ class LoopEngine:
                 continue
             sexpr = tree.sexpr()
 
-            # Step 6: LLM审查（抽样）
-            do_llm = llm_review_budget > 0 and rng.random() < 0.3
+            # Step 6: LLM审查（抽样50%，预算10个/轮）
+            do_llm = llm_review_budget > 0 and rng.random() < 0.5
             bus.push(EventType.STEP_UPDATE, step=6, name="LLM审查", status="running",
                      source=src, sampled=do_llm)
             if do_llm:

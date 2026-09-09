@@ -17,6 +17,9 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+
 from common import (QLIB_DATA_DIR, SCHED_LAST_FILE, SCHED_STATE_FILE, SIGNALS_DIR,
                     all_pools, get_evolved_factors, get_last_trade_day, load_watchlist, save_json, load_json,
                     trade_day_offset)
@@ -871,8 +874,8 @@ def job_loopengine(batch: int = 30, **_ignored) -> str:
     eng = LoopEngine("沪深300")
     factor_type = DEFAULT_FACTOR_TYPES[eng.state["iteration"] % len(DEFAULT_FACTOR_TYPES)]
     r = eng.run_round(batch=batch, factor_type=factor_type)
-    return (f"第{r['iteration']}轮[{factor_type}] · 测试{r['tested']} · 过审拒绝{r['rejected_review']} · "
-            f"LLM否决{r.get('llm_rejected', 0)} · 重复{r['dup']} · FSA拦截{r['frozen']} · 入库{r['passed']} {r['new'][:3]}")
+    return (f"第{r['iteration']}轮[{factor_type}] · 测试{r['tested']} · 过审拒绝{r.get('rejected_review', 0)} · "
+            f"LLM否决{r.get('llm_rejected', 0)} · 重复{r.get('dup', 0)} · FSA拦截{r.get('frozen', 0)} · 入库{r.get('passed', 0)} {r.get('new', [])[:3]}")
 
 
 def job_multitype_mine(batch_per_type: int = 15, pool_name: str = "沪深300",

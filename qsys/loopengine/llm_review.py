@@ -36,7 +36,7 @@ def llm_review(sexpr: str) -> tuple[bool, str]:
             model="deepseek/deepseek-chat",
             messages=[{"role": "system", "content": _REVIEWER_SYS},
                       {"role": "user", "content": _REVIEWER_USER.format(sexpr=sexpr)}],
-            max_tokens=150)
+            max_tokens=150, timeout=30)
         text = r.choices[0].message.content.strip().strip("`")
         if text.startswith("json"):
             text = text[4:]

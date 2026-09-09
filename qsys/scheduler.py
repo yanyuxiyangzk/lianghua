@@ -1841,12 +1841,19 @@ class SchedulerManager:
         from apscheduler.executors.pool import ThreadPoolExecutor
         from apscheduler.schedulers.background import BackgroundScheduler
 
-        # 线程隔离：loopengine/quote_collect 等高频 interval 任务走独立小线程池，
-        # 否则它们长时间占满默认线程池，cron 任务(数据更新/扫描/回填)会被饿死跳过
-        # ——2026-08-19~24 实测 pool_scan 连续缺席即此因。
+        # 三池隔离（2026-09-09 优化）：
+        #   "default" (3) — cron 任务（数据更新/扫描/回填等），盘后高峰不超过 4 个并行
+        #   "interval" (2) — 轻量高频 interval（tick_sync/realtime_kline/minute_sync/position_track/ifind_realtime_sync）
+        #   "le" (1) — LoopEngine 演化引擎，单次可跑 5-10 分钟，独立池避免霸占 interval 线程
+        # ——实测 LoopEngine 2天 524 次执行、avg 105s/max 991s，挤在 interval 池导致
+        # tick_sync 间隔从 10s 退化到 14s、8.8% 超 15s。
         self.sched = BackgroundScheduler(
             timezone=TZ,
-            executors={"default": ThreadPoolExecutor(3), "interval": ThreadPoolExecutor(2)},
+            executors={
+                "default": ThreadPoolExecutor(3),
+                "interval": ThreadPoolExecutor(2),
+                "le": ThreadPoolExecutor(1),
+            },
             job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 3600},
         )
         self.sched.start()
@@ -1870,9 +1877,11 @@ class SchedulerManager:
             if not cfg["enabled"]:
                 continue
             if cfg.get("trigger") == "interval":
+                # loopengine 等重任务走独立 "le" 线程池，避免霸占 interval 池
+                executor = "le" if key in ("loopengine",) else "interval"
                 self.sched.add_job(lambda k=key: self._run(k), "interval", id=key,
                                    seconds=int(cfg["params"].get("interval_sec", 30)),
-                                   executor="interval", replace_existing=True)
+                                   executor=executor, replace_existing=True)
             else:
                 self.sched.add_job(lambda k=key: self._run(k), "cron", id=key,
                                    day_of_week="mon-fri", hour=cfg["hour"], minute=cfg["minute"],

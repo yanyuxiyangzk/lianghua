@@ -19,13 +19,9 @@ def _fetch_pdf_b64(url: str):
     """服务器端抓取 PDF 并 base64 编码（同花顺 PDF 是 force-download，浏览器无法直接内嵌，
     转成 data URI 才能在 iframe 里在线预览；按 URL 缓存一天）"""
     import base64
-    import requests
-    try:
-        r = requests.get(url, timeout=30, headers={"User-Agent": "Mozilla/5.0"})
-        if r.status_code == 200 and r.content[:4] == b"%PDF":
-            return base64.b64encode(r.content).decode()
-    except Exception:
-        pass
+    content = datasource.fetch_pdf(url)
+    if content:
+        return base64.b64encode(content).decode()
     return None
 
 

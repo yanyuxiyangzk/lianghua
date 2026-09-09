@@ -1,9 +1,9 @@
 """🐉 龙虎榜 — 个股明细 / 营业部排名 / 最新动态。
 
 数据链路：
-  - 个股明细 / 营业部排名 / 个股明细页：同花顺数据中心龙虎榜公开网页 HTML 解析
-  - 最新动态：同花顺数据中心龙虎榜页公开的「龙虎榜解析」资讯
-  （iFinD 专题报表 p04669/p04674 通过 HTTP data_pool 通道返回 -4001 无权限，改用公开网页）
+  1. 优先读 lhb_daily 表（定时任务 job_ifind_lhb 同步）
+  2. DB 为空时 fallback 到同花顺数据中心公开网页 HTML 解析
+  3. 营业部排名和最新动态仍从公开页面获取（DB 无对应表）
 """
 
 import re
@@ -76,6 +76,42 @@ def _parse_broker_table(tbl_html: str) -> list[dict]:
     return rows
 
 
+# ---------------------------------------------------------------- DB 读取 ----------------------------------------------------------------
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_lhb_from_db() -> pd.DataFrame:
+    """从 lhb_daily 表读取龙虎榜数据。"""
+    try:
+        from datasource import _conn
+        with _conn() as c:
+            df = pd.read_sql(
+                """SELECT code, date, name, close_price, change_pct,
+                          net_buy, buy_amount, sell_amount,
+                          inst_count, inst_buy_pct, hot_dept_count,
+                          win_rate, consecutive_days
+                   FROM lhb_daily
+                   WHERE date >= ?
+                   ORDER BY date DESC, net_buy DESC""",
+                c, params=((datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d"),))
+        if df.empty:
+            return df
+        # 格式化列名
+        df.rename(columns={
+            "date": "日期", "code": "代码", "name": "名称",
+            "close_price": "收盘价", "change_pct": "涨跌幅(%)",
+            "net_buy": "净买入额(万)", "buy_amount": "买入额(万)",
+            "sell_amount": "卖出额(万)", "inst_count": "机构数",
+            "inst_buy_pct": "机构买入占比", "consecutive_days": "连续上榜",
+        }, inplace=True)
+        # 代码格式：SH600519
+        df["代码"] = df["代码"].apply(lambda c: f"{_market(c)}{c}" if len(c) == 6 else c)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+# ---------------------------------------------------------------- HTML 爬取（fallback） ----------------------------------------------------------------
+
 @st.cache_data(ttl=600, show_spinner=False)
 def _scrape_all() -> tuple[pd.DataFrame, dict[str, dict]]:
     """一次性解析龙虎榜页面，返回 (个股列表, {code: {buy: [...], sell: [...], reason: str}})。"""
@@ -134,7 +170,6 @@ def _scrape_all() -> tuple[pd.DataFrame, dict[str, dict]]:
             d["sell"] = _parse_broker_table(tbl)
 
         if d.get("buy") or d.get("sell"):
-            # 同一股票可能有多个stockcont（不同上榜原因），合并
             if full_code in details:
                 existing = details[full_code]
                 existing.setdefault("buy", []).extend(d.get("buy", []))
@@ -177,42 +212,59 @@ def _scrape_yyb_ranking() -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+# ---------------------------------------------------------------- 渲染 ----------------------------------------------------------------
+
 def _tab_detail():
-    """📋 个股明细 + 可展开营业部买卖明细。"""
-    st.info("数据来自同花顺数据中心公开页面，每日收盘后更新")
-    df, details = _scrape_all()
-    if df.empty:
-        st.warning("暂未获取到龙虎榜个股数据，请稍后重试")
-        return
+    """📋 个股明细：优先 DB，fallback HTML。"""
+    db_df = _load_lhb_from_db()
+    use_db = not db_df.empty
 
-    # 标记有明细的个股
-    df["有明细"] = df["代码"].apply(lambda c: "🔍" if c in details else "")
-    st.dataframe(df[["代码", "名称", "收盘价", "涨跌幅(%)", "成交金额(万)", "净买入额(万)", "有明细"]],
-                 width="stretch", hide_index=True,
-                 height=min(35 * (len(df) + 1) + 3, 560))
-    st.download_button(f"📥 导出CSV（{len(df)}行）",
-                       df.drop(columns=["有明细"]).to_csv(index=False, encoding="utf-8-sig"),
-                       file_name=f"lhb_detail_{datetime.now():%Y%m%d_%H%M}.csv",
-                       key="lhb_d_dl")
+    if use_db:
+        st.info(f"数据来自 lhb_daily 表（最近7天，共 {len(db_df)} 条）")
+        # DB 模式：无营业部明细，简化展示
+        show_cols = [c for c in ["日期", "代码", "名称", "收盘价", "涨跌幅(%)",
+                                  "净买入额(万)", "买入额(万)", "卖出额(万)",
+                                  "机构数", "连续上榜"] if c in db_df.columns]
+        st.dataframe(db_df[show_cols], width="stretch", hide_index=True,
+                     height=min(35 * (len(db_df) + 1) + 3, 560))
+        st.download_button(f"📥 导出CSV（{len(db_df)}行）",
+                           db_df.to_csv(index=False, encoding="utf-8-sig"),
+                           file_name=f"lhb_db_{datetime.now():%Y%m%d_%H%M}.csv",
+                           key="lhb_db_dl")
+    else:
+        st.info("lhb_daily 表为空，从同花顺公开页面实时爬取")
+        df, details = _scrape_all()
+        if df.empty:
+            st.warning("暂未获取到龙虎榜个股数据，请稍后重试")
+            return
 
-    # 个股营业部明细
-    codes_with_detail = [c for c in df["代码"] if c in details]
-    if codes_with_detail:
-        st.markdown("---")
-        st.markdown("**🔍 个股营业部明细**")
-        options = [f"{c} {df[df['代码']==c].iloc[0]['名称']}" for c in codes_with_detail]
-        sel = st.selectbox("选择个股查看买卖前5营业部", options, index=None,
-                           placeholder="点击选择…", key="lhb_d_sel")
-        if sel is not None:
-            code = options[options.index(sel)].split()[0]
-            d = details[code]
-            if d.get("reason"):
-                st.caption(f"上榜原因：{d['reason']}")
-            for side, label in [("buy", "买入金额最大前5名营业部"), ("sell", "卖出金额最大前5名营业部")]:
-                rows = d.get(side, [])
-                if rows:
-                    st.markdown(f"**{label}**")
-                    st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+        df["有明细"] = df["代码"].apply(lambda c: "🔍" if c in details else "")
+        st.dataframe(df[["代码", "名称", "收盘价", "涨跌幅(%)", "成交金额(万)", "净买入额(万)", "有明细"]],
+                     width="stretch", hide_index=True,
+                     height=min(35 * (len(df) + 1) + 3, 560))
+        st.download_button(f"📥 导出CSV（{len(df)}行）",
+                           df.drop(columns=["有明细"]).to_csv(index=False, encoding="utf-8-sig"),
+                           file_name=f"lhb_detail_{datetime.now():%Y%m%d_%H%M}.csv",
+                           key="lhb_d_dl")
+
+        # 个股营业部明细（仅 HTML 模式可用）
+        codes_with_detail = [c for c in df["代码"] if c in details]
+        if codes_with_detail:
+            st.markdown("---")
+            st.markdown("**🔍 个股营业部明细**（实时爬取模式可用）")
+            options = [f"{c} {df[df['代码']==c].iloc[0]['名称']}" for c in codes_with_detail]
+            sel = st.selectbox("选择个股查看买卖前5营业部", options, index=None,
+                               placeholder="点击选择…", key="lhb_d_sel")
+            if sel is not None:
+                code = options[options.index(sel)].split()[0]
+                d = details[code]
+                if d.get("reason"):
+                    st.caption(f"上榜原因：{d['reason']}")
+                for side, label in [("buy", "买入金额最大前5名营业部"), ("sell", "卖出金额最大前5名营业部")]:
+                    rows = d.get(side, [])
+                    if rows:
+                        st.markdown(f"**{label}**")
+                        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
 
 
 def _tab_yyb():
@@ -267,7 +319,7 @@ def _tab_news():
 
 def render():
     st.title("🐉 龙虎榜")
-    st.caption("数据源：同花顺数据中心公开页面（每日收盘后更新）")
+    st.caption("数据源：lhb_daily 表（定时同步）或同花顺公开页面 · 营业部排名和资讯从公开页面获取")
     ifind_hub.header()
     t1, t2, t3 = st.tabs(["📋 个股明细", "🏛️ 营业部排名", "📰 最新动态"])
     with t1:

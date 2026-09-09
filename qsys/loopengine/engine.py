@@ -15,6 +15,7 @@ import gates as G
 import factor_eval as fe
 import library
 import structure
+import datasource
 from event_bus import EventType, bus
 from loopengine import genetics, review
 from loopengine.tree import all_fields, build_field_frames, emit_code, evaluate_tree, parse
@@ -65,7 +66,7 @@ class LoopEngine:
 
         codes = all_pools()[self.pool_name]
         end = get_last_trade_day()
-        panel = sig.get_panel_cached(codes, end, 800, source="qlib_local")
+        panel = sig.get_panel_cached(codes, end, 800, source=datasource.get_loop_source())
         # 构建额外帧（非量价类型）
         extra = None
         if factor_type != "量价":

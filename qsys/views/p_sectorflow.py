@@ -6,6 +6,16 @@
   - 地域板块：同花顺地域板块（33 地域，含净流入/涨跌幅/成交额/领涨股）
   - 证监会板块：同花顺证监会行业板块（19 板块，含涨跌幅/成交额/领涨股）
   - 轮动热力图：行业板块指数历史（stock_board_industry_index_ths）
+
+TODO(多源重构): 本页 6 个 akshare 直调 + 2 个 10jqka HTML 爬虫，需迁移至 datasource.py：
+  - _fetch_industry_summary → ak.stock_board_industry_summary_ths() → 新建 sector_industry_summary 表
+  - _fetch_concept_names → ak.stock_board_concept_name_ths() → 新建 sector_concept_list 表
+  - _fetch_concept_index → ak.stock_board_concept_index_ths() → 新建 sector_concept_index 表
+  - _fetch_industry_index → ak.stock_board_industry_index_ths() → 新建 sector_industry_index 表
+  - _fetch_concept_members → ak.stock_board_concept_info_ths() → 新建 sector_concept_members 表
+  - _fetch_regional → 10jqka HTML → 新建 sector_regional 表
+  - _fetch_csrc → 10jqka HTML → 新建 sector_csrc 表
+  迁移后由 scheduler 定时同步，页面只读本地 DB。
 """
 
 import re

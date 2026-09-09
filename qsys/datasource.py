@@ -2340,3 +2340,23 @@ def get_lhb_daily(code: str, days: int = 20) -> pd.DataFrame:
         return pd.read_sql(
             "SELECT * FROM lhb_daily WHERE code=? ORDER BY date DESC LIMIT ?",
             c, params=(code, days))
+
+
+# ---------------------------------------------------------------- PDF 统一下载代理 ----------------------------------------------------------------
+
+def fetch_pdf(url: str, timeout: int = 30) -> bytes | None:
+    """统一 PDF 下载代理：所有 PDF 下载请求应通过此函数，便于统一超时/重试/日志/未来代理切换。
+
+    Returns:
+        PDF bytes or None if failed.
+    """
+    import requests as _requests
+    try:
+        r = _requests.get(url, timeout=timeout,
+                          headers={"User-Agent": "Mozilla/5.0"},
+                          proxies={"http": None, "https": None})
+        if r.status_code == 200 and r.content[:4] == b"%PDF":
+            return r.content
+    except Exception:
+        pass
+    return None

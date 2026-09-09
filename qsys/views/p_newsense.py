@@ -35,34 +35,20 @@ def _norm_pdf_url(u: str) -> str | None:
 @st.cache_data(show_spinner=False, ttl=3600)
 def _load_announce_pdf(url: str):
     """服务端尽力下载公告 PDF 并抽取正文；返回 (pdf_bytes|None, text, err)。
-    仅作"加分项"（抽正文 / st.pdf），失败不影响浏览器内嵌预览。显式关闭代理以免误走代理。"""
+    仅作"加分项"（抽正文 / st.pdf），失败不影响浏览器内嵌预览。"""
     import io
-    import time
     from urllib.parse import urlparse
 
-    import requests
+    import datasource
     url = _norm_pdf_url(url)
     if not url:
         return None, "", "数据源未返回可用 PDF 链接（pdfURL 为占位/无效地址，无法重建）"
     host = urlparse(url).netloc or url
     if not url.startswith(("http://", "https://")):
         return None, "", f"URL 非法：{url[:60]}"
-    data = None
-    last_err = ""
-    for _ in range(2):
-        try:
-            r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"},
-                             timeout=30, proxies={"http": None, "https": None})
-            r.raise_for_status()
-            if r.content[:4] == b"%PDF":
-                data = r.content
-                break
-            last_err = "返回内容不是 PDF"
-        except Exception as e:
-            last_err = e
-        time.sleep(1)
+    data = datasource.fetch_pdf(url)
     if data is None:
-        return None, "", f"服务端无法抓取（主机 {host} 不可达，可能需特定网络/浏览器访问）：{last_err}"
+        return None, "", f"服务端无法抓取（主机 {host} 不可达，可能需特定网络/浏览器访问）"
 
     text = ""
     try:

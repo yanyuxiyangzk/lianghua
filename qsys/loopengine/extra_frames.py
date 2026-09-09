@@ -76,7 +76,7 @@ def build_sector_frames(codes: list[str], end: str, lookback: int = 800) -> dict
 
 
 def build_lhb_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
-    """龙虎榜帧：从 stock_lhb_daily 表构建（同花顺 iFinD 数据源）。
+    """龙虎榜帧：从 lhb_daily 表构建（同花顺 iFinD 数据源）。
 
     字段：lhb_net_buy（龙虎榜净买入）, lhb_inst_ratio（机构占比）,
           lhb_hot_count（上榜次数）, lhb_win_rate（次日胜率）, lhb_consecutive（连续上榜）
@@ -87,7 +87,7 @@ def build_lhb_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
     try:
         with _qconn() as c:
             df = pd.read_sql(
-                "SELECT code, trade_date, net_buy, inst_ratio FROM stock_lhb_daily WHERE trade_date >= ? AND trade_date <= ?",
+                "SELECT code, date as trade_date, net_buy, inst_buy_pct as inst_ratio FROM lhb_daily WHERE date >= ? AND date <= ?",
                 c, params=(start, end))
     except Exception:
         return {}

@@ -117,6 +117,42 @@ def _load_decay_stats():
         return pd.DataFrame()
 
 
+@st.cache_data(ttl=30)
+def _load_decay_detail():
+    """逐因子衰减详情。"""
+    import library
+    try:
+        with library._lconn() as c:
+            df = pd.read_sql(
+                "SELECT fd.factor_name, fd.decay_status, fd.decay_rate, fd.ic_long, fd.ic_short, "
+                "       fd.ic_std, fd.check_time, fr.family, fr.gate_status, fr.multi_objective_score "
+                "FROM factor_decay fd "
+                "LEFT JOIN factor_registry fr ON fd.factor_name = fr.name "
+                "WHERE fd.decay_status IN ('mild', 'moderate', 'severe') "
+                "ORDER BY fd.decay_rate ASC "
+                "LIMIT 100", c)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=30)
+def _load_budget_history():
+    """加载预算历史记录。"""
+    import library
+    try:
+        with library._lconn() as c:
+            row = c.execute("SELECT budget FROM engine_state WHERE id='loopengine'").fetchone()
+        if row and row[0]:
+            budget = json.loads(row[0])
+            history = budget.get("history", [])
+            p = budget.get("p", {})
+            return {"p": p, "history": history}
+    except Exception:
+        pass
+    return {"p": {}, "history": []}
+
+
 def _load_console_log(n_lines=200, only_err=False):
     try:
         size = LOG_FILE.stat().st_size
@@ -354,6 +390,126 @@ def _render_mo_and_decay(key_prefix=""):
         st.plotly_chart(fig, width="stretch", key=f"decay_{key_prefix}")
 
 
+def _render_decay_detail(key_prefix=""):
+    """衰减告警列表 + 逐因子衰减分析。"""
+    st.markdown("### ⚠️ 因子衰减告警")
+
+    decay_detail = _load_decay_detail()
+    if decay_detail.empty:
+        st.info("暂无衰减告警数据")
+        return
+
+    # 告警统计
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        n_mild = len(decay_detail[decay_detail["decay_status"] == "mild"])
+        st.metric("轻度衰减", f"{n_mild}", delta=f"权重 0.7", delta_color="off")
+    with c2:
+        n_mod = len(decay_detail[decay_detail["decay_status"] == "moderate"])
+        st.metric("中度衰减", f"{n_mod}", delta=f"权重 0.4", delta_color="off")
+    with c3:
+        n_sev = len(decay_detail[decay_detail["decay_status"] == "severe"])
+        st.metric("重度衰减", f"{n_sev}", delta=f"权重 0.2", delta_color="off")
+
+    # 筛选
+    status_filter = st.multiselect(
+        "衰减状态筛选", ["mild", "moderate", "severe"],
+        default=["moderate", "severe"], key=f"decay_filter_{key_prefix}"
+    )
+    filtered = decay_detail[decay_detail["decay_status"].isin(status_filter)]
+
+    if filtered.empty:
+        st.info("筛选后无数据")
+        return
+
+    # 告警表格
+    show = filtered.rename(columns={
+        "factor_name": "因子", "decay_status": "衰减状态", "decay_rate": "衰减率",
+        "ic_long": "长期IC", "ic_short": "短期IC", "ic_std": "IC标准差",
+        "check_time": "检查时间", "family": "机制族", "gate_status": "闸门",
+        "multi_objective_score": "评分"
+    })
+    st.dataframe(show, use_container_width=True, hide_index=True, height=400,
+                 column_config={
+                     "衰减率": st.column_config.NumberColumn(format="%.3f"),
+                     "长期IC": st.column_config.NumberColumn(format="%.4f"),
+                     "短期IC": st.column_config.NumberColumn(format="%.4f"),
+                     "IC标准差": st.column_config.NumberColumn(format="%.4f"),
+                     "评分": st.column_config.NumberColumn(format="%.3f")})
+
+    # 衰减率分布
+    if not filtered.empty:
+        fig = px.histogram(filtered, x="decay_rate", color="decay_status",
+                           title="衰减率分布", nbins=30,
+                           color_discrete_map={"mild": "#FFD700", "moderate": "#FF8C00", "severe": "#FF4500"})
+        fig.update_layout(height=300)
+        st.plotly_chart(fig, use_container_width=True, key=f"decay_hist_{key_prefix}")
+
+
+def _render_budget_history(key_prefix=""):
+    """预算历史演变时间序列。"""
+    st.markdown("###  生成方式预算演变")
+
+    budget_data = _load_budget_history()
+    history = budget_data.get("history", [])
+
+    if not history:
+        st.info("暂无预算历史记录")
+        return
+
+    # 解析历史记录
+    records = []
+    for i, item in enumerate(history):
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            source, accepted = item[0], item[1]
+            records.append({"轮次": i + 1, "生成方式": source, "通过": accepted})
+
+    if not records:
+        st.info("历史记录格式异常")
+        return
+
+    hist_df = pd.DataFrame(records)
+
+    # 按生成方式统计成功率
+    success_stats = hist_df.groupby("生成方式").agg(
+        总尝试=("通过", "count"),
+        通过数=("通过", "sum")
+    ).reset_index()
+    success_stats["成功率"] = (success_stats["通过数"] / success_stats["总尝试"] * 100).round(1)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig = px.bar(success_stats, x="生成方式", y="成功率", color="生成方式",
+                     title="各生成方式成功率",
+                     labels={"成功率": "成功率 (%)", "生成方式": "生成方式"})
+        fig.update_layout(height=350)
+        st.plotly_chart(fig, use_container_width=True, key=f"budget_success_{key_prefix}")
+
+    with c2:
+        fig = px.bar(success_stats, x="生成方式", y="总尝试", color="通过数",
+                     title="各生成方式尝试次数",
+                     labels={"总尝试": "尝试次数", "生成方式": "生成方式"})
+        fig.update_layout(height=350)
+        st.plotly_chart(fig, use_container_width=True, key=f"budget_tries_{key_prefix}")
+
+    # 时间序列（最近50轮）
+    recent = hist_df.tail(50)
+    if len(recent) > 1:
+        # 累计成功率时间序列
+        recent = recent.copy()
+        for source in recent["生成方式"].unique():
+            mask = recent["生成方式"] == source
+            recent.loc[mask, "累计通过"] = recent.loc[mask, "通过"].cumsum()
+            recent.loc[mask, "累计尝试"] = range(1, mask.sum() + 1)
+            recent.loc[mask, "累计成功率"] = (recent.loc[mask, "累计通过"] / recent.loc[mask, "累计尝试"] * 100)
+
+        fig = px.line(recent, x="轮次", y="累计成功率", color="生成方式",
+                      title="累计成功率演变（最近50轮）",
+                      labels={"累计成功率": "累计成功率 (%)", "轮次": "轮次"})
+        fig.update_layout(height=400)
+        st.plotly_chart(fig, use_container_width=True, key=f"budget_trend_{key_prefix}")
+
+
 # ---------- 主页面 ----------
 def render():
     st.markdown("## 🧬 LoopEngine 演化监控")
@@ -375,8 +531,8 @@ def render():
     st.divider()
 
     # 主tab: 实时日志 + 图表分析
-    tab_live, tab_log, tab_gate, tab_console, tab_chart = st.tabs(
-        ["⚡ 实时事件流", "📊 概览分析", "🚪 闸门日志", "📟 控制台日志", "📈 详细图表"])
+    tab_live, tab_log, tab_gate, tab_console, tab_chart, tab_decay, tab_budget = st.tabs(
+        ["⚡ 实时事件流", "📊 概览分析", "🚪 闸门日志", "📟 控制台日志", "📈 详细图表", "⚠️ 衰减告警", "  预算演变"])
 
     with tab_live:
         _render_sse_events()
@@ -400,6 +556,12 @@ def render():
         _render_funnel_chart("tab4")
         _render_family_chart("tab4")
         _render_field_chart(state, "tab4")
+
+    with tab_decay:
+        _render_decay_detail("tab_decay")
+
+    with tab_budget:
+        _render_budget_history("tab_budget")
 
 
 # ---------- 实时事件流（SSE） ----------

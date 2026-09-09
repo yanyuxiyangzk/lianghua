@@ -47,7 +47,7 @@ def render():
         st.info("因子库为空，请先运行 LoopEngine 挖掘。")
         return
 
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 挖掘总览", "🧬 遗传算法", "❌ 失败分析", "🔄 挖掘日志"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📊 挖掘总览", "🧬 遗传算法", "❌ 失败分析", "🔄 挖掘日志", "  失败趋势", "  多类型对比"])
 
     # ================================ Tab1: 挖掘总览 ================================
     with tab1:
@@ -273,6 +273,125 @@ def render():
                 st.metric("通过率", f"{rate:.2%}")
         else:
             st.info("无测试记录")
+
+    # ================================ Tab5: 失败趋势 ================================
+    with tab5:
+        st.markdown("## 失败模式趋势分析")
+
+        if failures.empty:
+            st.info("暂无失败记录。")
+        else:
+            # 失败时间趋势
+            if "created_at" in failures.columns:
+                st.markdown("### 失败数量时间趋势")
+                failures["date"] = pd.to_datetime(failures["created_at"], errors="coerce").dt.date
+                daily_failures = failures.dropna(subset=["date"]).groupby("date").size().reset_index(name="count")
+                if not daily_failures.empty:
+                    fig = px.line(daily_failures, x="date", y="count",
+                                  title="每日失败因子数量",
+                                  labels={"count": "失败数量", "date": "日期"})
+                    fig.update_layout(height=350)
+                    st.plotly_chart(fig, width="stretch")
+
+            st.divider()
+
+            # 失败→成功转化追踪
+            st.markdown("### 失败→成功转化追踪")
+            st.markdown("同一骨架的因子失败后，变体是否成功？")
+
+            if "skeleton" in failures.columns and "skeleton" in registry.columns:
+                failed_skeletons = set(failures["skeleton"].dropna().unique())
+                succeeded_skeletons = set(registry[registry["gate_status"] == 1]["skeleton"].dropna().unique())
+                converted = failed_skeletons & succeeded_skeletons
+
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    st.metric("失败骨架数", f"{len(failed_skeletons):,}")
+                with c2:
+                    st.metric("成功骨架数", f"{len(succeeded_skeletons):,}")
+                with c3:
+                    rate = len(converted) / max(len(failed_skeletons), 1) * 100
+                    st.metric("转化率", f"{rate:.1f}%")
+
+                if converted:
+                    with st.expander(f"查看已转化的骨架 ({len(converted)}个)"):
+                        for sk in sorted(converted):
+                            fail_cnt = len(failures[failures["skeleton"] == sk])
+                            st.write(f"  - `{sk}` (失败{fail_cnt}次后成功)")
+
+            st.divider()
+
+            # LLM拒绝 vs 规则拒绝
+            st.markdown("### LLM拒绝 vs 规则拒绝")
+            if "reason" in failures.columns:
+                reasons = failures["reason"].fillna("").tolist()
+                llm_count = sum(1 for r in reasons if "LLM" in str(r) or "llm" in str(r))
+                rule_count = len(reasons) - llm_count
+
+                fig = px.pie(values=[llm_count, rule_count],
+                             names=["LLM拒绝", "规则拒绝"],
+                             title="拒绝来源分布",
+                             color_discrete_sequence=["#FF6B6B", "#4ECDC4"])
+                fig.update_traces(textposition="inside", textinfo="percent+label")
+                st.plotly_chart(fig, width="stretch")
+
+    # ================================ Tab6: 多类型对比 ================================
+    with tab6:
+        st.markdown("## 多类型因子效率对比")
+
+        if "factor_type" in registry.columns:
+            # 按类型统计
+            type_stats = registry.groupby("factor_type").agg(
+                总因子数=("name", "count"),
+                通过闸门=("gate_status", lambda x: (x == 1).sum()),
+                平均评分=("multi_objective_score", "mean"),
+            ).reset_index()
+            type_stats["通过率"] = (type_stats["通过闸门"] / type_stats["总因子数"] * 100).round(1)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                fig = px.bar(type_stats, x="factor_type", y=["总因子数", "通过闸门"],
+                             title="各类型因子数量对比",
+                             labels={"value": "数量", "factor_type": "因子类型", "variable": "类别"},
+                             barmode="group")
+                fig.update_layout(height=400)
+                st.plotly_chart(fig, use_container_width=True)
+
+            with c2:
+                fig = px.bar(type_stats, x="factor_type", y="通过率",
+                             title="各类型因子通过率",
+                             labels={"通过率": "通过率 (%)", "factor_type": "因子类型"},
+                             color="通过率", color_continuous_scale="RdYlGn")
+                fig.update_layout(height=400)
+                st.plotly_chart(fig, use_container_width=True)
+
+            # 按类型 × 机制族交叉分析
+            st.markdown("### 类型 × 机制族交叉热力图")
+            cross = pd.crosstab(registry["factor_type"].fillna("量价"),
+                                registry["family"].fillna("其他"))
+            if not cross.empty:
+                fig = px.imshow(cross, text_auto=True, color_continuous_scale="YlOrRd",
+                                aspect="auto", title="因子类型 × 机制族分布")
+                fig.update_layout(height=500)
+                st.plotly_chart(fig, use_container_width=True)
+
+            # 按类型对比衰减状态
+            if "decay_status" in registry.columns:
+                st.markdown("### 各类型衰减状态对比")
+                decay_by_type = pd.crosstab(
+                    registry["factor_type"].fillna("量价"),
+                    registry["decay_status"].fillna("unknown")
+                )
+                if not decay_by_type.empty:
+                    fig = px.bar(decay_by_type.reset_index(), x="factor_type",
+                                 y=decay_by_type.columns.tolist(),
+                                 title="各类型因子衰减状态分布",
+                                 barmode="stack")
+                    fig.update_layout(height=400)
+                    st.plotly_chart(fig, use_container_width=True)
+
+        else:
+            st.info("无 factor_type 数据")
 
 
 render()

@@ -91,6 +91,9 @@ pages = {
         st.Page("views/p_wf_detail.py", title="Walk-Forward衰减", icon="📉", url_path="wf-detail"),
         st.Page("views/p_evo.py", title="进化看板", icon="🧬", url_path="evo"),
         st.Page("views/p_sched.py", title="定时任务", icon="⏰", url_path="sched"),
+        st.Page("views/p_factor_usage.py", title="因子使用率", icon=" ", url_path="factor-usage"),
+        st.Page("views/p_factor_scores.py", title="5维因子评分", icon=" ", url_path="factor-scores"),
+        st.Page("views/p_combo_detail.py", title="组合策略详情", icon=" ", url_path="combo-detail"),
     ],
     "系统": [
         st.Page("views/p_settings.py", title="设置", icon="⚙️", url_path="settings"),

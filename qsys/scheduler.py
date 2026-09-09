@@ -735,14 +735,16 @@ def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "")
                 # 投票不足，回退到最佳包
                 pack = top_list[0][0]
                 pk = top_list[0][1]
-                picks, pnote, weights, f_series = compute_pack_picks(pk, codes, end, top_n)
+                pack_codes = all_pools().get(pk.get("pool_name", "沪深300")) or all_pools().get("沪深300")
+                picks, pnote, weights, f_series = compute_pack_picks(pk, pack_codes, end, top_n)
                 pack_name = pack
                 note = f"策略包「{pack}」（{pnote}）"
         else:
             pack = _best_pack(packs) if not pack else pack
             pk = packs.get(pack) if pack else None
             if pk:
-                picks, pnote, weights, f_series = compute_pack_picks(pk, codes, end, top_n)
+                pack_codes = all_pools().get(pk.get("pool_name", "沪深300")) or all_pools().get("沪深300")
+                picks, pnote, weights, f_series = compute_pack_picks(pk, pack_codes, end, top_n)
                 pack_name = pack
                 note = f"策略包「{pack}」（{pnote}）"
             else:
@@ -1370,7 +1372,7 @@ def job_ifind_realtime_sync(**_ignored) -> str:
                 # 从数据库读取最新价格，触发事件
                 import sqlite3
                 from pathlib import Path
-                db_path = Path("/data/quote.db")
+                db_path = datasource.MKT_DB
                 if db_path.exists():
                     with sqlite3.connect(str(db_path)) as c:
                         placeholders = ",".join(["?" for _ in watched])

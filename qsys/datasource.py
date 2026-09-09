@@ -651,10 +651,10 @@ def ths_snapshot(codes: list[str], indicators: str, snap_time: str = ""):
         end = datetime.strptime(t, "%Y-%m-%d %H:%M:%S")  # 格式错误会抛给 _go 提示
         begin = end - timedelta(minutes=2)
         return _sdk_first(
-            lambda: ths_call("THS_SS", codes_s, ind, "dataType:Original",
+            lambda: ths_call("THS_SS", codes_s, indicators, "dataType:Original",
                              f"{begin:%Y-%m-%d %H:%M:%S}", f"{end:%Y-%m-%d %H:%M:%S}"), http)
     df, res, err = _sdk_first(
-        lambda: ths_call("THS_SS", codes_s, ind, "dataType:Original",
+        lambda: ths_call("THS_SS", codes_s, indicators, "dataType:Original",
                          f"{now - timedelta(minutes=10):%Y-%m-%d %H:%M:%S}",
                          f"{now:%Y-%m-%d %H:%M:%S}"), http)
     if df is None or df.empty:
@@ -666,7 +666,7 @@ def ths_snapshot(codes: list[str], indicators: str, snap_time: str = ""):
                 _ths_login()
             except Exception:
                 break  # HTTP 通道无历史快照可回退，直接返回空
-            df, res, err = ths_call("THS_SS", codes_s, ind, "dataType:Original",
+            df, res, err = ths_call("THS_SS", codes_s, indicators, "dataType:Original",
                                     f"{d:%Y-%m-%d} 14:55:00", f"{d:%Y-%m-%d} 15:00:00")
             if df is not None and not df.empty:
                 break

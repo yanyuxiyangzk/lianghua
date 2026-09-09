@@ -5,6 +5,7 @@
 """
 
 import json
+import logging
 import random
 from datetime import datetime
 
@@ -17,6 +18,8 @@ import structure
 from event_bus import EventType, bus
 from loopengine import genetics, review
 from loopengine.tree import all_fields, build_field_frames, emit_code, evaluate_tree, parse
+
+log = logging.getLogger("loopengine")
 
 STATE_KEY = "loopengine"
 

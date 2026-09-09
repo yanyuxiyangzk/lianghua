@@ -291,26 +291,122 @@ def render():
             st.caption("👆 点击表格中的因子行查看详情与回测")
 
     # ================================ ①.5 机制族覆盖 / FSA / 失败模式 ================================
-    with st.expander("🧬 机制族覆盖 · FSA 反同质化 · 失败模式库（P2）"):
-        import structure
+    st.markdown("## ①.5 机制族覆盖 · FSA 反同质化 · 失败模式库")
 
+    import structure
+
+    # FSA 冻结统计
+    fsa = library.fsa_recompute()
+    frozen = fsa[fsa["frozen"] == 1] if not fsa.empty and "frozen" in fsa.columns else pd.DataFrame()
+    unfrozen = fsa[fsa["frozen"] == 0] if not fsa.empty and "frozen" in fsa.columns else pd.DataFrame()
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("总骨架数", f"{len(fsa):,}" if not fsa.empty else "0")
+    with c2:
+        n_frozen = len(frozen) if not frozen.empty else 0
+        st.metric("冻结骨架", f"{n_frozen:,}", help="骨架占比>15% 或同构变体>3")
+    with c3:
+        n_active = len(unfrozen) if not unfrozen.empty else 0
+        st.metric("活跃骨架", f"{n_active:,}")
+    with c4:
+        if not frozen.empty and "count" in frozen.columns:
+            top_frozen = frozen.nlargest(1, "count")
+            top_name = top_frozen["skeleton"].iloc[0][:30] if not top_frozen.empty else "N/A"
+            top_cnt = top_frozen["count"].iloc[0] if not top_frozen.empty else 0
+            st.metric("最频繁冻结", f"{top_cnt}次", help=top_name)
+        else:
+            st.metric("最频繁冻结", "N/A")
+
+    st.divider()
+
+    # Tab 布局
+    fsa_tab1, fsa_tab2, fsa_tab3 = st.tabs(["  FSA冻结详情", "  机制族覆盖", "❌ 失败模式库"])
+
+    with fsa_tab1:
+        st.markdown("### FSA 冻结骨架详情")
+        st.markdown("""
+        **冻结规则**：
+        - 同构变体 > 3 个 → 冻结
+        - 骨架占比 > 15% → 冻结
+        - 失败次数 > 30 → 冻结
+        """)
+
+        if frozen.empty:
+            st.success("暂无冻结骨架")
+        else:
+            # 冻结骨架列表
+            st.dataframe(frozen[["skeleton", "count"]].sort_values("count", ascending=False),
+                         use_container_width=True, hide_index=True, height=400)
+
+            # 冻结骨架的因子数分布
+            if "count" in frozen.columns:
+                fig = px.bar(frozen.nlargest(20, "count"), x="skeleton", y="count",
+                             title="冻结骨架因子数（Top 20）",
+                             labels={"count": "因子数", "skeleton": "骨架"})
+                fig.update_layout(height=400, xaxis_tickangle=45)
+                st.plotly_chart(fig, use_container_width=True)
+
+    with fsa_tab2:
+        st.markdown("### 机制族覆盖度")
         cov = structure.family_coverage(registry)
-        c1, c2 = st.columns(2)
-        with c1:
-            st.markdown("**机制族覆盖**（0 = 待开垦方向，LLM引导应优先补）")
+
+        if cov:
             cov_df = pd.DataFrame({"机制族": list(cov.keys()), "因子数": list(cov.values())})
-            st.bar_chart(cov_df.set_index("机制族"))
-        with c2:
-            fsa = library.fsa_recompute()
-            frozen = fsa[fsa["frozen"] == 1] if not fsa.empty else fsa
-            st.markdown("**FSA 冻结名单**（骨架占比>15% 或同构变体>3）")
-            if frozen is not None and not frozen.empty:
-                st.dataframe(frozen[["skeleton", "count"]], width='stretch', height=180, hide_index=True)
-            else:
-                st.caption("暂无冻结骨架")
-        st.markdown("**高频失败骨架 TOP10**（生成阶段自动排除）")
-        fs = library.failure_stats(10)
-        st.dataframe(fs, width='stretch', hide_index=True) if not fs.empty else st.caption("暂无记录")
+            cov_df = cov_df.sort_values("因子数", ascending=False)
+
+            # 覆盖度概览
+            c1, c2 = st.columns(2)
+            with c1:
+                fig = px.bar(cov_df, x="机制族", y="因子数", color="因子数",
+                             color_continuous_scale="Blues",
+                             title="各机制族因子数")
+                fig.update_layout(height=400, xaxis_tickangle=45)
+                st.plotly_chart(fig, use_container_width=True)
+
+            with c2:
+                # 覆盖度百分比
+                total = sum(cov.values())
+                cov_df["占比"] = (cov_df["因子数"] / total * 100).round(1)
+                fig = px.pie(cov_df, values="因子数", names="机制族",
+                             title="机制族分布",
+                             color_discrete_sequence=px.colors.qualitative.Set3)
+                fig.update_traces(textposition="inside", textinfo="percent+label")
+                st.plotly_chart(fig, use_container_width=True)
+
+            # 覆盖度表格
+            with st.expander("查看详细数据"):
+                st.dataframe(cov_df, use_container_width=True, hide_index=True)
+        else:
+            st.info("无机制族覆盖数据")
+
+    with fsa_tab3:
+        st.markdown("### 高频失败模式")
+
+        fs = library.failure_stats(20)
+        if fs.empty:
+            st.info("暂无失败模式记录")
+        else:
+            st.dataframe(fs, use_container_width=True, hide_index=True)
+
+            # 失败原因分布
+            if "reason" in fs.columns:
+                st.markdown("#### 失败原因分布")
+                reasons = fs["reason"].dropna().tolist()
+                gate_keywords = ["IC", "超额", "夏普", "Calmar", "相关", "深度", "审查"]
+                gate_counts = {}
+                for kw in gate_keywords:
+                    cnt = sum(1 for r in reasons if kw in str(r))
+                    if cnt > 0:
+                        gate_counts[kw] = cnt
+
+                if gate_counts:
+                    gc_df = pd.DataFrame({"原因": list(gate_counts.keys()), "次数": list(gate_counts.values())})
+                    fig = px.bar(gc_df, x="原因", y="次数", color="次数",
+                                 color_continuous_scale="Reds",
+                                 title="失败原因分布")
+                    fig.update_layout(height=300)
+                    st.plotly_chart(fig, use_container_width=True)
 
     # ================================ ② 策略库 ================================
     st.markdown("## ② 策略库")

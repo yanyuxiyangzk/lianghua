@@ -153,6 +153,9 @@ def _lconn():
     # 迁移：strategies 加样本内胜率（🎯今日选股的过拟合信号灯用）
     if "is_winrate" not in st_cols:
         c.execute("ALTER TABLE strategies ADD COLUMN is_winrate TEXT")
+    # 迁移：strategies 加状态字段（active/degraded/disabled）
+    if "status" not in st_cols:
+        c.execute("ALTER TABLE strategies ADD COLUMN status TEXT DEFAULT 'active'")
     # 迁移：存量因子 factor_type 回填（NULL → 基于名称/family 推断）
     _backfill_factor_type(c)
     # 迁移：sched_exec_log 从 JSONL 导入历史数据
@@ -388,13 +391,21 @@ def list_strategies() -> dict:
     """返回与 packs.json 相同的结构 {name: pack_dict}，便于各处平滑切换。"""
     with _lconn() as c:
         rows = c.execute("SELECT name, pool_name, top_n, method, filters, factors, oos_winrate,"
-                         " horizon, is_winrate, updated_at FROM strategies").fetchall()
+                         " horizon, is_winrate, updated_at, status FROM strategies").fetchall()
     out = {}
-    for (name, pool, top_n, method, filters, factors, oos, horizon, is_wr, updated) in rows:
+    for (name, pool, top_n, method, filters, factors, oos, horizon, is_wr, updated, status) in rows:
         out[name] = {"pool_name": pool, "top_n": top_n, "method": method,
                      "filters": json.loads(filters or "[]"), "factors": json.loads(factors or "[]"),
-                     "oos_winrate": oos, "horizon": horizon, "is_winrate": is_wr, "updated": updated}
+                     "oos_winrate": oos, "horizon": horizon, "is_winrate": is_wr, "updated": updated,
+                     "status": status or "active"}
     return out
+
+
+def update_strategy_oos(name: str, new_oos: float, status: str = "active"):
+    """更新策略包的 OOS 胜率和状态（定期重验用）。"""
+    with _lconn() as c:
+        c.execute("UPDATE strategies SET oos_winrate=?, status=?, updated_at=? WHERE name=?",
+                  (f"{new_oos:.0%}", status, datetime.now().strftime("%Y-%m-%d %H:%M"), name))
 
 
 def delete_strategy(name: str):

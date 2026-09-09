@@ -428,36 +428,41 @@ class LoopEngine:
         logger = logging.getLogger("pack_gen")
         
         try:
-            # 检查是否有足够高质量因子（ICIR > 0.2）
+            # 检查是否有足够高质量因子（ICIR > 0.2）—— builtin + evolved 同台竞争
             with library._lconn() as c:
                 rows = c.execute('''
-                    SELECT name, kind FROM factor_scorecards
-                    WHERE pool_name = ? AND ABS(icir) > 0.2
-                      AND eval_date >= date('now', '-30 days')
-                      AND kind IN ('内置', '技术指标')
+                    SELECT fs.name, fs.kind, fr.code FROM factor_scorecards fs
+                    LEFT JOIN factor_registry fr ON fs.name = fr.name
+                    WHERE fs.pool_name = ? AND ABS(fs.icir) > 0.2
+                      AND fs.eval_date >= date('now', '-30 days')
+                      AND fs.kind IN ('内置', '技术指标', 'loopengine')
                 ''', (self.pool_name,)).fetchall()
                 
                 if len(rows) < 3:
                     logger.debug(f"高质量因子不足: {len(rows)} < 3")
                     return None  # 高质量因子不足
                 
-                factor_info = {r[0]: r[1] for r in rows[:8]}
+                factor_info = {r[0]: {"kind": r[1], "code": r[2]} for r in rows[:8]}
                 logger.debug(f"因子信息: {factor_info}")
             
-            # 获取因子值
+            # 获取因子值（builtin + evolved）
             codes = all_pools().get(self.pool_name) or all_pools().get("沪深300")
             end = get_last_trade_day()
             panel = sig.get_panel_cached(codes, end)
             
             factor_vals = {}
-            for name, kind in factor_info.items():
+            for name, info in factor_info.items():
+                kind = info["kind"]
+                code = info.get("code", "")
                 try:
-                    if kind == "内置":
+                    if kind in ("内置", "builtin"):
                         vals = sig.compute_builtin(panel, name)
                     elif name in sig.CATALOG_NAMES:
                         vals = sig.compute_common(panel, name)
                     elif name in sig.TECH_INDICATORS:
                         vals = sig.compute_tech(panel, name)
+                    elif code and "# sexpr:" in code:
+                        vals = sig.run_factor_code(code, name, codes, end)
                     else:
                         logger.debug(f"跳过因子 {name}: 不在任何列表中")
                         continue
@@ -497,6 +502,9 @@ class LoopEngine:
             # 构建策略包
             selected = list(factor_vals.keys())[:5]  # 最多5个因子
             weights = {n: (1.0 / len(selected), 1) for n in selected}
+            # kind 映射
+            kind_map = {"内置": "builtin", "技术指标": "tech", "loopengine": "evolved"}
+            factor_kind = {n: kind_map.get(factor_info.get(n, {}).get("kind", ""), "builtin") for n in selected}
             
             pack_name = f"LE_{self.pool_name}_{datetime.now().strftime('%m%d')}"
             
@@ -505,7 +513,7 @@ class LoopEngine:
                 "pool_name": self.pool_name,
                 "top_n": 10,
                 "method": "等权",
-                "factors": [{"name": n, "kind": "builtin", "weight": w, "direction": d}
+                "factors": [{"name": n, "kind": factor_kind.get(n, "builtin"), "weight": w, "direction": d}
                            for n, (w, d) in weights.items()],
                 "filters": ["tradable"],
                 "oos_winrate": f"{oos_wr:.0%}",

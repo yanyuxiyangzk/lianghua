@@ -18,6 +18,8 @@ import signals as sig
 import datasource
 from common import all_pools, get_last_trade_day, trade_day_offset
 
+COST = 0.0025  # 双边交易成本
+
 
 def backtest_strategy(strategy_name: str, pool_name: str = "沪深300",
                       top_n: int = 10, hold_days: int = 5) -> dict:
@@ -57,65 +59,64 @@ def backtest_strategy(strategy_name: str, pool_name: str = "沪深300",
     if not factor_vals:
         return {"ok": False, "msg": "无有效因子值"}
 
-    # 合成因子得分
-    weights = {f["name"]: f.get("weight", 1.0) * f.get("direction", 1) for f in factors if f["name"] in factor_vals}
-    total_w = sum(abs(w) for w in weights.values())
-    if total_w == 0:
-        return {"ok": False, "msg": "权重总和为0"}
+    # 构建权重 dict: {name: (weight, direction)}
+    weights = {}
+    for f in factors:
+        if f["name"] in factor_vals:
+            weights[f["name"]] = (f.get("weight", 1.0), f.get("direction", 1))
+    if not weights:
+        return {"ok": False, "msg": "无有效权重"}
 
-    # 逐日合成
+    # 预计算归一化因子值（z-score）
+    vals_norm = {}
+    for name, s in factor_vals.items():
+        s2 = fe._norm(s.dropna())
+        if not s2.empty:
+            vals_norm[name] = s2
+
+    # 获取所有交易日
     all_dates = sorted(set(
-        dt for vals in factor_vals.values()
+        dt for vals in vals_norm.values()
         for dt in vals.index.get_level_values("datetime").unique()
     ))
-    # 只保留回测窗口内的日期
     start_dt = pd.Timestamp(start)
     end_dt = pd.Timestamp(end)
     all_dates = [d for d in all_dates if start_dt <= pd.Timestamp(d) <= end_dt]
 
-    daily_scores = {}
-    for dt in all_dates:
-        score = 0
-        for name, w in weights.items():
-            vals = factor_vals[name]
-            v = vals[vals.index.get_level_values("datetime") == dt]
-            if not v.empty:
-                score += v.mean() * w / total_w
-        daily_scores[dt] = score
+    if len(all_dates) < hold_days + 1:
+        return {"ok": False, "msg": "回测窗口内数据不足"}
 
-    score_series = pd.Series(daily_scores).sort_index()
-
-    # 逐日选股+计算收益
+    # 逐日选股 + 计算收益
     nav = [1.0]
     nav_dates = [str(all_dates[0])[:10]]
     pick_log = []
+    turnovers = []
+    prev_picks = set()
 
-    for i in range(0, len(score_series) - hold_days, hold_days):
-        dt = score_series.index[i]
+    for i in range(0, len(all_dates) - hold_days, hold_days):
+        dt = all_dates[i]
         dt_str = str(dt)[:10]
 
-        # 取该日截面
-        day_vals = {}
-        for name in factor_vals:
-            v = factor_vals[name]
-            dv = v[v.index.get_level_values("datetime") == dt]
-            if not dv.empty:
-                for inst in dv.index.get_level_values("instrument").unique():
-                    iv = dv[dv.index.get_level_values("instrument") == inst]
-                    if not iv.empty:
-                        day_vals.setdefault(inst, 0)
-                        day_vals[inst] += iv.iloc[0] * weights.get(name, 0) / total_w
-
-        if not day_vals:
+        # 截面打分：z-score × 权重 × 方向（与 walk_forward 一致）
+        sc = fe._score_at(vals_norm, weights, dt)
+        if sc.empty:
             continue
 
-        # 选Top-N
-        ranked = sorted(day_vals.items(), key=lambda x: -x[1])
-        top_codes = [c for c, _ in ranked[:top_n]]
+        # 选 Top-N
+        ranked = sc.sort_values(ascending=False)
+        top_codes = list(ranked.index[:top_n])
+        if not top_codes:
+            continue
 
-        # 计算组合收益
+        # 换手率
+        cur_set = set(top_codes)
+        turnover = 1.0 if not prev_picks else 1 - len(cur_set & prev_picks) / max(len(cur_set), 1)
+        prev_picks = cur_set
+        turnovers.append(turnover)
+
+        # 组合收益（扣费）
         if dt in fwd.index:
-            day_fwd = fwd.loc[dt]  # Series: instrument -> return
+            day_fwd = fwd.loc[dt]
             returns = []
             for code in top_codes:
                 if code in day_fwd.index:
@@ -123,10 +124,20 @@ def backtest_strategy(strategy_name: str, pool_name: str = "沪深300",
                     if pd.notna(r):
                         returns.append(float(r))
             if returns:
-                port_ret = np.mean(returns)
-                nav.append(nav[-1] * (1 + port_ret))
+                gross_ret = np.mean(returns)
+                net_ret = gross_ret - turnover * COST
+                nav.append(nav[-1] * (1 + net_ret))
                 nav_dates.append(dt_str)
-                pick_log.append({"date": dt_str, "picks": top_codes[:3], "return": round(port_ret, 4)})
+                pick_log.append({
+                    "date": dt_str,
+                    "picks": top_codes[:3],
+                    "gross": round(gross_ret, 4),
+                    "net": round(net_ret, 4),
+                    "turnover": round(turnover, 2),
+                })
+
+    if len(nav) < 2:
+        return {"ok": False, "msg": "回测无有效交易"}
 
     nav_series = pd.Series(nav, index=range(len(nav)))
     total_return = nav[-1] / nav[0] - 1
@@ -149,6 +160,21 @@ def backtest_strategy(strategy_name: str, pool_name: str = "沪深300",
             monthly_rets.append(nav[i + 22] / nav[i] - 1)
     monthly_wr = sum(1 for r in monthly_rets if r > 0) / max(len(monthly_rets), 1)
 
+    avg_turnover = float(np.mean(turnovers)) if turnovers else 0
+
+    # 等权组合对照（与 walk_forward 一致）
+    eq_nav = [1.0]
+    for i in range(0, len(all_dates) - hold_days, hold_days):
+        dt = all_dates[i]
+        if dt in fwd.index:
+            day_fwd = fwd.loc[dt]
+            available = [c for c in day_fwd.index if pd.notna(day_fwd[c])]
+            if available:
+                eq_ret = float(day_fwd[available].mean())
+                eq_nav.append(eq_nav[-1] * (1 + eq_ret))
+    eq_total = eq_nav[-1] / eq_nav[0] - 1 if len(eq_nav) > 1 else 0
+    eq_ann = (1 + eq_total) ** (1 / max(years, 0.1)) - 1 if eq_total > -1 else 0
+
     result = {
         "ok": True,
         "strategy": strategy_name,
@@ -161,7 +187,10 @@ def backtest_strategy(strategy_name: str, pool_name: str = "沪深300",
         "max_drawdown": round(max_dd, 4),
         "sharpe": round(sharpe, 2),
         "monthly_winrate": round(monthly_wr, 2),
+        "avg_turnover": round(avg_turnover, 2),
         "trades": len(nav) - 1,
+        "eq_ann_return": round(eq_ann, 4),
+        "excess_ann_return": round(ann_return - eq_ann, 4),
         "picks": pick_log[:5],
     }
     return result
@@ -173,9 +202,9 @@ def print_result(r: dict):
         print(f"  ERROR: {r.get('msg', 'unknown')}")
         return
     print(f"  期间: {r['period']}")
-    print(f"  总收益: {r['total_return']:+.1%}  年化: {r['ann_return']:+.1%}")
+    print(f"  总收益: {r['total_return']:+.1%}  年化: {r['ann_return']:+.1%}  超额年化: {r.get('excess_ann_return',0):+.1%}")
     print(f"  最大回撤: {r['max_drawdown']:.1%}  夏普: {r['sharpe']:.2f}")
-    print(f"  月度胜率: {r['monthly_winrate']:.0%}  交易次数: {r['trades']}")
+    print(f"  月度胜率: {r['monthly_winrate']:.0%}  换手率: {r.get('avg_turnover',0):.0%}  交易次数: {r['trades']}")
 
 
 if __name__ == "__main__":

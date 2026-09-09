@@ -153,6 +153,10 @@ def _best_pack(packs: dict) -> str:
         if oos_wr < 55:
             continue
         
+        # 排除退化包（定期重验标记）
+        if pk.get("status") == "degraded":
+            continue
+        
         stats = actual_stats.get(name)
         
         if stats is not None:
@@ -1557,49 +1561,54 @@ def job_lhb_sync(lookback_days: int = 30, **_ignored) -> str:
 
 # ---------------------------------------------------------------- 策略包自动生成
 def _get_top_factors_for_pack(pool_name: str, top_n: int = 15) -> list[dict]:
-    """从因子评分表取Top因子用于策略包生成（IC/ICIR/胜率综合评分）。"""
+    """从因子评分表取Top因子用于策略包生成（builtin + evolved 同台竞争，按 ICIR 排序）。"""
     import sqlite3
     from pathlib import Path
     
     try:
         db_path = Path("/data/market.db")
         with sqlite3.connect(str(db_path), timeout=30) as c:
-            # 从factor_scorecards取最新评分（优先builtin因子，避免evolved因子的兼容性问题）
+            # builtin + evolved 因子都参与，按 ICIR 绝对值排序
             rows = c.execute('''
-                SELECT name, kind, ic_mean, icir, ic_winrate, top_winrate, direction
-                FROM factor_scorecards
-                WHERE pool_name = ? AND eval_date >= date('now', '-30 days')
-                  AND kind = '内置'
-                ORDER BY updated_at DESC
+                SELECT fs.name, fs.kind, fs.ic_mean, fs.icir, fs.ic_winrate,
+                       fs.top_winrate, fs.direction, fr.code
+                FROM factor_scorecards fs
+                LEFT JOIN factor_registry fr ON fs.name = fr.name
+                WHERE fs.pool_name = ? AND fs.eval_date >= date('now', '-30 days')
+                  AND fs.icir IS NOT NULL
+                  AND fs.kind IN ('内置', '技术指标', 'loopengine')
+                ORDER BY ABS(fs.icir) DESC
             ''', (pool_name,)).fetchall()
             
             if not rows:
-                # 回退：取所有池的builtin因子
+                # 回退：取所有池的因子
                 rows = c.execute('''
-                    SELECT name, kind, ic_mean, icir, ic_winrate, top_winrate, direction
-                    FROM factor_scorecards
-                    WHERE eval_date >= date('now', '-30 days')
-                      AND kind = '内置'
-                    ORDER BY updated_at DESC
+                    SELECT fs.name, fs.kind, fs.ic_mean, fs.icir, fs.ic_winrate,
+                           fs.top_winrate, fs.direction, fr.code
+                    FROM factor_scorecards fs
+                    LEFT JOIN factor_registry fr ON fs.name = fr.name
+                    WHERE fs.eval_date >= date('now', '-30 days')
+                      AND fs.icir IS NOT NULL
+                      AND fs.kind IN ('内置', '技术指标', 'loopengine')
+                    ORDER BY ABS(fs.icir) DESC
                 ''').fetchall()
             
-            # 按ICIR排序（绝对值）
             factors = []
-            for name, kind, ic_mean, icir, ic_wr, top_wr, direction in rows:
+            for name, kind, ic_mean, icir, ic_wr, top_wr, direction, code in rows:
                 if icir is None:
                     continue
+                # kind 映射：scorecards 用中文，策略包用英文
+                kind_map = {"内置": "builtin", "技术指标": "tech", "loopengine": "evolved"}
                 factors.append({
                     "name": name,
-                    "kind": "builtin",
+                    "kind": kind_map.get(kind, "builtin"),
+                    "code": code,
                     "ic": abs(float(ic_mean or 0)),
                     "icir": abs(float(icir or 0)),
                     "ic_winrate": float(ic_wr or 0.5),
                     "top_winrate": float(top_wr or 0.5),
                     "direction": 1 if direction == "正向" else -1,
                 })
-            
-            # 按ICIR绝对值排序，取Top
-            factors.sort(key=lambda x: x["icir"], reverse=True)
             
             # 去重（同名因子取评分最高的）
             seen = set()
@@ -1616,8 +1625,10 @@ def _get_top_factors_for_pack(pool_name: str, top_n: int = 15) -> list[dict]:
 
 def _generate_pack_candidates(pool_name: str, top_n: int = 10,
                                methods: list[str] | None = None) -> list[dict]:
-    """生成候选策略包：贪心选因子 + Walk-forward验证（仅使用builtin因子）。"""
+    """生成候选策略包：贪心选因子 + Walk-forward验证。"""
     import factor_eval as fe
+    import sqlite3 as sq
+    from pathlib import Path
     
     if methods is None:
         methods = ["ICIR加权", "等权", "胜率加权", "均值方差"]
@@ -1629,15 +1640,32 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
     codes = (all_pools().get(pool_name) or all_pools().get("沪深300"))
     end = get_last_trade_day()
     
-    # 获取builtin因子值
+    # 预读 scorecards 缓存（真实 ICIR/IC均值/胜率，替代硬编码）
+    scorecards_cache = {}
+    try:
+        with sq.connect(str(Path("/data/market.db")), timeout=30) as c:
+            rows = c.execute('''SELECT name, ic_mean, icir, top_winrate
+                                FROM factor_scorecards
+                                WHERE pool_name=? AND eval_date>=date('now','-30 days')''',
+                             (pool_name,)).fetchall()
+            for r in rows:
+                scorecards_cache[r[0]] = {"ic_mean": r[1], "icir": r[2], "top_winrate": r[3]}
+    except Exception:
+        pass
+    
+    # 获取因子值（支持 builtin + evolved）
     factor_vals = {}
     panel = sig.get_panel_cached(codes, end)
     for f in factors:
         try:
             if f["kind"] == "builtin":
                 vals = sig.compute_builtin(panel, f["name"])
-                if not vals.dropna().empty:
-                    factor_vals[f["name"]] = vals
+            elif f.get("code") and "# sexpr:" in f.get("code", ""):
+                vals = sig.run_factor_code(f["code"], f["name"], codes, end)
+            else:
+                continue
+            if not vals.dropna().empty:
+                factor_vals[f["name"]] = vals
         except Exception:
             continue
     
@@ -1647,7 +1675,7 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
     candidates = []
     for method in methods:
         try:
-            # 直接用所有因子进行walk-forward验证（不依赖贪心选择）
+            # walk-forward 验证（内部用真实 ICIR 计算权重）
             wf = fe.walk_forward(
                 factor_vals, panel, method, top_n, fwd_days=5, step=10, min_factors=2
             )
@@ -1662,14 +1690,21 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
             if oos_wr < 0.55:
                 continue
             
-            # 构建策略包定义（使用所有因子）
+            # 构建策略包定义（使用真实 scorecard 数据赋权）
             selected = list(factor_vals.keys())
-            sc = pd.DataFrame({
-                "因子": selected,
-                "IC均值": [float(factor_vals[n].mean()) for n in selected],
-                "ICIR": [1.0] * len(selected),
-                "Top组胜率": [0.5] * len(selected),
-            })
+            # kind 映射：scorecards 中文 → 策略包英文
+            kind_map = {"内置": "builtin", "技术指标": "tech", "loopengine": "evolved"}
+            factor_kind = {f["name"]: kind_map.get(f.get("kind", ""), "builtin") for f in factors}
+            sc_rows = []
+            for n in selected:
+                sc = scorecards_cache.get(n, {})
+                sc_rows.append({
+                    "因子": n,
+                    "IC均值": sc.get("ic_mean") or 0,
+                    "ICIR": sc.get("icir") or 1.0,
+                    "Top组胜率": sc.get("top_winrate") or 0.5,
+                })
+            sc = pd.DataFrame(sc_rows)
             w = fe.compute_weights(sc, method, selected)
             
             pack_def = {
@@ -1677,7 +1712,7 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
                 "pool_name": pool_name,
                 "top_n": top_n,
                 "method": method,
-                "factors": [{"name": n, "kind": "builtin", "weight": w[n][0], "direction": w[n][1]}
+                "factors": [{"name": n, "kind": factor_kind.get(n, "builtin"), "weight": w[n][0], "direction": w[n][1]}
                            for n in selected],
                 "weights": {n: w[n] for n in selected},
                 "filters": ["tradable"],
@@ -1730,6 +1765,72 @@ def job_strategy_gen(pool_name: str = "沪深300", top_n: int = 10,
     if saved:
         return f"策略包自动生成：{len(saved)}个新包 → {', '.join(saved)}"
     return f"策略包自动生成：无新包（候选{len(candidates)}个，均未达门槛）"
+
+
+def job_strategy_revalidate(pool_name: str = "沪深300") -> str:
+    """每周重验所有策略包的 OOS 表现，淘汰退化包。"""
+    import factor_eval as fe
+    import library
+    import sqlite3 as sq
+    from pathlib import Path
+    
+    packs = library.list_strategies()
+    if not packs:
+        return "无策略包需重验"
+    
+    codes = (all_pools().get(pool_name) or all_pools().get("沪深300"))
+    end = get_last_trade_day()
+    panel = sig.get_panel_cached(codes, end)
+    
+    results = []
+    for name, pk in packs.items():
+        try:
+            factors_list = pk.get("factors", [])
+            if not factors_list:
+                continue
+            
+            # 取因子值
+            factor_vals = {}
+            for fac in factors_list:
+                try:
+                    if fac.get("kind") == "builtin":
+                        vals = sig.compute_builtin(panel, fac["name"])
+                    elif fac.get("code") and "# sexpr:" in fac.get("code", ""):
+                        vals = sig.run_factor_code(fac["code"], fac["name"], codes, end)
+                    else:
+                        vals = sig.compute_builtin(panel, fac["name"])
+                    if not vals.dropna().empty:
+                        factor_vals[fac["name"]] = vals
+                except Exception:
+                    continue
+            
+            if len(factor_vals) < 2:
+                continue
+            
+            # walk-forward 重验
+            wf = fe.walk_forward(
+                factor_vals, panel, pk.get("method", "等权"), pk.get("top_n", 10),
+                fwd_days=5, step=10, min_factors=2
+            )
+            if wf.empty or "优化组合扣费超额" not in wf:
+                continue
+            
+            net = wf["优化组合扣费超额"]
+            new_oos = float((net > 0).mean())
+            old_oos_str = pk.get("oos_winrate", "50%")
+            old_oos = float(str(old_oos_str).rstrip("%")) / 100
+            
+            # 判断退化：OOS 下降 >5% 或跌破 50%
+            if old_oos - new_oos > 0.05 or new_oos < 0.50:
+                library.update_strategy_oos(name, new_oos, status="degraded")
+                results.append(f"{name}: 退化 {old_oos:.0%}→{new_oos:.0%}")
+            else:
+                library.update_strategy_oos(name, new_oos, status="active")
+                results.append(f"{name}: 正常 {new_oos:.0%}")
+        except Exception as e:
+            results.append(f"{name}: 异常 {e}")
+    
+    return f"策略包重验完成：{len(results)}个 → " + "; ".join(results[:10])
 
 
 # ---------------------------------------------------------------- 调度器
@@ -1833,6 +1934,10 @@ JOBS = {
     "strategy_gen": {"name": "🧬 策略包自动生成", "func": job_strategy_gen,
                      "default": {"enabled": False, "hour": 18, "minute": 30,
                                  "params": {"pool_name": "沪深300", "top_n": 10, "max_packs": 3}}},
+    "strategy_revalidate": {"name": "♻️ 策略包重验（每周）", "func": job_strategy_revalidate,
+                            "default": {"enabled": False, "hour": 3, "minute": 0,
+                                        "params": {"pool_name": "沪深300"},
+                                        "day_of_week": "sun"}},
 }
 
 

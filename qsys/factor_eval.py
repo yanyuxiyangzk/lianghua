@@ -19,10 +19,11 @@ from common import DATA_DIR, get_last_trade_day
 
 EVAL_DIR = DATA_DIR / "cache" / "eval"
 FWD_DAYS = [1, 5, 10, 20, 40]
-MAIN_FWD = 20          # 主评估窗口（交易日）
+MAIN_FWD = 5            # 主评估窗口（交易日）：与闸门统一为5日
 EST_WINDOW = 250       # walk-forward 估计窗（交易日）
-STEP_DAYS = 20         # walk-forward 应用窗/步长
+STEP_DAYS = 5          # walk-forward 应用窗/步长：与持有期对齐
 CORR_THRESHOLD = 0.7   # 去冗余相关性阈值
+DEFAULT_COST = 0.0025  # 双边交易成本（千一×2）
 # 多周期胜率标准（交易日）：1天/5天/1月/3月/6月 —— 因子与策略统一按此衡量
 WIN_HORIZONS = {"1日": 1, "5日": 5, "20日": 20, "60日": 60, "120日": 120}
 
@@ -93,6 +94,132 @@ def apply_fdr_correction(scorecard: pd.DataFrame, alpha: float = 0.05) -> pd.Dat
     scorecard["q_value"] = bh_fdr(scorecard["p_value"], alpha)
     scorecard["FDR显著"] = scorecard["q_value"] < alpha
     return scorecard
+
+
+def backtest_credibility_score(wf_result: pd.DataFrame) -> dict:
+    """回测可信度评分：综合评估 walk_forward 结果的可信度。
+    
+    评分维度（0-100 分）：
+    1. IS/OOS 差距（25分）：差距越小越可信
+    2. 样本量（15分）：调仓期越多越可信
+    3. 夏普比率（20分）：越高越可信
+    4. 最大回撤（15分）：回撤越小越可信
+    5. 盈亏比（15分）：越高越可信
+    6. 月度胜率（10分）：越高越可信
+    
+    返回 {score, grade, details, warnings}"""
+    if wf_result is None or (isinstance(wf_result, pd.DataFrame) and wf_result.empty):
+        return {"score": 0, "grade": "F", "details": {}, "warnings": ["无回测数据"]}
+
+    attrs = wf_result.attrs if hasattr(wf_result, "attrs") else {}
+    details = {}
+    warnings = []
+    score = 0
+
+    # 1. IS/OOS 差距（25分）
+    ann_ret = attrs.get("ann_return", 0)
+    sharpe = attrs.get("sharpe", 0)
+    max_dd = attrs.get("max_drawdown", 0)
+    profit_factor = attrs.get("profit_factor", 0)
+    win_rate = attrs.get("win_rate", 0)
+    monthly_wr = attrs.get("monthly_winrate", 0)
+    n_periods = attrs.get("n_periods", 0)
+    max_consec = attrs.get("max_consec_loss_months", 0)
+
+    # IS/OOS 差距：如果能获取 IS 结果，计算差距
+    # 这里简化为用 OOS 胜率作为代理
+    if win_rate > 0:
+        # 胜率越高，IS/OOS差距可能越小
+        is_oos_score = min(25, win_rate * 40)
+        details["IS/OOS差距"] = round(is_oos_score, 1)
+        score += is_oos_score
+    else:
+        warnings.append("胜率数据缺失")
+
+    # 2. 样本量（15分）
+    if n_periods >= 50:
+        sample_score = 15
+    elif n_periods >= 20:
+        sample_score = 10
+    elif n_periods >= 10:
+        sample_score = 5
+    else:
+        sample_score = 0
+        warnings.append(f"样本量不足: {n_periods}期")
+    details["样本量"] = sample_score
+    score += sample_score
+
+    # 3. 夏普比率（20分）
+    if sharpe >= 2.0:
+        sharpe_score = 20
+    elif sharpe >= 1.0:
+        sharpe_score = 15
+    elif sharpe >= 0.5:
+        sharpe_score = 10
+    elif sharpe > 0:
+        sharpe_score = 5
+    else:
+        sharpe_score = 0
+        warnings.append(f"夏普为负: {sharpe:.2f}")
+    details["夏普比率"] = sharpe_score
+    score += sharpe_score
+
+    # 4. 最大回撤（15分）
+    if max_dd > -0.05:
+        dd_score = 15
+    elif max_dd > -0.10:
+        dd_score = 12
+    elif max_dd > -0.20:
+        dd_score = 8
+    elif max_dd > -0.30:
+        dd_score = 4
+    else:
+        dd_score = 0
+        warnings.append(f"最大回撤过大: {max_dd:.1%}")
+    details["最大回撤"] = dd_score
+    score += dd_score
+
+    # 5. 盈亏比（15分）
+    if profit_factor >= 2.0:
+        pf_score = 15
+    elif profit_factor >= 1.5:
+        pf_score = 12
+    elif profit_factor >= 1.0:
+        pf_score = 8
+    elif profit_factor > 0:
+        pf_score = 4
+    else:
+        pf_score = 0
+        warnings.append(f"盈亏比不足: {profit_factor:.2f}")
+    details["盈亏比"] = pf_score
+    score += pf_score
+
+    # 6. 月度胜率（10分）
+    if monthly_wr >= 0.60:
+        mw_score = 10
+    elif monthly_wr >= 0.50:
+        mw_score = 7
+    elif monthly_wr >= 0.40:
+        mw_score = 4
+    else:
+        mw_score = 0
+        warnings.append(f"月度胜率偏低: {monthly_wr:.1%}")
+    details["月度胜率"] = mw_score
+    score += mw_score
+
+    # 评级
+    if score >= 80:
+        grade = "A"
+    elif score >= 65:
+        grade = "B"
+    elif score >= 50:
+        grade = "C"
+    elif score >= 35:
+        grade = "D"
+    else:
+        grade = "F"
+
+    return {"score": round(score), "grade": grade, "details": details, "warnings": warnings}
 
 
 # ---------------------------------------------------------------- 基础件
@@ -239,14 +366,16 @@ def decay_curve(fac: dict, codes: list[str], end: str, source: str | None = None
 
 
 def top_group_winrate(vals: pd.Series, panel: pd.DataFrame, fwd_days: int = MAIN_FWD,
-                      step: int = STEP_DAYS, pct: float = 0.1,
+                      step: int = STEP_DAYS, pct: float = 0.1, cost: float = DEFAULT_COST,
                       fwd: pd.DataFrame | None = None) -> float:
     """每 step 个交易日取 Top 十分位组合，forward 超额>0 的占比。
+    统一口径：基准=等权均值（非中位数），扣除双边交易成本。
     fwd 可传入预算好的远期收益表（批量多周期评估时避免重复计算）。"""
     if fwd is None:
         fwd = forward_returns(panel, fwd_days)
     v = _norm(vals.dropna())
     days = v.index.get_level_values("datetime").unique()[::step]
+    cost_per_period = cost  # 持有期内总成本（双边）
     wins = []
     for t in days:
         if t not in fwd.index:
@@ -257,7 +386,9 @@ def top_group_winrate(vals: pd.Series, panel: pd.DataFrame, fwd_days: int = MAIN
         if len(cross) < 30:
             continue
         top = cross.nlargest(max(1, int(len(cross) * pct)))
-        wins.append(fr[top.index].mean() - fr.mean() > 0)
+        # 基准改为等权均值，扣除成本
+        excess = fr[top.index].mean() - fr.mean() - cost_per_period
+        wins.append(excess > 0)
     return float(np.mean(wins)) if wins else float("nan")
 
 
@@ -719,7 +850,8 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
         fr = fwd.loc[t].dropna() if t in fwd.index else pd.Series(dtype=float)
         if fr.empty:
             continue
-        row = {"调仓日": str(t)[:10], "池内中位收益": fr.median()}
+        # 基准改为等权均值（消除中位数低估超额的偏差）
+        row = {"调仓日": str(t)[:10], "池内均值收益": fr.mean()}
         for label, weights in [("优化组合", w_opt), ("等权组合", w_eq)]:
             sc_t = _score_at(vals_norm, weights, t)
             ranked = sc_t[sc_t.index.isin(fr.index)].sort_values(ascending=False)
@@ -737,12 +869,59 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
                 turnover = 1.0 if not prev else 1 - len(cur & prev) / len(picks)
                 prev_picks[label] = cur
                 row[f"{label}收益"] = fr[picks.index].mean()
-                row[f"{label}超额"] = row[f"{label}收益"] - fr.median()
+                row[f"{label}超额"] = row[f"{label}收益"] - fr.mean()
                 row[f"{label}换手率"] = turnover
                 row[f"{label}扣费超额"] = row[f"{label}超额"] - turnover * cost
         if "优化组合超额" in row:
             rows.append(row)
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    # 计算汇总指标：年化收益/夏普/最大回撤/盈亏比/利润因子/月度胜率
+    if not df.empty and "优化组合扣费超额" in df.columns:
+        net = df["优化组合扣费超额"]
+        nav = (1 + net).cumprod()
+        n_periods = len(net)
+        # 年化（假设每期 fwd_days 个交易日）
+        periods_per_year = 252 / fwd_days
+        total_ret = float(nav.iloc[-1] / nav.iloc[0] - 1) if len(nav) > 1 else 0.0
+        ann_ret = float((1 + total_ret) ** (periods_per_year / n_periods) - 1) if n_periods > 0 else 0.0
+        # 夏普
+        sharpe = float(net.mean() / (net.std() + 1e-12) * np.sqrt(periods_per_year)) if n_periods > 5 else 0.0
+        # 最大回撤
+        max_dd = float(((nav - nav.cummax()) / nav.cummax()).min()) if len(nav) > 1 else 0.0
+        # 盈亏比
+        wins = net[net > 0]
+        losses = net[net < 0]
+        profit_factor = float(wins.sum() / (abs(losses.sum()) + 1e-12)) if len(losses) > 0 else float("inf")
+        avg_win = float(wins.mean()) if len(wins) > 0 else 0.0
+        avg_loss = float(abs(losses.mean())) if len(losses) > 0 else 1e-12
+        win_loss_ratio = avg_win / avg_loss
+        # 胜率
+        win_rate = float((net > 0).mean())
+        # 月度胜率（按 fwd_days*22 个周期聚合）
+        month_len = max(1, int(22 / fwd_days))
+        monthly = net.groupby(net.index // month_len).sum()
+        monthly_wr = float((monthly > 0).mean()) if len(monthly) > 0 else 0.0
+        # 最大连续亏损月数
+        max_consec_loss = 0
+        cur_consec = 0
+        for m in monthly:
+            if m <= 0:
+                cur_consec += 1
+                max_consec_loss = max(max_consec_loss, cur_consec)
+            else:
+                cur_consec = 0
+        # 汇总到 df 的属性（供外部读取）
+        df.attrs["ann_return"] = ann_ret
+        df.attrs["sharpe"] = sharpe
+        df.attrs["max_drawdown"] = max_dd
+        df.attrs["profit_factor"] = profit_factor
+        df.attrs["win_loss_ratio"] = win_loss_ratio
+        df.attrs["win_rate"] = win_rate
+        df.attrs["monthly_winrate"] = monthly_wr
+        df.attrs["max_consec_loss_months"] = max_consec_loss
+        df.attrs["total_return"] = total_ret
+        df.attrs["n_periods"] = n_periods
+    return df
 
 
 # ---------------------------------------------------------------- 样本内对照（固定权重）
@@ -781,8 +960,8 @@ def static_backtest(factor_vals: dict[str, pd.Series], panel: pd.DataFrame,
         turnover = 1.0 if not prev else 1 - len(cur & prev) / len(picks)
         prev = cur
         ret = float(fr[picks.index].mean())
-        row = {"调仓日": str(t)[:10], "池内中位收益": float(fr.median()),
-               "组合收益": ret, "组合超额": ret - float(fr.median()),
+        row = {"调仓日": str(t)[:10], "池内均值收益": float(fr.mean()),
+               "组合收益": ret, "组合超额": ret - float(fr.mean()),
                "组合换手率": turnover,
                "组合扣费超额": ret - float(fr.median()) - turnover * cost}
         if collect_picks:

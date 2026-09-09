@@ -334,7 +334,8 @@ def expected_eval_dates(trade_date: str, source: str | None = None) -> dict:
 
 
 # ---------------------------------------------------------------- 模拟交易（买入价→卖出价→平仓→盈亏）
-DEFAULT_RULES = {"take_profit": 0.15, "stop_loss": -0.08, "hold_days": 20, "cost": 0.0025}
+DEFAULT_RULES = {"take_profit": 0.15, "stop_loss": -0.08, "hold_days": 20, "cost": 0.0025,
+                  "atr_period": 14, "atr_tp_multiplier": 2.5, "use_atr_tp": True}
 # 规则：信号日次日开盘价买入；盘中先触止损按止损价、先触止盈按止盈价（同日双触按保守止损）；
 # 到期未触发则第 N 日收盘卖出。成本按往返 0.25% 计。
 
@@ -393,7 +394,23 @@ def simulate_trade(code: str, signal_date: str, rules: dict | None = None,
     if s.empty:
         return None
     entry_price = entry_price_override or float(s.iloc[0]["$open"])
-    tp_price = entry_price * (1 + r["take_profit"])
+
+    # 动态止盈：基于 ATR（真实波幅）计算止盈目标
+    if r.get("use_atr_tp", False) and len(s) >= r.get("atr_period", 14):
+        atr_period = r.get("atr_period", 14)
+        # 计算 ATR：True Range 的移动平均
+        tr = pd.concat([
+            s["$high"] - s["$low"],
+            (s["$high"] - s["$close"].shift(1)).abs(),
+            (s["$low"] - s["$close"].shift(1)).abs()
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(atr_period).mean().iloc[-1]
+        # 动态止盈 = 入场价 + ATR × 倍数
+        atr_tp = float(atr) * r.get("atr_tp_multiplier", 2.5) / entry_price
+        tp_price = entry_price * (1 + max(r["take_profit"], atr_tp))
+    else:
+        tp_price = entry_price * (1 + r["take_profit"])
+
     sl_price = entry_price * (1 + r["stop_loss"])
 
     exit_date, exit_price, reason = None, None, None

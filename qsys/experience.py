@@ -75,7 +75,8 @@ CREATE TABLE IF NOT EXISTS outcomes (
 
 
 def _conn():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=30)
+    c.execute("PRAGMA busy_timeout=30000")  # 写冲突时等待30秒，避免 database is locked
     c.executescript(_SCHEMA)
     c.executescript(_TRADES_SCHEMA)
     c.executescript(_POSITIONS_SCHEMA)

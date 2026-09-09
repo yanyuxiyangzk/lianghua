@@ -116,7 +116,7 @@ def _best_pack(packs: dict) -> str:
     actual_stats = {}
     try:
         db_path = Path("/data/experience.db")
-        with sqlite3.connect(str(db_path)) as c:
+        with sqlite3.connect(str(db_path), timeout=30) as c:
             rows = c.execute('''
                 SELECT p.pack_name, 
                        SUM(CASE WHEN t.pnl_pct > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as winrate,
@@ -187,7 +187,7 @@ def _top_packs(packs: dict, top_n: int = 3) -> list[tuple[str, dict]]:
     actual_stats = {}
     try:
         db_path = Path("/data/experience.db")
-        with sqlite3.connect(str(db_path)) as c:
+        with sqlite3.connect(str(db_path), timeout=30) as c:
             rows = c.execute('''
                 SELECT p.pack_name, 
                        SUM(CASE WHEN t.pnl_pct > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as winrate,
@@ -395,7 +395,7 @@ def auto_select_factors(pool_name: str = "沪深300", top_n: int = 10,
         edb = Path("/data/experience.db")
         if not edb.exists():
             raise FileNotFoundError(f"经验库不存在: {edb}")
-        with sqlite3.connect(str(edb)) as conn:
+        with sqlite3.connect(str(edb), timeout=30) as conn:
             rows = conn.execute("""
                 SELECT p.factors, t.code, t.pnl_pct, p.trade_date
                 FROM picks p
@@ -1377,7 +1377,7 @@ def job_ifind_realtime_sync(**_ignored) -> str:
                 from pathlib import Path
                 db_path = datasource.MKT_DB
                 if db_path.exists():
-                    with sqlite3.connect(str(db_path)) as c:
+                    with sqlite3.connect(str(db_path), timeout=30) as c:
                         placeholders = ",".join(["?" for _ in watched])
                         rows = c.execute(
                             f"SELECT code, price FROM ifind_realtime WHERE code IN ({placeholders})",
@@ -1563,7 +1563,7 @@ def _get_top_factors_for_pack(pool_name: str, top_n: int = 15) -> list[dict]:
     
     try:
         db_path = Path("/data/market.db")
-        with sqlite3.connect(str(db_path)) as c:
+        with sqlite3.connect(str(db_path), timeout=30) as c:
             # 从factor_scorecards取最新评分（优先builtin因子，避免evolved因子的兼容性问题）
             rows = c.execute('''
                 SELECT name, kind, ic_mean, icir, ic_winrate, top_winrate, direction

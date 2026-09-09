@@ -251,7 +251,7 @@ def scan(dry_run: bool = False) -> dict:
     used_picks = set()
     try:
         edb = Path(DATA_DIR) / "experience.db"
-        with sqlite3.connect(str(edb)) as c2:
+        with sqlite3.connect(str(edb), timeout=30) as c2:
             pick_factors = c2.execute("""
                 SELECT DISTINCT json_extract(value, '$.name')
                 FROM pick_items pi JOIN picks p ON pi.pick_id = p.id

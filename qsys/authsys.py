@@ -91,7 +91,7 @@ CREATE TABLE IF NOT EXISTS sys_role_menu (
 
 
 def _conn() -> sqlite3.Connection:
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=30)
     c.row_factory = sqlite3.Row
     c.executescript(_SCHEMA)
     _seed(c)

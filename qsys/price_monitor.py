@@ -260,7 +260,7 @@ class PriceMonitor:
             return 0
 
         try:
-            with sqlite3.connect(str(db_path)) as c:
+            with sqlite3.connect(str(db_path), timeout=30) as c:
                 opens = pd.read_sql(
                     "SELECT id, code, buy_price, shares, buy_date FROM positions WHERE status='open'",
                     c

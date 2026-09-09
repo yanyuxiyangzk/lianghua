@@ -82,8 +82,9 @@ def set_loop_source(source: str):
 
 # ---------------------------------------------------------------- market.db（来源标识）
 def _conn():
-    c = sqlite3.connect(MKT_DB)
+    c = sqlite3.connect(MKT_DB, timeout=30)
     c.execute("PRAGMA journal_mode=WAL")  # 并发读写更稳（后台采集线程 + 页面读取）
+    c.execute("PRAGMA busy_timeout=30000")  # 写冲突时等待30秒，避免 database is locked
     c.executescript("""
     CREATE TABLE IF NOT EXISTS market_daily(
         source TEXT NOT NULL, code TEXT NOT NULL, date TEXT NOT NULL,

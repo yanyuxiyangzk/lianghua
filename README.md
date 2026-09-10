@@ -915,6 +915,112 @@ T 之后（120/250 个交易日）样本外 IC 的关系（n=63~69）：
 
 ---
 
+##   调度任务清单
+
+系统已启用所有自动化任务，实现全流程自动化运行。
+
+### 数据采集任务
+
+| 任务 | 触发方式 | 频率 | 说明 |
+|------|---------|------|------|
+| `update_data` | cron | 17:35 | 每日数据更新（qlib社区数据） |
+| `ifind_daily_sync` | cron | 15:40 | iFinD日线入库（盘后） |
+| `ifind_calendar` | cron | 8:30 | iFinD交易日历入库 |
+| `ifind_announce` | cron | 16:30 | iFinD公告抓取入库 |
+| `ifind_stocklist_sync` | cron | 9:00 | iFinD A股列表同步 |
+| `ifind_indexlist_sync` | cron | 9:05 | iFinD指数列表同步 |
+| `ifind_cleanup` | cron | 16:00 | iFinD过期数据清理 |
+| `fundflow_sync` | cron | 17:45 | 个股资金流入库（盘后） |
+| `lhb_sync` | cron | 17:50 | 龙虎榜入库（盘后） |
+
+### 盘中实时采集
+
+| 任务 | 触发方式 | 频率 | 说明 |
+|------|---------|------|------|
+| `quote_collect` | interval | 30秒 | 行情快照采集（沪深300） |
+| `sector_flow_collect` | interval | 30秒 | 板块资金流采集 |
+| `tick_sync` | interval | 10秒 | Tick数据同步 |
+| `realtime_kline` | interval | 10秒 | 实时日K线聚合 |
+| `minute_sync` | interval | 5分钟 | 分钟线同步 |
+| `position_track` | interval | 5分钟 | 持仓跟踪（盘中开平仓） |
+| `ifind_realtime_sync` | interval | 5分钟 | iFinD实时快照同步 |
+| `auction_confirm` | cron | 9:26 | 竞价确认（对最新名单） |
+
+### 因子挖掘与评估
+
+| 任务 | 触发方式 | 频率 | 说明 |
+|------|---------|------|------|
+| `loopengine` | interval | 5分钟 | LoopEngine演化引擎（7种类型轮动） |
+| `multitype_mine` | cron | 1:00 | 多类型因子挖掘（批量） |
+| `event_mine` | cron | 22:30 | 事件定向挖因子（涨停等） |
+| `gate_check` | cron | 18:00 | 硬闸门筛查（因子库） |
+| `le_factor_eval` | cron | 21:30 | 因子滚动体检（批量1000） |
+| `le_factor_eval_noon` | cron | 12:30 | 因子体检（午间，批量500） |
+| `le_factor_eval_pm` | cron | 18:00 | 因子体检（盘后，批量500） |
+| `factor_lifecycle` | cron | 周日2:00 | 因子三层退役扫描（每周） |
+
+### 策略生成与验证
+
+| 任务 | 触发方式 | 频率 | 说明 |
+|------|---------|------|------|
+| `top5_composite` | cron | 18:20 | Top5复合因子（每日合成） |
+| `strategy_gen` | cron | 18:30 | 策略包自动生成 |
+| `strategy_revalidate` | cron | 周日3:00 | 策略包重验（每周） |
+
+### 选股与回填
+
+| 任务 | 触发方式 | 频率 | 说明 |
+|------|---------|------|------|
+| `pool_scan` | cron | 19:00 | 板块/股票池扫描（Top-N） |
+| `auto_scan` | cron | 19:30 | 自动选股（因子价值评分） |
+| `watchlist_signals` | cron | 18:30 | 个股信号（自选股×进化因子） |
+| `trade_simulate` | cron | 20:05 | 模拟交易回填（每日） |
+| `outcome_backfill` | cron | 18:45 | 战果回填（经验库） |
+
+### 任务执行流程
+
+```
+盘前 (8:30-9:30)
+├── 8:30  ifind_calendar（交易日历）
+├── 9:00  ifind_stocklist_sync（A股列表）
+├── 9:05  ifind_indexlist_sync（指数列表）
+└── 9:26  auction_confirm（竞价确认）
+
+盘中 (9:30-15:00)
+├── 每10秒  tick_sync, realtime_kline
+├── 每30秒  quote_collect, sector_flow_collect
+├── 每5分钟  minute_sync, position_track, ifind_realtime_sync
+└── 12:30   le_factor_eval_noon（午间体检）
+
+盘后 (15:00-21:30)
+├── 15:40  ifind_daily_sync（日线入库）
+├── 16:00  ifind_cleanup（数据清理）
+├── 16:30  ifind_announce（公告入库）
+├── 17:35  update_data（数据更新）
+├── 17:45  fundflow_sync（资金流入库）
+├── 17:50  lhb_sync（龙虎榜入库）
+├── 18:00  gate_check, le_factor_eval_pm
+├── 18:20  top5_composite（Top5合成）
+├── 18:30  strategy_gen, watchlist_signals
+├── 18:45  outcome_backfill（战果回填）
+├── 19:00  pool_scan（股票池扫描）
+├── 19:30  auto_scan（自动选股）
+├── 20:05  trade_simulate（模拟交易）
+└── 21:30  le_factor_eval（因子体检）
+
+夜间 (22:00-次日8:00)
+├── 1:00   multitype_mine（多类型挖掘）
+├── 2:00   factor_lifecycle（因子退役，每周日）
+├── 3:00   strategy_revalidate（策略重验，每周日）
+└── 5分钟间隔  loopengine（演化引擎，持续运行）
+
+每周任务
+├── 周日 2:00  factor_lifecycle（因子退役扫描）
+└── 周日 3:00  strategy_revalidate（策略包重验）
+```
+
+---
+
 ##   常见问题
 
 ### Q: 如何查看因子演化日志？

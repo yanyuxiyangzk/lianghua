@@ -74,12 +74,31 @@ CREATE TABLE IF NOT EXISTS outcomes (
 """
 
 
+_DAILY_REPORTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS daily_reports (
+    date TEXT PRIMARY KEY,
+    content TEXT,
+    account_json TEXT,
+    positions_json TEXT,
+    fills_json TEXT,
+    factors_json TEXT,
+    strategies_json TEXT,
+    market_json TEXT,
+    stats_json TEXT,
+    pnl_today REAL,
+    pnl_total REAL,
+    generated_at TEXT
+);
+"""
+
+
 def _conn():
     c = sqlite3.connect(DB_PATH, timeout=30)
     c.execute("PRAGMA busy_timeout=30000")  # 写冲突时等待30秒，避免 database is locked
     c.executescript(_SCHEMA)
     c.executescript(_TRADES_SCHEMA)
     c.executescript(_POSITIONS_SCHEMA)
+    c.executescript(_DAILY_REPORTS_SCHEMA)
     # 迁移：positions 增加限价字段（委托买入用，老库无此列则补上）
     pcols = [r[1] for r in c.execute("PRAGMA table_info(positions)")]
     if "limit_price" not in pcols:
@@ -866,3 +885,60 @@ def position_stats() -> dict:
     n, avg, total, wins = row
     return {"已平仓": n or 0, "胜率": (wins / n if n else None),
             "平均收益率": avg, "累计收益率": total, "当前持仓": n_open}
+
+
+# ---------------------------------------------------------------- 每日战报
+def save_daily_report(date: str, content: str, data: dict) -> None:
+    """保存每日战报到 DB。同日覆盖。"""
+    account = data.get("account", {})
+    pnl_today = account.get("今日盈亏", 0) or 0
+    pnl_total = account.get("持仓盈亏", 0) or 0
+    with _conn() as c:
+        c.execute("""
+            INSERT OR REPLACE INTO daily_reports
+            (date, content, account_json, positions_json, fills_json,
+             factors_json, strategies_json, market_json, stats_json,
+             pnl_today, pnl_total, generated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            date,
+            content,
+            json.dumps(account, ensure_ascii=False, default=str),
+            json.dumps(data.get("positions"), ensure_ascii=False, default=str) if hasattr(data.get("positions"), 'to_json') else json.dumps(data.get("positions"), ensure_ascii=False, default=str),
+            json.dumps(data.get("fills"), ensure_ascii=False, default=str) if hasattr(data.get("fills"), 'to_json') else json.dumps(data.get("fills"), ensure_ascii=False, default=str),
+            json.dumps(data.get("factors"), ensure_ascii=False, default=str) if hasattr(data.get("factors"), 'to_json') else json.dumps(data.get("factors"), ensure_ascii=False, default=str),
+            json.dumps(data.get("strategies"), ensure_ascii=False, default=str) if hasattr(data.get("strategies"), 'to_json') else json.dumps(data.get("strategies"), ensure_ascii=False, default=str),
+            json.dumps(data.get("indices"), ensure_ascii=False, default=str),
+            json.dumps(data.get("stats"), ensure_ascii=False, default=str),
+            pnl_today,
+            pnl_total,
+            datetime.now().isoformat(),
+        ))
+
+
+def get_daily_report(date: str) -> dict | None:
+    """读取指定日期的战报。"""
+    with _conn() as c:
+        row = c.execute("SELECT * FROM daily_reports WHERE date=?", (date,)).fetchone()
+    if not row:
+        return None
+    cols = ["date", "content", "account_json", "positions_json", "fills_json",
+            "factors_json", "strategies_json", "market_json", "stats_json",
+            "pnl_today", "pnl_total", "generated_at"]
+    d = dict(zip(cols, row))
+    for k in ["account_json", "positions_json", "fills_json", "factors_json",
+              "strategies_json", "market_json", "stats_json"]:
+        if d.get(k):
+            try:
+                d[k] = json.loads(d[k])
+            except Exception:
+                pass
+    return d
+
+
+def list_daily_reports(limit: int = 30) -> pd.DataFrame:
+    """列出最近 N 天的战报摘要。"""
+    with _conn() as c:
+        return pd.read_sql(
+            "SELECT date, pnl_today, pnl_total, generated_at FROM daily_reports ORDER BY date DESC LIMIT ?",
+            c, params=(limit,))

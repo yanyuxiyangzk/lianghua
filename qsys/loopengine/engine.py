@@ -19,6 +19,7 @@ import datasource
 from event_bus import EventType, bus
 from loopengine import genetics, review
 from loopengine.tree import all_fields, build_field_frames, emit_code, evaluate_tree, parse
+from loopengine.regime import detect_regime, get_regime_factor_weight, detect_regime_from_reports
 
 log = logging.getLogger("loopengine")
 
@@ -76,29 +77,36 @@ class LoopEngine:
         return panel, build_field_frames(panel, extra), codes, end
 
     # ---------------- 生成 ----------------
-    def _gen_candidate(self, rng, gaps, proven, live_boost, factor_type: str = "量价"):
+    def _gen_candidate(self, rng, gaps, proven, live_boost, factor_type: str = "量价",
+                       regime: str | None = None):
         src = self.state["budget"].choose(rng)
         fw = self.state["field_weights"].w
         if src == "llm":
             tree = self._llm_generate(rng, gaps, proven, factor_type) or genetics.random_tree(rng, 4, fw)
         elif src == "mutate":
-            parent = self._pick_parent(rng, live_boost, factor_type)
+            parent = self._pick_parent(rng, live_boost, factor_type, regime)
             tree = genetics.mutate(parent, rng, fw) if parent else genetics.random_tree(rng, 4, fw)
         elif src == "crossover":
-            p1 = self._pick_parent(rng, live_boost, factor_type)
-            p2 = self._pick_parent(rng, live_boost, factor_type)
+            p1 = self._pick_parent(rng, live_boost, factor_type, regime)
+            p2 = self._pick_parent(rng, live_boost, factor_type, regime)
             tree = genetics.crossover(p1, p2, rng) if p1 and p2 else genetics.random_tree(rng, 4, fw)
         elif src == "perturb":
-            parent = self._pick_parent(rng, live_boost, factor_type)
+            parent = self._pick_parent(rng, live_boost, factor_type, regime)
             tree = genetics.perturb(parent, rng, self.state["momentum"]) if parent else genetics.random_tree(rng, 4, fw)
         else:
             tree = genetics.random_tree(rng, 4, fw)
         return src, tree
 
-    def _pick_parent(self, rng, live_boost: dict | None = None, factor_type: str = "量价"):
+    def _pick_parent(self, rng, live_boost: dict | None = None, factor_type: str = "量价",
+                     regime: str | None = None):
         """从已通过硬闸门的 loopengine 因子中选取父本。
-        live_boost 非空时按族实战胜率加权；factor_type 过滤同类型因子。
-        优先按因子价值评分加权选择；同时考虑多样性评分和衰减状态。"""
+
+        升级版选择策略：
+        1. 精英保留：Top3 因子直接保留，确保优质基因传递
+        2. 锦标赛选择：随机选k个，取最优，平衡探索与利用
+        3. 小生境机制：同骨架最多选2个，保持多样性
+        4. regime加权：当前市场环境下有效的因子获得更高权重
+        """
         # 获取因子价值评分
         value_scores = {}
         try:
@@ -122,40 +130,111 @@ class LoopEngine:
         except Exception:
             pass
 
+        # 获取所有通过门控的因子
         with library._lconn() as c:
             rows = c.execute(
                 "SELECT code, family, name FROM factor_registry WHERE engine='loopengine'"
-                " AND gate_status=1 AND (factor_type=? OR factor_type IS NULL)"
-                " ORDER BY RANDOM() LIMIT 12", (factor_type,)).fetchall()
+                " AND gate_status=1 AND (factor_type=? OR factor_type IS NULL)",
+                (factor_type,)).fetchall()
         if not rows:
             # 回退到任意类型
             with library._lconn() as c:
                 rows = c.execute(
                     "SELECT code, family, name FROM factor_registry WHERE engine='loopengine'"
-                    " AND gate_status=1 ORDER BY RANDOM() LIMIT 12").fetchall()
+                    " AND gate_status=1").fetchall()
         if not rows:
             return None
-        
-        # 计算权重
+
+        # 计算适应度分数
         from loopengine.decay import adjust_factor_weight
-        w = []
+        from loopengine.review import skeleton_of
+
+        candidates = []
         for r in rows:
-            base = 1.0
+            score = 1.0
             # 族实战加权
             if live_boost:
-                base += live_boost.get(r[1] or "", 0.0)
-            # 因子价值加权（0~1 → 0~1.5倍额外权重）
+                score += live_boost.get(r[1] or "", 0.0)
+            # 因子价值加权
             if value_scores:
-                base += value_scores.get(r[2], 0.3) * 1.5
+                score += value_scores.get(r[2], 0.3) * 1.5
 
-            # 衰减状态调整权重（重度衰减软惩罚至 0.2，见 decay.adjust_factor_weight）
+            # 衰减状态调整
             decay_weight = 1.0
             if r[2] in decay_status:
                 decay_weight = adjust_factor_weight(r[2], decay_status[r[2]]['status'])
 
-            w.append(max(0.1, base) * decay_weight)
-        
-        row = rng.choices(rows, weights=w, k=1)[0]
+            # regime 加权
+            regime_weight = 1.0
+            if regime:
+                regime_weight = get_regime_factor_weight(regime, r[2])
+
+            final_score = max(0.1, score) * decay_weight * regime_weight
+
+            # 提取骨架用于小生境
+            try:
+                first = r[0].split("\n", 1)[0] if r[0] else ""
+                if first.startswith("# sexpr: "):
+                    tree = parse(first[len("# sexpr: "):], factor_type)
+                    sk = skeleton_of(tree)
+                else:
+                    sk = "unknown"
+            except Exception:
+                sk = "unknown"
+
+            candidates.append({
+                "row": r,
+                "score": final_score,
+                "skeleton": sk,
+            })
+
+        # 按适应度排序
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+
+        # 精英保留：Top3 直接保留
+        elite_n = min(3, len(candidates))
+        elites = candidates[:elite_n]
+
+        # 锦标赛选择（带小生境）
+        tournament_k = 3
+        max_per_skeleton = 2  # 同骨架最多选2个
+        skeleton_count = {}
+
+        # 从非精英中选择
+        pool = candidates[elite_n:]
+        selected = []
+
+        for _ in range(min(9, len(pool))):  # 最多再选9个，总共12个候选
+            if not pool:
+                break
+
+            # 锦标赛：随机选k个
+            k = min(tournament_k, len(pool))
+            contestants = rng.sample(pool, k)
+            winner = max(contestants, key=lambda x: x["score"])
+
+            # 小生境检查：同骨架最多max_per_skeleton个
+            sk = winner["skeleton"]
+            if skeleton_count.get(sk, 0) >= max_per_skeleton:
+                # 跳过，从池中移除并重试
+                pool = [c for c in pool if c["row"] != winner["row"]]
+                continue
+
+            selected.append(winner)
+            skeleton_count[sk] = skeleton_count.get(sk, 0) + 1
+            pool = [c for c in pool if c["row"] != winner["row"]]
+
+        # 合并精英和锦标赛选择的结果
+        all_selected = elites + selected
+
+        if not all_selected:
+            return None
+
+        # 从选中的候选中按适应度加权选择
+        weights = [c["score"] for c in all_selected]
+        chosen = rng.choices(all_selected, weights=weights, k=1)[0]
+
+        row = chosen["row"]
         if not row[0]:
             return None
         first = row[0].split("\n", 1)[0]
@@ -223,6 +302,20 @@ class LoopEngine:
                     "passed": 0, "dup": 0, "frozen": 0,
                     "new": [], "gaps": [], "proven": [], "budget": {}, "skip_reason": f"{factor_type}数据源为空"}
 
+        # Step 1.5: 市场环境识别（regime detection）
+        bus.push(EventType.STEP_UPDATE, step=1, name="市场环境识别", status="running")
+        try:
+            regime_info = detect_regime(codes=codes, end=end)
+            regime = regime_info["regime"]
+            bus.push(EventType.STEP_UPDATE, step=1, name="市场环境识别", status="done",
+                     regime=regime, confidence=regime_info["confidence"],
+                     details=regime_info["details"])
+        except Exception as e:
+            log.warning(f"市场环境识别失败: {e}")
+            regime = "sideways"
+            regime_info = {"regime": "sideways", "confidence": 0.3, "details": {}, "regime_weights": {}}
+            bus.push(EventType.STEP_UPDATE, step=1, name="市场环境识别", status="error", error=str(e))
+
         # Step 2: 机制族引导
         bus.push(EventType.STEP_UPDATE, step=2, name="机制族引导", status="running")
         registry = library.get_factor_registry()
@@ -256,7 +349,7 @@ class LoopEngine:
         llm_review_budget = 10
         for _ in range(batch):
             # Step 4: 生成候选
-            src, tree = self._gen_candidate(rng, gaps, proven, live_boost, factor_type)
+            src, tree = self._gen_candidate(rng, gaps, proven, live_boost, factor_type, regime)
             bus.push(EventType.STEP_UPDATE, step=4, name="生成候选", status="done",
                      source=src, batch_left=batch - _)
 
@@ -500,9 +593,60 @@ class LoopEngine:
                 logger.debug(f"OOS胜率不足: {oos_wr:.1%} < 50%")
                 return None
             
-            # 构建策略包
-            selected = list(factor_vals.keys())[:5]  # 最多5个因子
-            weights = {n: (1.0 / len(selected), 1) for n in selected}
+            # 相关性控制：剔除高相关因子
+            selected = list(factor_vals.keys())[:8]  # 最多8个候选
+            if len(selected) > 3:
+                # 计算因子值相关性矩阵
+                import pandas as pd
+                factor_df = pd.DataFrame({k: v for k, v in factor_vals.items() if k in selected})
+                if not factor_df.empty and factor_df.shape[1] > 3:
+                    corr_matrix = factor_df.corr().abs()
+                    # 贪心选择：按ICIR降序，剔除相关系数>0.7的因子
+                    # 获取ICIR用于排序
+                    icir_map = {}
+                    for name in selected:
+                        try:
+                            with library._lconn() as c:
+                                row = c.execute(
+                                    "SELECT icir FROM factor_scorecards WHERE name=? "
+                                    "ORDER BY eval_date DESC LIMIT 1", (name,)).fetchone()
+                                icir_map[name] = abs(row[0]) if row else 0.5
+                        except Exception:
+                            icir_map[name] = 0.5
+                    
+                    # 按ICIR降序排序
+                    selected.sort(key=lambda x: icir_map.get(x, 0), reverse=True)
+                    
+                    # 贪心选择，剔除高相关
+                    filtered = [selected[0]]
+                    for name in selected[1:]:
+                        if all(corr_matrix.loc[name, s] < 0.7 for s in filtered):
+                            filtered.append(name)
+                        if len(filtered) >= 5:
+                            break
+                    selected = filtered
+            
+            # ICIR加权（而非等权）
+            icir_weights = {}
+            total_icir = 0
+            for name in selected:
+                try:
+                    with library._lconn() as c:
+                        row = c.execute(
+                            "SELECT icir FROM factor_scorecards WHERE name=? "
+                            "ORDER BY eval_date DESC LIMIT 1", (name,)).fetchone()
+                        icir = abs(row[0]) if row else 0.5
+                        icir_weights[name] = icir
+                        total_icir += icir
+                except Exception:
+                    icir_weights[name] = 0.5
+                    total_icir += 0.5
+            
+            # 归一化权重
+            if total_icir > 0:
+                weights = {n: (icir_weights[n] / total_icir, 1) for n in selected}
+            else:
+                weights = {n: (1.0 / len(selected), 1) for n in selected}
             # kind 映射
             kind_map = {"内置": "builtin", "技术指标": "tech", "loopengine": "evolved"}
             factor_kind = {n: kind_map.get(factor_info.get(n, {}).get("kind", ""), "builtin") for n in selected}

@@ -28,6 +28,25 @@ GATE = {
     "LOOKBACK_DAYS": 600,   # 近600个交易日
 }
 
+# 类型特定门控阈值：不同因子类型使用不同的IC阈值
+# 基于历史数据：板块轮动ICIR最高(0.33)，资金流次之(0.23)，龙虎榜/爆量最低(0.08-0.13)
+TYPE_SPECIFIC_GATES = {
+    "量价": {"IC_MIN": 0.02, "SHARPE_MIN": 0.5},           # 标准
+    "资金流": {"IC_MIN": 0.025, "SHARPE_MIN": 0.5},        # 稍高（质量好）
+    "板块轮动": {"IC_MIN": 0.03, "SHARPE_MIN": 0.6},       # 最高（质量最好）
+    "指数": {"IC_MIN": 0.015, "SHARPE_MIN": 0.4},          # 降低（数据稀缺）
+    "盘口异动": {"IC_MIN": 0.02, "SHARPE_MIN": 0.5},       # 标准
+    "龙虎榜": {"IC_MIN": 0.015, "SHARPE_MIN": 0.4},        # 降低（质量差）
+    "爆量抢筹": {"IC_MIN": 0.015, "SHARPE_MIN": 0.4},      # 降低（质量差）
+}
+
+
+def get_factor_gates(factor_type: str | None = None) -> dict:
+    """获取因子类型的门控阈值。"""
+    if factor_type and factor_type in TYPE_SPECIFIC_GATES:
+        return {**GATE, **TYPE_SPECIFIC_GATES[factor_type]}
+    return GATE.copy()
+
 
 def _daily_excess(vals: pd.Series, fwd: pd.DataFrame) -> pd.Series:
     """逐日超额序列：因子 Top10% 组合 forward 收益 − 池均值 − 双边成本摊薄。"""
@@ -147,6 +166,146 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
             reasons.append(f"OOS IC胜率 {oos_ic_wr:.1%} < 50%")
 
     return {"pass": len(reasons) == 0, "reasons": reasons, "metrics": metrics}
+
+
+def adaptive_gate_thresholds(factor_pool: list[dict] | None = None) -> dict:
+    """自适应门控阈值：根据因子池质量动态调整。
+
+    Args:
+        factor_pool: 因子池列表，每个因子包含 name, ic_mean, gate_status 等
+
+    Returns:
+        自适应后的阈值字典
+    """
+    # 默认阈值
+    adaptive = GATE.copy()
+
+    if not factor_pool or len(factor_pool) < 20:
+        # 样本不足，使用默认阈值
+        return adaptive
+
+    # 计算因子池质量指标
+    ic_values = [f.get("ic_mean", 0) for f in factor_pool if f.get("gate_status") == 1]
+    if not ic_values:
+        return adaptive
+
+    avg_ic = np.mean(ic_values)
+    ic_std = np.std(ic_values) if len(ic_values) > 1 else 0.01
+
+    # 自适应调整规则
+    # 1. 如果因子池质量高（平均IC高），提高门槛
+    # 2. 如果因子池质量低，降低门槛
+    # 3. 如果因子池方差大，收紧门槛
+
+    if avg_ic > 0.03:
+        # 高质量池子，提高门槛
+        adaptive["IC_MIN"] = min(0.04, avg_ic * 0.8)
+        adaptive["SHARPE_MIN"] = min(0.7, GATE["SHARPE_MIN"] * 1.2)
+    elif avg_ic < 0.015:
+        # 低质量池子，降低门槛
+        adaptive["IC_MIN"] = max(0.01, avg_ic * 0.7)
+        adaptive["SHARPE_MIN"] = max(0.3, GATE["SHARPE_MIN"] * 0.8)
+
+    # 如果方差大，收紧相关性门槛（避免高相关因子堆积）
+    if ic_std > 0.02:
+        adaptive["CORR_MAX"] = max(0.60, GATE["CORR_MAX"] - 0.05)
+
+    return adaptive
+
+
+def analyze_failure_patterns() -> dict:
+    """分析失败模式，提供生成指导。
+
+    Returns:
+        {
+            "common_failures": list,  # 常见失败原因
+            "avoid_patterns": list,   # 应避免的模式
+            "suggestions": list,      # 改进建议
+        }
+    """
+    import sqlite3
+    from pathlib import Path
+
+    db_path = Path("/data/market.db")
+    if not db_path.exists():
+        return {"common_failures": [], "avoid_patterns": [], "suggestions": []}
+
+    try:
+        with sqlite3.connect(str(db_path), timeout=30) as conn:
+            conn.execute("PRAGMA busy_timeout=30000")
+
+            # 确保表存在
+            conn.execute("""CREATE TABLE IF NOT EXISTS failure_patterns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                factor_name TEXT, skeleton TEXT, family TEXT,
+                reason TEXT, engine TEXT, created_at TEXT
+            )""")
+
+            # 查询失败记录
+            rows = conn.execute(
+                "SELECT reason, COUNT(*) as cnt FROM failure_patterns "
+                "GROUP BY reason ORDER BY cnt DESC LIMIT 10"
+            ).fetchall()
+
+            common_failures = [{"reason": r[0], "count": r[1]} for r in rows]
+
+            # 分析常见失败原因
+            avoid_patterns = []
+            suggestions = []
+
+            for f in common_failures:
+                reason = f["reason"]
+                if "过拟合" in reason or "gap" in reason.lower():
+                    avoid_patterns.append("IS/OOS差异过大的结构")
+                    suggestions.append("增加正则化，限制表达式复杂度")
+                elif "样本不足" in reason or "insufficient" in reason.lower():
+                    avoid_patterns.append("小样本因子")
+                    suggestions.append("优先生成有足够数据支撑的因子")
+                elif "相关性" in reason or "corr" in reason.lower():
+                    avoid_patterns.append("高相关因子")
+                    suggestions.append("增加多样性压力，避免相似结构")
+                elif "衰减" in reason or "decay" in reason.lower():
+                    avoid_patterns.append("易衰减结构")
+                    suggestions.append("关注因子稳定性，避免过度拟合特定市场环境")
+
+            return {
+                "common_failures": common_failures,
+                "avoid_patterns": avoid_patterns,
+                "suggestions": suggestions,
+            }
+
+    except Exception as e:
+        return {"common_failures": [], "avoid_patterns": [], "suggestions": [str(e)]}
+
+
+def record_gate_failure(factor_name: str, reasons: list[str], metrics: dict):
+    """记录门控失败信息，用于失败模式学习。"""
+    import sqlite3
+    from pathlib import Path
+
+    db_path = Path("/data/market.db")
+    if not db_path.exists():
+        return
+
+    try:
+        with sqlite3.connect(str(db_path), timeout=30) as conn:
+            conn.execute("PRAGMA busy_timeout=30000")
+
+            # 确保表存在
+            conn.execute("""CREATE TABLE IF NOT EXISTS gate_failure_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                factor_name TEXT, reasons TEXT, metrics TEXT,
+                created_at TEXT
+            )""")
+
+            conn.execute(
+                "INSERT INTO gate_failure_log (factor_name, reasons, metrics, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (factor_name, json.dumps(reasons), json.dumps(metrics),
+                 datetime.now().isoformat())
+            )
+    except Exception:
+        pass
 
 
 def log_gate_detail(factor_name: str, gate_date: str, result: dict, pool_name: str = "沪深300"):

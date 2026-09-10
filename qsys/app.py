@@ -49,6 +49,7 @@ pages = {
         st.Page("views/p_dash.py", title="量化驾驶舱", icon="🚀", url_path="dash"),
         st.Page("views/p_desk.py", title="今日执行", icon="🎯", url_path="today"),
         st.Page("views/p_broker.py", title="资金账号", icon="💹", url_path="broker"),
+        st.Page("views/p_daily_report.py", title="每日战报", icon="📊", url_path="daily-report"),
     ],
     "市场数据": [
         st.Page("views/p_quotes.py", title="股票行情", icon="📈", url_path="quotes"),

@@ -52,7 +52,7 @@ def build_sector_frames(codes: list[str], end: str, lookback: int = 800) -> dict
         with _qconn() as c:
             flow_df = pd.read_sql(
                 """SELECT sector_name, DATE(ts) as date,
-                          SUM(net_inflow) as net_flow
+                          SUM(net_amt) as net_flow
                    FROM sector_inflow_snapshots
                    WHERE ts >= ? AND ts <= ?
                    GROUP BY sector_name, date
@@ -64,6 +64,8 @@ def build_sector_frames(codes: list[str], end: str, lookback: int = 800) -> dict
         return {}
     flow_df["date"] = pd.to_datetime(flow_df["date"])
     pivot_flow = flow_df.pivot_table(index="date", columns="sector_name", values="net_flow")
+    if pivot_flow.empty or pivot_flow.shape[1] < 3:
+        return {}
     frames = {}
     frames["sector_net_flow"] = pivot_flow
     frames["sector_momentum"] = pivot_flow.rolling(5, min_periods=2).mean()
@@ -168,8 +170,8 @@ def build_index_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
     import signals as sig
     from datasource import _qconn
 
-    # 主要宽基指数
-    idx_codes = ["000300.SH", "000905.SH", "000852.SH"]
+    # 主要宽基指数（qlib格式）
+    idx_codes = ["SH000300", "SZ000905", "SH000852"]
     start = (pd.Timestamp(end) - pd.Timedelta(days=int(lookback * 1.6))).strftime("%Y-%m-%d")
     try:
         # 获取指数面板
@@ -184,7 +186,7 @@ def build_index_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
     idx_unstacked = idx_panel.unstack("instrument")
     idx_ret = idx_unstacked["$close"].pct_change()
     # 用沪深300作为主基准
-    bench_ret = idx_ret.get("000300.SH")
+    bench_ret = idx_ret.get("SH000300")
     if bench_ret is None:
         return {}
     # 计算个股收益率

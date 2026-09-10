@@ -345,3 +345,70 @@ def run_decay_detection(codes: list[str], end: str,
              f"中度衰减 {stats['moderate']}, 重度衰减 {stats['severe']}")
     
     return stats
+
+
+def detect_factor_decay_regime_aware(factor_name: str, codes: list[str], end: str,
+                                     regime: str = "sideways") -> dict:
+    """Regime-aware 衰减检测：根据市场环境调整检测参数。
+
+    不同市场环境下，因子衰减的判断标准不同：
+    - 高波动期（bear/high_vol）：缩短检测窗口，更敏感
+    - 低波动期（bull/low_vol）：延长检测窗口，更稳定
+    - 转换期（transition）：使用标准窗口
+
+    Args:
+        factor_name: 因子名称
+        codes: 股票池代码
+        end: 截止日期
+        regime: 当前市场环境 (bull/bear/sideways/transition)
+
+    Returns:
+        dict: 衰减检测结果
+    """
+    # 根据 regime 调整窗口参数
+    regime_windows = {
+        "bull": {"short": 40, "long": 400},      # 牛市：因子衰减慢，延长窗口
+        "bear": {"short": 30, "long": 300},      # 熊市：因子衰减快，缩短窗口
+        "sideways": {"short": 60, "long": 500},  # 震荡：标准窗口
+        "transition": {"short": 45, "long": 450}, # 转换：中等窗口
+    }
+
+    windows = regime_windows.get(regime, regime_windows["sideways"])
+
+    return detect_factor_decay(
+        factor_name, codes, end,
+        lookback_short=windows["short"],
+        lookback_long=windows["long"]
+    )
+
+
+def adjust_weight_by_regime_and_decay(factor_name: str, decay_status: str,
+                                      regime: str = "sideways") -> float:
+    """根据 regime 和 decay 状态综合调整因子权重。
+
+    在不同市场环境下，衰减因子的惩罚力度不同：
+    - 熊市：衰减因子惩罚更重（市场变化快）
+    - 牛市：衰减因子惩罚更轻（可能只是暂时波动）
+    - 转换期：标准惩罚
+
+    Args:
+        factor_name: 因子名称
+        decay_status: 衰减状态
+        regime: 当前市场环境
+
+    Returns:
+        float: 综合调整后的权重系数
+    """
+    # 基础衰减权重
+    base_weight = adjust_factor_weight(factor_name, decay_status)
+
+    # regime 调整系数
+    regime_multipliers = {
+        "bull": 1.1,        # 牛市：轻微放宽（因子可能只是暂时波动）
+        "bear": 0.8,        # 熊市：收紧（市场变化快，衰减更可信）
+        "sideways": 1.0,    # 震荡：标准
+        "transition": 0.9,  # 转换：略收紧
+    }
+
+    multiplier = regime_multipliers.get(regime, 1.0)
+    return base_weight * multiplier

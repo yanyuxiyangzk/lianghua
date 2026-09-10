@@ -127,12 +127,123 @@ def perturb(tree, rng, momentum: dict):
     return t
 
 
+def mutate_operator(tree, rng, field_weights):
+    """算子变异：保持结构，改变算子类型。
+
+    例如：ma(close,20) → ema(close,20)
+         sub(x,y) → add(x,y)
+    """
+    t = _clone(tree)
+    node_paths = [(p, n) for p, n in _paths(t) if isinstance(n, Node)]
+
+    if not node_paths:
+        return random_tree(rng, 3, field_weights)
+
+    # 随机选择一个节点
+    path, node = rng.choice(node_paths)
+
+    # 找到兼容的算子（相同维度和arity）
+    current_op = node.op
+    compatible_ops = []
+    for op_name, (arity, windowed, kind) in OPS.items():
+        if op_name == current_op:
+            continue
+        if arity == node.arity:
+            # 检查维度兼容性
+            if kind == "rank" and node.dim() == "val":
+                continue
+            compatible_ops.append(op_name)
+
+    if not compatible_ops:
+        return t
+
+    # 选择一个兼容的算子
+    new_op = rng.choice(compatible_ops)
+    node.op = new_op
+
+    # 如果新算子需要窗口，而原算子没有，添加窗口
+    new_arity, new_windowed, new_kind = OPS[new_op]
+    if new_windowed and node.window is None:
+        node.window = _pick_window(rng)
+    elif not new_windowed:
+        node.window = None
+
+    return t
+
+
+def perturb_field(tree, rng, field_weights):
+    """字段扰动：切换到相近字段。
+
+    例如：close → open, volume → amount
+    """
+    t = _clone(tree)
+    leaf_paths = [(p, n) for p, n in _paths(t) if isinstance(n, Leaf)]
+
+    if not leaf_paths:
+        return t
+
+    # 随机选择一个叶子节点
+    path, leaf = rng.choice(leaf_paths)
+
+    # 定义相近字段组
+    related_fields = {
+        "close": ["open", "high", "low"],
+        "open": ["close", "high", "low"],
+        "high": ["close", "open", "low"],
+        "low": ["close", "open", "high"],
+        "volume": ["amount"],
+        "amount": ["volume"],
+    }
+
+    current_field = leaf.field
+    if current_field in related_fields:
+        new_field = rng.choice(related_fields[current_field])
+        leaf.field = new_field
+
+    return t
+
+
+def hill_climb(tree, rng, field_weights, fitness_fn, steps=5):
+    """局部搜索：对优质因子做邻域优化。
+
+    尝试小的扰动，如果适应度提升则保留。
+    """
+    best = tree
+    best_fitness = fitness_fn(tree)
+
+    for _ in range(steps):
+        # 随机选择一种扰动方式
+        perturbation_type = rng.choice(["window", "operator", "field"])
+
+        if perturbation_type == "window":
+            neighbor = perturb(best, rng, {})
+        elif perturbation_type == "operator":
+            neighbor = mutate_operator(best, rng, field_weights)
+        else:
+            neighbor = perturb_field(best, rng, field_weights)
+
+        # 检查维度一致性
+        if neighbor.dim() != tree.dim():
+            continue
+
+        neighbor_fitness = fitness_fn(neighbor)
+        if neighbor_fitness > best_fitness:
+            best = neighbor
+            best_fitness = neighbor_fitness
+
+    return best
+
+
 # ---------------------------------------------------------------- 自适应预算
 class Budget:
-    SOURCES = ["mutate", "crossover", "perturb", "random", "llm"]
+    SOURCES = ["mutate", "crossover", "perturb", "random", "llm", "mutate_op", "perturb_field"]
 
     def __init__(self):
-        self.p = {"mutate": 0.25, "crossover": 0.25, "perturb": 0.15, "random": 0.15, "llm": 0.20}
+        self.p = {
+            "mutate": 0.20, "crossover": 0.20, "perturb": 0.12,
+            "random": 0.12, "llm": 0.16,
+            "mutate_op": 0.10, "perturb_field": 0.10,
+        }
         self.history = deque(maxlen=50)
 
     def choose(self, rng) -> str:

@@ -85,6 +85,10 @@ def _conn():
     c = sqlite3.connect(MKT_DB, timeout=30)
     c.execute("PRAGMA journal_mode=WAL")  # 并发读写更稳（后台采集线程 + 页面读取）
     c.execute("PRAGMA busy_timeout=30000")  # 写冲突时等待30秒，避免 database is locked
+    c.execute("PRAGMA cache_size=-64000")  # 64MB 缓存（默认 2MB），提升查询性能
+    c.execute("PRAGMA synchronous=NORMAL")  # WAL 模式下 NORMAL 更快，兼顾安全
+    c.execute("PRAGMA temp_store=MEMORY")  # 临时表放内存，加速排序/聚合
+    c.execute("PRAGMA mmap_size=268435456")  # 256MB 内存映射，减少磁盘 I/O
     c.executescript("""
     CREATE TABLE IF NOT EXISTS market_daily(
         source TEXT NOT NULL, code TEXT NOT NULL, date TEXT NOT NULL,
@@ -96,6 +100,7 @@ def _conn():
     CREATE TABLE IF NOT EXISTS ifind_basic_daily(
         code TEXT NOT NULL, date TEXT NOT NULL, indicator TEXT NOT NULL,
         value REAL, fetched_at TEXT, PRIMARY KEY(code, date, indicator));
+    CREATE INDEX IF NOT EXISTS idx_basic_daily_date ON ifind_basic_daily(date);
     CREATE TABLE IF NOT EXISTS ifind_announcements(
         seq TEXT PRIMARY KEY, code TEXT, report_date TEXT, title TEXT,
         pdf_url TEXT, ctime TEXT, fetched_at TEXT);
@@ -126,10 +131,18 @@ def _conn():
         code TEXT NOT NULL, datetime TEXT NOT NULL,
         open REAL, high REAL, low REAL, close REAL, volume REAL, amount REAL,
         PRIMARY KEY(code, datetime));
+    CREATE INDEX IF NOT EXISTS idx_minute_dt ON ifind_minute(datetime);
     CREATE TABLE IF NOT EXISTS ifind_config(
         key TEXT PRIMARY KEY,
         value TEXT,
         updated_at TEXT);
+    CREATE TABLE IF NOT EXISTS tick_data(
+        code TEXT NOT NULL, datetime TEXT NOT NULL,
+        price REAL, volume INTEGER, amount REAL,
+        buyorsell INTEGER, source TEXT,
+        PRIMARY KEY(code, datetime));
+    CREATE INDEX IF NOT EXISTS idx_tick_data_date ON tick_data(datetime);
+    CREATE INDEX IF NOT EXISTS idx_tick_data_code ON tick_data(code);
     """)
     cols = [r[1] for r in c.execute("PRAGMA table_info(market_daily)")]
     if "outstanding_share" not in cols:
@@ -1406,9 +1419,10 @@ def fetch_indexlist_to_db() -> int:
 
 # ---------------------------------------------------------------- 分钟线落库（分时/分钟K 页面读库）
 def fetch_minute_to_db(code: str, day: str = "", interval: str = "1min") -> int:
-    """THS_HF 拉取 code 在 day（YYYY-MM-DD）的分钟线，双写入 ifind_minute（SQLite）+ minute_bars（DuckDB）。
+    """THS_HF 拉取 code 在 day（YYYY-MM-DD）的分钟线，写入 ifind_minute（SQLite）。
 
-    code 用库内格式（SH600519 / BJ920002）；day 缺省为今天。interval 支持 1min/5min/15min/30min/60min。
+    code 用库内格式（SH600519 / BJ920002）；day 缺省为今天。
+    仅 interval="1min" 时写入 SQLite；其他周期只拉取不入库（需从 1min resample）。
     """
     day = day or datetime.now().strftime("%Y-%m-%d")
     df, _res, err = ths_highfreq(_to_ths_code(code), "open,high,low,close,volume,amount",
@@ -1422,7 +1436,8 @@ def fetch_minute_to_db(code: str, day: str = "", interval: str = "1min") -> int:
         return 0
     d["datetime"] = pd.to_datetime(d[tcol]).dt.strftime("%Y-%m-%d %H:%M:%S")
     d["amount"] = d["amount"] if "amount" in d.columns else d["close"] * d["volume"]
-    # SQLite 写入（仅 1min 保持兼容）
+    d["code"] = code  # iFinD 单股查询返回无 code 列，手动补充
+    # 仅 1min 写入 SQLite（ifind_minute 表无 interval 列，多周期会互相覆盖）
     if interval == "1min":
         vals = [(code, r.datetime, r.open, r.high, r.low, r.close, r.volume, r.amount)
                 for r in d.itertuples()]
@@ -1430,9 +1445,6 @@ def fetch_minute_to_db(code: str, day: str = "", interval: str = "1min") -> int:
             c.executemany(
                 "INSERT OR REPLACE INTO ifind_minute"
                 "(code,datetime,open,high,low,close,volume,amount) VALUES (?,?,?,?,?,?,?,?)", vals)
-    # DuckDB 写入（所有周期）
-    hf_df = d[["code", "datetime", "open", "high", "low", "close", "volume", "amount"]].copy()
-    save_minute_to_duckdb(hf_df, interval=interval)
     return len(d)
 
 
@@ -1899,13 +1911,6 @@ def fetch_realtime_to_db() -> int:
                 "volume,amount,turnover,quantity_ratio,amplitude,float_shares,float_mv,speed)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 vals)
-    # 同步写入 DuckDB realtime_snapshots
-    if vals:
-        rt_df = pd.DataFrame(vals, columns=["code", "datetime", "price", "prev_close", "open",
-                                             "high", "low", "change_pct", "volume", "amount",
-                                             "turnover", "quantity_ratio", "amplitude",
-                                             "float_shares", "float_mv", "speed"])
-        save_realtime_to_duckdb(rt_df)
     return len(vals)
 
 
@@ -1940,6 +1945,7 @@ def cleanup_old_data(retention_days: dict = None):
         retention_days = {
             "ifind_realtime": 7,
             "ifind_minute": 7,
+            "tick_data": 7,
             # market_daily 是K线历史库，长期保留（15天会删没K线历史，2026-09 踩坑险删）
             "market_daily": 36500,
             "ifind_basic_daily": 15,
@@ -1951,7 +1957,7 @@ def cleanup_old_data(retention_days: dict = None):
             if table == "ifind_announcements":
                 cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
                 c.execute(f"DELETE FROM {table} WHERE ctime < ?", (cutoff,))
-            elif table in ("ifind_realtime", "ifind_minute"):
+            elif table in ("ifind_realtime", "ifind_minute", "tick_data"):
                 cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
                 c.execute(f"DELETE FROM {table} WHERE datetime < ?", (cutoff,))
             elif table in ("market_daily", "ifind_basic_daily"):
@@ -2374,198 +2380,3 @@ def fetch_pdf(url: str, timeout: int = 30) -> bytes | None:
     except Exception:
         pass
     return None
-
-
-# ==================================================================== DuckDB 高频数据层 ====================================================================
-
-HF_DB = DATA_DIR / "hf.duckdb"
-
-import duckdb as _duckdb
-
-
-def _hf_conn():
-    """DuckDB 连接：高频数据专用（分钟线/tick/实时快照）。"""
-    conn = _duckdb.connect(str(HF_DB))
-    conn.execute("SET TimeZone='Asia/Shanghai'")
-    return conn
-
-
-def _ensure_hf_tables():
-    """确保 DuckDB 高频表存在。"""
-    with _hf_conn() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS minute_bars (
-                code VARCHAR NOT NULL,
-                datetime VARCHAR NOT NULL,
-                interval VARCHAR NOT NULL DEFAULT '1min',
-                open DOUBLE, high DOUBLE, low DOUBLE, close DOUBLE,
-                volume DOUBLE, amount DOUBLE,
-                PRIMARY KEY(code, datetime, interval)
-            )""")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS tick_data (
-                code VARCHAR NOT NULL,
-                datetime VARCHAR NOT NULL,
-                price DOUBLE, volume INTEGER, amount DOUBLE,
-                bid1 DOUBLE, ask1 DOUBLE,
-                bid_vol INTEGER, ask_vol INTEGER,
-                PRIMARY KEY(code, datetime)
-            )""")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS realtime_snapshots (
-                code VARCHAR NOT NULL,
-                datetime VARCHAR NOT NULL,
-                price DOUBLE, prev_close DOUBLE,
-                open DOUBLE, high DOUBLE, low DOUBLE,
-                change_pct DOUBLE, volume DOUBLE, amount DOUBLE,
-                turnover DOUBLE, quantity_ratio DOUBLE, amplitude DOUBLE,
-                bid1 DOUBLE, ask1 DOUBLE,
-                limit_up DOUBLE, limit_down DOUBLE,
-                float_shares DOUBLE, float_mv DOUBLE,
-                PRIMARY KEY(code, datetime)
-            )""")
-
-
-# ---------------------------------------------------------------- 分钟线（DuckDB） ----------------------------------------------------------------
-
-def save_minute_to_duckdb(df: pd.DataFrame, interval: str = "1min") -> int:
-    """写入分钟线到 DuckDB。df 需包含 code, datetime, open, high, low, close, volume, amount。"""
-    if df.empty:
-        return 0
-    _ensure_hf_tables()
-    df = df.copy()
-    df["interval"] = interval
-    cols = ["code", "datetime", "interval", "open", "high", "low", "close", "volume", "amount"]
-    with _hf_conn() as conn:
-        conn.execute("DELETE FROM minute_bars WHERE interval = ? AND datetime >= ? AND datetime <= ?",
-                     [interval, df["datetime"].min(), df["datetime"].max()])
-        conn.execute("INSERT INTO minute_bars SELECT * FROM df[cols]")
-    return len(df)
-
-
-def get_minute_from_duckdb(codes: list[str] | None = None, interval: str = "1min",
-                           start: str | None = None, end: str | None = None,
-                           limit: int = 5000) -> pd.DataFrame:
-    """从 DuckDB 读取分钟线。"""
-    _ensure_hf_tables()
-    query = "SELECT code, datetime, open, high, low, close, volume, amount FROM minute_bars WHERE interval = ?"
-    params: list = [interval]
-    if codes:
-        placeholders = ",".join(["?"] * len(codes))
-        query += f" AND code IN ({placeholders})"
-        params.extend(codes)
-    if start:
-        query += " AND datetime >= ?"
-        params.append(start)
-    if end:
-        query += " AND datetime <= ?"
-        params.append(end)
-    query += " ORDER BY datetime DESC LIMIT ?"
-    params.append(limit)
-    with _hf_conn() as conn:
-        return conn.execute(query, params).fetchdf()
-
-
-def cleanup_minute_bars(keep_days: int = 30) -> int:
-    """清理过期分钟线（默认保留 30 天）。"""
-    cutoff = (datetime.now() - timedelta(days=keep_days)).strftime("%Y-%m-%d")
-    with _hf_conn() as conn:
-        r = conn.execute("DELETE FROM minute_bars WHERE datetime < ?", [cutoff])
-        return r.rowcount
-
-
-# ---------------------------------------------------------------- Tick 数据（DuckDB） ----------------------------------------------------------------
-
-def save_ticks_to_duckdb(df: pd.DataFrame) -> int:
-    """写入 tick 数据到 DuckDB。df 需包含 code, datetime, price, volume, amount 等。"""
-    if df.empty:
-        return 0
-    _ensure_hf_tables()
-    cols = ["code", "datetime", "price", "volume", "amount",
-            "bid1", "ask1", "bid_vol", "ask_vol"]
-    for c in cols:
-        if c not in df.columns:
-            df[c] = None
-    with _hf_conn() as conn:
-        conn.execute("DELETE FROM tick_data WHERE datetime >= ? AND datetime <= ?",
-                     [df["datetime"].min(), df["datetime"].max()])
-        conn.execute("INSERT INTO tick_data SELECT * FROM df[cols]")
-    return len(df)
-
-
-def get_ticks_from_duckdb(codes: list[str] | None = None,
-                          start: str | None = None, end: str | None = None,
-                          limit: int = 10000) -> pd.DataFrame:
-    """从 DuckDB 读取 tick 数据。"""
-    _ensure_hf_tables()
-    query = "SELECT * FROM tick_data WHERE 1=1"
-    params: list = []
-    if codes:
-        placeholders = ",".join(["?"] * len(codes))
-        query += f" AND code IN ({placeholders})"
-        params.extend(codes)
-    if start:
-        query += " AND datetime >= ?"
-        params.append(start)
-    if end:
-        query += " AND datetime <= ?"
-        params.append(end)
-    query += " ORDER BY datetime DESC LIMIT ?"
-    params.append(limit)
-    with _hf_conn() as conn:
-        return conn.execute(query, params).fetchdf()
-
-
-def cleanup_ticks(keep_days: int = 7) -> int:
-    """清理过期 tick 数据（默认保留 7 天）。"""
-    cutoff = (datetime.now() - timedelta(days=keep_days)).strftime("%Y-%m-%d %H:%M:%S")
-    with _hf_conn() as conn:
-        r = conn.execute("DELETE FROM tick_data WHERE datetime < ?", [cutoff])
-        return r.rowcount
-
-
-# ---------------------------------------------------------------- 实时快照（DuckDB） ----------------------------------------------------------------
-
-def save_realtime_to_duckdb(df: pd.DataFrame) -> int:
-    """写入实时快照到 DuckDB（包含 bid/ask/limit 等完整字段）。"""
-    if df.empty:
-        return 0
-    _ensure_hf_tables()
-    cols = ["code", "datetime", "price", "prev_close", "open", "high", "low",
-            "change_pct", "volume", "amount", "turnover", "quantity_ratio",
-            "amplitude", "bid1", "ask1", "limit_up", "limit_down",
-            "float_shares", "float_mv"]
-    for c in cols:
-        if c not in df.columns:
-            df[c] = None
-    with _hf_conn() as conn:
-        conn.execute("DELETE FROM realtime_snapshots WHERE datetime >= ? AND datetime <= ?",
-                     [df["datetime"].min(), df["datetime"].max()])
-        conn.execute("INSERT INTO realtime_snapshots SELECT * FROM df[cols]")
-    return len(df)
-
-
-def cleanup_realtime_snapshots(keep_days: int = 7) -> int:
-    """清理过期实时快照（默认保留 7 天）。"""
-    cutoff = (datetime.now() - timedelta(days=keep_days)).strftime("%Y-%m-%d %H:%M:%S")
-    with _hf_conn() as conn:
-        r = conn.execute("DELETE FROM realtime_snapshots WHERE datetime < ?", [cutoff])
-        return r.rowcount
-
-
-# ---------------------------------------------------------------- 高频统计 ----------------------------------------------------------------
-
-def hf_stats() -> dict:
-    """返回 DuckDB 高频库统计信息。"""
-    _ensure_hf_tables()
-    stats = {}
-    with _hf_conn() as conn:
-        for t in ["minute_bars", "tick_data", "realtime_snapshots"]:
-            count = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-            try:
-                latest = conn.execute(f"SELECT MAX(datetime) FROM {t}").fetchone()[0]
-            except Exception:
-                latest = None
-            stats[t] = {"rows": count, "latest": latest}
-    stats["db_size_mb"] = round(HF_DB.stat().st_size / 1024 / 1024, 1) if HF_DB.exists() else 0
-    return stats

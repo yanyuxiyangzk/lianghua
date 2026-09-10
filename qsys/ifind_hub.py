@@ -9,6 +9,7 @@ SDK：iFinDPy 不在 PyPI 且非 pip 包——官方 tar.gz 放 qsys/ifind_sdk/ 
      重新 build qsys 镜像即自动装入（解压 /opt/iFinD + .pth）。
 """
 
+import re as _re
 import pandas as pd
 import streamlit as st
 
@@ -192,6 +193,52 @@ def _ltd() -> datetime:
     while d.weekday() >= 5:
         d -= timedelta(days=1)
     return d
+
+
+def _to_db_code(code: str) -> str:
+    """600519.SH → SH600519（ifind_minute 的代码格式）"""
+    m = _re.match(r"^(\d{6})\.(SH|SZ|BJ)$", code)
+    return f"{m.group(2)}{m.group(1)}" if m else code
+
+
+def _highfreq_from_db(code: str, start: str, end: str, interval: str) -> pd.DataFrame:
+    """高频分钟线读穿缓存：先读 ifind_minute 库，库空时调 API 写库再读。
+    支持 1min/5min/15min/30min/60min 粒度，非 1min 从 1min 数据 resample。"""
+    db_code = _to_db_code(code)
+    # 解析日期范围
+    start_dt = datetime.strptime(start[:19], "%Y-%m-%d %H:%M:%S")
+    end_dt = datetime.strptime(end[:19], "%Y-%m-%d %H:%M:%S")
+    day = start_dt.strftime("%Y-%m-%d")
+
+    # 1. 先读库
+    df = datasource.get_minute_from_db(db_code, day)
+
+    # 2. 库空则调 API 写库
+    if df.empty:
+        try:
+            datasource.fetch_minute_to_db(db_code, day, interval="1min")
+            df = datasource.get_minute_from_db(db_code, day)
+        except Exception as e:
+            import logging
+            logging.getLogger("ifind_hub").warning(f"fetch_minute_to_db failed for {code}: {e}")
+
+    if df.empty:
+        return df
+
+    # 3. 按时间范围过滤
+    df = df[(df.index >= start_dt) & (df.index <= end_dt)]
+
+    # 4. 非 1min 则 resample
+    if interval != "1min":
+        n = interval.replace("min", "")
+        g = df.resample(f"{n}min")
+        df = pd.DataFrame({
+            "open": g["open"].first(), "high": g["high"].max(), "low": g["low"].min(),
+            "close": g["close"].last(), "volume": g["volume"].sum(),
+            "amount": g["amount"].sum(),
+        }).dropna(subset=["open", "close"])
+
+    return df
 
 
 def _live_row(key_prefix: str, default_on: bool = False) -> bool:
@@ -383,7 +430,20 @@ def page_highfreq():
             h1 = c2.text_input("结束时间", f"{ltd} 15:00:00", key="hf_e")
             interval = c3.selectbox("粒度", ["1min", "5min", "15min", "30min", "60min"], key="hf_iv")
             if st.button("重新查询", key="hf_go") and codes:
-                _go(datasource.ths_highfreq, codes[0], ind, h0, h1, interval)
+                # 标准 OHLCV 指标走读穿缓存，自定义指标走 API
+                standard_inds = {"open", "high", "low", "close", "volume", "amount"}
+                req_inds = set(ind.replace(",", ";").split(";"))
+                if req_inds <= standard_inds:
+                    df = _highfreq_from_db(codes[0], h0, h1, interval)
+                    st.session_state["ifind_res_ths_highfreq"] = (df, None, 0)
+                    # 保存参数供自动刷新时重新查询
+                    _code, _h0, _h1, _iv = codes[0], h0, h1, interval
+                    st.session_state["ifind_call_ths_highfreq"] = (
+                        lambda c=_code, s=_h0, e=_h1, iv=_iv: (
+                            _highfreq_from_db(c, s, e, iv), None, 0))
+                    st.session_state["ifind_ts_ths_highfreq"] = datetime.now()
+                else:
+                    _go(datasource.ths_highfreq, codes[0], ind, h0, h1, interval)
         hf_live = _live_row("hf")
         _auto("ths_highfreq", datasource.ths_highfreq, codes[0], ind, h0, h1, interval)
         _render("ths_highfreq", refresh=hf_live)
@@ -401,7 +461,21 @@ def page_snapshot():
             stime = st.text_input("快照时间（留空=最近可用）", "", key="ss_t",
                                   help="支持 HH:MM:SS 或 YYYY-MM-DD HH:MM:SS；自动取前后2分钟窗口")
             if st.button("重新查询", key="ss_go") and codes:
-                _go(datasource.ths_snapshot, codes, ind, stime)
+                # session_state 缓存：30秒内重复请求不调 API
+                import time
+                cache_key = f"snapshot_{'_'.join(codes)}_{ind}_{stime}"
+                now = time.time()
+                cached = st.session_state.get(cache_key)
+                if cached and now - cached["ts"] < 30:
+                    st.session_state["ifind_res_ths_snapshot"] = cached["data"]
+                    st.session_state["ifind_call_ths_snapshot"] = None
+                    st.session_state["ifind_ts_ths_snapshot"] = datetime.now()
+                else:
+                    _go(datasource.ths_snapshot, codes, ind, stime)
+                    # 存入缓存
+                    res = st.session_state.get("ifind_res_ths_snapshot")
+                    if res is not None:
+                        st.session_state[cache_key] = {"data": res, "ts": now}
         _auto("ths_snapshot", datasource.ths_snapshot, codes, ind, stime)
         _render("ths_snapshot")
 

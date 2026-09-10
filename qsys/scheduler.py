@@ -999,41 +999,8 @@ def job_minute_sync(**_ignored) -> str:
     return f"{now.strftime('%H:%M')} 分钟线同步：{n_ok}/{len(codes)} 只 · 写入 {n_rows} 行"
 
 
-def job_hf_multi_interval(**_ignored) -> str:
-    """盘中多周期高频同步（每15分钟）：5/15/30/60min 分钟线写入 DuckDB minute_bars。
-    仅同步沪深300成分股，避免 API 调用量过大。"""
-    from zoneinfo import ZoneInfo
-
-    now = datetime.now(ZoneInfo(TZ))
-    if now.weekday() >= 5:
-        return "非交易日，跳过"
-    if not ("0930" <= now.strftime("%H%M") <= "1505"):
-        return "非交易时段，跳过"
-
-    from common import all_pools
-    codes = all_pools().get("沪深300", [])[:50]  # 限制 50 只，避免 API 限制
-    if not codes:
-        return "沪深300 为空，跳过"
-
-    today = now.strftime("%Y-%m-%d")
-    intervals = ["5min", "15min", "30min", "60min"]
-    total_rows = 0
-    n_ok = 0
-
-    for code in codes:
-        for interval in intervals:
-            try:
-                n = datasource.fetch_minute_to_db(code, today, interval=interval)
-                total_rows += n
-                n_ok += 1 if n else 0
-            except Exception:
-                continue
-
-    return f"{now.strftime('%H:%M')} 多周期HF：{n_ok}/{len(codes) * len(intervals)} · 写入 {total_rows} 行"
-
-
 def job_tick_sync(**_ignored) -> str:
-    """盘中tick数据同步（每分钟）：自选股+当前持仓的逐笔成交落库（tick_data 表）。
+    """盘中tick数据同步（每10秒）：自选股+当前持仓的逐笔成交落库（tick_data 表）。
     分时图页面直接读本地库，不再每次直连数据源。"""
     from zoneinfo import ZoneInfo
 
@@ -1055,47 +1022,44 @@ def job_tick_sync(**_ignored) -> str:
                 codes.add(it.code)
 
     n_rows = n_ok = 0
-    import sqlite3 as sq
-    from pathlib import Path
-    db_path = Path("/data/market.db")
-    tick_rows = []  # 收集 tick 数据用于 DuckDB 批量写入
+
+    # 批量收集所有 tick 数据，最后一次性写入
+    all_tick_rows = []
 
     for code in codes:
         try:
             ticks = datasource.get_ticks_tdx(code, max_pages=5)
             if ticks is None or ticks.empty:
                 continue
-            # 写入 SQLite tick_data 表
-            with sq.connect(str(db_path)) as c:
-                for _, row in ticks.iterrows():
-                    try:
-                        c.execute(
-                            "INSERT OR IGNORE INTO tick_data (code, datetime, price, volume, buyorsell, source) "
-                            "VALUES (?, ?, ?, ?, ?, 'tdx')",
-                            (code, str(row.get("datetime", "")), row.get("price"),
-                             int(row.get("vol", 0)), int(row.get("buyorsell", 0)))
-                        )
-                    except Exception:
-                        continue
-            # 收集用于 DuckDB 写入
+            # 收集 tick 数据用于批量写入
             for _, row in ticks.iterrows():
-                tick_rows.append({
-                    "code": code,
-                    "datetime": str(row.get("datetime", "")),
-                    "price": row.get("price"),
-                    "volume": int(row.get("vol", 0)),
-                    "amount": float(row.get("price", 0)) * int(row.get("vol", 0)),
-                })
+                price = row.get("price", 0) or 0
+                vol = int(row.get("vol", 0)) or 0
+                all_tick_rows.append((
+                    code,
+                    str(row.get("datetime", "")),
+                    price,
+                    vol,
+                    price * vol,  # amount = price * volume
+                    int(row.get("buyorsell", 0)),
+                    'tdx'
+                ))
             n_rows += len(ticks)
             n_ok += 1
         except Exception:
             continue
 
-    # 批量写入 DuckDB
-    if tick_rows:
-        import pandas as pd
-        tick_df = pd.DataFrame(tick_rows)
-        datasource.save_ticks_to_duckdb(tick_df)
+    # 批量写入 SQLite（executemany 比逐行 INSERT 快 10-50 倍）
+    if all_tick_rows:
+        try:
+            with datasource._qconn() as c:
+                c.executemany(
+                    "INSERT OR IGNORE INTO tick_data (code, datetime, price, volume, amount, buyorsell, source) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    all_tick_rows
+                )
+        except Exception as e:
+            return f"{now.strftime('%H:%M')} tick同步：{n_ok}/{len(codes)} 只 · 写入失败: {e}"
 
     return f"{now.strftime('%H:%M')} tick同步：{n_ok}/{len(codes)} 只 · 写入 {n_rows} 行"
 
@@ -1138,7 +1102,8 @@ def job_realtime_kline(**_ignored) -> str:
         # 从tick_data聚合今日数据
         rows = c.execute('''
             SELECT code,
-                   MIN(price) as open,
+                   (SELECT price FROM tick_data WHERE code=t.code AND datetime LIKE ? 
+                    ORDER BY datetime ASC LIMIT 1) as open,
                    MAX(price) as high,
                    MIN(price) as low,
                    (SELECT price FROM tick_data WHERE code=t.code AND datetime LIKE ? 
@@ -1149,7 +1114,7 @@ def job_realtime_kline(**_ignored) -> str:
             FROM tick_data t
             WHERE datetime LIKE ?
             GROUP BY code
-        ''', (f'{today}%', f'{today}%')).fetchall()
+        ''', (f'{today}%', f'{today}%', f'{today}%')).fetchall()
 
         n_updated = 0
         for row in rows:
@@ -1457,22 +1422,12 @@ def job_ifind_realtime_sync(**_ignored) -> str:
 
 
 def job_ifind_cleanup(**_ignored) -> str:
-    """清理过期数据（每日16:00执行）：SQLite + DuckDB 高频数据。"""
+    """清理过期数据（每日16:00执行）：SQLite 过期数据。"""
     from zoneinfo import ZoneInfo
 
     now = datetime.now(ZoneInfo(TZ))
     datasource.cleanup_old_data()
-    # DuckDB 高频数据清理
-    try:
-        n_minute = datasource.cleanup_minute_bars(keep_days=30)
-        n_tick = datasource.cleanup_ticks(keep_days=7)
-        n_rt = datasource.cleanup_realtime_snapshots(keep_days=7)
-        stats = datasource.hf_stats()
-        return (f"{now.strftime('%Y-%m-%d %H:%M:%S')} 清理完成："
-                f"DuckDB 分钟线-{n_minute}行 tick-{n_tick}行 快照-{n_rt}行 | "
-                f"DB大小 {stats['db_size_mb']}MB")
-    except Exception as e:
-        return f"{now.strftime('%Y-%m-%d %H:%M:%S')} 清理完成（DuckDB 异常: {e}）"
+    return f"{now.strftime('%Y-%m-%d %H:%M:%S')} SQLite 过期数据清理完成"
 
 
 def job_le_factor_eval(batch: int = 500, pool_name: str = "沪深300") -> str:
@@ -1960,13 +1915,9 @@ JOBS = {
                                    "params": {"interval_sec": 300},
                                    "trigger": "interval"}},
     "minute_sync": {"name": "⏱ 分钟线同步（盘中）", "func": job_minute_sync,
-                    "default": {"enabled": True, "hour": 9, "minute": 30,
-                                "params": {"interval_sec": 300},
-                                "trigger": "interval"}},
-    "hf_multi_interval": {"name": "⏱ 多周期HF同步（5/15/30/60min·DuckDB）", "func": job_hf_multi_interval,
-                           "default": {"enabled": True, "hour": 9, "minute": 30,
-                                       "params": {"interval_sec": 900},
-                                       "trigger": "interval"}},
+                     "default": {"enabled": True, "hour": 9, "minute": 30,
+                                 "params": {"interval_sec": 300},
+                                 "trigger": "interval"}},
     "tick_sync": {"name": "📈 Tick数据同步（盘中·秒级）", "func": job_tick_sync,
                   "default": {"enabled": True, "hour": 9, "minute": 30,
                               "params": {"interval_sec": 10},

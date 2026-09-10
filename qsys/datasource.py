@@ -2023,7 +2023,8 @@ def get_daily_from_db(code: str, start_date: str = None, end_date: str = None) -
             import sqlite3 as sq
             from pathlib import Path
             db_path = Path("/data/market.db")
-            with sq.connect(str(db_path)) as rc:
+            with sq.connect(str(db_path), timeout=30) as rc:
+                rc.execute("PRAGMA busy_timeout=30000")
                 rt = pd.read_sql_query(
                     "SELECT code, date, open, high, low, close, volume, amount "
                     "FROM realtime_daily WHERE code = ?",

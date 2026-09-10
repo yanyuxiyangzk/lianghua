@@ -218,7 +218,8 @@ def _load_data():
         exp_db = DATA_DIR / "experience.db"
         if exp_db.exists():
             import sqlite3
-            with sqlite3.connect(str(exp_db)) as ec:
+            with sqlite3.connect(str(exp_db), timeout=30) as ec:
+                ec.execute("PRAGMA busy_timeout=30000")
                 r3 = ec.execute("""
                     SELECT
                         (SELECT COUNT(*) FROM picks) as pick_total,

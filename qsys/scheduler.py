@@ -7,6 +7,7 @@
 """
 
 import json
+import logging
 import tarfile
 import tempfile
 import time
@@ -1080,7 +1081,8 @@ def job_realtime_kline(**_ignored) -> str:
     db_path = Path("/data/market.db")
     today = now.strftime("%Y-%m-%d")
 
-    with sq.connect(str(db_path)) as c:
+    with sq.connect(str(db_path), timeout=30) as c:
+        c.execute("PRAGMA busy_timeout=30000")
         # 创建realtime_daily表（如果不存在）
         c.execute('''
             CREATE TABLE IF NOT EXISTS realtime_daily (
@@ -1173,6 +1175,8 @@ def job_auction_confirm() -> str:
     if dates[0] < prev.strftime("%Y-%m-%d"):
         return f"最新名单为 {dates[0]}（过旧），跳过"
     picks = experience.picks_on_date(dates[0])
+    if picks.empty:
+        return f"日期 {dates[0]} 无名单数据"
     items = experience.pick_items_detail(int(picks.iloc[0]["id"]))
     rows = []
     for code in items["code"]:
@@ -1662,6 +1666,7 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
     scorecards_cache = {}
     try:
         with sq.connect(str(Path("/data/market.db")), timeout=30) as c:
+            c.execute("PRAGMA busy_timeout=30000")
             rows = c.execute('''SELECT name, ic_mean, icir, top_winrate
                                 FROM factor_scorecards
                                 WHERE pool_name=? AND eval_date>=date('now','-30 days')''',

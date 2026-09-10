@@ -210,8 +210,11 @@ def render():
     if main_pick is None and not picks.empty:
         non_sat = picks[picks["pack_name"] != sat_name] if sat_name else picks
         sched = non_sat[non_sat["source"] == "sched_pool_scan"]
-        main_pick = (sched.iloc[0] if not sched.empty else non_sat.iloc[0])
-        if main_name is None and pd.notna(main_pick.get("pack_name")):
+        if not sched.empty:
+            main_pick = sched.iloc[0]
+        elif not non_sat.empty:
+            main_pick = non_sat.iloc[0]
+        if main_name is None and main_pick is not None and pd.notna(main_pick.get("pack_name")):
             main_name = main_pick["pack_name"]
 
     _render_track("🛡", "主轨 · 稳健（仓位大头，建议 7 成）", main_name, main_pick, "main", "主轨资金")

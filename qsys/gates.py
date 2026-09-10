@@ -54,7 +54,7 @@ def _daily_excess(vals: pd.Series, fwd: pd.DataFrame) -> pd.Series:
     fr = fwd.stack().rename("r")
     j = v.rename("f").to_frame().join(fr, how="inner").dropna()
     if j.empty:
-        return pd.Series(dtype=float)
+        return pd.Series(dtype=float, index=pd.DatetimeIndex([]))
 
     def _x(g: pd.DataFrame) -> float:
         k = max(1, int(len(g) * GATE["TOP_PCT"]))
@@ -109,6 +109,8 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
     nav = (1 + x).cumprod()
 
     def _year_stats(year: int):
+        if len(x) == 0 or not hasattr(x.index, 'year'):
+            return 0.0, 0.0
         xy = x[x.index.year == year]
         if len(xy) < 20:
             return 0.0, 0.0

@@ -514,37 +514,60 @@ class LoopEngine:
         return result
 
     def _try_generate_pack(self) -> str | None:
-        """尝试生成策略包：从已通过闸门的因子中选Top因子，构建组合并验证。"""
+        """尝试生成策略包：从已通过闸门的因子中选Top因子，构建组合并验证。
+
+        每日最多生成一次（包名带日期 LE_池_MMDD）：打分用每日三班体检后的评分卡，
+        盘后 21:30 体检的分数会进入次日早盘的包。此前每轮（5分钟）都重算
+        walk-forward + 逐因子子进程求值，单次可达 20+ 分钟，纯属浪费。"""
         import logging
         import signals as sig
         from common import all_pools, get_last_trade_day
-        
+
         logger = logging.getLogger("pack_gen")
-        
+
         try:
+            # 每日一次闸：今日包已存在则跳过
+            today_pack = f"LE_{self.pool_name}_{datetime.now().strftime('%m%d')}"
+            try:
+                with library._lconn() as c:
+                    if c.execute("SELECT 1 FROM strategies WHERE name=?",
+                                 (today_pack,)).fetchone():
+                        return None
+            except Exception:
+                pass
+
             # 检查是否有足够高质量因子（ICIR > 0.2）—— builtin + evolved 同台竞争
+            # 每个因子只取最新一次评分（经典因子每日重评会产生多行，须按 eval_date 取新）；
+            # 按 |ICIR| 降序；kind 值是评分卡中文标签（'演化引擎'——原写 'loopengine' 永不命中）
             with library._lconn() as c:
                 rows = c.execute('''
-                    SELECT fs.name, fs.kind, fr.code FROM factor_scorecards fs
+                    SELECT fs.name, fs.kind, fr.code, fs.direction FROM factor_scorecards fs
                     LEFT JOIN factor_registry fr ON fs.name = fr.name
+                    JOIN (SELECT name, MAX(eval_date) md FROM factor_scorecards
+                          WHERE pool_name = ? GROUP BY name) latest
+                      ON fs.name = latest.name AND fs.eval_date = latest.md
                     WHERE fs.pool_name = ? AND ABS(fs.icir) > 0.2
                       AND fs.eval_date >= date('now', '-30 days')
-                      AND fs.kind IN ('内置', '技术指标', 'loopengine')
-                ''', (self.pool_name,)).fetchall()
+                      AND fs.kind IN ('内置', '技术指标', '进化', '演化引擎')
+                    ORDER BY ABS(fs.icir) DESC
+                ''', (self.pool_name, self.pool_name)).fetchall()
                 
                 if len(rows) < 3:
                     logger.debug(f"高质量因子不足: {len(rows)} < 3")
                     return None  # 高质量因子不足
                 
-                factor_info = {r[0]: {"kind": r[1], "code": r[2]} for r in rows[:8]}
+                factor_info = {r[0]: {"kind": r[1], "code": r[2],
+                                      "direction": -1 if r[3] == "负向" else 1}
+                               for r in rows[:8]}
                 logger.debug(f"因子信息: {factor_info}")
             
             # 获取因子值（builtin + evolved）
             codes = all_pools().get(self.pool_name) or all_pools().get("沪深300")
             end = get_last_trade_day()
             panel = sig.get_panel_cached(codes, end)
-            
+
             factor_vals = {}
+            _frames = None  # 树直算帧（有进化因子时才构建，构建一次复用）
             for name, info in factor_info.items():
                 kind = info["kind"]
                 code = info.get("code", "")
@@ -556,7 +579,17 @@ class LoopEngine:
                     elif name in sig.TECH_INDICATORS:
                         vals = sig.compute_tech(panel, name)
                     elif code and "# sexpr:" in code:
-                        vals = sig.run_factor_code(code, name, codes, end)
+                        # 树直算快速路径（~0.02s/因子），失败回退子进程执行（分钟级）
+                        try:
+                            if _frames is None:
+                                from loopengine.tree import build_field_frames
+                                _frames = build_field_frames(panel)
+                            from loopengine.tree import evaluate_tree, parse
+                            sexpr = code.split("\n", 1)[0][len("# sexpr: "):]
+                            vals = evaluate_tree(parse(sexpr), _frames).stack().rename(name).dropna()
+                            vals.index = vals.index.set_names(["datetime", "instrument"])
+                        except Exception:
+                            vals = sig.run_factor_code(code, name, codes, end)
                     else:
                         logger.debug(f"跳过因子 {name}: 不在任何列表中")
                         continue
@@ -642,11 +675,14 @@ class LoopEngine:
                     icir_weights[name] = 0.5
                     total_icir += 0.5
             
-            # 归一化权重
+            # 归一化权重（方向取评分卡建议方向：负 IC 因子反向使用，
+            # 2026-09-11 踩坑：方向曾硬编码 1，alpha041/mom_60d 实际 IC 为负）
             if total_icir > 0:
-                weights = {n: (icir_weights[n] / total_icir, 1) for n in selected}
+                weights = {n: (icir_weights[n] / total_icir,
+                               factor_info.get(n, {}).get("direction", 1)) for n in selected}
             else:
-                weights = {n: (1.0 / len(selected), 1) for n in selected}
+                weights = {n: (1.0 / len(selected),
+                               factor_info.get(n, {}).get("direction", 1)) for n in selected}
             # kind 映射
             kind_map = {"内置": "builtin", "技术指标": "tech", "loopengine": "evolved"}
             factor_kind = {n: kind_map.get(factor_info.get(n, {}).get("kind", ""), "builtin") for n in selected}

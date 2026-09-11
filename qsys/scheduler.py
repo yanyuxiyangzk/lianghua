@@ -1456,21 +1456,25 @@ def job_ifind_cleanup(**_ignored) -> str:
 
 
 def job_le_factor_eval(batch: int = 500, pool_name: str = "沪深300") -> str:
-    """LoopEngine 因子滚动体检（每晚一批）：边际价值优先取一批出评分卡。
+    """因子滚动体检（每日三批）：经典层全量重评 + 进化层边际价值清队列。
 
-    选股策略（边际价值排序）：
-      1. 非量价因子优先（资金流/板块轮动/龙虎榜/盘口异动/指数）—— 多元化验证
-      2. gate_detail_log 中 IC 最高的未体检因子 —— 高质量因子优先验证
-      3. 与已体检因子相关性 < 0.70 的因子 —— 增加多样性
-      4. 族配额兜底：同族覆盖越少越优先 —— 避免单一族垄断
+    两层结构：
+      经典层（tech/builtin，每次全量重评）——评分卡驱动每日策略包选因子/定权重/定方向，
+        必须当日新鲜（2026-09-11 踩坑：LE 包用了 17 天前的评分，方向与最新 IC 相反）；
+      进化层（loopengine，按边际价值排序清未体检队列）：
+        1. 非量价因子优先（资金流/板块轮动/龙虎榜/盘口异动/指数）—— 多元化验证
+        2. gate_detail_log 中 IC 最高的未体检因子 —— 高质量因子优先验证
+        3. 与已体检因子相关性 < 0.70 的因子 —— 增加多样性
+        4. 族配额兜底：同族覆盖越少越优先 —— 避免单一族垄断
     """
     import factor_eval as fe
     import library
 
     reg = library.get_factor_registry()
     le = reg[reg["engine"] == "loopengine"] if not reg.empty else reg
-    if le.empty:
-        return "无 LoopEngine 因子，跳过"
+    classic = reg[reg["kind"].isin(["tech", "builtin"])] if not reg.empty else reg
+    if le.empty and classic.empty:
+        return "无因子，跳过"
 
     with library._lconn() as c:
         # 已体检因子
@@ -1484,44 +1488,55 @@ def job_le_factor_eval(batch: int = 500, pool_name: str = "沪深300") -> str:
         ).fetchall():
             ic_map[row[0]] = abs(row[1]) if row[1] else 0
 
-    # 标记未体检因子
-    le = le.assign(
-        _eval_at=le["name"].map(lambda n: evaluated.get(n, "")),
-        _ic=le["name"].map(lambda n: ic_map.get(n, 0)),
-    )
-    le["_fam"] = le["family"].fillna("其他").astype(str) if "family" in le.columns else "其他"
-    uneval = le[le["_eval_at"] == ""].copy()
-    if uneval.empty:
-        return "所有因子已体检，跳过"
+    # 经典层：tech/builtin 全量（每次重评）
+    classic_facs = [{"name": r["name"], "kind": r["kind"], "code": None}
+                    for _, r in classic.iterrows()]
 
-    # 边际价值评分：综合因子类型多样性 + IC质量 + 族覆盖
-    fam_cov = le.groupby("_fam", dropna=False)["_eval_at"].apply(lambda s: int((s != "").sum()))
-    fam_total = le.groupby("_fam", dropna=False).size()
-    # 族覆盖率越低，优先级越高（0~1，越小越优先）
-    uneval["_fam_score"] = uneval["_fam"].map(
-        lambda f: fam_cov.get(f, 0) / max(fam_total.get(f, 1), 1))
+    # 进化层：未体检队列按边际价值取剩余配额
+    picked = pd.DataFrame()
+    if not le.empty:
+        # 标记未体检因子
+        le = le.assign(
+            _eval_at=le["name"].map(lambda n: evaluated.get(n, "")),
+            _ic=le["name"].map(lambda n: ic_map.get(n, 0)),
+        )
+        le["_fam"] = le["family"].fillna("其他").astype(str) if "family" in le.columns else "其他"
+        uneval = le[le["_eval_at"] == ""].copy()
+    else:
+        uneval = le
+    if not uneval.empty:
+        fam_cov = le.groupby("_fam", dropna=False)["_eval_at"].apply(lambda s: int((s != "").sum()))
+        fam_total = le.groupby("_fam", dropna=False).size()
+        # 族覆盖率越低，优先级越高（0~1，越小越优先）
+        uneval["_fam_score"] = uneval["_fam"].map(
+            lambda f: fam_cov.get(f, 0) / max(fam_total.get(f, 1), 1))
 
-    # 因子类型权重：非量价优先
-    type_weights = {"量价": 0.0, "资金流": 1.0, "板块轮动": 0.9,
-                    "龙虎榜": 0.8, "盘口异动": 0.7, "指数": 0.6}
-    uneval["_type_weight"] = uneval["factor_type"].map(
-        lambda t: type_weights.get(t, 0.3) if pd.notna(t) else 0.3)
+        # 因子类型权重：非量价优先
+        type_weights = {"量价": 0.0, "资金流": 1.0, "板块轮动": 0.9,
+                        "龙虎榜": 0.8, "盘口异动": 0.7, "指数": 0.6}
+        uneval["_type_weight"] = uneval["factor_type"].map(
+            lambda t: type_weights.get(t, 0.3) if pd.notna(t) else 0.3)
 
-    # 综合边际价值分 = IC质量(40%) + 类型多样性(35%) + 族覆盖(25%)
-    uneval["_marginal"] = (
-        uneval["_ic"].clip(0, 0.1) / 0.1 * 0.4   # IC归一化到0~1
-        + uneval["_type_weight"] * 0.35
-        + (1 - uneval["_fam_score"]) * 0.25         # 族覆盖越少分越高
-    )
+        # 综合边际价值分 = IC质量(40%) + 类型多样性(35%) + 族覆盖(25%)
+        uneval["_marginal"] = (
+            uneval["_ic"].clip(0, 0.1) / 0.1 * 0.4   # IC归一化到0~1
+            + uneval["_type_weight"] * 0.35
+            + (1 - uneval["_fam_score"]) * 0.25         # 族覆盖越少分越高
+        )
 
-    # 按边际价值降序取batch个
-    picked = uneval.nlargest(batch, "_marginal")
+        # 按边际价值降序取剩余配额（经典层占掉的名额先扣）
+        quota = max(int(batch) - len(classic_facs), 0)
+        picked = uneval.nlargest(quota, "_marginal") if quota else uneval.iloc[0:0]
+
     codes = all_pools().get(pool_name) or []
     if len(codes) < 30:
         return f"池 {pool_name} 为空，跳过"
     end = get_last_trade_day()
     train_end = trade_day_offset(end, -250)
-    facs = [{"name": r["name"], "kind": "loopengine", "code": r["code"]} for _, r in picked.iterrows()]
+    facs = classic_facs + [{"name": r["name"], "kind": "loopengine", "code": r["code"]}
+                           for _, r in picked.iterrows()]
+    if not facs:
+        return "所有进化因子已体检，经典层无可评，跳过"
 
     # P2+P3+P4: 批量计算因子值（一次构建面板，批量计算所有因子，跳过已有缓存，大批次并行）
     if len(facs) > 50:
@@ -1532,12 +1547,14 @@ def job_le_factor_eval(batch: int = 500, pool_name: str = "沪深300") -> str:
     ok = card.dropna(subset=["ICIR"])
 
     # 统计边际价值分布
-    type_counts = picked["factor_type"].value_counts()
-    type_summary = " ".join(f"{t}:{n}" for t, n in type_counts.items() if pd.notna(t))
+    type_counts = picked["factor_type"].value_counts() if not picked.empty else {}
+    type_summary = " ".join(f"{t}:{n}" for t, n in type_counts.items()) if len(type_counts) else ""
 
-    return (f"LoopEngine 体检 {len(facs)} 个（批量计算 · 有效 {len(ok)} 个），"
-            f"类型: {type_summary or '量价'}，"
-            f"累计已评估 {len(evaluated) + len(facs) - len([n for n in picked['name'] if n in evaluated])}"
+    n_le = len(facs) - len(classic_facs)
+    n_le_new = n_le - len([n for n in picked["name"] if n in evaluated]) if "name" in picked else n_le
+    return (f"体检 {len(facs)} 个（经典 {len(classic_facs)} · 进化 {n_le} · 有效 {len(ok)} 个），"
+            f"类型: {type_summary or '—'}，"
+            f"进化累计已评估 {len(evaluated) + n_le_new}"
             f"/{len(reg[reg['engine']=='loopengine'])}")
 
 
@@ -1986,6 +2003,68 @@ JOBS = {
 
 
 class SchedulerManager:
+    """调度器管理。容器内有两个进程会实例化（entrypoint 调度进程 + streamlit 页面进程），
+    用 /data/scheduler_owner.json 抢锁保证只有 owner 真正注册任务，否则全部任务双跑
+    （历史上成对的执行记录与频发 database is locked 的部分原因）。owner 每 60s 心跳，
+    超 180s 无心跳允许接管。被动实例只读状态（view/手动触发不受影响）。"""
+
+    _LOCK_FILE = Path(SCHED_STATE_FILE).parent / "scheduler_owner.json"
+    _LIVE_FILE = Path(SCHED_STATE_FILE).parent / "scheduler_live.json"
+    _HEARTBEAT_S = 60
+    _STALE_S = 180
+
+    def _claim_ownership(self) -> bool:
+        import os
+        my_pid = os.getpid()
+        try:
+            if self._LOCK_FILE.exists():
+                info = json.loads(self._LOCK_FILE.read_text())
+                fresh = time.time() - float(info.get("ts", 0)) < self._STALE_S
+                if fresh and info.get("pid") != my_pid:
+                    return False
+        except Exception:
+            pass
+        self._write_owner(my_pid)
+        import threading
+        threading.Thread(target=self._heartbeat, args=(my_pid,), daemon=True,
+                         name="sched-owner-heartbeat").start()
+        return True
+
+    def _write_owner(self, pid: int):
+        try:
+            self._LOCK_FILE.write_text(json.dumps({"pid": pid, "ts": time.time()}))
+        except Exception:
+            pass
+
+    def _write_live(self):
+        """owner 落盘实时状态（running + 下次运行时间），供被动进程的页面读取。"""
+        import os
+        try:
+            nxt = {}
+            for key in self._state():
+                job = self.sched.get_job(key)
+                nxt[key] = job.next_run_time.strftime("%m-%d %H:%M") if job else None
+            self._LIVE_FILE.write_text(json.dumps(
+                {"pid": os.getpid(), "ts": time.time(),
+                 "running": dict(self._running), "next": nxt}, ensure_ascii=False))
+        except Exception:
+            pass
+
+    def _heartbeat(self, pid: int):
+        last_state_mtime = 0.0
+        while True:
+            time.sleep(self._HEARTBEAT_S)
+            self._write_owner(pid)
+            self._write_live()
+            # 配置热更新：页面进程（被动）改状态文件后，owner 在本心跳内重新应用
+            try:
+                m = SCHED_STATE_FILE.stat().st_mtime
+                if m != last_state_mtime:
+                    last_state_mtime = m
+                    self._apply_state()
+            except Exception:
+                pass
+
     def __init__(self):
         from apscheduler.executors.pool import ThreadPoolExecutor
         from apscheduler.schedulers.background import BackgroundScheduler
@@ -2009,6 +2088,10 @@ class SchedulerManager:
         self._running: dict[str, float] = {}  # job_key → 开始时间戳（供采集监控页显示"正在爬取"）
         import threading
         self._last_lock = threading.Lock()  # scheduler_last.json 读改写并发保护
+        self._owner = self._claim_ownership()
+        if not self._owner:
+            logging.info("[scheduler] 另一进程持有调度权（%s），本实例被动运行（只读/手动触发）",
+                         self._LOCK_FILE)
         self._apply_state()
 
     # ---- 状态持久化 ----
@@ -2020,6 +2103,8 @@ class SchedulerManager:
         save_json(SCHED_STATE_FILE, st_)
 
     def _apply_state(self):
+        if not self._owner:
+            return  # 被动实例不注册任务，避免双进程双跑
         state = self._state()
         for key, cfg in state.items():
             try:
@@ -2044,6 +2129,8 @@ class SchedulerManager:
         cfg = self._state()[key]
         t0 = time.time()
         self._running[key] = t0
+        if self._owner:
+            self._write_live()
         now_start = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         # 推送 JOB_START 事件
         try:
@@ -2089,17 +2176,27 @@ class SchedulerManager:
         except Exception as e:
             logging.warning("[scheduler] sched_exec_log insert failed for %s: %s", key, e)
         self._running.pop(key, None)
+        if self._owner:
+            self._write_live()
 
     # ---- 对外 API ----
     def view(self) -> dict:
         state, last = self._state(), load_json(SCHED_LAST_FILE, {})
+        # 被动进程（streamlit 页面）从 owner 的实时文件读 running/next
+        live = {} if self._owner else load_json(self._LIVE_FILE, {})
+        live_running = live.get("running") or {}
+        live_next = live.get("next") or {}
         out = {}
         for key, cfg in state.items():
             job = self.sched.get_job(key)
-            out[key] = {**cfg, "label": JOBS[key]["name"],
-                        "next": (job.next_run_time.strftime("%m-%d %H:%M") if job else None),
-                        "last": last.get(key),
-                        "running_since": self._running.get(key)}
+            if self._owner:
+                nxt = job.next_run_time.strftime("%m-%d %H:%M") if job else None
+                running = self._running.get(key)
+            else:
+                nxt = live_next.get(key)
+                running = live_running.get(key, self._running.get(key))
+            out[key] = {**cfg, "label": JOBS[key]["name"], "next": nxt,
+                        "last": last.get(key), "running_since": running}
         return out
 
     def set_enabled(self, key: str, enabled: bool):

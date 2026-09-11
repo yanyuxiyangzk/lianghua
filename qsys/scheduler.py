@@ -1489,7 +1489,8 @@ def job_le_factor_eval(batch: int = 500, pool_name: str = "沪深300") -> str:
             ic_map[row[0]] = abs(row[1]) if row[1] else 0
 
     # 经典层：tech/builtin 全量（每次重评）
-    classic_facs = [{"name": r["name"], "kind": r["kind"], "code": None}
+    classic_facs = [{"name": r["name"], "kind": r["kind"], "code": None,
+                     "first_seen": r.get("first_seen")}
                     for _, r in classic.iterrows()]
 
     # 进化层：未体检队列按边际价值取剩余配额
@@ -1533,7 +1534,8 @@ def job_le_factor_eval(batch: int = 500, pool_name: str = "沪深300") -> str:
         return f"池 {pool_name} 为空，跳过"
     end = get_last_trade_day()
     train_end = trade_day_offset(end, -250)
-    facs = classic_facs + [{"name": r["name"], "kind": "loopengine", "code": r["code"]}
+    facs = classic_facs + [{"name": r["name"], "kind": "loopengine", "code": r["code"],
+                            "first_seen": r.get("first_seen")}
                            for _, r in picked.iterrows()]
     if not facs:
         return "所有进化因子已体检，经典层无可评，跳过"

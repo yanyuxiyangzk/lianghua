@@ -146,6 +146,10 @@ def _lconn():
     sc_cols = [r[1] for r in c.execute("PRAGMA table_info(factor_scorecards)")]
     if "winrates" not in sc_cols:
         c.execute("ALTER TABLE factor_scorecards ADD COLUMN winrates TEXT")
+    # 迁移：factor_scorecards 加 OOS 列（因子被发现后的纯净样本外表现，2026-09-11）
+    for col, ddl in [("ic_oos", "REAL"), ("icir_oos", "REAL"), ("oos_days", "INTEGER")]:
+        if col not in sc_cols:
+            c.execute(f"ALTER TABLE factor_scorecards ADD COLUMN {col} {ddl}")
     # 迁移：strategies 加持有期（多周期共振用）
     st_cols = [r[1] for r in c.execute("PRAGMA table_info(strategies)")]
     if "horizon" not in st_cols:
@@ -330,12 +334,15 @@ def save_scorecard(card: pd.DataFrame, pool_name: str, eval_date: str):
                      _f(r.get("IC均值")), _f(r.get("ICIR")), _f(r.get("IC胜率")),
                      _f(r.get("Top组胜率")), str(r.get("建议方向", "")),
                      int(r.get("天数", 0) or 0),
-                     json.dumps(winrates, ensure_ascii=False), now))
+                     json.dumps(winrates, ensure_ascii=False), now,
+                     _f(r.get("IC_OOS")), _f(r.get("ICIR_OOS")),
+                     int(r.get("OOS天数", 0) or 0)))
     with _lconn() as c:
         c.executemany(
             "INSERT OR REPLACE INTO factor_scorecards (name, pool_name, eval_date, kind,"
-            " ic_mean, icir, ic_winrate, top_winrate, direction, days, winrates, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            " ic_mean, icir, ic_winrate, top_winrate, direction, days, winrates, updated_at,"
+            " ic_oos, icir_oos, oos_days)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
 
 
 def _f(v):

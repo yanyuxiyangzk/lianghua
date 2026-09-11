@@ -536,20 +536,30 @@ class LoopEngine:
             except Exception:
                 pass
 
-            # 检查是否有足够高质量因子（ICIR > 0.2）—— builtin + evolved 同台竞争
-            # 每个因子只取最新一次评分（经典因子每日重评会产生多行，须按 eval_date 取新）；
-            # 按 |ICIR| 降序；kind 值是评分卡中文标签（'演化引擎'——原写 'loopengine' 永不命中）
+            # 检查是否有足够高质量因子—— builtin + evolved 同台竞争。
+            # 排名分：OOS 可信（被发现后 ≥20 交易日）用 |ICIR_OOS|，否则样本内 |ICIR| 打五折——
+            # 样本内分数被引擎选择过程污染（实测 ICIR 3.7 的组合 WF OOS 仅 49.4%）。
+            # 方向同理优先取 OOS 符号。每因子只取最新一次评分。
             with library._lconn() as c:
                 rows = c.execute('''
-                    SELECT fs.name, fs.kind, fr.code, fs.direction FROM factor_scorecards fs
-                    LEFT JOIN factor_registry fr ON fs.name = fr.name
-                    JOIN (SELECT name, MAX(eval_date) md FROM factor_scorecards
-                          WHERE pool_name = ? GROUP BY name) latest
-                      ON fs.name = latest.name AND fs.eval_date = latest.md
-                    WHERE fs.pool_name = ? AND ABS(fs.icir) > 0.2
-                      AND fs.eval_date >= date('now', '-30 days')
-                      AND fs.kind IN ('内置', '技术指标', '进化', '演化引擎')
-                    ORDER BY ABS(fs.icir) DESC
+                    SELECT * FROM (
+                        SELECT fs.name, fs.kind, fr.code,
+                               CASE WHEN fs.oos_days >= 20 AND fs.ic_oos IS NOT NULL
+                                    THEN CASE WHEN fs.ic_oos < 0 THEN '负向' ELSE '正向' END
+                                    ELSE fs.direction END AS direction,
+                               CASE WHEN fs.oos_days >= 20 AND fs.icir_oos IS NOT NULL
+                                    THEN ABS(fs.icir_oos) ELSE ABS(fs.icir) * 0.5 END AS score
+                        FROM factor_scorecards fs
+                        LEFT JOIN factor_registry fr ON fs.name = fr.name
+                        JOIN (SELECT name, MAX(eval_date) md FROM factor_scorecards
+                              WHERE pool_name = ? GROUP BY name) latest
+                          ON fs.name = latest.name AND fs.eval_date = latest.md
+                        WHERE fs.pool_name = ?
+                          AND fs.eval_date >= date('now', '-30 days')
+                          AND fs.kind IN ('内置', '技术指标', '进化', '演化引擎')
+                    )
+                    WHERE score > 0.2
+                    ORDER BY score DESC
                 ''', (self.pool_name, self.pool_name)).fetchall()
                 
                 if len(rows) < 3:
@@ -559,6 +569,7 @@ class LoopEngine:
                 factor_info = {r[0]: {"kind": r[1], "code": r[2],
                                       "direction": -1 if r[3] == "负向" else 1}
                                for r in rows[:8]}
+                score_map = {r[0]: float(r[4] or 0.5) for r in rows}  # OOS 感知分数
                 logger.debug(f"因子信息: {factor_info}")
             
             # 获取因子值（builtin + evolved）
@@ -637,20 +648,9 @@ class LoopEngine:
                 factor_df = pd.DataFrame({k: v for k, v in factor_vals.items() if k in selected})
                 if not factor_df.empty and factor_df.shape[1] > 3:
                     corr_matrix = factor_df.corr().abs()
-                    # 贪心选择：按ICIR降序，剔除相关系数>0.7的因子
-                    # 获取ICIR用于排序
-                    icir_map = {}
-                    for name in selected:
-                        try:
-                            with library._lconn() as c:
-                                row = c.execute(
-                                    "SELECT icir FROM factor_scorecards WHERE name=? "
-                                    "ORDER BY eval_date DESC LIMIT 1", (name,)).fetchone()
-                                icir_map[name] = abs(row[0]) if row else 0.5
-                        except Exception:
-                            icir_map[name] = 0.5
-                    
-                    # 按ICIR降序排序
+                    # 贪心选择：按OOS感知分数降序，剔除相关系数>0.7的因子
+                    icir_map = {n: score_map.get(n, 0.5) for n in selected}
+                    # 按分数降序排序
                     selected.sort(key=lambda x: icir_map.get(x, 0), reverse=True)
                     
                     # 贪心选择，剔除高相关
@@ -662,21 +662,9 @@ class LoopEngine:
                             break
                     selected = filtered
             
-            # ICIR加权（而非等权）
-            icir_weights = {}
-            total_icir = 0
-            for name in selected:
-                try:
-                    with library._lconn() as c:
-                        row = c.execute(
-                            "SELECT icir FROM factor_scorecards WHERE name=? "
-                            "ORDER BY eval_date DESC LIMIT 1", (name,)).fetchone()
-                        icir = abs(row[0]) if row else 0.5
-                        icir_weights[name] = icir
-                        total_icir += icir
-                except Exception:
-                    icir_weights[name] = 0.5
-                    total_icir += 0.5
+            # ICIR加权（而非等权）：权重用候选查询的 OOS 感知分数，与排名口径一致
+            icir_weights = {n: score_map.get(n, 0.5) for n in selected}
+            total_icir = sum(icir_weights.values())
             
             # 归一化权重（方向取评分卡建议方向：负 IC 因子反向使用，
             # 2026-09-11 踩坑：方向曾硬编码 1，alpha041/mom_60d 实际 IC 为负）

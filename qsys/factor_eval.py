@@ -451,10 +451,8 @@ def build_scorecard_batch(factors: list[dict], codes: list[str], end: str,
     source = source or "qlib_local"
     rows = []
 
-    # 1. 一次性构建面板和帧（最大开销）
+    # 1. 一次性构建面板和帧（最大开销；全窗口，IS/OOS 切片在评估循环内做）
     panel = sig.get_panel_cached(codes, end, 800, source=source)
-    if train_end:
-        panel = panel[panel.index.get_level_values("datetime") <= train_end]
     fwds = {d: forward_returns(panel, d) for d in WIN_HORIZONS.values()}
     frames = build_field_frames(panel)
 
@@ -469,8 +467,8 @@ def build_scorecard_batch(factors: list[dict], codes: list[str], end: str,
                 factor_values[fac["name"]] = get_factor_values(fac, codes, end, source=source)
                 continue
 
-            # P4: 检查缓存是否已存在
-            ck = _cache("fvals", f"{source}|{fac['name']}|{fac['kind']}|{ck_prefix}|{end}|800")
+            # P4: 检查缓存是否已存在（"800f"=全窗口值）
+            ck = _cache("fvals", f"{source}|{fac['name']}|{fac['kind']}|{ck_prefix}|{end}|800f")
             if ck.exists():
                 hit = sig._read_parquet_safe(ck)
                 if hit is not None:
@@ -506,10 +504,12 @@ def build_scorecard_batch(factors: list[dict], codes: list[str], end: str,
             if vals.empty:
                 raise RuntimeError("因子值为空")
 
-            # 计算IC序列
+            # 计算IC序列（全窗口；OOS 统计用 train_end 之后的段）
             ic = ic_series(vals, fwds[MAIN_FWD])
             if ic.empty:
                 raise RuntimeError("IC 序列为空")
+            oos = _oos_stats(ic, fac.get("first_seen"), train_end,
+                             engine_selected=fac.get("kind") not in ("builtin", "tech"))
 
             if train_end:
                 ic = ic[ic.index <= train_end]
@@ -526,6 +526,7 @@ def build_scorecard_batch(factors: list[dict], codes: list[str], end: str,
                 "Top组胜率": top_group_winrate(vals, panel, fwd=fwds[MAIN_FWD]),
                 "建议方向": "正向" if ic.mean() >= 0 else "负向",
                 "天数": len(ic),
+                **oos,
             }
             for label, d in WIN_HORIZONS.items():
                 row[f"{label}胜率"] = top_group_winrate(
@@ -543,6 +544,29 @@ def build_scorecard_batch(factors: list[dict], codes: list[str], end: str,
     return df
 
 
+def _oos_stats(ic_full: pd.Series, first_seen: str | None, train_end: str | None,
+               engine_selected: bool = True) -> dict:
+    """OOS 指标：IC 序列在 OOS 窗口内的切片统计。
+
+    窗口起点：引擎选拔过的因子（loopengine/rdagent）取 max(train_end, 首次入库日)——
+    被发现之后的数据才未被选择过程污染；builtin/tech 是外生标准因子，无选择偏差，
+    直接用 train_end 起算（约近 250 交易日，2026-09-11 实测否则只剩 ~10 天太噪）。"""
+    empty = {"IC_OOS": None, "ICIR_OOS": None, "OOS天数": 0}
+    if ic_full is None or ic_full.empty or not train_end:
+        return empty
+    base = str(train_end)[:10]
+    oos_start = max(base, str(first_seen or "")[:10]) if engine_selected else base
+    try:
+        seg = ic_full[ic_full.index > pd.Timestamp(oos_start)]
+    except Exception:
+        return empty
+    if len(seg) < 5:
+        return {"IC_OOS": None, "ICIR_OOS": None, "OOS天数": int(len(seg))}
+    return {"IC_OOS": float(seg.mean()),
+            "ICIR_OOS": float(seg.mean() / (seg.std() + 1e-12)),
+            "OOS天数": int(len(seg))}
+
+
 def _eval_single_factor(args):
     """单因子评估函数（用于并行执行）。"""
     fac, vals, panel, fwds, train_end = args
@@ -551,10 +575,12 @@ def _eval_single_factor(args):
         if vals is None or vals.empty:
             raise RuntimeError("因子值为空")
 
-        # 计算IC序列
+        # 计算IC序列（全窗口——OOS 统计要用 train_end 之后的段）
         ic = ic_series(vals, fwds[MAIN_FWD])
         if ic.empty:
             raise RuntimeError("IC 序列为空")
+        oos = _oos_stats(ic, fac.get("first_seen"), train_end,
+                         engine_selected=fac.get("kind") not in ("builtin", "tech"))
 
         if train_end:
             ic = ic[ic.index <= train_end]
@@ -571,6 +597,7 @@ def _eval_single_factor(args):
             "Top组胜率": top_group_winrate(vals, panel, fwd=fwds[MAIN_FWD]),
             "建议方向": "正向" if ic.mean() >= 0 else "负向",
             "天数": len(ic),
+            **oos,
         }
         for label, d in WIN_HORIZONS.items():
             row[f"{label}胜率"] = top_group_winrate(
@@ -594,10 +621,9 @@ def build_scorecard_parallel(factors: list[dict], codes: list[str], end: str,
 
     source = source or "qlib_local"
 
-    # 1. 一次性构建面板和帧
+    # 1. 一次性构建面板和帧（全窗口：IS 统计在 worker 内按 train_end 切片，
+    #    OOS 统计需要 train_end 之后的段——面板不能预截断）
     panel = sig.get_panel_cached(codes, end, 800, source=source)
-    if train_end:
-        panel = panel[panel.index.get_level_values("datetime") <= train_end]
     fwds = {d: forward_returns(panel, d) for d in WIN_HORIZONS.values()}
     frames = build_field_frames(panel)
 
@@ -611,8 +637,8 @@ def build_scorecard_parallel(factors: list[dict], codes: list[str], end: str,
                 factor_values[fac["name"]] = get_factor_values(fac, codes, end, source=source)
                 continue
 
-            # P4: 检查缓存
-            ck = _cache("fvals", f"{source}|{fac['name']}|{fac['kind']}|{ck_prefix}|{end}|800")
+            # P4: 检查缓存（"800f"=全窗口值；旧的截断窗口缓存在口径变更后作废）
+            ck = _cache("fvals", f"{source}|{fac['name']}|{fac['kind']}|{ck_prefix}|{end}|800f")
             if ck.exists():
                 hit = sig._read_parquet_safe(ck)
                 if hit is not None:

@@ -2006,6 +2006,9 @@ class SchedulerManager:
             job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 3600},
         )
         self.sched.start()
+        self._running: dict[str, float] = {}  # job_key → 开始时间戳（供采集监控页显示"正在爬取"）
+        import threading
+        self._last_lock = threading.Lock()  # scheduler_last.json 读改写并发保护
         self._apply_state()
 
     # ---- 状态持久化 ----
@@ -2040,6 +2043,7 @@ class SchedulerManager:
     def _run(self, key: str):
         cfg = self._state()[key]
         t0 = time.time()
+        self._running[key] = t0
         now_start = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         # 推送 JOB_START 事件
         try:
@@ -2064,9 +2068,10 @@ class SchedulerManager:
                      duration_ms=dur_ms)
         except Exception:
             pass
-        last = load_json(SCHED_LAST_FILE, {})
-        last[key] = {"time": now, "ok": ok, "msg": detail}
-        save_json(SCHED_LAST_FILE, last)
+        with self._last_lock:
+            last = load_json(SCHED_LAST_FILE, {})
+            last[key] = {"time": now, "ok": ok, "msg": detail}
+            save_json(SCHED_LAST_FILE, last)
         hist = Path(SCHED_LAST_FILE).parent / "scheduler_history.jsonl"
         with hist.open("a") as f:
             f.write(json.dumps({"job": key, **last[key]}, ensure_ascii=False) + "\n")
@@ -2083,6 +2088,7 @@ class SchedulerManager:
                      json.dumps(cfg.get("params", {}), ensure_ascii=False), now))
         except Exception as e:
             logging.warning("[scheduler] sched_exec_log insert failed for %s: %s", key, e)
+        self._running.pop(key, None)
 
     # ---- 对外 API ----
     def view(self) -> dict:
@@ -2092,7 +2098,8 @@ class SchedulerManager:
             job = self.sched.get_job(key)
             out[key] = {**cfg, "label": JOBS[key]["name"],
                         "next": (job.next_run_time.strftime("%m-%d %H:%M") if job else None),
-                        "last": last.get(key)}
+                        "last": last.get(key),
+                        "running_since": self._running.get(key)}
         return out
 
     def set_enabled(self, key: str, enabled: bool):

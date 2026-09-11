@@ -91,6 +91,7 @@ pages = {
         st.Page("views/p_factor_stats.py", title="体检统计", icon="📈", url_path="factor-stats"),
         st.Page("views/p_wf_detail.py", title="Walk-Forward衰减", icon="📉", url_path="wf-detail"),
         st.Page("views/p_evo.py", title="进化看板", icon="🧬", url_path="evo"),
+        st.Page("views/p_datahub.py", title="数据采集中心", icon="🛰", url_path="datahub"),
         st.Page("views/p_sched.py", title="定时任务", icon="⏰", url_path="sched"),
         st.Page("views/p_factor_usage.py", title="因子使用率", icon="📊", url_path="factor-usage"),
         st.Page("views/p_factor_scores.py", title="5维因子评分", icon="💯", url_path="factor-scores"),

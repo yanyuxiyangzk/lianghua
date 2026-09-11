@@ -514,13 +514,28 @@ def _ths_access_token() -> str:
     return at
 
 
-def _ths_http(endpoint: str, payload: dict):
-    """iFinD HTTP API 调用 → (df, res, errcode)；tables JSON 复用 _tables_to_df 解析。"""
+def _ths_http(endpoint: str, payload: dict, _retried: bool = False):
+    """iFinD HTTP API 调用 → (df, res, errcode)；tables JSON 复用 _tables_to_df 解析。
+    -1302（access_token 失效/被轮换）时自动作废旧 token 重取一次再重试。"""
     import requests
     at = _ths_access_token()
     res = requests.post(f"{_THS_API}/{endpoint}", json=payload, timeout=30,
                         headers={"Content-Type": "application/json", "access_token": at}).json()
-    return _tables_to_df(res.get("tables")), res, res.get("errorcode", -1)
+    err = res.get("errorcode", -1)
+    if err == -1302 and not _retried:
+        # token 失效（可能被其他进程/终端轮换）：作废缓存并重取
+        _THS_HTTP.update(access_token="", until=0.0)
+        try:
+            _set_config_value("access_token", "")
+            _set_config_value("token_expires_at", "")
+        except Exception:
+            pass
+        try:
+            _ths_access_token()  # 用 refresh_token 重取并入库
+            return _ths_http(endpoint, payload, _retried=True)
+        except Exception:
+            pass  # refresh_token 也失效 → 原样返回 -1302，由上层走 SDK 兜底
+    return _tables_to_df(res.get("tables")), res, err
 
 
 def _sdk_or_http(sdk_call, http_call):
@@ -1911,6 +1926,62 @@ def fetch_realtime_to_db() -> int:
                 "volume,amount,turnover,quantity_ratio,amplitude,float_shares,float_mv,speed)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 vals)
+    return len(vals)
+
+
+def fetch_realtime_hot(codes: list[str]) -> int:
+    """热码高频快照：小名单（持仓/自选/今日名单，~80只）走 iFinD RQ 高频落库。
+
+    与全市场批次（fetch_realtime_to_db，5分钟）同表共存——读取端按代码取最新行，
+    互不干扰。返回写入行数。
+    """
+    import re as _re
+    if not codes:
+        return 0
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _to_ifind(code):
+        m = _re.match(r"^([A-Za-z]{2})(\d{6})$", code)
+        return f"{m.group(2)}.{m.group(1).upper()}" if m else code
+
+    def _norm(raw):
+        m = _re.match(r"(\d{6})\.([A-Z]{2})", str(raw).strip())
+        return f"{m.group(2)}{m.group(1)}" if m else str(raw)
+
+    indicators = "latest,preClose,open,high,low,changeRatio,volume,amount,turnoverRatio"
+    vals = []
+    batch_size = 50
+    for i in range(0, len(codes), batch_size):
+        batch = codes[i:i + batch_size]
+        try:
+            df, _res, err = _ths_http("real_time_quotation", {
+                "codes": ",".join(_to_ifind(c) for c in batch), "indicators": indicators})
+            if df is None or df.empty:
+                continue
+            code_col = next((c for c in df.columns
+                             if "code" in c.lower() or "代码" in c or "thscode" in c.lower()),
+                            df.columns[0])
+            for _, row in df.iterrows():
+                code = _norm(row[code_col])
+                vals.append((
+                    code, now,
+                    _safe_float(row.get("latest")), _safe_float(row.get("preClose")),
+                    _safe_float(row.get("open")), _safe_float(row.get("high")),
+                    _safe_float(row.get("low")), _safe_float(row.get("changeRatio")),
+                    _safe_float(row.get("volume")), _safe_float(row.get("amount")),
+                    _safe_float(row.get("turnoverRatio")),
+                    None, None, None, None, None,
+                ))
+        except Exception:
+            continue
+    if not vals:
+        return 0
+    with _qconn() as c:
+        c.executemany(
+            "INSERT OR REPLACE INTO ifind_realtime"
+            "(code,datetime,price,prev_close,open,high,low,change_pct,"
+            "volume,amount,turnover,quantity_ratio,amplitude,float_shares,float_mv,speed)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", vals)
     return len(vals)
 
 

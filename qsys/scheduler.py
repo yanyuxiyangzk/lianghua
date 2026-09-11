@@ -1030,9 +1030,14 @@ def job_minute_sync(**_ignored) -> str:
     return f"{now.strftime('%H:%M')} 分钟线同步：{n_ok}/{len(codes)} 只 · 写入 {n_rows} 行"
 
 
+_TICK_FAIL = {"n": 0}  # tick_sync 连续全灭计数（TDX 断链退避用）
+
+
 def job_tick_sync(**_ignored) -> str:
     """盘中tick数据同步（每10秒）：自选股+当前持仓的逐笔成交落库（tick_data 表）。
-    分时图页面直接读本地库，不再每次直连数据源。"""
+    分时图页面直接读本地库，不再每次直连数据源。
+    退避：TDX 通道连续全灭 30 次后降为每分钟试一次（2026-09-10 起通道协议失配，
+    每 10 秒空转 6 台服务器超时白白霸占 interval 线程池）。"""
     from zoneinfo import ZoneInfo
 
     now = datetime.now(ZoneInfo(TZ))
@@ -1040,6 +1045,11 @@ def job_tick_sync(**_ignored) -> str:
         return "非交易日，跳过"
     if not ("0930" <= now.strftime("%H%M") <= "1505"):
         return "非交易时段，跳过"
+
+    # 退避：连续全灭时 6 次周期只真正试 1 次
+    if _TICK_FAIL["n"] >= 30 and _TICK_FAIL["n"] % 6 != 0:
+        _TICK_FAIL["n"] += 1
+        return f"TDX断链退避中（第{_TICK_FAIL['n']}次）"
 
     import experience
     codes = set(load_watchlist())
@@ -1092,6 +1102,11 @@ def job_tick_sync(**_ignored) -> str:
         except Exception as e:
             return f"{now.strftime('%H:%M')} tick同步：{n_ok}/{len(codes)} 只 · 写入失败: {e}"
 
+    # 退避计数：全灭 +1，有货清零
+    if n_ok == 0:
+        _TICK_FAIL["n"] += 1
+    else:
+        _TICK_FAIL["n"] = 0
     return f"{now.strftime('%H:%M')} tick同步：{n_ok}/{len(codes)} 只 · 写入 {n_rows} 行"
 
 
@@ -1480,6 +1495,50 @@ def job_ifind_realtime_sync(**_ignored) -> str:
         return f"{now.strftime('%H:%M:%S')} 实时快照写入完成：{n} 只"
     else:
         return "实时快照写入失败（可能iFinD限流或无数据）"
+
+
+def job_ifind_hot_sync(**_ignored) -> str:
+    """热码高频快照（每15秒）：持仓+自选+最新名单的实时价落库（ifind_realtime）。
+
+    全市场批次（5分钟/112次调用）物理上快不了；热码仅 ~80 只（2 次调用/2-4秒），
+    高频后止盈止损触发与限价单撮合才真正接近实盘（用户要求：交易必须用同花顺
+    实盘高频数据驱动）。同时推给 PriceMonitor 事件驱动评估。"""
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5:
+        return "非交易日，跳过"
+    if not ("0925" <= now.strftime("%H%M") <= "1505"):
+        return "非交易时段，跳过"
+
+    import experience
+    codes = set(load_watchlist())
+    with experience._conn() as c:
+        for r in c.execute("SELECT code FROM positions WHERE status IN ('open','pending')").fetchall():
+            codes.add(r[0])
+        for r in c.execute("SELECT DISTINCT code FROM broker_positions WHERE shares>0").fetchall():
+            codes.add(r[0])
+    latest = experience.list_pick_dates(limit=1)
+    if latest:
+        for r in experience.picks_on_date(latest[0]).itertuples():
+            for it in experience.pick_items_detail(int(r.id)).itertuples():
+                codes.add(it.code)
+
+    n = datasource.fetch_realtime_hot(sorted(codes))
+
+    # PriceMonitor 事件驱动（读回热码最新价触发止盈止损评估）
+    if n > 0:
+        try:
+            from price_monitor import monitor
+            watched = monitor.get_watched_codes()
+            if watched:
+                prices = experience._latest_prices(watched)
+                for code, (price, _o, _p) in prices.items():
+                    if price:
+                        monitor.on_price_update(code, price, now.strftime("%Y-%m-%d %H:%M:%S"))
+        except Exception:
+            pass
+    return f"{now.strftime('%H:%M:%S')} 热码快照 {n}/{len(codes)} 只"
 
 
 def job_ifind_cleanup(**_ignored) -> str:
@@ -1956,6 +2015,10 @@ JOBS = {
                             "default": {"enabled": True, "hour": 9, "minute": 30,
                                         "params": {"interval_sec": 300},
                                         "trigger": "interval"}},  # interval_sec 必须放 params 里（调度器从 params 读）
+    "ifind_hot_sync": {"name": "⚡ 热码高频快照（盘中·15s）", "func": job_ifind_hot_sync,
+                       "default": {"enabled": True, "hour": 9, "minute": 30,
+                                   "params": {"interval_sec": 15},
+                                   "trigger": "interval"}},
     "ifind_cleanup": {"name": "🧹 iFinD 过期数据清理", "func": job_ifind_cleanup,
                       "default": {"enabled": True, "hour": 16, "minute": 0, "params": {}}},
     "watchlist_signals": {"name": "📈 个股信号（自选股 × 进化因子）", "func": job_watchlist_signals,

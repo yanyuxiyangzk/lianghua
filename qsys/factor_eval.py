@@ -274,6 +274,19 @@ def forward_returns(panel: pd.DataFrame, days: int) -> pd.DataFrame:
     return close.shift(-days) / close - 1
 
 
+def _eval_source() -> str:
+    """评估数据源：跟随演化闭环源（loop_factor_source，当前=同花顺 iFinD）。
+
+    选拔（engine._frames）、体检（本模块）、打包（_try_generate_pack）、
+    实盘交易（ifind_realtime）必须同一数据口径——此前此处硬编码 qlib_local，
+    同一个因子"选拔一套数据、打分另一套数据、实盘再一套"（2026-09-11 排查）。"""
+    import datasource
+    try:
+        return datasource.get_loop_source()
+    except Exception:
+        return "qlib_local"
+
+
 def get_factor_values(fac: dict, codes: list[str], end: str, lookback_days: int = 800,
                        source: str | None = None) -> pd.Series:
     """统一取因子长表 Series[(datetime, instrument)]。
@@ -282,8 +295,7 @@ def get_factor_values(fac: dict, codes: list[str], end: str, lookback_days: int 
     """
     import datasource
 
-    # 因子评估强制 qlib_local：与 RD-Agent 同源 + 批量取数（全局切换只影响展示层）
-    source = source or "qlib_local"
+    source = source or _eval_source()
     ck = _cache("fvals", f"{source}|{fac['name']}|{fac['kind']}|{'|'.join(sorted(codes))}|{end}|{lookback_days}")
     if ck.exists():
         hit = sig._read_parquet_safe(ck)
@@ -345,7 +357,7 @@ def get_ic_series(fac: dict, codes: list[str], end: str, fwd_days: int = MAIN_FW
                   lookback_days: int = 800, source: str | None = None) -> pd.Series:
     import datasource
 
-    source = source or "qlib_local"
+    source = source or _eval_source()
     ck = _cache("ic", f"{source}|{fac['name']}|{fac['kind']}|{'|'.join(sorted(codes))}|{end}|{fwd_days}|{lookback_days}")
     if ck.exists():
         hit = sig._read_parquet_safe(ck)
@@ -448,7 +460,7 @@ def build_scorecard_batch(factors: list[dict], codes: list[str], end: str,
     import datasource
     from loopengine.tree import build_field_frames, evaluate_tree, parse
 
-    source = source or "qlib_local"
+    source = source or _eval_source()
     rows = []
 
     # 1. 一次性构建面板和帧（最大开销；全窗口，IS/OOS 切片在评估循环内做）
@@ -619,7 +631,7 @@ def build_scorecard_parallel(factors: list[dict], codes: list[str], end: str,
     from concurrent.futures import ProcessPoolExecutor, as_completed
     from loopengine.tree import build_field_frames, evaluate_tree, parse
 
-    source = source or "qlib_local"
+    source = source or _eval_source()
 
     # 1. 一次性构建面板和帧（全窗口：IS 统计在 worker 内按 train_end 切片，
     #    OOS 统计需要 train_end 之后的段——面板不能预截断）
@@ -1425,14 +1437,14 @@ def multi_objective_score(factor_name: str, codes: list[str], end: str,
             fac = resolve_factor(factor_name) or fac
         if not fac.get("code"):
             return {'score': 0.0, 'error': f'无法解析因子代码: {factor_name}'}
-        vals = get_factor_values(fac, codes, end, source="qlib_local")
-        ic_series = get_ic_series(fac, codes, end, source="qlib_local")
+        vals = get_factor_values(fac, codes, end, source=_eval_source())
+        ic_series = get_ic_series(fac, codes, end, source=_eval_source())
         
         if vals.empty or ic_series.empty:
             return {'score': 0.0, 'error': '数据为空'}
         
         # 获取面板和远期收益
-        panel = sig.get_panel_cached(codes, end, 800, source="qlib_local")
+        panel = sig.get_panel_cached(codes, end, 800, source=_eval_source())
         fwd = forward_returns(panel, 5)  # 5日远期收益
         
         # 计算IC指标
@@ -1527,14 +1539,14 @@ def risk_budget_check(strategy_pack: dict, codes: list[str], end: str,
             return {'passed': False, 'violations': ['策略包无因子'], 'metrics': {}}
         
         # 计算组合得分
-        panel = sig.get_panel_cached(codes, end, 800, source="qlib_local")
+        panel = sig.get_panel_cached(codes, end, 800, source=_eval_source())
         fwd = forward_returns(panel, 5)
         
         # 模拟组合收益
         combo_vals = None
         for fac in factors:
             try:
-                vals = get_factor_values(fac, codes, end, source="qlib_local")
+                vals = get_factor_values(fac, codes, end, source=_eval_source())
                 if combo_vals is None:
                     combo_vals = vals
                 else:

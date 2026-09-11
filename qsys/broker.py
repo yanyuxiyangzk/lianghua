@@ -135,15 +135,17 @@ def _settle_today():
 
 # ---------------------------------------------------------------- 行情
 def _latest_prices(codes: list[str]) -> dict:
-    """ifind_realtime 最新快照 {code: (price, prev_close, open)}。"""
+    """ifind_realtime 每代码各自最新快照 {code: (price, prev_close, open)}。
+    按代码取最新：热码高频快照与全市场批次同表共存时冷码不丢（2026-09-11）。"""
     import datasource
     if not codes:
         return {}
     with datasource._qconn() as c:
         df = pd.read_sql(
-            f"SELECT code, price, prev_close, open FROM ifind_realtime"
-            f" WHERE datetime=(SELECT MAX(datetime) FROM ifind_realtime)"
-            f" AND code IN ({','.join('?' * len(codes))})", c, params=codes)
+            f"""SELECT r.code, r.price, r.prev_close, r.open FROM ifind_realtime r
+                JOIN (SELECT code, MAX(datetime) md FROM ifind_realtime
+                      WHERE code IN ({','.join('?' * len(codes))}) GROUP BY code) t
+                  ON r.code = t.code AND r.datetime = t.md""", c, params=codes)
     return {r.code: (r.price, r.prev_close, r.open) for r in df.itertuples()}
 
 

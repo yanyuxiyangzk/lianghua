@@ -37,8 +37,11 @@ PIPELINES = [
      "sla_trading_sec": 120},
     {"key": "minute_sync", "channel": "iFinD HTTP", "group": "盘中高频",
      "tables": [("ifind_minute", "datetime")], "sla_trading_sec": 600},
+    {"key": "ifind_hot_sync", "channel": "iFinD HTTP", "group": "盘中高频",
+     "tables": [("ifind_realtime", "datetime")], "sla_trading_sec": 120},
     {"key": "ifind_realtime_sync", "channel": "iFinD HTTP", "group": "盘中高频",
-     "tables": [("ifind_realtime", "datetime")], "sla_trading_sec": 600},
+     "tables": [("ifind_realtime", "datetime")], "sla_trading_sec": 600,
+     "fresh_min_rows": 4000},  # 热码任务同表写小批量，全量批次须按窗口行数判定
     # ---- 盘后批量 ----
     {"key": "ifind_daily_sync", "channel": "iFinD HTTP", "group": "盘后批量",
      "tables": [("market_daily", "date")], "daily_cutoff": "16:00"},
@@ -164,6 +167,19 @@ def _freshness(pl: dict, stats: dict, now: datetime, trading_day: bool) -> str:
                      and "0915" <= now.strftime("%H%M") <= "1505")
         if not in_window:
             return "idle"
+        # 窗口行数判定（全量批次与热码小批次同表共存时，行数门槛区分真假新鲜）
+        min_rows = pl.get("fresh_min_rows")
+        if min_rows:
+            try:
+                import datasource
+                t, col = pl["tables"][0]
+                with datasource._qconn() as c:
+                    n = c.execute(
+                        f"SELECT COUNT(*) FROM {t} WHERE {col} >= "
+                        f" datetime('now','localtime','-{int(sla)} seconds')").fetchone()[0]
+                return "ok" if n >= min_rows else "stale"
+            except Exception:
+                return "stale"
         latest = max((stats.get(t, {}).get("latest") or "" for t, _ in pl["tables"]), default="")
         if not latest:
             return "stale"

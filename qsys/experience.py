@@ -538,15 +538,20 @@ def export_experience_report(out_path: Path | None = None) -> Path:
 
 # ---------------------------------------------------------------- 持仓跟踪（盘中触发开平仓，T+1）
 def _latest_prices(codes: list[str]) -> dict:
-    """ifind_realtime 最新一批快照 {code: (price, open, prev_close)}。"""
+    """每代码各自最新一行快照 {code: (price, open, prev_close)}。
+
+    按代码取最新（而非整批 MAX(datetime)）：高频热码快照（持仓/自选/名单，
+    15s 一批）与全市场快照（5min 一批）同表共存时，冷码不会被新批次的
+    整批时间戳"挤没"。"""
     import datasource
     if not codes:
         return {}
     with datasource._qconn() as c:
         df = pd.read_sql(
-            f"SELECT code, price, open, prev_close FROM ifind_realtime"
-            f" WHERE datetime=(SELECT MAX(datetime) FROM ifind_realtime)"
-            f" AND code IN ({','.join('?' * len(codes))})", c, params=codes)
+            f"""SELECT r.code, r.price, r.open, r.prev_close FROM ifind_realtime r
+                JOIN (SELECT code, MAX(datetime) md FROM ifind_realtime
+                      WHERE code IN ({','.join('?' * len(codes))}) GROUP BY code) t
+                  ON r.code = t.code AND r.datetime = t.md""", c, params=codes)
     return {r.code: (r.price, r.open, r.prev_close) for r in df.itertuples()}
 
 

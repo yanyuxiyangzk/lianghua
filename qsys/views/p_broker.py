@@ -225,216 +225,203 @@ def render():
         _render_calendar_tab()
 
 
-def _get_daily_returns() -> pd.DataFrame:
-    """计算每日收益率：基于资金流水的余额变化。"""
+@st.cache_data(ttl=60, show_spinner=False)
+def _load_equity_curve() -> tuple[pd.DataFrame, dict]:
+    """逐交易日重建账户总资产（现金 + 持仓市值×收盘价），计算日收益。
+
+    - 现金取资金流水的 balance（权威记录，含手动出入金）；持仓由 broker_fills 回放
+    - 出入金属于外部现金流，日收益按修正迪茨法剔除：ret = 权益/(昨日权益+今日净入金) - 1
+    - 不能用现金余额直接算收益率：买入让现金下降，建仓会被误判为大亏
+    """
     import sqlite3
-    from pathlib import Path
-    
-    db_path = Path("/data/experience.db")
-    if not db_path.exists():
-        return pd.DataFrame()
-    
+    if not broker.DB_PATH.exists():
+        return pd.DataFrame(), {}
     try:
-        with sqlite3.connect(str(db_path), timeout=30) as c:
+        with sqlite3.connect(str(broker.DB_PATH), timeout=30) as c:
             c.execute("PRAGMA busy_timeout=30000")
+            fills = pd.read_sql(
+                "SELECT date, code, side, price, shares, amount, fee, tax"
+                " FROM broker_fills ORDER BY date, id", c)
             flows = pd.read_sql(
-                "SELECT ts, type, amount, balance FROM broker_cashflows ORDER BY ts", c)
+                "SELECT ts, type, amount, balance FROM broker_cashflows ORDER BY id", c)
     except Exception:
-        return pd.DataFrame()
-    
-    if flows.empty:
-        return pd.DataFrame()
-    
-    # 解析日期
-    flows["date"] = pd.to_datetime(flows["ts"]).dt.date
-    flows["balance"] = flows["balance"].astype(float)
-    
-    # 每日结束时的余额（取每天最后一次交易后的余额）
-    daily_balance = flows.groupby("date")["balance"].last().reset_index()
-    daily_balance.columns = ["date", "end_balance"]
-    daily_balance["date"] = pd.to_datetime(daily_balance["date"])
-    
-    # 计算日收益率
-    daily_balance["prev_balance"] = daily_balance["end_balance"].shift(1)
-    daily_balance["return_pct"] = (daily_balance["end_balance"] / daily_balance["prev_balance"] - 1) * 100
-    daily_balance = daily_balance.dropna(subset=["return_pct"])
-    
-    return daily_balance
+        return pd.DataFrame(), {}
+    if fills.empty or flows.empty:
+        return pd.DataFrame(), {}
+
+    flows["date"] = flows["ts"].str[:10]
+    eod_cash = flows.groupby("date")["balance"].last().astype(float)
+    ext = flows[~flows["type"].isin(["买入", "卖出"])].groupby("date")["amount"].sum()
+    init_cash = float(flows.loc[flows["type"] == "初始入金", "amount"].sum())
+    if init_cash <= 0:
+        init_cash = broker.INIT_CASH
+    start = str(min(flows["date"].min(), fills["date"].min()))
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # 各持仓股票的日线收盘价（含今日实时合并）；缺行情的日用最近价/成本兜底
+    import datasource
+    close = {}
+    for code in fills["code"].unique():
+        try:
+            d = datasource.get_daily_from_db(code, start, today)
+        except Exception:
+            d = pd.DataFrame()
+        if not d.empty:
+            s = pd.to_numeric(d.set_index("date")["close"], errors="coerce").dropna()
+            close[code] = s[~s.index.duplicated(keep="last")]
+
+    days = sorted({x for s in close.values() for x in s.index}
+                  | set(fills["date"]) | set(eod_cash.index))
+    days = [str(d) for d in days if start <= str(d) <= today]
+    eod_cash = eod_cash.reindex(days).ffill()
+
+    fills_by_date = {d: g for d, g in fills.groupby("date")}
+    shares, px_last, cost_last = {}, {}, {}
+    rows = []
+    for d in days:
+        g = fills_by_date.get(d)
+        if g is not None:
+            for f in g.itertuples():
+                if f.side == "buy":
+                    shares[f.code] = shares.get(f.code, 0) + int(f.shares)
+                else:
+                    left = shares.get(f.code, 0) - int(f.shares)
+                    if left > 0:
+                        shares[f.code] = left
+                    else:
+                        shares.pop(f.code, None)
+                cost_last[f.code] = float(f.price)
+        for code, s in close.items():
+            v = s.get(d)
+            if v is not None:
+                px_last[code] = float(v)
+        mv = sum(n * px_last.get(c_, cost_last.get(c_, 0.0)) for c_, n in shares.items())
+        cash = float(eod_cash[d]) if pd.notna(eod_cash[d]) else 0.0
+        equity = cash + mv
+        denom = (rows[-1]["equity"] if rows else 0.0) + float(ext.get(d, 0.0))
+        pnl = equity - denom
+        rows.append({"date": d, "cash": round(cash, 2), "mv": round(mv, 2),
+                     "equity": round(equity, 2), "pnl": round(pnl, 2),
+                     "ret_pct": pnl / denom * 100 if denom else 0.0})
+    if not rows:
+        return pd.DataFrame(), {}
+    eq = pd.DataFrame(rows)
+    eq["date"] = pd.to_datetime(eq["date"])
+    meta = {"init": init_cash, "ext_total": float(ext.sum())}
+    return eq, meta
 
 
 def _render_calendar_tab():
-    """渲染收益日历标签页。"""
+    """收益日历：总资产曲线 + 逐月日历（收益 = 总资产日变动，含持仓市值）。"""
+    import calendar as cal_mod
     import plotly.graph_objects as go
-    import plotly.express as px
-    from plotly.subplots import make_subplots
-    
-    daily_returns = _get_daily_returns()
-    
-    if daily_returns.empty:
-        st.info("暂无收益数据——完成交易后将自动生成收益日历")
+
+    eq, meta = _load_equity_curve()
+    if eq.empty:
+        st.info("暂无成交记录——完成交易后将自动生成收益日历")
         return
-    
-    # 按月分组
-    daily_returns["year_month"] = daily_returns["date"].dt.to_period("M")
-    daily_returns["day"] = daily_returns["date"].dt.day
-    daily_returns["month"] = daily_returns["date"].dt.month
-    daily_returns["year"] = daily_returns["date"].dt.year
-    
-    # 选择显示模式
-    col1, col2 = st.columns([1, 3])
-    with col1:
-        view_mode = st.radio("显示模式", ["日收益", "月收益"], key="calendar_mode")
-        if view_mode == "月收益":
-            # 月度收益率
-            monthly = daily_returns.groupby("year_month").agg(
-                total_return=("return_pct", "sum"),
-                trading_days=("return_pct", "count"),
-                win_days=("return_pct", lambda x: (x > 0).sum()),
-                avg_return=("return_pct", "mean")
-            ).reset_index()
-            monthly["year_month_str"] = monthly["year_month"].astype(str)
-            monthly["win_rate"] = (monthly["win_days"] / monthly["trading_days"] * 100).round(1)
-            
-            st.metric("累计收益率", f"{daily_returns['return_pct'].sum():.2f}%")
-            st.metric("月均收益率", f"{monthly['total_return'].mean():.2f}%")
-            st.metric("交易天数", f"{len(daily_returns)}")
-            
-            # 月度收益柱状图
-            fig_monthly = px.bar(monthly, x="year_month_str", y="total_return",
-                                color="total_return",
-                                color_continuous_scale=["#ef5350", "#26a69a"],
-                                title="月度收益率",
-                                labels={"total_return": "收益率(%)", "year_month_str": "月份"})
-            fig_monthly.update_layout(height=400, showlegend=False)
-            st.plotly_chart(fig_monthly, use_container_width=True)
-            
-            # 月度胜率
-            fig_wr = px.bar(monthly, x="year_month_str", y="win_rate",
-                           title="月度交易日胜率",
-                           labels={"win_rate": "胜率(%)", "year_month_str": "月份"})
-            fig_wr.update_layout(height=300)
-            st.plotly_chart(fig_wr, use_container_width=True)
+    init_cash = meta.get("init", broker.INIT_CASH)
+
+    # 累计收益率用时间加权（剔除出入金影响）；累计盈亏为金额口径
+    total_ret = ((1 + eq["ret_pct"] / 100).prod() - 1) * 100
+    total_pnl = eq["equity"].iloc[-1] - meta.get("ext_total", init_cash)
+    win, lose = int((eq["ret_pct"] > 0).sum()), int((eq["ret_pct"] < 0).sum())
+    n = len(eq)
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("累计收益率", f"{total_ret:+.2f}%")
+    c2.metric("累计盈亏", f"{total_pnl:+,.0f} 元")
+    c3.metric("交易天数", n)
+    c4.metric("日胜率", f"{win / n * 100:.1f}%")
+    c5.metric("最大单日涨幅", f"{eq['ret_pct'].max():+.2f}%")
+    c6.metric("最大单日跌幅", f"{eq['ret_pct'].min():+.2f}%")
+    st.caption("收益率按时间加权计算，手动入金/出金不影响收益率；盈亏金额 = 当前总资产 − 累计净入金")
+
+    # 总资产曲线
+    line_color = UP if total_ret >= 0 else DOWN
+    fig = go.Figure(go.Scatter(
+        x=eq["date"], y=eq["equity"], mode="lines", name="总资产",
+        line=dict(color=line_color, width=2),
+        hovertemplate="%{x|%Y-%m-%d}<br>总资产 %{y:,.0f} 元<extra></extra>"))
+    fig.add_hline(y=init_cash, line_dash="dot", line_color="gray", line_width=1,
+                  annotation_text=f"初始资金 {init_cash:,.0f}", annotation_position="top left")
+    fig.update_layout(height=240, margin=dict(l=10, r=10, t=20, b=10),
+                      xaxis_title=None, yaxis_title=None, showlegend=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 月历
+    eq["year_month"] = eq["date"].dt.to_period("M")
+    months = sorted(eq["year_month"].unique(), reverse=True)
+    sel = st.selectbox("选择月份", [str(m) for m in months], key="cal_month")
+    period = pd.Period(sel)
+    md = eq[eq["year_month"] == period].copy()
+    year, month = period.year, period.month
+
+    m_ret = ((1 + md["ret_pct"] / 100).prod() - 1) * 100
+    m_pnl = md["pnl"].sum()
+    m_win, m_lose = int((md["ret_pct"] > 0).sum()), int((md["ret_pct"] < 0).sum())
+    m_color = UP if m_ret >= 0 else DOWN
+    st.markdown(
+        f"**{year} 年 {month} 月**　<span style='color:{m_color};font-weight:700'>"
+        f"{m_ret:+.2f}%（{m_pnl:+,.0f} 元）</span>　"
+        f"<span style='opacity:.65'>盈利 {m_win} 天 / 亏损 {m_lose} 天</span>",
+        unsafe_allow_html=True)
+
+    by_day = {int(d.day): r for d, r in zip(md["date"], md.itertuples())}
+    max_abs = md["ret_pct"].abs().max() or 1.0
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    def _cell(day: int) -> str:
+        if day == 0:
+            return "<td class='cal-off'></td>"
+        r = by_day.get(day)
+        if r is None:
+            if f"{year:04d}-{month:02d}-{day:02d}" > today_str:
+                return (f"<td class='cal-off'><div class='cal-d' style='opacity:.3'>"
+                        f"{day}</div></td>")
+            return (f"<td class='cal-closed'><div class='cal-d'>{day}</div>"
+                    f"<div class='cal-r' style='opacity:.35'>休市</div></td>")
+        ret, pnl = r.ret_pct, r.pnl
+        a = 0.10 + 0.62 * min(abs(ret) / max_abs, 1.0)
+        if ret > 0:
+            bg, fg = f"rgba(229,69,69,{a:.2f})", ("#fff" if a > 0.42 else "inherit")
+        elif ret < 0:
+            bg, fg = f"rgba(38,166,154,{a:.2f})", ("#fff" if a > 0.42 else "inherit")
         else:
-            # 日度收益率
-            st.metric("累计收益率", f"{daily_returns['return_pct'].sum():.2f}%")
-            st.metric("日均收益率", f"{daily_returns['return_pct'].mean():.2f}%")
-            st.metric("最大单日涨幅", f"{daily_returns['return_pct'].max():.2f}%")
-            st.metric("最大单日跌幅", f"{daily_returns['return_pct'].min():.2f}%")
-            
-            # 日收益K线图
-            fig_daily = go.Figure(data=[go.Candlestick(
-                x=daily_returns["date"],
-                open=daily_returns["prev_balance"],
-                high=daily_returns["end_balance"],
-                low=daily_returns["end_balance"],
-                close=daily_returns["end_balance"],
-                increasing_line_color="#ef5350",
-                decreasing_line_color="#26a69a",
-                name="账户余额"
-            )])
-            fig_daily.update_layout(
-                title="日度账户余额变化",
-                xaxis_title="日期",
-                yaxis_title="账户余额",
-                height=400,
-                xaxis_rangeslider_visible=False
-            )
-            st.plotly_chart(fig_daily, use_container_width=True)
-            
-            # 日收益率柱状图
-            colors = ["#ef5350" if r >= 0 else "#26a69a" for r in daily_returns["return_pct"]]
-            fig_bar = go.Figure(data=[go.Bar(
-                x=daily_returns["date"],
-                y=daily_returns["return_pct"],
-                marker_color=colors,
-                name="日收益率"
-            )])
-            fig_bar.update_layout(
-                title="日度收益率",
-                xaxis_title="日期",
-                yaxis_title="收益率(%)",
-                height=300
-            )
-            st.plotly_chart(fig_bar, use_container_width=True)
-    
-    with col2:
-        # 收益日历热力图
-        st.markdown("###   收益日历")
-        
-        # 选择月份
-        months = sorted(daily_returns["year_month"].unique(), reverse=True)
-        selected_month = st.selectbox("选择月份", months, key="calendar_month")
-        
-        month_data = daily_returns[daily_returns["year_month"] == selected_month].copy()
-        
-        if not month_data.empty:
-            # 创建日历网格
-            year = month_data["date"].dt.year.iloc[0]
-            month = month_data["date"].dt.month.iloc[0]
-            
-            # 创建月份日历
-            import calendar
-            cal = calendar.monthcalendar(year, month)
-            
-            # 构建热力图数据
-            z_data = []
-            text_data = []
-            for week in cal:
-                row_z = []
-                row_text = []
-                for day in week:
-                    if day == 0:
-                        row_z.append(None)
-                        row_text.append("")
-                    else:
-                        ret = month_data[month_data["day"] == day]["return_pct"]
-                        if len(ret) > 0:
-                            row_z.append(ret.iloc[0])
-                            row_text.append(f"{ret.iloc[0]:+.2f}%")
-                        else:
-                            row_z.append(0)
-                            row_text.append("休市")
-                z_data.append(row_z)
-                text_data.append(row_text)
-            
-            # 绘制热力图
-            fig_heat = go.Figure(data=go.Heatmap(
-                z=z_data,
-                text=text_data,
-                texttemplate="%{text}",
-                textfont={"size": 14},
-                colorscale=["#26a69a", "#ffffff", "#ef5350"],
-                colorbar=dict(title="收益率(%)"),
-                hovertemplate="日期: %{text}<br>收益率: %{z:.2f}%<extra></extra>"
-            ))
-            
-            fig_heat.update_layout(
-                title=f"{year}年{month}月 收益日历",
-                xaxis=dict(
-                    tickvals=[0, 1, 2, 3, 4],
-                    ticktext=["周一", "周二", "周三", "周四", "周五"]
-                ),
-                yaxis=dict(
-                    tickvals=list(range(len(cal))),
-                    ticktext=[f"第{i+1}周" for i in range(len(cal))]
-                ),
-                height=350
-            )
-            st.plotly_chart(fig_heat, use_container_width=True)
-            
-            # 月度统计
-            total_ret = month_data["return_pct"].sum()
-            win_days = (month_data["return_pct"] > 0).sum()
-            total_days = len(month_data)
-            avg_ret = month_data["return_pct"].mean()
-            
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("月度收益", f"{total_ret:+.2f}%")
-            c2.metric("交易天数", f"{total_days}")
-            c3.metric("上涨天数", f"{win_days}")
-            c4.metric("胜率", f"{win_days/total_days*100:.1f}%")
-        else:
-            st.info(f"{selected_month} 暂无交易数据")
+            bg, fg = "rgba(128,128,128,.10)", "inherit"
+        return (f"<td style='background:{bg};color:{fg}'>"
+                f"<div class='cal-d'>{day}</div>"
+                f"<div class='cal-r'>{ret:+.2f}%</div>"
+                f"<div class='cal-p'>{pnl:+,.0f}</div></td>")
+
+    weeks = cal_mod.monthcalendar(year, month)
+    head = "".join(f"<th>{w}</th>" for w in ["周一", "周二", "周三", "周四", "周五"])
+    body = "".join(
+        "<tr>" + "".join(_cell(day) for day in week[:5]) + "</tr>" for week in weeks)
+    st.markdown(f"""<style>
+.cal {{width:100%;border-collapse:separate;border-spacing:6px;table-layout:fixed;}}
+.cal th {{text-align:center;font-size:13px;font-weight:500;opacity:.6;padding:2px 0;}}
+.cal td {{height:84px;vertical-align:top;border-radius:10px;padding:8px 10px;}}
+.cal .cal-d {{font-size:13px;font-weight:600;opacity:.8;}}
+.cal .cal-r {{font-size:16px;font-weight:700;margin-top:8px;}}
+.cal .cal-p {{font-size:12px;opacity:.85;margin-top:2px;}}
+.cal .cal-off {{background:transparent;}}
+.cal .cal-closed {{background:rgba(128,128,128,.07);}}
+</style>
+<table class="cal"><tr>{head}</tr>{body}</table>""", unsafe_allow_html=True)
+
+    # 按月汇总
+    with st.expander("按月汇总"):
+        rows = []
+        for m in months:
+            g = eq[eq["year_month"] == m]
+            w = int((g["ret_pct"] > 0).sum())
+            rows.append({"月份": str(m),
+                         "收益率": f"{((1 + g['ret_pct'] / 100).prod() - 1) * 100:+.2f}%",
+                         "盈亏(元)": f"{g['pnl'].sum():+,.0f}", "交易天数": len(g),
+                         "盈利天数": w, "胜率": f"{w / len(g) * 100:.1f}%"})
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width='stretch')
 
 
 def _sell_label(sellable: pd.DataFrame, k: str) -> str:

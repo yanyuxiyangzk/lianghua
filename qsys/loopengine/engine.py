@@ -63,16 +63,22 @@ class LoopEngine:
     # ---------------- 面板 ----------------
     def _frames(self, factor_type: str = "量价"):
         import signals as sig
-        from common import all_pools, get_last_trade_day
+        from common import all_pools, get_last_trade_day, trade_day_offset
 
         codes = all_pools()[self.pool_name]
         end = get_last_trade_day()
-        panel = sig.get_panel_cached(codes, end, 800, source=datasource.get_loop_source())
-        # 构建额外帧（非量价类型）
+        # 防泄漏（2026-09-11 评审）：选拔/评估只用 train_end 之前的数据，
+        # 最近 250 交易日对生成端不可见，留给评分卡 OOS 层做盲测——
+        # 否则引擎每天在"预留考场"上选拔，OOS 度量被源头污染。
+        # 面板加深到 1600 日：截断后仍余 ~860 交易日，容纳 400+ 天长窗因子。
+        train_end = trade_day_offset(end, -250)
+        panel = sig.get_panel_cached(codes, end, 1600, source=datasource.get_loop_source())
+        panel = panel[panel.index.get_level_values("datetime") <= train_end]
+        # 构建额外帧（非量价类型）——同样以 train_end 为右端
         extra = None
         if factor_type != "量价":
             from loopengine.extra_frames import build_extra_frames
-            extra = build_extra_frames(factor_type, codes, end, lookback=800)
+            extra = build_extra_frames(factor_type, codes, train_end, lookback=1600)
         self._last_extra_frames = extra if factor_type != "量价" else True
         return panel, build_field_frames(panel, extra), codes, end
 
@@ -620,27 +626,8 @@ class LoopEngine:
             if len(factor_vals) < 3:
                 logger.debug(f"有效因子不足: {len(factor_vals)} < 3")
                 return None
-            
-            # Walk-forward验证
-            import factor_eval as fe
-            wf = fe.walk_forward(
-                factor_vals, panel, "等权", 10, fwd_days=5, step=10, min_factors=2
-            )
-            
-            if wf.empty or "优化组合扣费超额" not in wf:
-                logger.debug("walk-forward无结果")
-                return None
-            
-            net = wf["优化组合扣费超额"]
-            oos_wr = float((net > 0).mean())
-            logger.debug(f"OOS胜率: {oos_wr:.1%}")
-            
-            # 质量门槛
-            if oos_wr < 0.50:
-                logger.debug(f"OOS胜率不足: {oos_wr:.1%} < 50%")
-                return None
-            
-            # 相关性控制：剔除高相关因子
+
+            # ① 先相关性精简出最终组合（按 OOS 感知分数贪心去冗余）
             selected = list(factor_vals.keys())[:8]  # 最多8个候选
             if len(selected) > 3:
                 # 计算因子值相关性矩阵
@@ -648,12 +635,8 @@ class LoopEngine:
                 factor_df = pd.DataFrame({k: v for k, v in factor_vals.items() if k in selected})
                 if not factor_df.empty and factor_df.shape[1] > 3:
                     corr_matrix = factor_df.corr().abs()
-                    # 贪心选择：按OOS感知分数降序，剔除相关系数>0.7的因子
-                    icir_map = {n: score_map.get(n, 0.5) for n in selected}
-                    # 按分数降序排序
-                    selected.sort(key=lambda x: icir_map.get(x, 0), reverse=True)
-                    
-                    # 贪心选择，剔除高相关
+                    # 按分数降序贪心选择，剔除相关系数>0.7的因子
+                    selected.sort(key=lambda x: score_map.get(x, 0.5), reverse=True)
                     filtered = [selected[0]]
                     for name in selected[1:]:
                         if all(corr_matrix.loc[name, s] < 0.7 for s in filtered):
@@ -661,7 +644,31 @@ class LoopEngine:
                         if len(filtered) >= 5:
                             break
                     selected = filtered
-            
+
+            if len(selected) < 3:
+                logger.debug(f"相关性精简后因子不足: {len(selected)} < 3")
+                return None
+
+            # ② 再 Walk-forward 验证最终组合——验证什么就上线什么
+            #    （此前顺序相反：WF 验证的是未精简的全量组合，出包组合从未被整体验证过）
+            import factor_eval as fe
+            final_vals = {n: factor_vals[n] for n in selected}
+            wf = fe.walk_forward(
+                final_vals, panel, "等权", 10, fwd_days=5, step=10, min_factors=2
+            )
+
+            if wf.empty or "优化组合扣费超额" not in wf:
+                logger.debug("walk-forward无结果")
+                return None
+
+            net = wf["优化组合扣费超额"]
+            oos_wr = float((net > 0).mean())
+            logger.debug(f"OOS胜率: {oos_wr:.1%}")
+
+            # 质量门槛
+            if oos_wr < 0.50:
+                logger.debug(f"OOS胜率不足: {oos_wr:.1%} < 50%")
+                return None
             # ICIR加权（而非等权）：权重用候选查询的 OOS 感知分数，与排名口径一致
             icir_weights = {n: score_map.get(n, 0.5) for n in selected}
             total_icir = sum(icir_weights.values())
@@ -674,8 +681,9 @@ class LoopEngine:
             else:
                 weights = {n: (1.0 / len(selected),
                                factor_info.get(n, {}).get("direction", 1)) for n in selected}
-            # kind 映射
-            kind_map = {"内置": "builtin", "技术指标": "tech", "loopengine": "evolved"}
+            # kind 映射（评分卡存中文标签：演化引擎/进化 都归 evolved）
+            kind_map = {"内置": "builtin", "技术指标": "tech", "loopengine": "evolved",
+                        "演化引擎": "evolved", "进化": "evolved"}
             factor_kind = {n: kind_map.get(factor_info.get(n, {}).get("kind", ""), "builtin") for n in selected}
             
             pack_name = f"LE_{self.pool_name}_{datetime.now().strftime('%m%d')}"

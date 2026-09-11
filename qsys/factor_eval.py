@@ -686,7 +686,11 @@ def build_scorecard_parallel(factors: list[dict], codes: list[str], end: str,
                          "ICIR": np.nan, "IC胜率": np.nan, "Top组_winrate": np.nan,
                          "建议方向": "计算失败", "天数": 0})
 
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    # FDR 校正（与串行路径一致——此前并行路径漏挂，>50 因子的批量全都没校正）
+    if len(df) > 1:
+        df = apply_fdr_correction(df)
+    return df
 
 
 # ---------------------------------------------------------------- 相关性与去冗余

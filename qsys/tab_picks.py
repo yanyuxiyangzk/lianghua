@@ -102,30 +102,38 @@ def render():
 
     # ---- 名单明细（含个股模拟交易成绩） ----
     items = experience.pick_items_detail(pick_id)
-    # 股票名称映射（快照库里最近一次采集的名字）
+    # 股票名称映射（iFinD 股票列表，每日 09:00 同步）
     try:
         with datasource._qconn() as conn:
             rows = conn.execute(
-                f"SELECT code, name, MAX(ts) FROM quote_snapshots"
-                f" WHERE code IN ({','.join('?' * len(items))}) GROUP BY code",
+                f"SELECT code, name FROM ifind_stocklist"
+                f" WHERE code IN ({','.join('?' * len(items))})",
                 list(items["code"])).fetchall()
         name_map = {r[0]: r[1] for r in rows}
     except Exception:
         name_map = {}
     items.insert(1, "名称", [name_map.get(c, "") for c in items["code"]])
 
-    # 当天/最近的名单叠加实时行情（腾讯快照）
+    # 当天/最近的名单叠加实时行情（同花顺 iFinD 快照，按代码取最新行）
     try:
-        snaps, snap_ts = datasource.get_latest_snapshots(list(items["code"]))
-        smap = {s["code"]: s for s in snaps}
-        items["最新价"] = [smap.get(c, {}).get("price") for c in items["code"]]
+        codes = list(items["code"])
+        with datasource._qconn() as conn:
+            rows = conn.execute(
+                f"""SELECT r.code, r.price, r.prev_close, r.datetime FROM ifind_realtime r
+                    JOIN (SELECT code, MAX(datetime) md FROM ifind_realtime
+                          WHERE code IN ({','.join('?' * len(codes))}) GROUP BY code) t
+                      ON r.code = t.code AND r.datetime = t.md""",
+                codes).fetchall()
+        smap = {r[0]: {"price": r[1], "prev_close": r[2]} for r in rows}
+        snap_ts = max((r[3] for r in rows), default=None)
+        items["最新价"] = [smap.get(c, {}).get("price") for c in codes]
         items["较昨收%"] = [
             round((smap[c]["price"] / smap[c]["prev_close"] - 1) * 100, 2)
             if smap.get(c) and smap[c].get("price") and smap[c].get("prev_close") else None
-            for c in items["code"]
+            for c in codes
         ]
         if snap_ts:
-            st.caption(f"实时列为腾讯快照（最新采集 {snap_ts}）")
+            st.caption(f"实时列为同花顺 iFinD 快照（最新 {snap_ts}）")
     except Exception:
         pass
 

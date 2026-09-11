@@ -51,15 +51,18 @@ pages = {
         st.Page("views/p_broker.py", title="资金账号", icon="💹", url_path="broker"),
         st.Page("views/p_daily_report.py", title="每日战报", icon="📊", url_path="daily-report"),
     ],
-    "市场数据": [
-        st.Page("views/p_quotes.py", title="股票行情", icon="📈", url_path="quotes"),
-        st.Page("views/p_stocklist.py", title="股票/指数列表", icon="📋", url_path="stocklist"),
-        st.Page("views/p_sector.py", title="板块行情", icon="🏛️", url_path="sector"),
-        st.Page("views/p_kline.py", title="自选K线", icon="🕯️", url_path="kline"),
-        st.Page("views/p_kpro.py", title="专业K线", icon="📉", url_path="kpro"),
-        st.Page("views/p_sectorflow.py", title="板块资金流", icon="🌐", url_path="sectorflow"),
-        st.Page("views/p_stock_fundflow.py", title="个股资金流", icon="💰", url_path="fundflow"),
-    ],
+    # 「市场数据」菜单已隐藏（2026-09-11 用户要求）：其页面多用腾讯/东财等杂源，
+    # 与 📡iFinD数据 菜单（后台统一同花顺落库）重复且口径不一。页面文件保留在
+    # views/ 可随时恢复；统一口径后行情分析请用 iFinD数据 菜单。
+    # "市场数据": [
+    #     st.Page("views/p_quotes.py", title="股票行情", icon="📈", url_path="quotes"),
+    #     st.Page("views/p_stocklist.py", title="股票/指数列表", icon="📋", url_path="stocklist"),
+    #     st.Page("views/p_sector.py", title="板块行情", icon="🏛️", url_path="sector"),
+    #     st.Page("views/p_kline.py", title="自选K线", icon="🕯️", url_path="kline"),
+    #     st.Page("views/p_kpro.py", title="专业K线", icon="📉", url_path="kpro"),
+    #     st.Page("views/p_sectorflow.py", title="板块资金流", icon="🌐", url_path="sectorflow"),
+    #     st.Page("views/p_stock_fundflow.py", title="个股资金流", icon="💰", url_path="fundflow"),
+    # ],
     # iFinD 数据中心：独立菜单板块，每个子页只展示对应数据（逻辑在 ifind_hub.py）
     # （实时行情/历史行情/高频行情/日内快照/基本面数据/特色数据 已下线——被「行情」页覆盖或用不到，页面文件保留在 views/ 可随时恢复）
     "📡 iFinD数据": [

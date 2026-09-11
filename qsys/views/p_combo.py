@@ -39,8 +39,8 @@ def _name_map(codes: list[str]) -> dict:
     try:
         with datasource._qconn() as conn:
             rows = conn.execute(
-                f"SELECT code, name, MAX(ts) FROM quote_snapshots"
-                f" WHERE code IN ({','.join('?' * len(codes))}) GROUP BY code",
+                f"SELECT code, name FROM ifind_stocklist"
+                f" WHERE code IN ({','.join('?' * len(codes))})",
                 list(codes)).fetchall()
         return {r[0]: r[1] for r in rows}
     except Exception:

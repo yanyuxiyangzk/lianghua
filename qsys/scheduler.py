@@ -1513,6 +1513,8 @@ def job_ifind_hot_sync(**_ignored) -> str:
 
     import experience
     codes = set(load_watchlist())
+    # 驾驶舱 5 大指数也进热码（实盘高频价）
+    codes.update(["SH000001", "SZ399001", "SZ399006", "SH000300", "SH000905"])
     with experience._conn() as c:
         for r in c.execute("SELECT code FROM positions WHERE status IN ('open','pending')").fetchall():
             codes.add(r[0])

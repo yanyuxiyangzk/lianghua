@@ -142,23 +142,49 @@ def _kpi(label: str, value: str, delta: str, delta_cls: str, sub: str):
 # ---------------------------------------------------------------- 数据层（全缓存 + 降级）
 @st.cache_data(ttl=60, show_spinner=False)
 def _index_quotes() -> dict[str, dict]:
-    """5 大指数腾讯快照。返回 {code: {name, price, chg_pct, amount_yi}}，失败为空。"""
+    """5 大指数同花顺快照（ifind_realtime 按代码取最新行，热码 15s 高频覆盖），
+    名称取 ifind_indexlist。失败为空。"""
     codes = ["SH000001", "SZ399001", "SZ399006", "SH000300", "SH000905"]
     out = {}
     try:
-        rows = datasource.get_batch_snapshots(codes)
+        with datasource._qconn() as c:
+            rows = c.execute(
+                f"""SELECT r.code, r.price, r.prev_close, r.amount FROM ifind_realtime r
+                    JOIN (SELECT code, MAX(datetime) md FROM ifind_realtime
+                          WHERE code IN ({','.join('?' * len(codes))}) GROUP BY code) t
+                      ON r.code = t.code AND r.datetime = t.md""", codes).fetchall()
+            names = dict(c.execute(
+                f"SELECT code, name FROM ifind_indexlist"
+                f" WHERE code IN ({','.join('?' * len(codes))})", codes).fetchall())
     except Exception:
-        rows = []
+        rows, names = [], {}
+    got = {r[0] for r in rows}
+    missing = [c for c in codes if c not in got]
+    if missing:
+        # 兜底：热码未开（盘后/早盘前）读 ifind_indexlist 日更价
+        # （指数列表为 iFinD 格式 000001.SH，需转换）
+        import re as _re
+        def _to_ifind(c):
+            m = _re.match(r"^([A-Za-z]{2})(\d{6})$", c)
+            return f"{m.group(2)}.{m.group(1)}" if m else c
+        try:
+            with datasource._qconn() as c:
+                extra = c.execute(
+                    f"SELECT code, price, prev_close, name FROM ifind_indexlist"
+                    f" WHERE code IN ({','.join('?' * len(missing))})",
+                    [_to_ifind(x) for x in missing]).fetchall()
+            back = {_to_ifind(x): x for x in missing}
+            for code, price, prev, nm in extra:
+                chg = ((price - prev) / prev * 100) if price and prev else None
+                out[back.get(code, code)] = {"name": nm or code, "price": price,
+                                             "chg_pct": chg, "amount_yi": 0}
+        except Exception:
+            pass
     for r in rows:
-        price = r.get("price")
-        prev = r.get("prev_close")
+        code, price, prev, amount = r
         chg = ((price - prev) / prev * 100) if price and prev else None
-        out[r["code"]] = {
-            "name": r.get("name") or r["code"],
-            "price": price,
-            "chg_pct": chg,
-            "amount_yi": (r.get("amount") or 0) / 1e8,
-        }
+        out[code] = {"name": names.get(code) or code, "price": price,
+                     "chg_pct": chg, "amount_yi": (amount or 0) / 1e8}
     return out
 
 

@@ -1104,11 +1104,11 @@ def job_realtime_kline(**_ignored) -> str:
         # 从tick_data聚合今日数据
         rows = c.execute('''
             SELECT code,
-                   (SELECT price FROM tick_data WHERE code=t.code AND datetime LIKE ? 
+                   (SELECT price FROM tick_data WHERE code=t.code AND datetime LIKE ?
                     ORDER BY datetime ASC LIMIT 1) as open,
                    MAX(price) as high,
                    MIN(price) as low,
-                   (SELECT price FROM tick_data WHERE code=t.code AND datetime LIKE ? 
+                   (SELECT price FROM tick_data WHERE code=t.code AND datetime LIKE ?
                     ORDER BY datetime DESC LIMIT 1) as close,
                    SUM(volume) as volume,
                    SUM(price * volume) as amount,
@@ -1117,6 +1117,27 @@ def job_realtime_kline(**_ignored) -> str:
             WHERE datetime LIKE ?
             GROUP BY code
         ''', (f'{today}%', f'{today}%', f'{today}%')).fetchall()
+
+        src = "tick"
+        if not rows:
+            # TDX 通道故障兜底（2026-09-10 起 TDX 全服务器协议失配）：
+            # 改用 iFinD 1分钟线（ifind_minute，minute_sync 每5分钟落库）聚合今日 OHLCV
+            rows = c.execute('''
+                SELECT code,
+                       (SELECT open FROM ifind_minute WHERE code=m.code AND datetime LIKE ?
+                        ORDER BY datetime ASC LIMIT 1) as open,
+                       MAX(high) as high,
+                       MIN(low) as low,
+                       (SELECT close FROM ifind_minute WHERE code=m.code AND datetime LIKE ?
+                        ORDER BY datetime DESC LIMIT 1) as close,
+                       SUM(volume) as volume,
+                       SUM(amount) as amount,
+                       SUM(amount) / SUM(volume) as avg_price
+                FROM ifind_minute m
+                WHERE datetime LIKE ?
+                GROUP BY code
+            ''', (f'{today}%', f'{today}%', f'{today}%')).fetchall()
+            src = "ifind分钟线"
 
         n_updated = 0
         for row in rows:
@@ -1141,7 +1162,7 @@ def job_realtime_kline(**_ignored) -> str:
                   prev_close, round(change_pct, 2), now.strftime('%Y-%m-%d %H:%M:%S')))
             n_updated += 1
 
-    return f"{now.strftime('%H:%M')} 实时日K线聚合：{n_updated} 只"
+    return f"{now.strftime('%H:%M')} 实时日K线聚合：{n_updated} 只（{src}）"
 
 
 def job_trade_simulate() -> str:
@@ -1375,7 +1396,7 @@ def job_ifind_indexlist_sync(**_ignored) -> str:
 
 
 def job_ifind_realtime_sync(**_ignored) -> str:
-    """iFinD 实时行情快照同步（盘中每15分钟执行）。
+    """iFinD 实时行情快照同步（盘中每5分钟执行）。
 
     调用 datasource.fetch_realtime_to_db() 写入 ifind_realtime 表。
     同时触发 PriceMonitor 事件驱动评估。
@@ -1386,8 +1407,8 @@ def job_ifind_realtime_sync(**_ignored) -> str:
     # 交易日判断：周一到周五
     if now.weekday() >= 5:
         return "非交易日，跳过"
-    # 交易时段判断：09:30-15:00
-    if not ("0930" <= now.strftime("%H%M") <= "1500"):
+    # 交易时段判断：09:30-15:05（放宽到 15:05 确保采到 15:00 收盘价快照）
+    if not ("0930" <= now.strftime("%H%M") <= "1505"):
         return "非交易时段，跳过"
 
     n = datasource.fetch_realtime_to_db()

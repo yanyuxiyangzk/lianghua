@@ -95,6 +95,7 @@ CREATE TABLE IF NOT EXISTS daily_reports (
 def _conn():
     c = sqlite3.connect(DB_PATH, timeout=30)
     c.execute("PRAGMA busy_timeout=30000")  # 写冲突时等待30秒，避免 database is locked
+    c.execute("PRAGMA journal_mode=WAL")    # 读写不互斥（此前默认 DELETE，锁升级死锁频发）
     c.executescript(_SCHEMA)
     c.executescript(_TRADES_SCHEMA)
     c.executescript(_POSITIONS_SCHEMA)
@@ -722,6 +723,45 @@ def get_pending_positions() -> pd.DataFrame:
     prices = _latest_prices(list(df["code"]))
     df["最新价"] = df["code"].map(lambda x: (prices.get(x) or (None,))[0])
     return df
+
+
+def position_reconcile(today: str) -> str:
+    """双账本对账自愈：柜台 ai 持仓 vs 经验库 open 持仓，差额补记为 open 仓。
+
+    背景（2026-09-11 踩坑）：fill_check 中柜台买入（独立事务已扣款）与
+    positions 记账 UPDATE 是两条事务，锁冲突/进程被杀会让"钱花了账没记"，
+    产生孤儿仓（柜台有、账本无——止盈止损永远覆盖不到）。对账补记后，
+    孤儿仓重新进入止盈/止损/到期管理（成本取柜台成本价，T+1 同样生效）。
+    """
+    import broker
+    with _conn() as c:
+        opens = pd.read_sql(
+            "SELECT code, SUM(shares) sh FROM positions WHERE status='open' GROUP BY code", c)
+    try:
+        bposs = broker.get_positions()
+    except Exception:
+        return "柜台持仓读取失败"
+    exp_shares = {r["code"]: int(r["sh"]) for _, r in opens.iterrows()} if not opens.empty else {}
+    fixed = []
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with _conn() as c:
+        for _, bp in bposs.iterrows():
+            if (bp["source"] or "") != "ai":
+                continue
+            code = str(bp["code"])
+            diff = int(bp["shares"] or 0) - exp_shares.get(code, 0)
+            cost = float(bp["cost"] or 0)
+            if diff <= 0 or cost <= 0:
+                continue
+            c.execute(
+                "INSERT INTO positions (code, name, buy_date, buy_price, buy_ts, pick_id,"
+                " source, pack_name, status, limit_price, shares, buy_amount, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?, 'open', NULL, ?, ?, ?)",
+                (code, bp.get("name") or code, str(bp.get("last_buy_date") or today),
+                 cost, now, None, "reconcile_fix", "对账补记",
+                 diff, round(diff * cost, 2), now))
+            fixed.append(f"{bp.get('name') or code}×{diff}")
+    return "对账补记：" + ",".join(fixed) if fixed else "对账一致"
 
 
 def position_close_check(today: str) -> str:

@@ -981,6 +981,7 @@ def job_position_track(**_ignored) -> str:
         logging.getLogger("scheduler").warning(f"PriceMonitor 初始化失败: {e}")
 
     latest = experience.list_pick_dates(limit=1)
+    m0 = experience.position_reconcile(today)  # 双账本对账：先接住孤儿仓再谈开平仓
     m1 = experience.position_open_from_picks(latest[0], today) if latest else "无名单"
     m_fill = experience.position_fill_check(today)
     m2 = experience.position_close_check(today)
@@ -988,7 +989,8 @@ def job_position_track(**_ignored) -> str:
     import broker
     n_fill = broker.fill_pending_orders()
     n_stop = broker.check_stop_exits()
-    parts = [m1, m_fill, m2] + ([f"挂单成交 {n_fill} 笔"] if n_fill else []) \
+    parts = ([m0] if m0 != "对账一致" else []) + [m1, m_fill, m2] \
+        + ([f"挂单成交 {n_fill} 笔"] if n_fill else []) \
         + ([f"手动止盈止损 {n_stop} 笔"] if n_stop else [])
     if n_registered:
         parts.append(f"PriceMonitor 监控 {n_registered} 个持仓")

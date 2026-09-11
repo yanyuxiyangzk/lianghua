@@ -209,6 +209,7 @@ def render():
     main_pick = _pick_for(main_name)
     if main_pick is None and not picks.empty:
         non_sat = picks[picks["pack_name"] != sat_name] if sat_name else picks
+        non_sat = non_sat[non_sat["source"] != "le_shadow"]  # 影子名单不上执行页
         sched = non_sat[non_sat["source"] == "sched_pool_scan"]
         if not sched.empty:
             main_pick = sched.iloc[0]

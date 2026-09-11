@@ -687,9 +687,8 @@ class LoopEngine:
             factor_kind = {n: kind_map.get(factor_info.get(n, {}).get("kind", ""), "builtin") for n in selected}
             
             pack_name = f"LE_{self.pool_name}_{datetime.now().strftime('%m%d')}"
-            
-            # 保存到strategies表
-            library.save_strategy(pack_name, {
+
+            payload = {
                 "pool_name": self.pool_name,
                 "top_n": 10,
                 "method": "等权",
@@ -698,9 +697,14 @@ class LoopEngine:
                 "filters": ["tradable"],
                 "oos_winrate": f"{oos_wr:.0%}",
                 "horizon": "5日",
-            })
-            
-            logger.info(f"策略包已保存: {pack_name}(OOS={oos_wr:.0%})")
+            }
+            # 日期版仅归档留档；固定名 current 版参与每日选股竞争——
+            # 实战归因按包名累积，每天换名字的包永远是"零实战"、进不了 Top3
+            library.save_strategy(pack_name, payload, status="archived")
+            current = f"LE_{self.pool_name}_current"
+            library.save_strategy(current, payload, status="active")
+
+            logger.info(f"策略包已保存: {pack_name}(OOS={oos_wr:.0%}) + {current}(固定名)")
             return f"{pack_name}(OOS={oos_wr:.0%})"
         except Exception as e:
             logger.warning(f"策略包生成异常: {e}")

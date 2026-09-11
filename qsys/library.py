@@ -381,7 +381,7 @@ def list_scorecard_pools() -> list[str]:
 
 
 # ---------------------------------------------------------------- 策略包
-def save_strategy(name: str, pack: dict):
+def save_strategy(name: str, pack: dict, status: str | None = None):
     with _lconn() as c:
         c.execute(
             "INSERT OR REPLACE INTO strategies (name, pool_name, top_n, method, filters, factors,"
@@ -392,6 +392,8 @@ def save_strategy(name: str, pack: dict):
              json.dumps(pack.get("factors", []), ensure_ascii=False),
              pack.get("oos_winrate"), pack.get("horizon"), pack.get("is_winrate"),
              pack.get("updated") or datetime.now().strftime("%Y-%m-%d %H:%M")))
+        if status is not None:
+            c.execute("UPDATE strategies SET status=? WHERE name=?", (status, name))
 
 
 def list_strategies() -> dict:

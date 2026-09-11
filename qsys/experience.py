@@ -600,6 +600,8 @@ def position_open_from_picks(trade_date: str, today: str) -> str:
     n_new = 0
     with _conn() as c:
         for r in picks.itertuples():
+            if r.source == "le_shadow":
+                continue  # LE 影子名单：只结算战果攒战绩，绝不开仓
             items = pick_items_detail(int(r.id))
             if items.empty:
                 continue

@@ -154,8 +154,8 @@ def _best_pack(packs: dict) -> str:
         if oos_wr < 55:
             continue
         
-        # 排除退化包（定期重验标记）
-        if pk.get("status") == "degraded":
+        # 排除退化包（定期重验标记）与归档包（LE 日期版仅留档，固定名 current 参赛）
+        if pk.get("status") in ("degraded", "archived"):
             continue
         
         stats = actual_stats.get(name)
@@ -216,6 +216,9 @@ def _top_packs(packs: dict, top_n: int = 3) -> list[tuple[str, dict]]:
     
     scored = []
     for name, pk in packs.items():
+        # 退化/归档包不参与投票（此前只查了 OOS 门槛，degraded 也能混进来）
+        if pk.get("status") in ("degraded", "archived"):
+            continue
         v = str(pk.get("oos_winrate") or "")
         if not v.endswith("%"):
             continue
@@ -736,7 +739,8 @@ def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "")
                 # 只保留投票通过的股票
                 voted_scores = best_picks[best_picks.index.isin(voted)]
                 picks = voted_scores.head(top_n)
-                pack_name = f"多包投票({len(top_list)}包)"
+                # 归因补记参与包名（此前只写"多包投票(N包)"，成员包实战归因断链）
+                pack_name = f"多包投票({len(top_list)}包:{'+'.join(n for n, _ in top_list)})"
                 note = f"多包投票 · {len(voted)}只候选 · {len(picks)}只入选（{pnote}）"
                 pk = top_list[0][1]
             else:
@@ -826,7 +830,31 @@ def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "")
             sat_msg = f" · 卫星包「{sat_name}」Top{len(spicks)}"
     except Exception as e:
         sat_msg = f" · 卫星包扫描失败({e})"
-    return f"{end} {pool_name} 扫描完成：Top{top_n} 已出（{note}）{sat_msg}"
+
+    # LE 影子名单：最新 LE 包每日出名单落库但不开仓（le_shadow 不开仓、不上今日执行页），
+    # outcome 到期照常结算——积累真实战绩后凭实力参与多包投票竞争
+    shadow_msg = ""
+    try:
+        le_name = f"LE_{pool_name}_current"
+        le_pk = packs.get(le_name)
+        if le_pk and le_pk.get("status") == "active":
+            le_codes = pools.get(le_pk.get("pool_name") or pool_name) or codes
+            le_top = int(le_pk.get("top_n", 10))
+            le_picks, _ln, _lw, _lf = compute_pack_picks(le_pk, le_codes, end, le_top)
+            le_oos = None
+            try:
+                le_oos = float(str(le_pk.get("oos_winrate") or "").strip("%")) / 100
+            except (TypeError, ValueError):
+                le_oos = None
+            experience.save_pick(source="le_shadow", pool_name=le_pk.get("pool_name") or pool_name,
+                                 top_n=le_top, method=le_pk.get("method"),
+                                 filters=le_pk.get("filters", []), factors=le_pk["factors"],
+                                 final_scores=le_picks, pack_name=le_name,
+                                 oos_winrate=le_oos, trade_date=end)
+            shadow_msg = f" · LE影子名单 Top{len(le_picks)}"
+    except Exception as e:
+        shadow_msg = f" · LE影子名单失败({e})"
+    return f"{end} {pool_name} 扫描完成：Top{top_n} 已出（{note}）{sat_msg}{shadow_msg}"
 
 
 def job_auto_scan(pool_name: str = "沪深300", top_n: int = 10, **_ignored) -> str:
@@ -1198,7 +1226,13 @@ def job_auction_confirm() -> str:
     picks = experience.picks_on_date(dates[0])
     if picks.empty:
         return f"日期 {dates[0]} 无名单数据"
-    items = experience.pick_items_detail(int(picks.iloc[0]["id"]))
+    picks = picks[picks["source"] != "le_shadow"]  # 影子名单不做竞价确认
+    if picks.empty:
+        return f"日期 {dates[0]} 无正式名单（仅影子）"
+    # 优先确认主轨名单（picks 按 id 倒序，影子名单最后插入会在最前）
+    sched = picks[picks["source"] == "sched_pool_scan"]
+    target = sched.iloc[0] if not sched.empty else picks.iloc[0]
+    items = experience.pick_items_detail(int(target["id"]))
     rows = []
     for code in items["code"]:
         try:

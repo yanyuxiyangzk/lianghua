@@ -67,18 +67,18 @@ class LoopEngine:
 
         codes = all_pools()[self.pool_name]
         end = get_last_trade_day()
-        # 防泄漏（2026-09-11 评审）：选拔/评估只用 train_end 之前的数据，
-        # 最近 250 交易日对生成端不可见，留给评分卡 OOS 层做盲测——
-        # 否则引擎每天在"预留考场"上选拔，OOS 度量被源头污染。
-        # 面板加深到 1600 日：截断后仍余 ~860 交易日，容纳 400+ 天长窗因子。
-        train_end = trade_day_offset(end, -250)
         panel = sig.get_panel_cached(codes, end, 1600, source=datasource.get_loop_source())
-        panel = panel[panel.index.get_level_values("datetime") <= train_end]
-        # 构建额外帧（非量价类型）——同样以 train_end 为右端
+        if factor_type == "量价":
+            # 防泄漏（2026-09-11 评审）：选拔/评估截到 end-250 交易日，
+            # 最近一年对生成端不可见，留给评分卡 OOS 层做盲测。
+            train_end = trade_day_offset(end, -250)
+            panel = panel[panel.index.get_level_values("datetime") <= train_end]
+        # 非量价类型（资金流/龙虎榜等）数据源历史仅 ~45 天，无 250 天盲测段可留——
+        # 不截断，其验证完全依赖"发现后 OOS"（评分卡 ic_oos 逐日累积）
         extra = None
         if factor_type != "量价":
             from loopengine.extra_frames import build_extra_frames
-            extra = build_extra_frames(factor_type, codes, train_end, lookback=1600)
+            extra = build_extra_frames(factor_type, codes, end, lookback=1600)
         self._last_extra_frames = extra if factor_type != "量价" else True
         return panel, build_field_frames(panel, extra), codes, end
 

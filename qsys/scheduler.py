@@ -1543,6 +1543,21 @@ def job_ifind_hot_sync(**_ignored) -> str:
     return f"{now.strftime('%H:%M:%S')} 热码快照 {n}/{len(codes)} 只"
 
 
+def job_sector_industry_sync(**_ignored) -> str:
+    """行业分类同步（每日盘前，iFinD 问财）：全市场同花顺一级行业 → stock_industry。"""
+    import sectorflow as sf
+    return sf.sync_industry_ifind()
+
+
+def job_sector_daily(**_ignored) -> str:
+    """板块日线聚合（盘后）：stock_industry 映射 × iFinD 日线 → sector_daily（近3天幂等重算）。
+    此前只在页面手动触发回填，停更快两周（2026-09-12 排查）——改为每日自动。"""
+    import sectorflow as sf
+    sf.backfill_sector_daily(days=3, background=False)
+    s = sf.sector_daily_status()
+    return f"板块日线聚合完成：{s['rows']} 行 · 最新 {s['max_date']}"
+
+
 def job_ifind_cleanup(**_ignored) -> str:
     """清理过期数据（每日16:00执行）：SQLite 过期数据。"""
     from zoneinfo import ZoneInfo
@@ -2023,6 +2038,10 @@ JOBS = {
                                    "trigger": "interval"}},
     "ifind_cleanup": {"name": "🧹 iFinD 过期数据清理", "func": job_ifind_cleanup,
                       "default": {"enabled": True, "hour": 16, "minute": 0, "params": {}}},
+    "sector_industry_sync": {"name": "🏭 行业分类同步（每日·iFinD）", "func": job_sector_industry_sync,
+                             "default": {"enabled": True, "hour": 8, "minute": 50, "params": {}}},
+    "sector_daily": {"name": "🏛 板块日线聚合（盘后）", "func": job_sector_daily,
+                     "default": {"enabled": True, "hour": 16, "minute": 20, "params": {}}},
     "watchlist_signals": {"name": "📈 个股信号（自选股 × 进化因子）", "func": job_watchlist_signals,
                           "default": {"enabled": True, "hour": 18, "minute": 30, "params": {}}},
     "pool_scan": {"name": "🏛️ 板块/股票池扫描（Top-N）", "func": job_pool_scan,
@@ -2064,10 +2083,10 @@ JOBS = {
                      "default": {"enabled": True, "hour": 9, "minute": 30,
                                  "params": {"interval_sec": 300},
                                  "trigger": "interval"}},
-    "tick_sync": {"name": "📈 Tick数据同步（盘中·秒级）", "func": job_tick_sync,
-                  "default": {"enabled": True, "hour": 9, "minute": 30,
+    "tick_sync": {"name": "📈 Tick数据同步（盘中·秒级·TDX已断链停用）", "func": job_tick_sync,
+                  "default": {"enabled": False, "hour": 9, "minute": 30,
                               "params": {"interval_sec": 10},
-                              "trigger": "interval"}},
+                              "trigger": "interval"}},  # 2026-09-10 起 TDX 全服务器协议失配；tick 无页面消费，realtime_kline 由 iFinD 分钟线兜底
     "realtime_kline": {"name": "📊 实时日K线聚合（盘中·秒级）", "func": job_realtime_kline,
                        "default": {"enabled": True, "hour": 9, "minute": 30,
                                    "params": {"interval_sec": 10},

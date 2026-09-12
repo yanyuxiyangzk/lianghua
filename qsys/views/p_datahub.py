@@ -58,6 +58,10 @@ PIPELINES = [
     # ---- 每日例行 ----
     {"key": "ifind_calendar", "channel": "iFinD HTTP", "group": "每日例行",
      "tables": [("ifind_calendar", "date")], "daily_cutoff": "09:00"},
+    {"key": "sector_industry_sync", "channel": "iFinD 问财", "group": "每日例行",
+     "tables": [("stock_industry", "updated_at")], "daily_cutoff": "09:30"},
+    {"key": "sector_daily", "channel": "本地聚合", "group": "盘后批量",
+     "tables": [("sector_daily", "date")], "daily_cutoff": "16:40"},
     {"key": "ifind_stocklist_sync", "channel": "iFinD HTTP", "group": "每日例行",
      "tables": [("ifind_stocklist", None)], "daily_cutoff": "09:30"},
     {"key": "ifind_indexlist_sync", "channel": "iFinD HTTP", "group": "每日例行",
@@ -68,7 +72,6 @@ PIPELINES = [
 
 # 数据表健康看板额外关注的表（不属于任何单一管道）
 EXTRA_TABLES = [
-    ("sector_daily", "date"),
     ("stock_fundflow_intraday", "datetime"),
 ]
 

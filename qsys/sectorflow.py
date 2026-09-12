@@ -61,7 +61,46 @@ def industry_status() -> dict:
     return {"stocks": n, "sectors": (s[0] or 0), "updated_at": (s[1] or "—")}
 
 
+def sync_industry_ifind() -> str:
+    """从同花顺 iFinD 问财同步全市场行业分类（一级行业）→ stock_industry 表。
+
+    统一默认数据源（2026-09-12 用户要求）：行业映射此前来自新浪（akshare），
+    现改 iFinD——板块日线聚合用的日线已是 iFinD，分类也统一后板块数据全链路同花顺。
+    """
+    import datasource as ds
+    df, _res, err = ds.ths_wcquery("A股 所属同花顺行业", domain="stock")
+    if err not in (0, None) or df is None or df.empty:
+        return f"问财行业分类拉取失败 err={err}"
+    import re as _re
+
+    def _norm_code(raw):
+        m = _re.match(r"(\d{6})\.([A-Z]{2})", str(raw).strip())
+        return f"{m.group(2)}{m.group(1)}" if m else str(raw)
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    code_col = next(c for c in df.columns if "代码" in c)
+    ind_col = next(c for c in df.columns if "行业" in c)
+    rows = []
+    for r in df.itertuples():
+        ind = str(getattr(r, ind_col) or "")
+        if not ind or ind == "nan":
+            continue
+        lvl1 = ind.split("-")[0].strip()  # 一级行业（如"非银金融"）
+        rows.append((_norm_code(getattr(r, code_col)), lvl1, lvl1, "ths_ifind", now))
+    if not rows:
+        return "行业分类为空"
+    with _sconn() as c:
+        c.execute("DELETE FROM stock_industry WHERE source != 'ths_ifind'")  # 清旧源（新浪）
+        c.executemany(
+            "INSERT OR REPLACE INTO stock_industry (code, sector_label, sector_name, source, updated_at)"
+            " VALUES (?,?,?,?,?)", rows)
+    return f"iFinD 行业分类同步完成：{len(rows)} 只 · {len({r[1] for r in rows})} 个一级行业"
+
+
 _sync_state = {"running": False, "done": 0, "total": 0, "err": None}
+
+
+
 
 
 def sync_industry_map(background: bool = True):

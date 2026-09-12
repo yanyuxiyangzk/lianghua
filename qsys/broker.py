@@ -135,18 +135,20 @@ def _settle_today():
 
 # ---------------------------------------------------------------- 行情
 def _latest_prices(codes: list[str]) -> dict:
-    """ifind_realtime 每代码各自最新快照 {code: (price, prev_close, open)}。
+    """ifind_realtime 每代码各自最新快照 {code: (price, prev_close, open, limit_up, limit_down)}。
     按代码取最新：热码高频快照与全市场批次同表共存时冷码不丢（2026-09-11）。"""
     import datasource
     if not codes:
         return {}
     with datasource._qconn() as c:
         df = pd.read_sql(
-            f"""SELECT r.code, r.price, r.prev_close, r.open FROM ifind_realtime r
+            f"""SELECT r.code, r.price, r.prev_close, r.open, r.limit_up, r.limit_down
+                FROM ifind_realtime r
                 JOIN (SELECT code, MAX(datetime) md FROM ifind_realtime
                       WHERE code IN ({','.join('?' * len(codes))}) GROUP BY code) t
                   ON r.code = t.code AND r.datetime = t.md""", c, params=codes)
-    return {r.code: (r.price, r.prev_close, r.open) for r in df.itertuples()}
+    return {r.code: (r.price, r.prev_close, r.open, r.limit_up, r.limit_down)
+            for r in df.itertuples()}
 
 
 def get_name(code: str) -> str:
@@ -187,10 +189,25 @@ def place_order(code: str, side: str, price: float | None, shares: int,
                             (code, source)).fetchone()
             if not pos or pos[0] < shares:
                 return f"可卖数量不足（可卖 {pos[0] if pos else 0} 股，T+1：当日买入不可当日卖出）"
-        # 市价单立即成交检查现金
         is_market = not price or price <= 0
+        # 涨跌停可成交性（实盘规则）：涨停买单/跌停卖单不可立即成交
+        limit_up = pr[3] if pr and len(pr) > 3 else None
+        limit_down = pr[4] if pr and len(pr) > 4 else None
+        if limit_down is None and pr and pr[1]:
+            # 缺 lowerLimit 时按 upperLimit 幅度推（各板块幅度对称）
+            limit_down = round(pr[1] * (2 - limit_up / pr[1]), 2) if limit_up else None
+        at_limit_up = bool(cur and limit_up and cur >= limit_up * 0.999)
+        at_limit_down = bool(cur and limit_down and cur <= limit_down * 1.001)
+        if side == "buy" and at_limit_up:
+            return f"已涨停（{limit_up}），买单无法成交（实盘规则：涨停买不进）"
+        if side == "sell" and at_limit_down and is_market:
+            # 市价卖单打在跌停板上无法成交 → 自动转为限价挂（略低于现价，等开板）
+            price = round(cur * 0.995, 2)
+            is_market = False
+        # 市价单立即成交检查现金；限价卖单挂在跌停价上也不予成交（等开板）
         fill_now = is_market or (cur is not None and (
-            (side == "buy" and cur <= price) or (side == "sell" and cur >= price)))
+            (side == "buy" and cur <= price) or
+            (side == "sell" and cur >= price and not at_limit_down)))
         if side == "buy" and fill_now and cur:
             need = cur * shares + max(FEE_MIN, cur * shares * FEE_RATE)
             if _get_cash() < need:
@@ -206,7 +223,8 @@ def place_order(code: str, side: str, price: float | None, shares: int,
                 return "无最新行情价，市价单无法成交（已撤）"
             _fill(c, cur_o, cur)
             return f"已成交：{'买入' if side == 'buy' else '卖出'} {code} {shares}股 @ {cur:.2f}"
-        return f"已挂单（限价 {price:.2f}，等待价格触及后自动成交，可在撤单页撤销）"
+        return (f"已挂单（限价 {price:.2f}，等待价格触及后自动成交，当日有效"
+                f"，收盘未成交自动撤销）（委托号 #{cur_o}）")
 
 
 def _fill(c, order_id: int, fill_price: float):
@@ -261,7 +279,8 @@ def _fill(c, order_id: int, fill_price: float):
 
 
 def fill_pending_orders() -> int:
-    """盘中由持仓跟踪任务调用：检查已报挂单，价格触及限价即成交。返回成交笔数。"""
+    """盘中由持仓跟踪任务调用：检查已报挂单，价格触及限价即成交。返回成交笔数。
+    可成交性约束（实盘规则）：买单在涨停价上、卖单在跌停价上不予成交（挂起等开板）。"""
     _init_account()
     _settle_today()
     with _conn() as c:
@@ -276,6 +295,14 @@ def fill_pending_orders() -> int:
             cur = pr[0] if pr else None
             if cur is None:
                 continue
+            limit_up = pr[3] if len(pr) > 3 else None
+            limit_down = pr[4] if len(pr) > 4 else None
+            if limit_down is None and pr[1] and limit_up:
+                limit_down = round(pr[1] * (2 - limit_up / pr[1]), 2)
+            if side == "buy" and limit_up and cur >= limit_up * 0.999:
+                continue  # 涨停买不进
+            if side == "sell" and limit_down and cur <= limit_down * 1.001:
+                continue  # 跌停卖不出
             if (side == "buy" and cur <= limit) or (side == "sell" and cur >= limit):
                 if side == "buy":
                     shares = c.execute(
@@ -288,6 +315,20 @@ def fill_pending_orders() -> int:
                 _fill(c, oid, cur)
                 n += 1
         return n
+
+
+def expire_day_orders() -> int:
+    """日终撤单（实盘规则：委托当日有效）：15:00 后把当日未成交挂单全部撤销。
+    次日由止盈止损/开仓逻辑按当时价格重新评估重新挂单。"""
+    today = _today()
+    now_hm = datetime.now().strftime("%H%M")
+    with _conn() as c:
+        if now_hm < "1500":
+            return 0
+        n = c.execute(
+            "UPDATE broker_orders SET status='已撤', cancel_ts=? WHERE status='已报' AND date<=?",
+            (_now(), today)).rowcount
+    return n
 
 
 def check_stop_exits() -> int:

@@ -989,9 +989,11 @@ def job_position_track(**_ignored) -> str:
     import broker
     n_fill = broker.fill_pending_orders()
     n_stop = broker.check_stop_exits()
+    n_expire = broker.expire_day_orders()  # 实盘规则：委托当日有效，15:00 未成交全撤
     parts = ([m0] if m0 != "对账一致" else []) + [m1, m_fill, m2] \
         + ([f"挂单成交 {n_fill} 笔"] if n_fill else []) \
-        + ([f"手动止盈止损 {n_stop} 笔"] if n_stop else [])
+        + ([f"手动止盈止损 {n_stop} 笔"] if n_stop else []) \
+        + ([f"日终撤单 {n_expire} 笔"] if n_expire else [])
     if n_registered:
         parts.append(f"PriceMonitor 监控 {n_registered} 个持仓")
     return "；".join(p for p in parts if p)

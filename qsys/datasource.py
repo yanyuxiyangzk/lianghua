@@ -1963,7 +1963,7 @@ def fetch_realtime_hot(codes: list[str]) -> int:
         m = _re.match(r"(\d{6})\.([A-Z]{2})", str(raw).strip())
         return f"{m.group(2)}{m.group(1)}" if m else str(raw)
 
-    indicators = "latest,preClose,open,high,low,changeRatio,volume,amount,turnoverRatio"
+    indicators = "latest,preClose,open,high,low,changeRatio,volume,amount,turnoverRatio,upperLimit"
     vals = []
     batch_size = 50
     for i in range(0, len(codes), batch_size):
@@ -1978,14 +1978,18 @@ def fetch_realtime_hot(codes: list[str]) -> int:
                             df.columns[0])
             for _, row in df.iterrows():
                 code = _norm(row[code_col])
+                prev = _safe_float(row.get("preClose"))
+                up = _safe_float(row.get("upperLimit"))
+                # iFinD RQ 无 lowerLimit 字段：按上板幅度推算下板（各板块幅度对称）
+                down = round(prev * (2 - up / prev), 2) if prev and up else None
                 vals.append((
                     code, now,
-                    _safe_float(row.get("latest")), _safe_float(row.get("preClose")),
+                    _safe_float(row.get("latest")), prev,
                     _safe_float(row.get("open")), _safe_float(row.get("high")),
                     _safe_float(row.get("low")), _safe_float(row.get("changeRatio")),
                     _safe_float(row.get("volume")), _safe_float(row.get("amount")),
                     _safe_float(row.get("turnoverRatio")),
-                    None, None, None, None, None,
+                    None, None, None, up, down,
                 ))
         except Exception:
             continue
@@ -1995,8 +1999,8 @@ def fetch_realtime_hot(codes: list[str]) -> int:
         c.executemany(
             "INSERT OR REPLACE INTO ifind_realtime"
             "(code,datetime,price,prev_close,open,high,low,change_pct,"
-            "volume,amount,turnover,quantity_ratio,amplitude,float_shares,float_mv,speed)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", vals)
+            "volume,amount,turnover,quantity_ratio,amplitude,limit_up,limit_down)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", vals)
     return len(vals)
 
 

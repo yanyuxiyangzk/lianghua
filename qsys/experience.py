@@ -108,6 +108,8 @@ def _conn():
         c.execute("ALTER TABLE positions ADD COLUMN shares INTEGER")  # 成交股数（100股整手）
     if "buy_amount" not in pcols:
         c.execute("ALTER TABLE positions ADD COLUMN buy_amount REAL")  # 买入金额 = 股数×成交价
+    if "sell_order_id" not in pcols:
+        c.execute("ALTER TABLE positions ADD COLUMN sell_order_id INTEGER")  # 卖出委托号（委托制）
     return c
 
 
@@ -741,7 +743,40 @@ def position_reconcile(today: str) -> str:
     import broker
     with _conn() as c:
         opens = pd.read_sql(
-            "SELECT code, SUM(shares) sh FROM positions WHERE status='open' GROUP BY code", c)
+            "SELECT code, SUM(shares) sh FROM positions"
+            " WHERE status IN ('open','closing') GROUP BY code", c)
+    # ---- closing 仓结算（委托制）：委托成交→closed；日终撤单→回 open 次日重估 ----
+    settled = []
+    with _conn() as c:
+        closing = pd.read_sql("SELECT * FROM positions WHERE status='closing'", c)
+    if not closing.empty:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with broker._conn() as bc, _conn() as c:
+            for _, p in closing.iterrows():
+                oid = p.get("sell_order_id")
+                if pd.isna(oid) or not oid:
+                    # 无委托号的 closing（异常残留）→ 回 open
+                    c.execute("UPDATE positions SET status='open', sell_order_id=NULL,"
+                              " sell_reason=NULL WHERE id=?", (int(p["id"]),))
+                    continue
+                row = bc.execute(
+                    "SELECT status, filled_price, filled_ts FROM broker_orders WHERE id=?",
+                    (int(oid),)).fetchone()
+                if not row:
+                    continue
+                st_, fprice, fts = row
+                if st_ == "已成":
+                    pnl = (round(fprice / p["buy_price"] - 1 - DEFAULT_RULES["cost"], 6)
+                           if fprice and p["buy_price"] else None)
+                    c.execute("UPDATE positions SET status='closed', sell_date=?, sell_price=?,"
+                              " sell_ts=?, pnl_pct=?, hold_days=?, closed_at=? WHERE id=?",
+                              (today, fprice, fts or now, pnl,
+                               _trade_days_between(str(p["buy_date"]), today), now, int(p["id"])))
+                    settled.append(f"{p.get('name') or p['code']}·成交")
+                elif st_ == "已撤":
+                    c.execute("UPDATE positions SET status='open', sell_order_id=NULL,"
+                              " sell_reason=NULL WHERE id=?", (int(p["id"]),))
+                    settled.append(f"{p.get('name') or p['code']}·撤单重持")
     try:
         bposs = broker.get_positions()
     except Exception:
@@ -766,7 +801,8 @@ def position_reconcile(today: str) -> str:
                  cost, now, None, "reconcile_fix", "对账补记",
                  diff, round(diff * cost, 2), now))
             fixed.append(f"{bp.get('name') or code}×{diff}")
-    return "对账补记：" + ",".join(fixed) if fixed else "对账一致"
+    head = "对账补记：" + ",".join(fixed) if fixed else "对账一致"
+    return head + (" · closing结算：" + ",".join(settled) if settled else "")
 
 
 def position_close_check(today: str) -> str:
@@ -792,7 +828,7 @@ def position_close_check(today: str) -> str:
     except Exception:
         broker_shares = {}
     open_sum = opens.groupby("code")["shares"].sum()
-    n_close = n_skip = 0
+    n_close = n_skip = n_order = 0
     with _conn() as c:
         for _, p in opens.iterrows():
             if str(p["buy_date"]) >= today:
@@ -816,39 +852,50 @@ def position_close_check(today: str) -> str:
                 continue
             entry = p["buy_price"]
             tp, sl = entry * (1 + r["take_profit"]), entry * (1 + r["stop_loss"])
-            reason = None
+            reason = limit_price = None
             if cur >= tp:
-                reason = "止盈"
+                # 止盈：挂止盈价，价格再次触及才成交（回落不成交=继续持有，实盘如此）
+                reason, limit_price = "止盈", round(tp, 2)
             elif cur <= sl:
-                reason = "止损"
+                # 止损：要务是成交——限价略低于触发价让半步（跌停板上broker会自动转挂等开板）
+                reason, limit_price = "止损", round(cur * 0.995, 2)
             else:
                 hd = _trade_days_between(str(p["buy_date"]), today)
                 if hd >= r["hold_days"]:
-                    reason = "到期"
+                    reason, limit_price = "到期", round(cur * 0.995, 2)
             if reason:
-                # 走柜台真实卖出（回笼资金、T+1 可卖校验），盈亏按实际成交价记账
-                msg = broker.place_order(code, "sell", None, int(p["shares"] or 0),
+                # 委托制（实盘规则）：触发只挂单，触及才成交；当日未成交收盘自动撤，次日重估重挂
+                msg = broker.place_order(code, "sell", limit_price, int(p["shares"] or 0),
                                          source="ai")
-                if "已成交" not in msg:
-                    continue  # 卖出失败（如可卖不足）→ 保持持仓，下个周期再试
-                m = re.search(r"@ ([\d.]+)", msg)
-                fill = float(m.group(1)) if m else None
-                pnl = (round(fill / entry - 1 - r["cost"], 6)
-                       if fill and entry else None)  # 扣往返成本
-                c.execute("UPDATE positions SET status='closed', sell_date=?, sell_price=?,"
-                          " sell_ts=?, sell_reason=?, pnl_pct=?, hold_days=?, closed_at=?"
-                          " WHERE id=?",
-                          (today, fill, now, reason, pnl,
-                           _trade_days_between(str(p["buy_date"]), today), now, int(p["id"])))
-                n_close += 1
+                if "已成交" in msg:
+                    # 限价当下即触及（止损让半步/更优价），按实际成交价平仓记账
+                    mf = re.search(r"@ ([\d.]+)", msg)
+                    fill = float(mf.group(1)) if mf else None
+                    pnl = (round(fill / entry - 1 - r["cost"], 6)
+                           if fill and entry else None)
+                    c.execute("UPDATE positions SET status='closed', sell_date=?, sell_price=?,"
+                              " sell_ts=?, sell_reason=?, pnl_pct=?, hold_days=?, closed_at=?"
+                              " WHERE id=?",
+                              (today, fill, now, reason, pnl,
+                               _trade_days_between(str(p["buy_date"]), today), now, int(p["id"])))
+                    n_close += 1
+                    # 取消 PriceMonitor 监控（仅成交后；挂单中继续持有、继续监控）
+                    try:
+                        from price_monitor import monitor
+                        monitor.unregister(code, int(p["id"]))
+                    except Exception:
+                        pass
+                elif "已挂单" in msg:
+                    mo = re.search(r"委托号 #(\d+)", msg)
+                    c.execute("UPDATE positions SET status='closing', sell_reason=?,"
+                              " sell_order_id=? WHERE id=?",
+                              (reason, int(mo.group(1)) if mo else None, int(p["id"])))
+                    n_order += 1
+                # 其他结果（可卖不足等）→ 保持 open，下个周期再试
 
-                # 取消 PriceMonitor 监控
-                try:
-                    from price_monitor import monitor
-                    monitor.unregister(code, int(p["id"]))
-                except Exception:
-                    pass
     parts = [f"平仓 {n_close} 笔"] if n_close else ["持仓检查：无触发"]
+    if n_order:
+        parts.append(f"挂出卖单 {n_order} 笔")
     if n_skip:
         parts.append(f"账本不一致跳过 {n_skip} 笔（经验库与柜台股数对不上）")
     return "；".join(parts)

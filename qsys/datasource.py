@@ -2385,6 +2385,38 @@ def get_fundflow_intraday(code: str) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------- 龙虎榜数据（同花顺 iFinD → market.db） ----------------------------------------------------------------
+def _lhb_backfill_prices() -> int:
+    """回填龙虎榜的收盘价/涨跌幅：问财榜单只给净额列，价格从本地日线（ths_ifind）取。
+    涨跌幅=当日收盘/上一交易日收盘-1。lhb_sync 入库后调用；历史空值一并补齐。"""
+    _ensure_lhb_db()
+    with _conn() as c:
+        n1 = c.execute("""
+            UPDATE lhb_daily SET close_price = (
+                SELECT m.close FROM market_daily m
+                WHERE m.code = lhb_daily.code AND m.date = lhb_daily.date
+                  AND m.source = 'ths_ifind')
+            WHERE close_price IS NULL
+              AND EXISTS (SELECT 1 FROM market_daily m
+                          WHERE m.code = lhb_daily.code AND m.date = lhb_daily.date
+                            AND m.source = 'ths_ifind')""").rowcount
+        n2 = c.execute("""
+            UPDATE lhb_daily SET change_pct = ROUND((
+                SELECT (m.close / p.prev - 1) * 100
+                FROM market_daily m
+                JOIN (SELECT code, date, close AS prev FROM market_daily
+                      WHERE source = 'ths_ifind') p
+                  ON p.code = m.code
+                 AND p.date = (SELECT MAX(date) FROM market_daily
+                               WHERE code = m.code AND date < m.date AND source = 'ths_ifind')
+                WHERE m.code = lhb_daily.code AND m.date = lhb_daily.date
+                  AND m.source = 'ths_ifind'), 2)
+            WHERE close_price IS NOT NULL AND change_pct IS NULL
+              AND EXISTS (SELECT 1 FROM market_daily m
+                          WHERE m.code = lhb_daily.code AND m.date = lhb_daily.date
+                            AND m.source = 'ths_ifind')""").rowcount
+    return n1 + n2
+
+
 def fetch_lhb_via_ths(date: str) -> int:
     """通过同花顺 iFinD 问财获取某日龙虎榜数据，写入 lhb_daily。
 
@@ -2436,6 +2468,11 @@ def fetch_lhb_via_ths(date: str) -> int:
                     "(code,date,name,close_price,change_pct,net_buy,buy_amount,sell_amount,"
                     "inst_count,inst_buy_pct,hot_dept_count,win_rate,consecutive_days,fetched_at)"
                     " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            # 回填收盘价/涨跌幅（问财榜单只有净额列，价格从本地日线取）
+            try:
+                _lhb_backfill_prices()
+            except Exception:
+                pass
             return len(rows)
     except Exception as e:
         import logging

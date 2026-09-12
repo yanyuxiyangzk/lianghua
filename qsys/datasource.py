@@ -2136,20 +2136,25 @@ def get_daily_from_db(code: str, start_date: str = None, end_date: str = None) -
 
 
 def get_stocklist_from_db() -> pd.DataFrame:
-    """从 ifind_stocklist 表读取全市场A股列表，并用 ifind_realtime 最新数据覆盖。"""
+    """从 ifind_stocklist 表读取全市场A股列表，并用 ifind_realtime 各代码最新行覆盖。
+
+    实时覆盖按"每代码取最新行"（热码高频与全市场批次同表共存）——若用整批
+    MAX(datetime)，热码小批次会把全市场实时字段顶没（2026-09-12 行情页
+    涨速/量比/成交额全空的事故）。"""
     with _qconn() as c:
         df = pd.read_sql_query("SELECT * FROM ifind_stocklist ORDER BY code", c)
-        # 用 ifind_realtime 最新快照覆盖价格类和实时字段
+        # 用 ifind_realtime 每代码最新行覆盖价格类和实时字段
         # 注：不覆盖 pe_ttm——ifind_realtime 不再写 PE（RQ 的 pe_ttm 是 TTM 口径），
         #     PE 统一用每日同步的动态 PE（ths_pe_stock,3，与同花顺终端口径一致）
         if not df.empty:
             rt = pd.read_sql_query(
-                """SELECT code, price, prev_close, open, high, low,
-                          change_pct, volume, amount, turnover,
-                          quantity_ratio, amplitude, float_shares, float_mv,
-                          speed
-                   FROM ifind_realtime
-                   WHERE datetime = (SELECT MAX(datetime) FROM ifind_realtime)""",
+                """SELECT r.code, r.price, r.prev_close, r.open, r.high, r.low,
+                          r.change_pct, r.volume, r.amount, r.turnover,
+                          r.quantity_ratio, r.amplitude, r.float_shares, r.float_mv,
+                          r.speed
+                   FROM ifind_realtime r
+                   JOIN (SELECT code, MAX(datetime) md FROM ifind_realtime GROUP BY code) t
+                     ON r.code = t.code AND r.datetime = t.md""",
                 c,
             )
             if not rt.empty:

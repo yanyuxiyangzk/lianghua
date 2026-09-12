@@ -92,7 +92,7 @@ def _load_lhb_from_db() -> pd.DataFrame:
                    FROM lhb_daily
                    WHERE date >= ?
                    ORDER BY date DESC, net_buy DESC""",
-                c, params=((datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d"),))
+                c, params=((datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"),))
         if df.empty:
             return df
         # 格式化列名
@@ -220,7 +220,7 @@ def _tab_detail():
     use_db = not db_df.empty
 
     if use_db:
-        st.info(f"数据来自 lhb_daily 表（最近7天，共 {len(db_df)} 条）")
+        st.info(f"数据来自 lhb_daily 表（最近30天，共 {len(db_df)} 条）")
         # DB 模式：无营业部明细，简化展示
         show_cols = [c for c in ["日期", "代码", "名称", "收盘价", "涨跌幅(%)",
                                   "净买入额(万)", "买入额(万)", "卖出额(万)",

@@ -2257,7 +2257,8 @@ def fetch_fundflow_via_ths(date: str) -> int:
     # 分批查询：问财每次返回约 5000 条，全市场 A 股约 5000+ 只
     # 用"主力净流入额"作为筛选条件，分正负两批获取全部股票
     queries = [
-        f"{date_compact} 主力净流入额 股票",
+        f"{date_compact} 主力净流入额大于0 股票",
+        f"{date_compact} 主力净流出 股票",
     ]
     for query in queries:
         try:

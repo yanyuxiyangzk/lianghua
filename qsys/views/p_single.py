@@ -74,7 +74,7 @@ if st.button("🔬 开始研究", type="primary", key="ps_run"):
     st.session_state.pop("ps_wf", None)  # 新研究作废旧验证结果
     with st.status("研究中…", expanded=True) as bar:
         bar.write("① 加载面板并找事件点…")
-        panel = sig.get_panel_cached(codes, end, 800, source="qlib_local")
+        panel = sig.get_panel_cached(codes, end, 800)
         events = fe.find_events(panel, kind)
         if events.empty:
             st.session_state["ps_res"] = {"empty": True, "kind": kind}
@@ -159,7 +159,7 @@ if res:
                         fvals[r["因子"]] = res["fvals"][r["因子"]]
                         weights[r["因子"]] = (1.0 / 5, 1 if r["差值"] >= 0 else -1)
                     with st.spinner("walk-forward 验证中…"):
-                        panel = sig.get_panel_cached(res["codes"], end, 800, source="qlib_local")
+                        panel = sig.get_panel_cached(res["codes"], end, 800)
                         wf = fe.walk_forward(fvals, panel, "等权", 10,
                                              fwd_days=5, step=5, min_factors=1)
                     st.session_state["ps_wf"] = wf

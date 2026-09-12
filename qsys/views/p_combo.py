@@ -108,7 +108,7 @@ if st.button("🤖 自动组建因子组合", type="primary", key="pc_build"):
         kept = [n for n in kept if n in facs][:12]
         bar.write(f"③ 贪心搜索（{len(kept)} 候选 × walk-forward）…")
         fvals = {n: fe.get_factor_values(facs[n], codes, end) for n in kept}
-        panel = sig.get_panel_cached(codes, end, 800, source="qlib_local")
+        panel = sig.get_panel_cached(codes, end, 800)
         hdays = fe.WIN_HORIZONS.get(hold_h, fe.MAIN_FWD)
         step = max(1, min(fe.STEP_DAYS, hdays))
         buffer_n = top_n if hold_h == "1日" else 0
@@ -332,7 +332,7 @@ else:
                           for _, r in reg[reg["engine"] == "loopengine"].iterrows()}
                 pool0 = vote["pool"]
                 codes0 = pools.get(pool0) or []
-                panel = sig.get_panel_cached(codes0, end, 800, source="qlib_local")
+                panel = sig.get_panel_cached(codes0, end, 800)
                 pack_defs = []
                 for p in vote["packs"]:
                     pk = packs[p]

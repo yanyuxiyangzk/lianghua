@@ -1929,6 +1929,21 @@ def fetch_realtime_to_db() -> int:
     return len(vals)
 
 
+def get_ifind_latest(codes: list[str]) -> dict:
+    """每代码最新快照 {code: {price, prev_close, open, datetime}}（ifind_realtime，
+    热码高频与全市场批次同表共存，按代码取最新行）。统一默认数据源（同花顺）读法。"""
+    if not codes:
+        return {}
+    with _qconn() as c:
+        df = pd.read_sql(
+            f"""SELECT r.code, r.price, r.prev_close, r.open, r.datetime FROM ifind_realtime r
+                JOIN (SELECT code, MAX(datetime) md FROM ifind_realtime
+                      WHERE code IN ({','.join('?' * len(codes))}) GROUP BY code) t
+                  ON r.code = t.code AND r.datetime = t.md""", c, params=list(codes))
+    return {r.code: {"price": r.price, "prev_close": r.prev_close, "open": r.open,
+                     "datetime": r.datetime} for r in df.itertuples()}
+
+
 def fetch_realtime_hot(codes: list[str]) -> int:
     """热码高频快照：小名单（持仓/自选/今日名单，~80只）走 iFinD RQ 高频落库。
 

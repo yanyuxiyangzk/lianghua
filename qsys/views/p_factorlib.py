@@ -80,7 +80,7 @@ def _render_factor_detail(pick: str, pool_name: str, row: pd.Series, reg_map: di
         with st.spinner("回测中（因子值缓存命中则秒出）…"):
             fac = _fac_of(pick, reg_map)
             vals = fe.get_factor_values(fac, codes, end)
-            panel = sig.get_panel_cached(codes, end, 800, source="qlib_local")
+            panel = sig.get_panel_cached(codes, end, 800)
             st.session_state[f"fl_bt_{pool_name}_{pick}"] = fe.factor_group_backtest(vals, panel)
     bt = st.session_state.get(f"fl_bt_{pool_name}_{pick}")
     if bt:
@@ -135,7 +135,7 @@ def _render_strategy_detail(name: str, pk: dict, reg_map: dict):
 
     if run_bt:
         with st.spinner("滚动回测中…"):
-            panel = sig.get_panel_cached(codes, end, 800, source="qlib_local")
+            panel = sig.get_panel_cached(codes, end, 800)
             wf = fe.walk_forward(_fvals(), panel, pk.get("method", "ICIR加权"), pk["top_n"])
             st.session_state[f"st_wf_{name}"] = wf
     wf = st.session_state.get(f"st_wf_{name}")
@@ -155,7 +155,7 @@ def _render_strategy_detail(name: str, pk: dict, reg_map: dict):
         with st.spinner("计算今日名单…"):
             weights = {f["name"]: (f["weight"], f["direction"]) for f in pk["factors"]}
             score = sig.composite_score(_fvals(), weights)
-            panel = sig.get_panel_cached(codes, end, 800, source="qlib_local")
+            panel = sig.get_panel_cached(codes, end, 800)
             survived = sig.apply_filters(score.index.tolist(), panel, pk.get("filters", []))
             final = score[score.index.isin(survived)].head(pk["top_n"])
             st.session_state[f"st_picks_{name}"] = final

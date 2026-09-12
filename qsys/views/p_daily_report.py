@@ -27,9 +27,12 @@ def _collect_all_data() -> dict:
     # 5. 策略表现
     strategies = experience.pack_leaderboard()
 
-    # 6. 市场环境（5大指数）
-    indices = datasource.get_batch_snapshots(
-        ["SH000001", "SZ399001", "SZ399006", "SH000300", "SH000905"])
+    # 6. 市场环境（5大指数，同花顺快照——热码集已含指数，盘后回落到日更值）
+    idx_codes = ["SH000001", "SZ399001", "SZ399006", "SH000300", "SH000905"]
+    snaps = datasource.get_ifind_latest(idx_codes)
+    indices = [{"code": c, "price": s.get("price"), "prev_close": s.get("prev_close"),
+                "amount": None}
+               for c in idx_codes if (s := snaps.get(c))]
 
     # 7. 交易统计
     stats = experience.position_stats()

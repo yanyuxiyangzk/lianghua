@@ -1409,6 +1409,21 @@ def job_ifind_announce(pool_name: str = "自选股", days: int = 7, **_ignored) 
     return f"公告入库：拉到 {len(df)} 条，新增 {n} 条（seq 去重）"
 
 
+def job_sr_scan(**_ignored) -> str:
+    """支撑/阻力扫描（Density-SR）：每交易日 18:10，全市场四信号融合扫描落库 sr_scan_daily。
+
+    纯本地数据（market_daily 的 ths_ifind 日线），不调外部 API；全市场约 1-2 分钟。
+    """
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5:
+        return "非交易日，跳过"
+    import density_sr
+    n = density_sr.scan_and_store()
+    return f"{now.strftime('%Y-%m-%d')} 支撑阻力扫描完成：{n} 只"
+
+
 def job_ifind_stocklist_sync(**_ignored) -> str:
     """iFinD 全市场A股列表同步（每日09:00执行）。
 
@@ -2028,6 +2043,8 @@ JOBS = {
                                    "params": {"pool_name": "自选股", "days": 7}}},
     "ifind_stocklist_sync": {"name": "📋 iFinD A股列表同步（每日）", "func": job_ifind_stocklist_sync,
                              "default": {"enabled": True, "hour": 9, "minute": 0, "params": {}}},
+    "sr_scan": {"name": "🧭 支撑阻力扫描（每日盘后）", "func": job_sr_scan,
+                "default": {"enabled": True, "hour": 18, "minute": 10, "params": {}}},
     "ifind_indexlist_sync": {"name": "📉 iFinD 指数列表同步（每日）", "func": job_ifind_indexlist_sync,
                              "default": {"enabled": True, "hour": 9, "minute": 5, "params": {}}},
     "ifind_realtime_sync": {"name": "📊 iFinD 实时快照同步（盘中）", "func": job_ifind_realtime_sync,

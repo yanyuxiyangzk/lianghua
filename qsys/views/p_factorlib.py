@@ -199,12 +199,21 @@ def render():
 
     view_all = st.toggle("📚 显示全部注册因子（含未体检）", value=False, key="fl_all")
     if view_all:
+        import datasource as _ds
+        _loop_src = _ds.get_loop_source()  # loopengine/builtin/tech 的生成&评估数据口径跟随此开关
+        _SRC_LABEL = {"ths_ifind": "iFinD·不复权", "qlib_local": "qlib社区·前复权"}
+        # 引擎 → (显示名, 生成数据口径)。RD-Agent 研发固定 qlib 社区数据；Density-SR 固定 iFinD 日线
+        _ENG_MAP = {"rdagent": ("RD-Agent", "qlib社区·前复权"),
+                    "loopengine": ("LoopEngine", _SRC_LABEL.get(_loop_src, _loop_src)),
+                    "density_sr": ("Density-SR", "iFinD·不复权"),
+                    "builtin": ("内置经典", _SRC_LABEL.get(_loop_src, _loop_src)),
+                    "tech": ("技术指标", _SRC_LABEL.get(_loop_src, _loop_src))}
         f1, f2, f3, f4 = st.columns([1, 1, 1, 2])
         with f1:
             fams = ["全部"] + sorted(registry["family"].dropna().unique().tolist()) if not registry.empty else ["全部"]
             fam_sel = st.selectbox("机制族", fams, key="fl_fam")
         with f2:
-            srcs = ["全部", "loopengine", "rdagent", "builtin", "tech"]
+            srcs = ["全部", "loopengine", "rdagent", "density_sr", "builtin", "tech"]
             src_sel = st.selectbox("来源引擎", srcs, key="fl_src")
         with f3:
             ftypes = ["全部"] + sorted(registry["factor_type"].dropna().unique().tolist()) if not registry.empty and "factor_type" in registry.columns else ["全部"]
@@ -221,9 +230,11 @@ def render():
         if kw.strip():
             reg_show = reg_show[reg_show["name"].str.contains(kw.strip(), case=False)]
         reg_show["闸门"] = reg_show["gate_status"].map({1: "收益✅", 0: "❌", 2: "事件✅"}).fillna("未测")
-        disp_all = reg_show[["name", "family", "factor_type", "engine", "闸门", "first_seen"]].rename(
-            columns={"name": "因子", "family": "机制族", "factor_type": "因子类型", "engine": "来源", "first_seen": "入库时间"})
-        st.caption(f"命中 {len(disp_all)} 个")
+        reg_show["来源"] = reg_show["engine"].map(lambda e: _ENG_MAP.get(e, (e, ""))[0])
+        reg_show["生成数据"] = reg_show["engine"].map(lambda e: _ENG_MAP.get(e, ("", "?"))[1])
+        disp_all = reg_show[["name", "family", "factor_type", "来源", "生成数据", "闸门", "first_seen"]].rename(
+            columns={"name": "因子", "family": "机制族", "factor_type": "因子类型", "first_seen": "入库时间"})
+        st.caption(f"命中 {len(disp_all)} 个 · 生成数据=因子研发/演化时用的数据口径（评估体检统一在 {_SRC_LABEL.get(_loop_src, _loop_src)}）")
         all_page, _, all_ph = _paginate(disp_all, "fl_all_pg")
         (all_ph or st).dataframe(all_page, width='stretch', height=380, hide_index=True)
         st.markdown("---")
@@ -255,8 +266,20 @@ def render():
         else:
             show["实战胜率"] = None
         show["用于策略"] = show["因子"].map(lambda n: "、".join(usage.get(n, [])) or "—")
-        _src_map = {"evolved": "进化", "builtin": "内置", "tech": "技术指标", "loopengine": "演化引擎"}
+        # 来源标注带生成数据口径：RD-Agent 研发用 qlib 社区数据(前复权)；LoopEngine/经典层跟随评估源开关
+        import datasource as _ds2
+        _src_lbl = {"ths_ifind": "iFinD", "qlib_local": "qlib社区"}.get(_ds2.get_loop_source(), "iFinD")
+        _src_map = {"evolved": "RD-Agent·qlib社区", "进化": "RD-Agent·qlib社区",
+                    "loopengine": f"LoopEngine·{_src_lbl}", "演化引擎": f"LoopEngine·{_src_lbl}",
+                    "builtin": f"内置·{_src_lbl}", "内置": f"内置·{_src_lbl}",
+                    "tech": f"技术指标·{_src_lbl}", "技术指标": f"技术指标·{_src_lbl}",
+                    "density_sr": "Density-SR·iFinD"}
         show["来源"] = show["来源"].map(lambda k: _src_map.get(k, k))
+        # SR 因子 kind=tech 会被泛化成"技术指标"，按注册表 engine 精确覆盖
+        _sr_names = set(registry[registry["engine"] == "density_sr"]["name"]) if not registry.empty else set()
+        if _sr_names:
+            show["来源"] = show.apply(
+                lambda r: "Density-SR·iFinD" if r["因子"] in _sr_names else r["来源"], axis=1)
         show["因子类型"] = show["_factor_type"]
         show["类别"] = show["因子"].map(lambda n: sig.NAME2CAT.get(n, "量价"))
         reg_gate = registry.set_index("name")["gate_status"].to_dict() if "gate_status" in registry.columns else {}

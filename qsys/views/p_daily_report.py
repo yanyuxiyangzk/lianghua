@@ -1,6 +1,7 @@
 """📊 每日量化战报：点击生成 AI 深度分析报告。"""
 
 from datetime import datetime
+import pandas as pd
 import streamlit as st
 
 import broker
@@ -240,39 +241,62 @@ def _generate_report(data: dict) -> str:
 
 
 # ---------------------------------------------------------------- 页面渲染
+def _load_history_report(date: str, generated_at: str):
+    """把历史战报载入 session_state（供下方渲染区显示）。"""
+    report_data = experience.get_daily_report(date)
+    if not report_data:
+        st.warning(f"{date} 的战报内容不存在")
+        return
+    st.session_state["daily_report"] = report_data.get("content", "")
+    st.session_state["daily_report_data"] = {
+        "account": report_data.get("account_json", {}),
+        "positions": report_data.get("positions_json", []),
+        "factors": report_data.get("factors_json", []),
+        "strategies": report_data.get("strategies_json", []),
+        "indices": report_data.get("market_json", []),
+        "stats": report_data.get("stats_json", {}),
+        "date": date,
+    }
+    st.session_state["daily_report_meta"] = {
+        "label": f"历史战报 {date}", "generated_at": generated_at or "—"}
+
+
 def page_daily_report():
     st.title("📊 每日量化战报")
-    st.caption("点击按钮，AI 实时分析今日盈亏原因、不足之处和改进建议")
-
-    # 历史战报查看
-    history_df = experience.list_daily_reports(limit=30)
-    if not history_df.empty:
-        with st.expander("📜 历史战报", expanded=False):
-            for _, row in history_df.iterrows():
-                date = row["date"]
-                pnl = row.get("pnl_today", 0) or 0
-                gen = row.get("generated_at", "")[:16]
-                icon = "🟢" if pnl >= 0 else "🔴"
-                if st.button(f"{icon} {date}  盈亏: {pnl:+,.0f}元  ({gen})", key=f"hist_{date}"):
-                    report_data = experience.get_daily_report(date)
-                    if report_data:
-                        st.session_state["daily_report"] = report_data.get("content", "")
-                        st.session_state["daily_report_data"] = {
-                            "account": report_data.get("account_json", {}),
-                            "positions": report_data.get("positions_json", []),
-                            "factors": report_data.get("factors_json", []),
-                            "strategies": report_data.get("strategies_json", []),
-                            "indices": report_data.get("market_json", []),
-                            "stats": report_data.get("stats_json", {}),
-                            "date": date,
-                        }
-                        st.rerun()
-
-    # 一键生成按钮
-    col1, col2, col3 = st.columns([1, 2, 1])
-    with col2:
+    top_l, top_r = st.columns([3.6, 1.4], vertical_alignment="center")
+    with top_l:
+        st.caption("AI 实时分析今日盈亏原因、不足之处和改进建议 · 历史战报支持列表查询")
+    with top_r:
         generate = st.button("🤖 生成今日战报", type="primary", use_container_width=True)
 
+    # ---------------- 历史战报：列表查询 ----------------
+    history_df = experience.list_daily_reports(limit=60)
+    if not history_df.empty:
+        st.markdown(f"##### 📜 历史战报（共 {len(history_df)} 篇）")
+        months = sorted(history_df["date"].str[:7].unique(), reverse=True)
+        fcol, _ = st.columns([1.2, 4.8])
+        with fcol:
+            month = st.selectbox("月份筛选", ["全部"] + list(months), key="dr_hist_month")
+        show = history_df if month == "全部" else history_df[history_df["date"].str.startswith(month)]
+        disp = pd.DataFrame({
+            " ": show["pnl_today"].map(lambda v: "🟢" if (v or 0) >= 0 else "🔴"),
+            "日期": show["date"],
+            "当日盈亏(元)": show["pnl_today"].map(lambda v: f"{(v or 0):+,.0f}"),
+            "持仓盈亏(元)": show["pnl_total"].map(lambda v: f"{(v or 0):+,.0f}"),
+            "生成时间": show["generated_at"].str[:16],
+        })
+        event = st.dataframe(disp, width="stretch", hide_index=True,
+                             height=min(320, 40 + 35 * len(disp)),
+                             on_select="rerun", selection_mode="single-row",
+                             key="dr_hist_table")
+        sel = event.selection.rows if event and event.selection else []
+        if sel:
+            row = show.reset_index(drop=True).iloc[sel[0]]
+            _load_history_report(row["date"], row.get("generated_at", ""))
+        else:
+            st.caption("👆 点击行查看对应日期的战报")
+
+    # ---------------- 生成今日战报 ----------------
     if generate:
         with st.spinner("📊 正在采集数据..."):
             data = _collect_all_data()
@@ -280,21 +304,27 @@ def page_daily_report():
             report = _generate_report(data)
         st.session_state["daily_report"] = report
         st.session_state["daily_report_data"] = data
+        st.session_state["daily_report_meta"] = {
+            "label": f"今日战报 {data['date']}",
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M")}
         # 保存战报到 DB
         try:
             experience.save_daily_report(data["date"], report, data)
         except Exception as e:
             st.warning(f"战报保存失败: {e}")
 
-    # 显示报告
+    # ---------------- 显示报告 ----------------
     if "daily_report" in st.session_state:
         report = st.session_state["daily_report"]
         data = st.session_state.get("daily_report_data", {})
+        meta = st.session_state.get("daily_report_meta", {})
+
+        st.markdown("---")
+        st.markdown(f"**正在查看：{meta.get('label', '今日战报')}**  ·  生成于 {meta.get('generated_at', '—')}")
 
         # 顶部概览卡片
         if data:
             acc = data.get("account", {})
-            st.markdown("---")
             c1, c2, c3, c4 = st.columns(4)
             total = acc.get("总资产", 0) or 0
             pnl = acc.get("持仓盈亏", 0) or 0
@@ -312,12 +342,8 @@ def page_daily_report():
         st.markdown("---")
         st.markdown(report)
 
-        # 底部时间戳
-        st.markdown("---")
-        st.caption(f"⏰ 报告生成时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-
     elif not generate:
-        st.info("👆 点击上方按钮，AI 将实时采集数据并生成分析报告")
+        st.info("👆 点击右上角按钮，AI 将实时采集数据并生成分析报告；历史战报在下方列表查询")
 
 
 # 入口

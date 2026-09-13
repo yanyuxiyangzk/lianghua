@@ -14,7 +14,7 @@ pandarallel.initialize(verbose=1)
 from rdagent.components.runner import CachedRunner
 from rdagent.core.exception import FactorEmptyError
 from rdagent.log import rdagent_logger as logger
-from rdagent.scenarios.qlib.developer.utils import process_factor_data
+from rdagent.scenarios.qlib.developer.utils import align_concat_cols, process_factor_data
 from rdagent.scenarios.qlib.experiment.factor_experiment import QlibFactorExperiment
 from rdagent.scenarios.qlib.experiment.model_experiment import QlibModelExperiment
 
@@ -120,7 +120,8 @@ class QlibFactorRunner(CachedRunner[QlibFactorExperiment]):
                     raise FactorEmptyError(
                         "The factors generated in this round are highly similar to the previous factors. Please change the direction for creating new factors."
                     )
-                combined_factors = pd.concat([SOTA_factor, new_factors], axis=1).dropna()
+                logger.info(f"[MEM] SOTA+新因子合并前: SOTA={SOTA_factor.shape} 新={new_factors.shape}")
+                combined_factors = align_concat_cols([SOTA_factor, new_factors]).dropna()
             else:
                 combined_factors = new_factors
 

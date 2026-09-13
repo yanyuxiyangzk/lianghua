@@ -1,12 +1,30 @@
 """📋 个股行情：全市场A股和主要指数的完整列表"""
 
 import math
+import re
 
 import pandas as pd
 import streamlit as st
 
 import datasource
 import ifind_hub
+
+# 完整代码写法正则：提取 6 位数字核（股票库前缀 SH600519，指数库后缀 000001.SH，
+# 用户可能输入 iFinD 后缀式 600519.SH / 东财式 600519.XSHG / 前缀式 SH600519，统一归一）
+_CODE_RE = re.compile(r"(?i)^(?:SH|SZ|BJ|XSHG|XSHE|XBEI)?[.\s]*(\d{6})(?:[.\s]*(?:SH|SZ|BJ|XSHG|XSHE|XBEI))?$")
+
+
+def _search_mask(df: pd.DataFrame, keyword: str):
+    """代码/名称搜索。完整代码（任意写法）提取数字核匹配代码列；
+    其它关键字按字面包含匹配两列（regex=False，避免 '.' 等被当正则）。"""
+    kw = keyword.strip()
+    if not kw:
+        return None
+    m = _CODE_RE.match(kw)
+    if m:
+        return df["code"].str.contains(m.group(1), regex=False, na=False)
+    return (df["code"].str.contains(kw, case=False, regex=False, na=False)
+            | df["name"].str.contains(kw, case=False, regex=False, na=False))
 
 # 列定义：(数据库列名, 显示名, 格式化)
 # 涨跌 = price - prev_close（计算列）
@@ -73,34 +91,20 @@ def _render_stock_list():
     except Exception:
         db_df = pd.DataFrame()
 
-    # 添加显示列：优先使用 float_shares/float_mv，否则使用 total_shares/total_mv
+    # 添加显示列：只用真实流通口径数据——缺失就显示 "-"，
+    # 不回退总股本/总市值（新股流通盘远小于总股本，回退会把 4.3 亿总股本
+    # 误显为流通股：燧原科技 2026-09-13 实际流通仅 1790 万股，占比 4%）
     if not db_df.empty:
-        # 流通股：优先使用 float_shares，否则从 float_mv/price 计算，最后用 total_shares
-        if "float_shares" in db_df.columns and "total_shares" in db_df.columns:
-            db_df["_float_shares_display"] = db_df["float_shares"].fillna(db_df["total_shares"])
-        elif "float_shares" in db_df.columns:
-            db_df["_float_shares_display"] = db_df["float_shares"]
-        elif "total_shares" in db_df.columns:
-            db_df["_float_shares_display"] = db_df["total_shares"]
-        else:
-            db_df["_float_shares_display"] = None
+        db_df["_float_shares_display"] = db_df["float_shares"] if "float_shares" in db_df.columns else None
 
-        # 如果 float_shares_display 仍为 NaN，尝试从 float_mv/price 计算
+        # float_shares 缺失时可从 float_mv/price 反推（同为真实流通口径）
         if "_float_shares_display" in db_df.columns:
             need_calc = db_df["_float_shares_display"].isna()
             if need_calc.any() and "float_mv" in db_df.columns and "price" in db_df.columns:
                 calc = db_df.loc[need_calc, "float_mv"] / db_df.loc[need_calc, "price"]
                 db_df.loc[need_calc, "_float_shares_display"] = calc
 
-        # 流通市值：优先使用 float_mv，否则使用 total_mv
-        if "float_mv" in db_df.columns and "total_mv" in db_df.columns:
-            db_df["_float_mv_display"] = db_df["float_mv"].fillna(db_df["total_mv"])
-        elif "float_mv" in db_df.columns:
-            db_df["_float_mv_display"] = db_df["float_mv"]
-        elif "total_mv" in db_df.columns:
-            db_df["_float_mv_display"] = db_df["total_mv"]
-        else:
-            db_df["_float_mv_display"] = None
+        db_df["_float_mv_display"] = db_df["float_mv"] if "float_mv" in db_df.columns else None
         
         # 判断新股（N字头）：涨跌幅 > 44%（主板）或 > 20%（创业板/科创板）
         def _is_new_stock(row):
@@ -180,7 +184,7 @@ def _render_stock_list():
     c1, c2, c3 = st.columns([2, 1.5, 1.5])
     with c1:
         keyword = st.text_input("搜索代码/名称", "", key="stock_kw", label_visibility="collapsed",
-                                placeholder="输入代码或名称关键字…")
+                                placeholder="输入代码（600519 / SH600519 / 600519.SH）或名称关键字…")
     with c2:
         sort_col = st.selectbox("排序", list(SORT_OPTIONS.keys()),
                                 format_func=lambda x: SORT_OPTIONS[x], key="stock_sort",
@@ -198,9 +202,9 @@ def _render_stock_list():
 
             # 搜索过滤
             if keyword:
-                mask = df["code"].str.contains(keyword, case=False, na=False) | \
-                       df["name"].str.contains(keyword, case=False, na=False)
-                df = df[mask]
+                _mask = _search_mask(df, keyword)
+                if _mask is not None:
+                    df = df[_mask]
 
             # 排序
             if sort_col in df.columns:
@@ -326,7 +330,7 @@ def _render_index_list():
     c1, c2, c3 = st.columns([2, 1.5, 1])
     with c1:
         keyword = st.text_input("搜索代码/名称", "", key="index_kw", label_visibility="collapsed",
-                                placeholder="输入指数代码或名称关键字…")
+                                placeholder="输入指数代码（000001 / 000001.SH / SH000001）或名称关键字…")
     with c2:
         cats = ["全部"] + [x for x in ["宽基指数", "沪深指数", "行业指数", "主题指数"]
                            if x in set(db_df["category"].dropna())]
@@ -341,9 +345,9 @@ def _render_index_list():
     # 应用筛选
     df = db_df.copy()
     if keyword:
-        mask = df["code"].str.contains(keyword, case=False, na=False) | \
-               df["name"].str.contains(keyword, case=False, na=False)
-        df = df[mask]
+        _mask = _search_mask(df, keyword)
+        if _mask is not None:
+            df = df[_mask]
     if cat_filter != "全部":
         df = df[df["category"] == cat_filter]
 

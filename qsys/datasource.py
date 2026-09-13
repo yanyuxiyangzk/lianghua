@@ -2173,10 +2173,20 @@ def get_stocklist_from_db() -> pd.DataFrame:
                 # 流通股/流通市值：只在 ifind_realtime 有值时覆盖（避免 None 覆盖有效值）
                 for col in ["float_shares", "float_mv"]:
                     if col in rt_indexed.columns:
-                        mapped = df["code"].map(rt_indexed[col])
+                        mapped = pd.to_numeric(df["code"].map(rt_indexed[col]), errors="coerce")
                         # 只覆盖 ifind_realtime 有值的行
                         mask = mapped.notna()
-                        df.loc[mask, col] = mapped[mask]
+                        df.loc[mask, col] = mapped[mask].astype(float)
+                # 流通市值/总市值随最新价重算：stocklist 落库的 mv 是同步时刻价格
+                # 拍的快照，实时价覆盖后不重算就会与现价脱节（2026-09-13 神宇股份：
+                # 现价已被覆盖为周五收盘 27.92，流通市值还是周三价 24.1 拍的 30.5 亿，
+                # 应为 1.267 亿股 × 27.92 = 35.4 亿，与问财终端口径一致）
+                if "float_shares" in df.columns and "price" in df.columns:
+                    m = df["float_shares"].notna() & df["price"].notna()
+                    df.loc[m, "float_mv"] = (df.loc[m, "float_shares"] * df.loc[m, "price"]).round(2)
+                if "total_shares" in df.columns and "price" in df.columns:
+                    m = df["total_shares"].notna() & df["price"].notna()
+                    df.loc[m, "total_mv"] = (df.loc[m, "total_shares"] * df.loc[m, "price"]).round(2)
     return df
 
 

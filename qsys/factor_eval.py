@@ -301,7 +301,11 @@ def get_factor_values(fac: dict, codes: list[str], end: str, lookback_days: int 
         hit = sig._read_parquet_safe(ck)
         if hit is not None:
             return hit.iloc[:, 0]
-    if fac["kind"] == "builtin":
+    # Density-SR 支撑阻力因子：值在 sr_scan_daily（逐日快照），不走 panel 计算
+    if fac["name"] in ("sr_entry", "sr_hold", "sr_strength"):
+        import density_sr
+        s = density_sr.factor_series(fac["name"], codes, end, lookback_days)
+    elif fac["kind"] == "builtin":
         panel = sig.get_panel_cached(codes, end, lookback_days, source=source)
         s = sig.compute_builtin(panel, fac["name"])
     elif fac["kind"] == "tech":

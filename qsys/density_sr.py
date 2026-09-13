@@ -381,3 +381,114 @@ def list_scan_dates(limit: int = 20) -> list[str]:
         rows = c.execute("SELECT DISTINCT date FROM sr_scan_daily ORDER BY date DESC LIMIT ?",
                          (limit,)).fetchall()
     return [r[0] for r in rows]
+
+
+# ---------------------------------------------------------------- 因子化（接入选股体系）
+# SR 因子即每日扫描快照的截面列，名字注册进 signals.FACTOR_CATALOG["支撑阻力"]
+SR_FACTOR_NAMES = {"sr_entry", "sr_hold", "sr_strength"}
+
+
+def factor_series(name: str, codes: list[str], end: str,
+                  lookback_days: int = 800) -> pd.Series:
+    """SR 因子长表 Series[(datetime, instrument)]，接 factor_eval.get_factor_values。
+
+    数据源 sr_scan_daily（每日盘后任务落库 + 历史回填），只取 date<=end（无未来信息）。
+    - sr_hold     : 守住概率（0-1）
+    - sr_strength : 支撑强度×共振窗数
+    - sr_entry    : 逐日截面合成 z(p_hold)+z(强度×共振)−z(距离ATR)
+    """
+    start = (pd.Timestamp(end) - pd.Timedelta(days=int(lookback_days * 1.6))).strftime("%Y-%m-%d")
+    with datasource._conn() as c:
+        c.executescript(_SCHEMA)
+        df = pd.read_sql_query(
+            "SELECT date, code, p_hold, sup_strength, resonance, sup_dist_atr "
+            "FROM sr_scan_daily WHERE date>=? AND date<=?", c, params=(start, end))
+    if df.empty:
+        return pd.Series(dtype=float)
+    if codes:
+        df = df[df["code"].isin(set(codes))]
+    if df.empty:
+        return pd.Series(dtype=float)
+
+    df["strength_res"] = df["sup_strength"].fillna(0) * df["resonance"].fillna(1)
+    if name == "sr_hold":
+        val = df["p_hold"]
+    elif name == "sr_strength":
+        val = df["strength_res"]
+    else:  # sr_entry：逐日截面 zscore 合成
+        def _z(s):
+            sd = s.std()
+            return (s - s.mean()) / sd if sd and sd > 0 else s * 0
+        df["_entry"] = (df.groupby("date")["p_hold"].transform(_z)
+                        + df.groupby("date")["strength_res"].transform(_z)
+                        - df.groupby("date")["sup_dist_atr"].transform(_z))
+        val = df["_entry"]
+
+    s = pd.Series(val.to_numpy(), index=pd.MultiIndex.from_arrays(
+        [df["date"], df["code"]], names=["datetime", "instrument"]),
+        name=name).dropna()
+    return s
+
+
+def latest_sr_map(codes: list[str] | None = None,
+                  asof: str | None = None) -> pd.DataFrame:
+    """最新一次扫描（或 asof 前最近一次）的逐股快照——供 apply_filters 用。
+    返回以 code 为索引的 DataFrame（p_hold/sup_dist_atr/resonance/...）。"""
+    with datasource._conn() as c:
+        c.executescript(_SCHEMA)
+        if asof:
+            row = c.execute("SELECT MAX(date) FROM sr_scan_daily WHERE date<=?", (asof,)).fetchone()
+        else:
+            row = c.execute("SELECT MAX(date) FROM sr_scan_daily").fetchone()
+        date = row[0] if row else None
+        if not date:
+            return pd.DataFrame()
+        df = pd.read_sql_query("SELECT * FROM sr_scan_daily WHERE date=?", c, params=(date,))
+    if codes:
+        df = df[df["code"].isin(set(codes))]
+    return df.set_index("code")
+
+
+def backfill(days: int = 120, min_amount: float = MIN_AMOUNT_AVG,
+             progress=None) -> int:
+    """历史回填：对最近 days 个交易日逐日重算（analyze 只用 ≤当日 K 线，point-in-time 安全）。
+    用于评分卡立刻获得 IC/胜率历史；日常增量由 sr_scan 任务每日追加。返回写入行数。"""
+    bars = _load_all_bars(days=int(max(WINDOWS) * 1.6 + days * 1.1))
+    if not bars:
+        return 0
+    # 交易日历：取全市场出现过的最近 days 个交易日
+    all_dates = sorted({d for b in bars.values() for d in b["date"]})
+    trade_days = all_dates[-days:]
+    day_set = set(trade_days)
+
+    # 流动性过滤（用全窗均额近似）
+    liquid = {c: b for c, b in bars.items()
+              if len(b) >= min(WINDOWS) + days // 2
+              and (b["amount"].iloc[-20:].mean() or 0) >= min_amount}
+
+    total_rows = 0
+    with datasource._conn() as c:
+        c.executescript(_SCHEMA)
+        for di, d in enumerate(trade_days):
+            rows = []
+            for code, b in liquid.items():
+                sl = b[b["date"] <= d]
+                if len(sl) < min(WINDOWS):
+                    continue
+                r = analyze(code, sl)
+                if r:
+                    rows.append((d, code, r["close"], r["atr"],
+                                 r["sup_lo"], r["sup_hi"], r["sup_strength"], r["sup_dist_atr"],
+                                 r["res_lo"], r["res_hi"], r["res_dist_atr"],
+                                 r["p_touch"], r["p_hold"], r["vol_extreme"], r["resonance"],
+                                 r["score"], r["zones_json"], f"backfill"))
+            c.executemany(
+                "INSERT OR REPLACE INTO sr_scan_daily (date, code, close, atr, sup_lo, sup_hi,"
+                " sup_strength, sup_dist_atr, res_lo, res_hi, res_dist_atr, p_touch, p_hold,"
+                " vol_extreme, resonance, score, zones_json, computed_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            c.commit()  # 逐日提交：释放写锁，别卡住 market.db 上的其它写者（回填一次数分钟）
+            total_rows += len(rows)
+            if progress:
+                progress(di + 1, len(trade_days), len(rows))
+    return total_rows

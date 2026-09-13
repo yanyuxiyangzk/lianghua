@@ -178,6 +178,9 @@ FACTOR_CATALOG.update({
     "Alpha101": ["alpha004", "alpha005", "alpha012", "alpha015", "alpha018", "alpha022",
                "alpha025", "alpha026", "alpha033", "alpha037", "alpha041", "alpha054", "alpha101"],
     "K线形态": ["doji", "hammer", "engulfing", "upper_shadow", "lower_shadow", "body_ratio", "gap_open"],
+    # 支撑阻力（Density-SR）：值来自 density_sr（sr_scan_daily 逐日快照），
+    # get_factor_values 按名字路由到 density_sr.factor_series，不走 panel 计算
+    "支撑阻力": ["sr_entry", "sr_hold", "sr_strength"],
 })
 CATALOG_NAMES = [n for names in FACTOR_CATALOG.values() for n in names]
 NAME2CAT = {n: cat for cat, names in FACTOR_CATALOG.items() for n in names}
@@ -615,6 +618,10 @@ STRATEGY_FILTERS = {
     "not_toppy": "位置不过高（60日价格位置 < 0.85）",
     "macd_gold": "MACD金叉（DIF 上穿 DEA）",
     "rsi_oversold": "RSI6 超卖（<30，博反弹）",
+    # 支撑阻力（Density-SR）：读 sr_scan_daily 最新一次扫描（≤panel 末日，无未来信息）
+    "sr_near_support": "贴近强支撑（距最近支撑 ≤0.5 ATR）",
+    "sr_hold_high": "支撑守住概率 ≥0.65（Density-SR）",
+    "sr_resonant": "支撑多窗共振 ≥2（Density-SR）",
 }
 
 
@@ -647,6 +654,14 @@ def apply_filters(codes: list[str], panel: pd.DataFrame, filters: list[str]) -> 
     dea_now, dea_prev = _last2(dea_s)
     rsi6_now = _last(rsi6_s)
 
+    # Density-SR 支撑阻力过滤：读 ≤panel 末日的最近一次扫描快照（无未来信息）
+    sr_tbl = None
+    if any(f.startswith("sr_") for f in filters):
+        import density_sr
+        sr_tbl = density_sr.latest_sr_map(codes, asof=str(last_day)[:10])
+        if sr_tbl is None or sr_tbl.empty:
+            return []  # 无 SR 扫描数据时，SR 条件一律不满足（宁缺毋滥）
+
     ok = []
     for c in codes:
         if c not in snap.index:
@@ -668,6 +683,19 @@ def apply_filters(codes: list[str], panel: pd.DataFrame, filters: list[str]) -> 
                 continue
             if "rsi_oversold" in filters and not (rsi6_now.get(c, 100) < 30):
                 continue
+            if sr_tbl is not None:
+                if c not in sr_tbl.index:
+                    continue  # 无 SR 数据（流动性不足未扫描）视为不满足
+                srow = sr_tbl.loc[c]
+                if "sr_near_support" in filters and not (pd.notna(srow["sup_dist_atr"])
+                                                         and srow["sup_dist_atr"] <= 0.5):
+                    continue
+                if "sr_hold_high" in filters and not (pd.notna(srow["p_hold"])
+                                                      and srow["p_hold"] >= 0.65):
+                    continue
+                if "sr_resonant" in filters and not (pd.notna(srow["resonance"])
+                                                     and srow["resonance"] >= 2):
+                    continue
         except (TypeError, ValueError):
             continue
         ok.append(c)

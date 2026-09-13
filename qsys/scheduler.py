@@ -1421,6 +1421,14 @@ def job_sr_scan(**_ignored) -> str:
         return "非交易日，跳过"
     import density_sr
     n = density_sr.scan_and_store()
+    # 注册进因子注册表（kind=tech → 体检经典层每日自动重评，评分卡驱动选因子）
+    try:
+        import library
+        library.sync_factor_registry([
+            {"name": f, "kind": "tech", "engine": "density_sr", "factor_type": "量价"}
+            for f in sorted(density_sr.SR_FACTOR_NAMES)])
+    except Exception:
+        pass
     return f"{now.strftime('%Y-%m-%d')} 支撑阻力扫描完成：{n} 只"
 
 

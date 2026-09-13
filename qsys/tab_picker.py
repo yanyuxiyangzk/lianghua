@@ -32,6 +32,9 @@ def _factor_universe():
         reg = library.get_factor_registry()
         for _, r in reg[reg["engine"] == "loopengine"].iterrows():
             facs.append({"name": r["name"], "kind": "loopengine", "code": r["code"]})
+        # 手工因子（在线因子实验室入库，engine='manual'）
+        for _, r in reg[reg["engine"] == "manual"].iterrows():
+            facs.append({"name": r["name"], "kind": "manual", "code": r["code"]})
     except Exception:
         pass
     return facs

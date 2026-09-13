@@ -206,6 +206,7 @@ def render():
         _ENG_MAP = {"rdagent": ("RD-Agent", "qlib社区·前复权"),
                     "loopengine": ("LoopEngine", _SRC_LABEL.get(_loop_src, _loop_src)),
                     "density_sr": ("Density-SR", "iFinD·不复权"),
+                    "manual": ("手工编写", _SRC_LABEL.get(_loop_src, _loop_src)),
                     "builtin": ("内置经典", _SRC_LABEL.get(_loop_src, _loop_src)),
                     "tech": ("技术指标", _SRC_LABEL.get(_loop_src, _loop_src))}
         f1, f2, f3, f4 = st.columns([1, 1, 1, 2])
@@ -213,7 +214,7 @@ def render():
             fams = ["全部"] + sorted(registry["family"].dropna().unique().tolist()) if not registry.empty else ["全部"]
             fam_sel = st.selectbox("机制族", fams, key="fl_fam")
         with f2:
-            srcs = ["全部", "loopengine", "rdagent", "density_sr", "builtin", "tech"]
+            srcs = ["全部", "loopengine", "rdagent", "density_sr", "manual", "builtin", "tech"]
             src_sel = st.selectbox("来源引擎", srcs, key="fl_src")
         with f3:
             ftypes = ["全部"] + sorted(registry["factor_type"].dropna().unique().tolist()) if not registry.empty and "factor_type" in registry.columns else ["全部"]
@@ -273,7 +274,7 @@ def render():
                     "loopengine": f"LoopEngine·{_src_lbl}", "演化引擎": f"LoopEngine·{_src_lbl}",
                     "builtin": f"内置·{_src_lbl}", "内置": f"内置·{_src_lbl}",
                     "tech": f"技术指标·{_src_lbl}", "技术指标": f"技术指标·{_src_lbl}",
-                    "density_sr": "Density-SR·iFinD"}
+                    "density_sr": "Density-SR·iFinD", "manual": f"手工编写·{_src_lbl}"}
         show["来源"] = show["来源"].map(lambda k: _src_map.get(k, k))
         # SR 因子 kind=tech 会被泛化成"技术指标"，按注册表 engine 精确覆盖
         _sr_names = set(registry[registry["engine"] == "density_sr"]["name"]) if not registry.empty else set()

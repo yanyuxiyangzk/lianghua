@@ -294,6 +294,13 @@ def _migrate(c):
 
 
 # ---------------------------------------------------------------- 因子注册表
+def delete_factor(name: str) -> bool:
+    """从注册表删除因子（在线因子实验室的删除入口）。"""
+    with _lconn() as c:
+        cur = c.execute("DELETE FROM factor_registry WHERE name=?", (name,))
+        return cur.rowcount > 0
+
+
 def sync_factor_registry(factors: list[dict]):
     """同步因子注册表（自动提取骨架/机制族）。factors: [{name, kind, code?, trace?, round?, decision?, factor_type?}]"""
     import structure

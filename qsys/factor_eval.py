@@ -314,8 +314,9 @@ def get_factor_values(fac: dict, codes: list[str], end: str, lookback_days: int 
             s = sig.compute_common(panel, fac["name"])
         else:
             s = sig.compute_tech(panel, fac["name"])
-    elif fac["kind"] == "loopengine":
-        # 树直算快速路径：避免子进程执行（~5秒/个 → ~0.02秒/个）
+    elif fac["kind"] in ("loopengine", "manual"):
+        # 树直算快速路径（loopengine 演化因子 + manual 手工表达式因子共用）：
+        # 避免子进程执行（~5秒/个 → ~0.02秒/个）；无 sexpr 前缀的手工 Python 因子走子进程
         code = fac.get("code") or ""
         if code.startswith("# sexpr: "):
             try:

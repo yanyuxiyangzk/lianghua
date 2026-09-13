@@ -1609,7 +1609,8 @@ def job_le_factor_eval(batch: int = 500, pool_name: str = "沪深300") -> str:
 
     reg = library.get_factor_registry()
     le = reg[reg["engine"] == "loopengine"] if not reg.empty else reg
-    classic = reg[reg["kind"].isin(["tech", "builtin"])] if not reg.empty else reg
+    # 经典层 = tech/builtin + manual（在线因子实验室手工入库的因子同管线每日体检）
+    classic = reg[reg["kind"].isin(["tech", "builtin", "manual"])] if not reg.empty else reg
     if le.empty and classic.empty:
         return "无因子，跳过"
 

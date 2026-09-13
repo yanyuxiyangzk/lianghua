@@ -89,8 +89,14 @@ def run_factor_code(code: str, name: str, codes: list[str], end: str, lookback_d
         td = Path(td)
         build_daily_pv_h5(codes, start, end, td / "daily_pv.h5", source=source)
         (td / "factor.py").write_text(code)
+        # PYTHONPATH 带上 app 根目录：手工/演化因子代码可能 import loopengine 等项目模块
+        # （python factor.py 的 sys.path[0] 是临时目录，默认找不到 /app）
+        import os
+        env = dict(os.environ)
+        app_root = str(Path(__file__).resolve().parent)
+        env["PYTHONPATH"] = app_root + os.pathsep + env.get("PYTHONPATH", "")
         proc = subprocess.run([sys.executable, "factor.py"], cwd=td, capture_output=True,
-                              text=True, timeout=300)
+                              text=True, timeout=300, env=env)
         if proc.returncode != 0 or not (td / "result.h5").exists():
             raise RuntimeError(f"因子 {name} 执行失败: {proc.stderr[-400:]}")
         res = pd.read_hdf(td / "result.h5", key="data")

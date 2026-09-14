@@ -148,7 +148,7 @@ def mutate_operator(tree, rng, field_weights):
     for op_name, (arity, windowed, kind) in OPS.items():
         if op_name == current_op:
             continue
-        if arity == node.arity:
+        if arity == len(node.children):
             # 检查维度兼容性
             if kind == "rank" and node.dim() == "val":
                 continue

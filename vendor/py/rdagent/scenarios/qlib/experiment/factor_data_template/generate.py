@@ -65,20 +65,3 @@ data_debug = data_debug.rename(columns=field_aliases)
 
 data_debug.to_hdf("./daily_pv_debug.h5", key="data")
 print(f"Generated daily_pv_debug.h5: {data_debug.shape[0]} rows, {data_debug.shape[1]} columns")
-
-# 生成市场情绪/板块数据（从 market.db 提取）
-import subprocess
-import sys
-
-try:
-    result = subprocess.run(
-        [sys.executable, "generate_market_data.py"],
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    print(result.stdout)
-    if result.returncode != 0:
-        print(f"WARNING: generate_market_data.py failed: {result.stderr}")
-except Exception as e:
-    print(f"WARNING: Failed to run generate_market_data.py: {e}")

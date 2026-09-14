@@ -50,14 +50,6 @@ def generate_data_folder_from_qlib():
         Path(FACTOR_COSTEER_SETTINGS.data_folder_debug) / "README.md",
     )
 
-    # 复制额外数据文件（板块日线数据、股票行业映射等）
-    extra_h5_files = ["sector_daily.h5", "stock_industry.h5"]
-    for h5_name in extra_h5_files:
-        src = Path(__file__).parent / "factor_data_template" / h5_name
-        if src.exists():
-            shutil.copy(src, Path(FACTOR_COSTEER_SETTINGS.data_folder) / h5_name)
-            shutil.copy(src, Path(FACTOR_COSTEER_SETTINGS.data_folder_debug) / h5_name)
-
 
 def get_file_desc(p: Path, variable_list=[]) -> str:
     """

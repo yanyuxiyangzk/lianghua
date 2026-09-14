@@ -1183,6 +1183,86 @@ def save_snapshots(rows: list[dict], ts: str | None = None) -> int:
     return len(rows)
 
 
+# ---------------------------------------------------------------- 快照归档（日聚合，永久保留）
+_ARCHIVE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS quote_snapshots_archive (
+    date TEXT NOT NULL,
+    code TEXT NOT NULL,
+    avg_bid_vol REAL,
+    avg_ask_vol REAL,
+    avg_outer REAL,
+    avg_inner REAL,
+    avg_quantity_ratio REAL,
+    avg_turnover REAL,
+    avg_bid1 REAL,
+    avg_ask1 REAL,
+    avg_price REAL,
+    sample_count INTEGER,
+    PRIMARY KEY(date, code));
+CREATE INDEX IF NOT EXISTS idx_archive_code_date ON quote_snapshots_archive(code, date);
+"""
+
+
+def archive_snapshots_daily(target_date: str | None = None) -> int:
+    """将 quote_snapshots 中指定日期的数据聚合为日均值，写入 archive 表（永久保留）。
+
+    target_date: 'YYYY-MM-DD' 格式，默认 yesterday（用于每日定时任务）。
+    返回写入行数。
+    """
+    if target_date is None:
+        target_date = (datetime.now() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    with _conn() as c:
+        c.executescript(_ARCHIVE_SCHEMA)
+        # 聚合指定日期的快照
+        rows = c.execute(
+            """SELECT code,
+                      AVG(bid_vol_sum) as avg_bid_vol,
+                      AVG(ask_vol_sum) as avg_ask_vol,
+                      AVG(outer_vol) as avg_outer,
+                      AVG(inner_vol) as avg_inner,
+                      AVG(quantity_ratio) as avg_quantity_ratio,
+                      AVG(turnover) as avg_turnover,
+                      AVG(bid1) as avg_bid1,
+                      AVG(ask1) as avg_ask1,
+                      AVG(avg_price) as avg_price,
+                      COUNT(*) as sample_count
+               FROM quote_snapshots
+               WHERE DATE(ts) = ? AND volume > 0
+               GROUP BY code""",
+            (target_date,)
+        ).fetchall()
+        if not rows:
+            return 0
+        c.executemany(
+            """INSERT OR REPLACE INTO quote_snapshots_archive
+               (date, code, avg_bid_vol, avg_ask_vol, avg_outer, avg_inner,
+                avg_quantity_ratio, avg_turnover, avg_bid1, avg_ask1, avg_price, sample_count)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            [(target_date, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10])
+             for r in rows]
+        )
+    return len(rows)
+
+
+def get_archived_snapshots(codes: list[str], start: str, end: str) -> pd.DataFrame:
+    """从 archive 表读取指定股票、日期范围的归档快照数据。
+
+    返回 DataFrame，columns: date, code, avg_bid_vol, avg_ask_vol, avg_outer, avg_inner,
+    avg_quantity_ratio, avg_turnover, avg_bid1, avg_ask1, avg_price, sample_count
+    """
+    with _conn() as c:
+        c.executescript(_ARCHIVE_SCHEMA)
+        marks = ",".join("?" * len(codes))
+        df = pd.read_sql(
+            f"""SELECT date, code, avg_bid_vol, avg_ask_vol, avg_outer, avg_inner,
+                       avg_quantity_ratio, avg_turnover, avg_bid1, avg_ask1, avg_price, sample_count
+                FROM quote_snapshots_archive
+                WHERE code IN ({marks}) AND date >= ? AND date <= ?
+                ORDER BY date, code""",
+            c, params=(*codes, start, end))
+    return df
+
+
 def get_speed_1min(codes: list[str], ref_ts: str) -> dict:
     """1分钟涨速基准价：每只股票在 ref_ts 45秒**之前**的最新一条快照价。
 

@@ -75,12 +75,12 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - ${LIANGHUA_ROOT}:${LIANGHUA_ROOT}
-    shm_size: "6g"
+    shm_size: "8g"
     # 内存上限：单个因子实现可能是内存炸弹（2026-09-12 Loop_59 全截面transform
     # 峰值>12GB，全局OOM每5分钟杀一次、 swap 被填满、qsys 险被误杀）。
     # 封顶后 OOM 约束在容器内（supervisor 自动续跑），不再拖垮整机。
-    mem_limit: "12g"
-    memswap_limit: "12g"  # =mem_limit 即禁用 swap，防止 stale swap 页长期占满宿主 swap
+    mem_limit: "20g"
+    memswap_limit: "20g"  # =mem_limit 即禁用 swap，防止 stale swap 页长期占满宿主 swap
     command: ["bash", "rdagent/factor_supervisor.sh"]
     restart: unless-stopped
 

@@ -584,7 +584,7 @@ class LoopEngine:
             # 面板深度：walk-forward 需要 250 交易日估计窗 + 因子自身长窗预热
             # （进化因子常见 400+ 日窗），800 日面板下有效交集 <265 天会让 WF 直接返回空；
             # 1600 日（约 1100+ 交易日）才有足够样本（2026-09-11 实测 8 因子 WF 全空）
-            panel = sig.get_panel_cached(codes, end, 1600)
+            panel = sig.get_panel_cached(codes, end, 1600, source=datasource.get_loop_source())
 
             factor_vals = {}
             _frames = None  # 树直算帧（有进化因子时才构建，构建一次复用）

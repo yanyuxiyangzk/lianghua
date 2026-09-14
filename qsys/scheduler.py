@@ -1297,6 +1297,13 @@ def job_quote_collect(pool_name: str = "沪深300", interval_sec: int = 30) -> s
     return f"{now.strftime('%H:%M:%S')} 采集 {pool_name} {n} 只快照"
 
 
+def job_snapshots_archive(**_ignored) -> str:
+    """每日快照归档：将前一日的 quote_snapshots 聚合为日均值写入 archive 表（永久保留）。"""
+    yesterday = (datetime.now() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    n = datasource.archive_snapshots_daily(yesterday)
+    return f"归档 {yesterday} 快照 {n} 只"
+
+
 def job_sector_flow_collect(interval_sec: int = 30, **_ignored) -> str:
     """板块资金流采集：交易时段内抓板块快照+资金净流入落库
     （sector_flow_snapshots / sector_inflow_snapshots），给 🌐资金趋势/🏛板块行情 页供数。
@@ -2087,6 +2094,8 @@ JOBS = {
                       "default": {"enabled": True, "hour": 0, "minute": 0,
                                   "params": {"pool_name": "沪深300", "interval_sec": 30},
                                   "trigger": "interval"}},
+    "snapshots_archive": {"name": "🗄 快照日归档（盘后）", "func": job_snapshots_archive,
+                          "default": {"enabled": True, "hour": 16, "minute": 5, "params": {}}},
     "sector_flow_collect": {"name": "🌐 板块资金流采集（盘中·资金趋势页供数）", "func": job_sector_flow_collect,
                             "default": {"enabled": True, "hour": 0, "minute": 0,
                                         "params": {"interval_sec": 30},

@@ -48,7 +48,8 @@ def _get_ic_series(factor_name: str, codes: list[str], end: str) -> pd.Series:
             log.warning(f"因子 {factor_name} 无代码，跳过衰减检测")
             return pd.Series(dtype=float)
         fac = {"name": factor_name, "kind": "loopengine", "code": code}
-        ic = fe.get_ic_series(fac, codes, end, source="qlib_local")
+        import datasource
+        ic = fe.get_ic_series(fac, codes, end, source=datasource.get_loop_source())
         return ic
     except Exception as e:
         log.warning(f"获取因子 {factor_name} 的IC序列失败: {e}")

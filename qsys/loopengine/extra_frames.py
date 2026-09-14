@@ -111,32 +111,16 @@ def build_lhb_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
 
 
 def build_tick_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
-    """盘口异动帧：从 quote_snapshots 快照数据构建。
+    """盘口异动帧：从 quote_snapshots_archive（永久归档）构建。
 
     字段：bid_ask_ratio（买卖比）, outer_inner_ratio（外内比）,
           quantity_ratio_dev（量比偏离）, tick_vol_ratio（逐笔量比）, bid_ask_spread（买卖价差）
     """
-    from datasource import _qconn
+    import datasource
 
     start = (pd.Timestamp(end) - pd.Timedelta(days=int(lookback * 1.6))).strftime("%Y-%m-%d")
     try:
-        with _qconn() as c:
-            df = pd.read_sql(
-                """SELECT code, DATE(ts) as date,
-                          AVG(bid_vol_sum) as avg_bid_vol,
-                          AVG(ask_vol_sum) as avg_ask_vol,
-                          AVG(outer_vol) as avg_outer,
-                          AVG(inner_vol) as avg_inner,
-                          AVG(quantity_ratio) as avg_qr,
-                          AVG(amount) as avg_amount,
-                          AVG(turnover) as avg_turnover,
-                          AVG(bid1) as avg_bid1,
-                          AVG(ask1) as avg_ask1
-                   FROM quote_snapshots
-                   WHERE ts >= ? AND ts <= ? AND volume > 0
-                   GROUP BY code, DATE(ts)
-                   ORDER BY code, date""",
-                c, params=(start, end + " 23:59:59"))
+        df = datasource.get_archived_snapshots(codes, start, end)
     except Exception:
         return {}
     if df.empty:
@@ -152,7 +136,7 @@ def build_tick_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
     pivot_inner = df.pivot_table(index="date", columns="code", values="avg_inner")
     frames["outer_inner_ratio"] = pivot_outer / (pivot_inner + 1e-6)
     # quantity_ratio_dev
-    pivot_qr = df.pivot_table(index="date", columns="code", values="avg_qr")
+    pivot_qr = df.pivot_table(index="date", columns="code", values="avg_quantity_ratio")
     frames["quantity_ratio_dev"] = pivot_qr - pivot_qr.rolling(20, min_periods=5).mean()
     # tick_vol_ratio
     pivot_tick = df.pivot_table(index="date", columns="code", values="avg_turnover")
@@ -168,16 +152,16 @@ def build_index_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
     字段：idx_beta, idx_rs（相对强弱）, idx_vol_ratio, idx_corr, idx_alpha
     """
     import signals as sig
-    from datasource import _qconn
+    import datasource
 
-    # 主要宽基指数（qlib格式）
+    # 主要宽基指数
     idx_codes = ["SH000300", "SZ000905", "SH000852"]
-    start = (pd.Timestamp(end) - pd.Timedelta(days=int(lookback * 1.6))).strftime("%Y-%m-%d")
+    src = datasource.get_loop_source()
     try:
         # 获取指数面板
-        idx_panel = sig.get_panel_cached(idx_codes, end, lookback, source="qlib_local")
+        idx_panel = sig.get_panel_cached(idx_codes, end, lookback, source=src)
         # 获取个股面板
-        stock_panel = sig.get_panel_cached(codes, end, lookback, source="qlib_local")
+        stock_panel = sig.get_panel_cached(codes, end, lookback, source=src)
     except Exception:
         return {}
     if idx_panel.empty or stock_panel.empty:

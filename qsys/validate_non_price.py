@@ -41,7 +41,8 @@ def validate_batch(factors: list[dict], pool: str = "沪深300", end: str | None
 
     factors_for_sc = [{"name": f["name"], "kind": f["kind"], "code": f["code"]} for f in factors]
     try:
-        df = fe.build_scorecard(factors_for_sc, codes, end, source="qlib_local")
+        import datasource
+        df = fe.build_scorecard(factors_for_sc, codes, end, source=datasource.get_loop_source())
     except Exception as e:
         return {"error": str(e), "results": []}
 

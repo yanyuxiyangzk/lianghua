@@ -112,7 +112,8 @@ def render():
         code = r.iloc[0].get("code")
         fac = {"name": fac_name, "kind": "loopengine", "code": code}
         vals = fe.get_factor_values(fac, list(codes_tuple), end_str)
-        panel = sig.get_panel_cached(list(codes_tuple), end_str, 800, source="qlib_local")
+        import datasource
+        panel = sig.get_panel_cached(list(codes_tuple), end_str, 800, source=datasource.get_loop_source())
         return vals, panel, code
 
     vals, panel, code = _calc_factor(selected, tuple(codes), end)

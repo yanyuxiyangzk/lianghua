@@ -21,9 +21,18 @@ class TransactionManager:
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
     
+    def _in_transaction(self) -> bool:
+        """检查当前是否已在事务中。"""
+        try:
+            return self.conn.in_transaction
+        except AttributeError:
+            return self.conn.get_isolation_level() != ""
+
     @contextmanager
     def transaction(self):
         """事务上下文管理器
+        
+        如果已在事务中，使用 SAVEPOINT 支持嵌套。
         
         Usage:
             with txn_mgr.transaction():
@@ -31,14 +40,18 @@ class TransactionManager:
                 conn.execute("UPDATE ...")
                 # 自动提交或回滚
         """
-        try:
-            self.conn.execute("BEGIN IMMEDIATE")
-            yield self.conn
-            self.conn.commit()
-        except Exception as e:
-            self.conn.rollback()
-            log.error(f"事务回滚: {e}")
-            raise
+        if self._in_transaction():
+            with self.savepoint():
+                yield self.conn
+        else:
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                yield self.conn
+                self.conn.commit()
+            except Exception as e:
+                self.conn.rollback()
+                log.error(f"事务回滚: {e}")
+                raise
     
     @contextmanager
     def savepoint(self, name: str = "sp"):

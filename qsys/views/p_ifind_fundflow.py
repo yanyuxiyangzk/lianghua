@@ -1,4 +1,4 @@
-"""📡 资金流向（同花顺） — 个股资金流排名 / 板块资金流汇总。
+"""💰 资金流向（同花顺） — 个股资金流排名 + 板块资金流（行业/概念/地域/证监会）。
 
 数据链路：
   1. 个股：优先读 stock_fundflow_daily 表（定时任务同步），DB 为空时 fallback 到同花顺 10jqka 公开页面
@@ -276,7 +276,7 @@ def _render_sector_tab(df: pd.DataFrame, title: str, key_prefix: str):
 
 
 def render():
-    st.title("📡 资金流向（同花顺）")
+    st.title("💰 资金流向")
     st.caption("数据源：stock_fundflow_daily / sector_daily 表（定时同步）或同花顺 10jqka 公开页面")
     ifind_hub.header()
 

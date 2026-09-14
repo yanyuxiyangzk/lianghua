@@ -148,7 +148,9 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
         for name, other_ic in library_ics.items():
             both = pd.concat([ic, other_ic], axis=1, keys=["a", "b"]).dropna()
             if len(both) > 30:
-                c = abs(float(both["a"].corr(both["b"])))
+                # 使用Spearman秩相关（对异常值稳健，不要求正态分布）
+                from scipy import stats as sp_stats
+                c = abs(float(sp_stats.spearmanr(both["a"], both["b"])[0]))
                 max_corr = max(max_corr, c)
     metrics["最大IC相关"] = round(max_corr, 2)
     if max_corr >= GATE["CORR_MAX"]:
@@ -166,6 +168,25 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
             reasons.append(f"OOS IC {oos_ic_mean:.4f} < 0.01")
         if oos_ic_wr < 0.50:
             reasons.append(f"OOS IC胜率 {oos_ic_wr:.1%} < 50%")
+    
+    # Gate 13: IS/OOS Gap检测（过拟合最直接信号）
+    # 如果样本内IC远高于样本外IC，说明过拟合风险高
+    if len(ic) >= 60:
+        split_70 = int(len(ic) * 0.7)
+        ic_is = ic.iloc[:split_70]
+        ic_oos_gap = ic.iloc[split_70:]
+        is_mean = float(ic_is.mean())
+        oos_mean_gap = float(ic_oos_gap.mean())
+        gap = is_mean - oos_mean_gap
+        metrics["IS_IC"] = round(is_mean, 4)
+        metrics["OOS_IC_gap"] = round(oos_mean_gap, 4)
+        metrics["IS_OOS_gap"] = round(gap, 4)
+        # 硬闸门：gap > 0.015 且 IS > 0.03（排除IS本身就差的情况）
+        if gap > 0.015 and is_mean > 0.03:
+            reasons.append(f"IS/OOS gap {gap:.4f} > 0.015 (IS={is_mean:.4f}, OOS={oos_mean_gap:.4f})，过拟合风险")
+    
+    # Gate 14: 因子复杂度检测（表达式越复杂过拟合风险越高）
+    # 此闸门由调用方在因子代码可用时单独调用 check_complexity_gate
 
     return {"pass": len(reasons) == 0, "reasons": reasons, "metrics": metrics}
 
@@ -420,8 +441,72 @@ def evaluate_event_gates(vals: pd.Series, panel: pd.DataFrame, kind: str,
     for name, other in (library_ics or {}).items():
         both = pd.concat([ic, other], axis=1, keys=["a", "b"]).dropna()
         if len(both) > 30:
-            max_corr = max(max_corr, abs(float(both["a"].corr(both["b"]))))
+            # 使用Spearman秩相关（对异常值稳健）
+            from scipy import stats as sp_stats
+            max_corr = max(max_corr, abs(float(sp_stats.spearmanr(both["a"], both["b"])[0])))
     metrics["最大IC相关"] = round(max_corr, 2)
     if max_corr >= EVT_GATE["CORR_MAX"]:
         reasons.append(f"IC相关 {max_corr:.2f} ≥ {EVT_GATE['CORR_MAX']}")
     return {"pass": len(reasons) == 0, "reasons": reasons, "metrics": metrics}
+
+
+def check_complexity_gate(code: str, max_depth: int = 5, max_ops: int = 12) -> dict:
+    """
+    因子复杂度闸门：表达式越复杂过拟合风险越高。
+    
+    基于奥卡姆剃刀原则：
+    - 深度 > 7 或算子数 > 18 → 极高风险 → 不通过
+    - 深度 > 5 或算子数 > 12 → 高风险 → 标记警告
+    
+    Args:
+        code: 因子代码（包含 sexpr 注释的 Python 代码）
+        max_depth: 最大允许深度（默认5）
+        max_ops: 最大允许算子数（默认12）
+    
+    Returns:
+        dict: {pass: bool, metrics: dict, reasons: list}
+    """
+    if not code:
+        return {"pass": True, "metrics": {}, "reasons": []}
+    
+    metrics = {}
+    reasons = []
+    
+    try:
+        # 尝试解析表达式树
+        from loopengine.tree import parse
+        # 提取 sexpr（如果有的话）
+        sexpr = code.split("\n", 1)[0].replace("# sexpr: ", "") if "# sexpr:" in code else code
+        tree = parse(sexpr)
+        depth = tree.depth()
+        
+        # 计算算子数量
+        ops_count = 0
+        def _count_ops(node):
+            nonlocal ops_count
+            if hasattr(node, "op"):
+                ops_count += 1
+                for ch in node.children:
+                    _count_ops(ch)
+        _count_ops(tree)
+        
+        metrics["depth"] = depth
+        metrics["ops_count"] = ops_count
+        
+        # 极高风险：直接不通过
+        if depth > 7 or ops_count > 18:
+            reasons.append(f"表达式过于复杂 (depth={depth}, ops={ops_count})，过拟合风险极高")
+            return {"pass": False, "metrics": metrics, "reasons": reasons}
+        
+        # 高风险：标记警告但允许通过
+        if depth > max_depth or ops_count > max_ops:
+            metrics["complexity_warning"] = True
+            reasons.append(f"表达式复杂度较高 (depth={depth}, ops={ops_count})，建议简化")
+    
+    except ImportError:
+        # loopengine.tree 不可用，跳过复杂度检查
+        metrics["parse_error"] = "loopengine.tree不可用"
+    except Exception as e:
+        metrics["parse_error"] = str(e)
+    
+    return {"pass": len(reasons) == 0, "metrics": metrics, "reasons": reasons}

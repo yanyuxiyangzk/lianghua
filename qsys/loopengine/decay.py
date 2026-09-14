@@ -112,15 +112,33 @@ def detect_factor_decay(factor_name: str, codes: list[str], end: str,
     else:
         decay_rate = (ic_short - ic_long) / abs(ic_long)
     
-    # 判断衰减状态
-    if decay_rate < DECAY_THRESHOLDS["severe"]:
-        decay_status = 'severe'  # 重度衰减，自动退役
-    elif decay_rate < DECAY_THRESHOLDS["moderate"]:
+    # 统计显著性检验：Welch's t-test（不假设等方差）
+    from scipy import stats
+    ic_long_series = ic_series[-lookback_long:-lookback_short]
+    ic_short_series = ic_series[-lookback_short:]
+    
+    t_stat = 0.0
+    p_value = 1.0
+    cohens_d = 0.0
+    significant = False
+    
+    if len(ic_long_series) >= 10 and len(ic_short_series) >= 10:
+        t_stat, p_value = stats.ttest_ind(ic_short_series, ic_long_series, equal_var=False)
+        # 效应量 (Cohen's d)
+        pooled_std = np.sqrt((ic_long_series.std()**2 + ic_short_series.std()**2) / 2)
+        cohens_d = (ic_short_series.mean() - ic_long_series.mean()) / pooled_std if pooled_std > 1e-12 else 0
+        significant = p_value < 0.05
+    
+    # 判断衰减状态（结合统计显著性）
+    # 只有统计显著的衰减才判定为真正衰减
+    if decay_rate < DECAY_THRESHOLDS["severe"] and significant:
+        decay_status = 'severe'  # 重度衰减，软惩罚
+    elif decay_rate < DECAY_THRESHOLDS["moderate"] and significant:
         decay_status = 'moderate'  # 中度衰减，警告
-    elif decay_rate < DECAY_THRESHOLDS["mild"]:
+    elif decay_rate < DECAY_THRESHOLDS["mild"] and significant:
         decay_status = 'mild'  # 轻度衰减，降低权重
     else:
-        decay_status = 'normal'  # 正常
+        decay_status = 'normal'  # 正常（包括不显著的衰减）
     
     return {
         'decay_status': decay_status,
@@ -128,6 +146,10 @@ def detect_factor_decay(factor_name: str, codes: list[str], end: str,
         'ic_long': round(float(ic_long), 4),
         'ic_short': round(float(ic_short), 4),
         'ic_std': round(float(ic_std), 4),
+        't_stat': round(t_stat, 4),
+        'p_value': round(p_value, 6),
+        'cohens_d': round(cohens_d, 4),
+        'significant': significant,
         'check_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     }
 

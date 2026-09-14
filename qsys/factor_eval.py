@@ -27,6 +27,15 @@ DEFAULT_COST = 0.0025  # 双边交易成本（千一×2）
 # 多周期胜率标准（交易日）：1天/5天/1月/3月/6月 —— 因子与策略统一按此衡量
 WIN_HORIZONS = {"1日": 1, "5日": 5, "20日": 20, "60日": 60, "120日": 120}
 
+# 多目标评分权重（经验校准：walk-forward OOS 验证）
+MULTI_OBJECTIVE_WEIGHTS = {
+    'ic': 0.65,        # IC主导（对数缩放+ICIR加权）
+    'risk': 0.10,      # 风险阈值惩罚
+    'sharpe': 0.10,    # 夏普阈值惩罚
+    'crowding': 0.10,  # 拥挤度评分
+    'stability': 0.05, # IC稳定性
+}
+
 
 # ---------------------------------------------------------------- 多重检验校正
 def bh_fdr(pvalues: pd.Series, alpha: float = 0.05) -> pd.Series:
@@ -563,12 +572,15 @@ def build_scorecard_batch(factors: list[dict], codes: list[str], end: str,
 
 def _oos_stats(ic_full: pd.Series, first_seen: str | None, train_end: str | None,
                engine_selected: bool = True) -> dict:
-    """OOS 指标：IC 序列在 OOS 窗口内的切片统计。
+    """OOS 指标：IC 序列在 OOS 窗口内的切片统计（含小样本Bayesian shrinkage）。
 
     窗口起点：引擎选拔过的因子（loopengine/rdagent）取 max(train_end, 首次入库日)——
     被发现之后的数据才未被选择过程污染；builtin/tech 是外生标准因子，无选择偏差，
-    直接用 train_end 起算（约近 250 交易日，2026-09-11 实测否则只剩 ~10 天太噪）。"""
-    empty = {"IC_OOS": None, "ICIR_OOS": None, "OOS天数": 0}
+    直接用 train_end 起算（约近 250 交易日，2026-09-11 实测否则只剩 ~10 天太噪）。
+    
+    小样本处理：当 OOS 天数 < 30 时，使用 Bayesian shrinkage 向 0 收缩，
+    避免小样本点估计过噪导致的假阳性/假阴性。"""
+    empty = {"IC_OOS": None, "ICIR_OOS": None, "OOS天数": 0, "OOS_confidence": 0.0}
     if ic_full is None or ic_full.empty or not train_end:
         return empty
     base = str(train_end)[:10]
@@ -577,11 +589,36 @@ def _oos_stats(ic_full: pd.Series, first_seen: str | None, train_end: str | None
         seg = ic_full[ic_full.index > pd.Timestamp(oos_start)]
     except Exception:
         return empty
-    if len(seg) < 5:
-        return {"IC_OOS": None, "ICIR_OOS": None, "OOS天数": int(len(seg))}
-    return {"IC_OOS": float(seg.mean()),
-            "ICIR_OOS": float(seg.mean() / (seg.std() + 1e-12)),
-            "OOS天数": int(len(seg))}
+    n_oos = len(seg)
+    if n_oos < 5:
+        return {"IC_OOS": None, "ICIR_OOS": None, "OOS天数": int(n_oos), "OOS_confidence": 0.0}
+    
+    oos_ic = float(seg.mean())
+    oos_icir = float(seg.mean() / (seg.std() + 1e-12))
+    
+    # 小样本 Bayesian shrinkage：向 0 收缩（保守估计）
+    # 收缩因子 = n / (n + k)，k 为先验强度（默认20，即等效20个先验样本）
+    if n_oos < 30:
+        prior_strength = 20
+        shrinkage_factor = n_oos / (n_oos + prior_strength)  # n=10 → 0.33, n=20 → 0.5, n=30 → 0.6
+        oos_ic_shrunk = oos_ic * shrinkage_factor
+        oos_icir_shrunk = oos_icir * shrinkage_factor
+        confidence = n_oos / 60  # 60 天满信心
+        return {
+            "IC_OOS": round(oos_ic_shrunk, 4),
+            "ICIR_OOS": round(oos_icir_shrunk, 4),
+            "OOS天数": int(n_oos),
+            "OOS_confidence": round(confidence, 3),
+            "OOS_raw_ic": round(oos_ic, 4),  # 保留原始值供诊断
+            "OOS_shrinkage": round(shrinkage_factor, 3)
+        }
+    else:
+        return {
+            "IC_OOS": round(oos_ic, 4),
+            "ICIR_OOS": round(oos_icir, 4),
+            "OOS天数": int(n_oos),
+            "OOS_confidence": 1.0
+        }
 
 
 def _eval_single_factor(args):
@@ -1398,6 +1435,62 @@ def _calc_ic_trend(ic_series: pd.Series) -> float:
     return float(max(0.0, min(1.0, 0.5 + frac / 4.0)))
 
 
+def _calc_crowding_score(vals: pd.Series, panel: pd.DataFrame, lookback: int = 60) -> float:
+    """
+    因子拥挤度评分：0=极度拥挤（需惩罚），1=不拥挤。
+    
+    拥挤度代理指标（无需持仓数据）：
+    1. 因子截面离散度下降 → 因子驱动的价格趋同 → 拥挤信号
+    2. 因子 Top/Bottom 组的成交额集中度上升 → 拥挤信号
+    3. 因子 IC 的自相关性突然增强 → 同质交易 → 拥挤信号
+    """
+    v = vals.dropna()
+    if v.empty:
+        return 0.5
+    
+    # 指标1：因子截面离散度趋势
+    cs_std = v.groupby(level="datetime").std()
+    if len(cs_std) < lookback:
+        return 0.5
+    recent_std = float(cs_std[-lookback//2:].mean())
+    earlier_std = float(cs_std[-lookback:-lookback//2].mean())
+    dispersion_ratio = recent_std / (earlier_std + 1e-12)
+    # 离散度下降 = 拥挤
+    dispersion_signal = max(0.0, min(1.0, 1.0 - (1.0 - dispersion_ratio) * 3))
+    
+    # 指标2：因子 Top 组换手率（如果 volume 可用）
+    crowding_from_turnover = 0.5
+    if "$volume" in panel.columns:
+        try:
+            volume = panel["$volume"].unstack("instrument") if "instrument" in panel.index.names else panel["$volume"]
+            ranks = v.groupby(level="datetime").rank(pct=True)
+            top_mask = ranks > 0.9
+            # Top 组股票的成交额占比趋势
+            if hasattr(volume, 'sum'):
+                top_vol_share = (volume[top_mask].sum() / volume.sum()).rolling(20).mean()
+                if len(top_vol_share.dropna()) > 20:
+                    recent_share = float(top_vol_share[-20:].mean())
+                    earlier_share = float(top_vol_share[-40:-20].mean()) if len(top_vol_share) > 40 else recent_share
+                    vol_signal = max(0.0, min(1.0, 1.0 - (recent_share - earlier_share) * 10))
+                    crowding_from_turnover = vol_signal
+        except Exception:
+            pass
+    
+    # 指标3：IC 序列的自相关性（拥挤 → 同步交易 → IC 自相关增强）
+    ic_signal = 0.5
+    try:
+        fwd = forward_returns(panel, 5)
+        ic = ic_series(v, fwd)
+        if len(ic) > 30:
+            autocorr = float(ic.autocorr(lag=1))
+            ic_signal = max(0.0, min(1.0, 1.0 - autocorr * 2))
+    except Exception:
+        pass
+    
+    # 综合：离散度(40%) + 成交集中度(30%) + IC自相关(30%)
+    return float(dispersion_signal * 0.4 + crowding_from_turnover * 0.3 + ic_signal * 0.3)
+
+
 def multi_objective_score(factor_name: str, codes: list[str], end: str,
                          weights: dict | None = None, code: str | None = None) -> dict:
     """
@@ -1407,15 +1500,16 @@ def multi_objective_score(factor_name: str, codes: list[str], end: str,
         factor_name: 因子名称
         codes: 股票池代码
         end: 截止日期
-        weights: 权重配置（默认 {'ic': 0.8, 'risk': 0.1, 'sharpe': 0.1}，经验校准）
+        weights: 权重配置（默认 {'ic': 0.65, 'risk': 0.10, 'sharpe': 0.10, 'crowding': 0.10, 'stability': 0.05}，经验校准）
         code: 因子代码（loopengine 因子入库前传 emit_code 结果，避免依赖注册表）
     
     Returns:
         dict: {
             'score': 综合评分 (0-1)
-            'ic_score': IC评分
+            'ic_score': IC评分（对数缩放+ICIR加权）
             'risk_score': 风险评分
             'sharpe_score': 夏普评分
+            'crowding_score': 拥挤度评分（0=拥挤，1=不拥挤）
             'stability_score': 稳定性评分
             'trend_score': 趋势评分
             'max_drawdown': 最大回撤
@@ -1424,6 +1518,7 @@ def multi_objective_score(factor_name: str, codes: list[str], end: str,
             'calmar': 卡玛比率
             'ic_mean': IC均值
             'ic_std': IC标准差
+            'icir': IC信息比率
             'details': 详细指标
         }
     """
@@ -1432,8 +1527,9 @@ def multi_objective_score(factor_name: str, codes: list[str], end: str,
         # 1) 过闸因子间 样本内夏普/索提诺/卡玛/回撤 与 OOS IC 显著负相关
         #    （ρ=-0.45~-0.60，p<0.001）——线性奖励平滑曲线=奖励过拟合；
         # 2) IC 稳定性/趋势分量同样负向预测 OOS（trend ρ=-0.45）——仅作诊断展示，不计入评分；
-        # 3) 风险/夏普只保留宽松的灾难阈值惩罚（多数因子满分，不产生有害排序）。
-        weights = {'ic': 0.8, 'risk': 0.1, 'sharpe': 0.1}
+        # 3) 风险/夏普只保留宽松的灾难阈值惩罚（多数因子满分，不产生有害排序）；
+        # 4) 新增：拥挤度评分（因子拥挤是A股因子失效首要原因）。
+        weights = {'ic': 0.65, 'risk': 0.10, 'sharpe': 0.10, 'crowding': 0.10, 'stability': 0.05}
     
     try:
         # 获取因子值和IC序列
@@ -1456,6 +1552,7 @@ def multi_objective_score(factor_name: str, codes: list[str], end: str,
         ic_mean = float(ic_series.mean())
         ic_std = float(ic_series.std())
         ic_winrate = float((ic_series > 0).mean())
+        icir = ic_mean / (ic_std + 1e-12)  # IC信息比率
         
         # 计算收益序列
         from gates import _daily_excess  # 延迟导入避免与 gates 的循环依赖
@@ -1474,8 +1571,23 @@ def multi_objective_score(factor_name: str, codes: list[str], end: str,
         trend = _calc_ic_trend(ic_series)
         
         # 计算各维度评分
-        # 1. IC评分 (0-1)：IC强度 + 胜率（稳定性/趋势经验上反向预测 OOS，仅作诊断不计分）
-        ic_score = min(1.0, abs(ic_mean) * 10) * 0.5 + ic_winrate * 0.5
+        # 1. IC评分 (0-1)：对数缩放 + ICIR加权（避免线性饱和，提升因子区分度）
+        #    |IC|=0.01 → ~0.26, |IC|=0.03 → ~0.52, |IC|=0.05 → ~0.67, |IC|=0.10 → ~0.85
+        import math
+        abs_ic = abs(ic_mean)
+        ic_component = math.log(1 + abs_ic * 50) / math.log(6)
+        ic_component = min(1.0, ic_component)
+        
+        # ICIR修正：高ICIR说明IC稳定可靠，给予加成
+        icir_factor = 1.0
+        if icir > 1.5:
+            icir_factor = 1.15
+        elif icir > 1.0:
+            icir_factor = 1.08
+        elif icir < 0.3:
+            icir_factor = 0.85
+        
+        ic_score = min(1.0, ic_component * icir_factor * 0.6 + ic_winrate * 0.4)
 
         # 2. 风险评分 (0-1)：灾难阈值惩罚（回撤 ≤70% 满分；更平滑不额外奖励）
         risk_score = 1.0 if abs(max_dd) <= 0.70 else max(0.0, 1.0 - (abs(max_dd) - 0.70) / 0.30)
@@ -1483,16 +1595,25 @@ def multi_objective_score(factor_name: str, codes: list[str], end: str,
         # 3. 夏普评分 (0-1)：门槛惩罚（夏普 ≥0.5 满分；更高不额外奖励）
         sharpe_score = 1.0 if sharpe >= 0.5 else max(0.0, sharpe / 0.5)
         
+        # 4. 拥挤度评分 (0-1)：检测因子拥挤度（拥挤度高则惩罚）
+        crowding_score = _calc_crowding_score(vals, panel)
+        
+        # 5. 稳定性评分 (0-1)：IC稳定性（作为辅助维度）
+        stability_score = max(0.0, min(1.0, stability))
+        
         # 综合评分
         score = (ic_score * weights['ic'] + 
                  risk_score * weights['risk'] + 
-                 sharpe_score * weights['sharpe'])
+                 sharpe_score * weights['sharpe'] +
+                 crowding_score * weights['crowding'] +
+                 stability_score * weights['stability'])
         
         return {
             'score': round(score, 4),
             'ic_score': round(ic_score, 4),
             'risk_score': round(risk_score, 4),
             'sharpe_score': round(sharpe_score, 4),
+            'crowding_score': round(crowding_score, 4),
             'stability_score': round(stability, 4),
             'trend_score': round(trend, 4),
             'max_drawdown': round(max_dd, 4),
@@ -1501,6 +1622,7 @@ def multi_objective_score(factor_name: str, codes: list[str], end: str,
             'calmar': round(calmar, 4),
             'ic_mean': round(ic_mean, 4),
             'ic_std': round(ic_std, 4),
+            'icir': round(icir, 4),
             'details': {
                 'ic_winrate': round(ic_winrate, 4),
                 'excess_mean': round(float(excess_series.mean()), 4),

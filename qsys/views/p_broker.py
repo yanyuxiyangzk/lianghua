@@ -372,16 +372,38 @@ def _render_calendar_tab():
 
     today_str = datetime.now().strftime("%Y-%m-%d")
 
+    # 加载交易日历（区分"休市"与"交易日无成交"）
+    trade_dates = set()
+    try:
+        import sqlite3 as _sqlite3
+        from pathlib import Path as _P
+        # 优先挂载卷 /data/market.db（实时更新），fallback 到 /app/data/ 镜像副本
+        for _db in ["/data/market.db", str(_P(__file__).resolve().parent.parent / "data" / "market.db")]:
+            try:
+                with _sqlite3.connect(f"file:{_db}?mode=ro", uri=True, timeout=5) as _c:
+                    _rows = _c.execute("SELECT date FROM ifind_calendar WHERE exchange='SSE'").fetchall()
+                    trade_dates = {r[0] for r in _rows}
+                    if trade_dates:
+                        break
+            except Exception:
+                continue
+    except Exception:
+        pass
+
     def _cell(day: int) -> str:
         if day == 0:
             return "<td class='cal-off'></td>"
         r = by_day.get(day)
         if r is None:
-            if f"{year:04d}-{month:02d}-{day:02d}" > today_str:
+            date_str = f"{year:04d}-{month:02d}-{day:02d}"
+            if date_str > today_str:
                 return (f"<td class='cal-off'><div class='cal-d' style='opacity:.3'>"
                         f"{day}</div></td>")
+            if trade_dates and date_str not in trade_dates:
+                return (f"<td class='cal-closed'><div class='cal-d'>{day}</div>"
+                        f"<div class='cal-r' style='opacity:.35'>休市</div></td>")
             return (f"<td class='cal-closed'><div class='cal-d'>{day}</div>"
-                    f"<div class='cal-r' style='opacity:.35'>休市</div></td>")
+                    f"<div class='cal-r' style='opacity:.35'>无交易</div></td>")
         ret, pnl = r.ret_pct, r.pnl
         a = 0.10 + 0.62 * min(abs(ret) / max_abs, 1.0)
         if ret > 0:

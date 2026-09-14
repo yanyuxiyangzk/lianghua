@@ -312,8 +312,53 @@ def scan(dry_run: bool = False) -> dict:
                         trace = COALESCE(trace, '') || ' | 三层退役(L' || ? || '): ' || ?
                     WHERE name = ? AND gate_status = 1
                 """, (r["layer"], reason_str, r["name"]))
-
+            
+            # 联动清理：从策略包中移除退役因子
+            retired_names = [r["name"] for r in results["retire"]]
+            _cleanup_strategies(c, retired_names)
+    
     return results
+
+
+def _cleanup_strategies(conn, retired_factor_names: list[str]):
+    """从策略包中移除退役因子，如果包内因子少于2个则标记为archived。"""
+    import json
+    
+    if not retired_factor_names:
+        return
+    
+    retired_set = set(retired_factor_names)
+    
+    # 获取所有策略包
+    rows = conn.execute("SELECT name, factors FROM strategies WHERE factors IS NOT NULL").fetchall()
+    
+    for pack_name, factors_json in rows:
+        try:
+            factors = json.loads(factors_json)
+            if not isinstance(factors, list):
+                continue
+            
+            # 检查是否包含退役因子
+            original_names = {f["name"] for f in factors if isinstance(f, dict)}
+            if not original_names.intersection(retired_set):
+                continue
+            
+            # 移除退役因子
+            new_factors = [f for f in factors if isinstance(f, dict) and f["name"] not in retired_set]
+            
+            if len(new_factors) < 2:
+                # 因子不足，归档策略包
+                conn.execute("""
+                    UPDATE strategies SET status = 'archived', factors = ?
+                    WHERE name = ?
+                """, (json.dumps(new_factors, ensure_ascii=False), pack_name))
+            else:
+                # 更新策略包
+                conn.execute("""
+                    UPDATE strategies SET factors = ? WHERE name = ?
+                """, (json.dumps(new_factors, ensure_ascii=False), pack_name))
+        except Exception:
+            continue
 
 
 def print_report(results: dict):

@@ -1950,10 +1950,23 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
                 "weights": {n: w[n] for n in selected},
                 "filters": ["tradable"],
                 "oos_winrate": f"{oos_wr:.0%}",
-                "is_winrate": None,
+                "is_winrate": None,  # IS胜率在walk-forward中无法直接获取
                 "horizon": "5日",
                 "avg_excess": avg_excess,
             }
+            
+            # 尝试计算IS胜率：用静态回测（非walk-forward）
+            try:
+                from factor_eval import static_backtest, compute_weights
+                # 用固定权重做IS回测
+                is_weights = {n: (w[n][0], w[n][1]) for n in selected}
+                is_bt = static_backtest(factor_vals, panel, is_weights, top_n, fwd_days=5, cost=0.0025)
+                if not is_bt.empty and "组合扣费超额" in is_bt.columns:
+                    is_wr = float((is_bt["组合扣费超额"] > 0).mean())
+                    pack_def["is_winrate"] = f"{is_wr:.0%}"
+            except Exception:
+                pass
+            
             candidates.append(pack_def)
         except Exception:
             continue

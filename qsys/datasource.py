@@ -143,6 +143,17 @@ def _conn():
         PRIMARY KEY(code, datetime));
     CREATE INDEX IF NOT EXISTS idx_tick_data_date ON tick_data(datetime);
     CREATE INDEX IF NOT EXISTS idx_tick_data_code ON tick_data(code);
+    -- iFinD 财务报表（三大报表 + 财务指标）
+    CREATE TABLE IF NOT EXISTS ifind_financial(
+        code TEXT NOT NULL,
+        report_date TEXT NOT NULL,
+        statement_type TEXT NOT NULL,
+        indicator TEXT NOT NULL,
+        value REAL,
+        fetched_at TEXT,
+        PRIMARY KEY(code, report_date, statement_type, indicator));
+    CREATE INDEX IF NOT EXISTS idx_financial_date ON ifind_financial(report_date);
+    CREATE INDEX IF NOT EXISTS idx_financial_code ON ifind_financial(code);
     """)
     cols = [r[1] for r in c.execute("PRAGMA table_info(market_daily)")]
     if "outstanding_share" not in cols:
@@ -748,6 +759,136 @@ def ths_date_serial(code: str, indicators: str, start: str, end: str, params: st
                           {"codes": cs, "startdate": start, "enddate": end,
                            "functionpara": {"Days": "Tradedays", "Fill": "Previous", "Interval": "D"},
                            "indipara": [{"indicator": i, "indiparams": [params]} for i in inds]}))
+
+
+# ---------------------------------------------------------------- 财务报表
+# 三大报表指标代码（同花顺 iFinD 格式）
+FINANCIAL_INDICATORS = {
+    "利润表": {
+        "ths营业收入_stock": "营业收入",
+        "ths营业成本_stock": "营业成本",
+        "ths营业利润_stock": "营业利润",
+        "ths净利润_stock": "净利润",
+        "ths归属母公司股东净利润_stock": "归母净利润",
+        "ths毛利_stock": "毛利",
+        "ths每股收益基本_stock": "基本每股收益",
+        "ths每股收益稀释_stock": "稀释每股收益",
+    },
+    "资产负债表": {
+        "ths总资产_stock": "总资产",
+        "ths总负债_stock": "总负债",
+        "ths股东权益合计_stock": "股东权益",
+        "ths归属母公司股东权益_stock": "归母权益",
+        "ths流动资产合计_stock": "流动资产",
+        "ths非流动资产合计_stock": "非流动资产",
+        "ths流动负债合计_stock": "流动负债",
+        "ths非流动负债合计_stock": "非流动负债",
+        "ths货币资金_stock": "货币资金",
+        "ths应收账款_stock": "应收账款",
+        "ths存货_stock": "存货",
+    },
+    "现金流量表": {
+        "ths经营活动产生的现金流量净额_stock": "经营现金流净额",
+        "ths投资活动产生的现金流量净额_stock": "投资现金流净额",
+        "ths筹资活动产生的现金流量净额_stock": "筹资现金流净额",
+        "ths现金及现金等价物净增加额_stock": "现金净增加额",
+        "ths期末现金及现金等价物余额_stock": "期末现金余额",
+    },
+}
+
+# 财务指标（杜邦/比率分析）
+FINANCIAL_RATIOS = {
+    "ths净资产收益率加权_stock": "ROE(加权)",
+    "ths净资产收益率摊薄_stock": "ROE(摊薄)",
+    "ths总资产报酬率_stock": "总资产报酬率",
+    "ths销售毛利率_stock": "销售毛利率",
+    "ths销售净利率_stock": "销售净利率",
+    "ths资产负债率_stock": "资产负债率",
+    "ths流动比率_stock": "流动比率",
+    "ths速动比率_stock": "速动比率",
+    "ths应收账款周转率_stock": "应收账款周转率",
+    "ths存货周转率_stock": "存货周转率",
+    "ths总资产周转率_stock": "总资产周转率",
+}
+
+
+def ths_financial_statement(codes: list[str], statement_type: str = "利润表",
+                            start: str = "", end: str = "") -> tuple:
+    """获取财务报表数据（三大报表 + 财务指标）。
+
+    Args:
+        codes: 股票代码列表
+        statement_type: 报表类型（利润表/资产负债表/现金流量表/财务指标）
+        start: 开始日期（YYYY-MM-DD）
+        end: 结束日期（YYYY-MM-DD）
+
+    Returns:
+        (DataFrame, result, error)
+    """
+    if statement_type == "财务指标":
+        indicators = ";".join(FINANCIAL_RATIOS.keys())
+    else:
+        indicators = ";".join(FINANCIAL_INDICATORS.get(statement_type, {}).keys())
+
+    if not indicators:
+        return pd.DataFrame(), None, "未知报表类型"
+
+    codes_s = ",".join(_to_ths_code(c) for c in codes)
+    today = datetime.now().strftime("%Y-%m-%d")
+    start = start or f"{datetime.now().year}-01-01"
+    end = end or today
+
+    # 使用 THS_DateSerial 获取时序财务数据
+    return _sdk_or_http(
+        lambda: ths_call("THS_DateSerial", codes_s, indicators, "", "", start, end),
+        lambda: _ths_http("date_sequence",
+                          {"codes": codes_s, "startdate": start, "enddate": end,
+                           "functionpara": {"Days": "Tradedays", "Fill": "Previous", "Interval": "D"},
+                           "indipara": [{"indicator": i, "indiparams": [""]} for i in indicators.split(";")]}))
+
+
+def ths_financial_to_db(codes: list[str], statement_type: str = "利润表",
+                        start: str = "", end: str = "") -> int:
+    """获取财务报表并写入数据库，返回写入行数。"""
+    df, res, err = ths_financial_statement(codes, statement_type, start, end)
+    if err not in (0, None) or df is None or df.empty:
+        return 0
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = []
+
+    # 确定报表类型对应的 indicator 映射
+    if statement_type == "财务指标":
+        ind_map = FINANCIAL_RATIOS
+    else:
+        ind_map = FINANCIAL_INDICATORS.get(statement_type, {})
+
+    date_col = "date" if "date" in df.columns else ("time" if "time" in df.columns else None)
+
+    for _, r in df.iterrows():
+        code = str(r.get("thscode", "")).replace(".SH", "").replace(".SZ", "")
+        rdate = str(r[date_col])[:10] if date_col else ""
+
+        for col in df.columns:
+            if col in ("time", "date", "thscode"):
+                continue
+            # 尝试匹配中文名或英文指标代码
+            cn_name = ind_map.get(col, col)
+            v = r.get(col)
+            if pd.notna(v):
+                try:
+                    rows.append((code, rdate, statement_type, cn_name, float(v), now))
+                except (ValueError, TypeError):
+                    continue
+
+    if rows:
+        with _conn() as c:
+            c.executemany(
+                "INSERT OR REPLACE INTO ifind_financial"
+                "(code,report_date,statement_type,indicator,value,fetched_at) "
+                "VALUES (?,?,?,?,?,?)", rows)
+
+    return len(rows)
 
 
 def ths_wcquery(query: str, domain: str = "stock"):

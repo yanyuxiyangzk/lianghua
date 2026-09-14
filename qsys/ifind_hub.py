@@ -558,3 +558,165 @@ def page_feature():
                 except _json.JSONDecodeError as e:
                     st.error(f"参数 JSON 解析失败：{e}")
         _render("ft")
+
+
+def page_financial():
+    """💰 财务报表（同花顺 iFinD）——查询本地数据库。"""
+    st.title("💰 财务报表（同花顺 iFinD）")
+    header()
+
+    # 数据源选择：本地数据库 or 在线查询
+    data_source = st.radio("数据来源", ["📦 本地数据库", "🌐 在线查询"],
+                           horizontal=True, key="fin_src")
+
+    if data_source == "📦 本地数据库":
+        _page_financial_local()
+    else:
+        _page_financial_online()
+
+
+def _page_financial_local():
+    """本地数据库查询财务报表。"""
+    with st.container(border=True):
+        st.subheader("📊 财务报表查询", anchor=False)
+        st.caption("查询本地数据库中的财务报表数据（由定时任务自动同步）")
+
+        with st.expander("⚙️ 查询参数", expanded=False):
+            c1, c2 = st.columns(2)
+            codes_input = c1.text_input("股票代码", "600519", key="fin_codes",
+                                         help="多只股票用逗号分隔，如 600519,000858")
+            stmt_type = c2.selectbox("报表类型",
+                                     ["利润表", "资产负债表", "现金流量表", "财务指标", "全部"],
+                                     key="fin_stmt")
+
+            c3, c4 = st.columns(2)
+            start_date = c3.text_input("开始日期", f"{datetime.now().year - 2}-01-01", key="fin_start")
+            end_date = c4.text_input("结束日期", datetime.now().strftime("%Y-%m-%d"), key="fin_end")
+
+            if st.button("查询", key="fin_go") and codes_input:
+                codes = [c.strip() for c in codes_input.split(",") if c.strip()]
+                df = _query_financial_local(codes, stmt_type, start_date, end_date)
+                if df is not None and not df.empty:
+                    st.session_state["fin_result"] = df
+                else:
+                    st.warning("未查询到数据，请先执行定时任务同步财务报表")
+
+        # 显示结果
+        if "fin_result" in st.session_state:
+            df = st.session_state["fin_result"]
+            _show_financial_df(df)
+
+    # 手动同步按钮
+    with st.container(border=True):
+        st.subheader("🔄 手动同步", anchor=False)
+        st.caption("从 iFinD 拉取财务报表数据到本地数据库")
+
+        with st.expander("⚙️ 同步参数", expanded=False):
+            c1, c2 = st.columns(2)
+            pool = c1.selectbox("股票池", ["沪深300", "自选股", "中证500", "全市场"],
+                                key="fin_sync_pool")
+            years = c2.number_input("回看年数", 1, 5, 2, key="fin_years")
+
+            if st.button("开始同步", key="fin_sync_go"):
+                with st.spinner("正在同步财务报表数据..."):
+                    codes = _get_pool_codes(pool)
+                    if codes:
+                        start = f"{datetime.now().year - years}-01-01"
+                        end = datetime.now().strftime("%Y-%m-%d")
+                        total = 0
+                        for stmt in ["利润表", "资产负债表", "现金流量表", "财务指标"]:
+                            n = datasource.ths_financial_to_db(codes, stmt, start, end)
+                            total += n
+                            st.info(f"{stmt}: {n} 行")
+                        st.success(f"同步完成！共写入 {total} 行数据")
+                    else:
+                        st.error("股票池为空")
+
+
+def _page_financial_online():
+    """在线查询财务报表（直接调用 iFinD 接口）。"""
+    with st.container(border=True):
+        st.subheader("📊 在线查询", anchor=False)
+        st.caption("直接从 iFinD 接口获取财务报表数据（不入库）")
+
+        with st.expander("⚙️ 查询参数", expanded=False):
+            c1, c2 = st.columns(2)
+            codes_input = c1.text_input("股票代码", "600519", key="fin_online_codes")
+            stmt_type = c2.selectbox("报表类型",
+                                     ["利润表", "资产负债表", "现金流量表", "财务指标"],
+                                     key="fin_online_stmt")
+
+            c3, c4 = st.columns(2)
+            start_date = c3.text_input("开始日期", f"{datetime.now().year - 1}-01-01", key="fin_online_start")
+            end_date = c4.text_input("结束日期", datetime.now().strftime("%Y-%m-%d"), key="fin_online_end")
+
+            if st.button("在线查询", key="fin_online_go") and codes_input:
+                codes = [c.strip() for c in codes_input.split(",") if c.strip()]
+                with st.spinner("查询中..."):
+                    df, res, err = datasource.ths_financial_statement(codes, stmt_type, start_date, end_date)
+                    if err not in (0, None):
+                        st.error(f"查询失败: {err}")
+                    elif df is not None and not df.empty:
+                        _show_financial_df(df)
+                    else:
+                        st.warning("查询结果为空")
+
+
+def _query_financial_local(codes, stmt_type, start_date, end_date):
+    """查询本地财务报表数据。"""
+    with datasource._conn() as c:
+        conditions = ["code IN ({})".format(",".join(["?"] * len(codes)))]
+        params = list(codes)
+
+        if stmt_type != "全部":
+            conditions.append("statement_type = ?")
+            params.append(stmt_type)
+
+        if start_date:
+            conditions.append("report_date >= ?")
+            params.append(start_date)
+        if end_date:
+            conditions.append("report_date <= ?")
+            params.append(end_date)
+
+        where = " AND ".join(conditions)
+        sql = f"SELECT code, report_date, statement_type, indicator, value FROM ifind_financial WHERE {where} ORDER BY report_date, indicator"
+        return pd.read_sql_query(sql, c, params=params)
+
+
+def _get_pool_codes(pool_name):
+    """获取股票池代码列表。"""
+    try:
+        from scheduler import load_watchlist, all_pools
+        if pool_name == "自选股":
+            return load_watchlist()
+        else:
+            return all_pools().get(pool_name, [])
+    except Exception:
+        return []
+
+
+def _show_financial_df(df):
+    """显示财务数据 DataFrame。"""
+    if df.empty:
+        st.warning("数据为空")
+        return
+
+    # 统计信息
+    nrow, ncol = df.shape
+    st.caption(f"{nrow} 行 × {ncol} 列")
+
+    # 透视表展示：行=代码+日期，列=指标
+    if "indicator" in df.columns and "value" in df.columns:
+        try:
+            pivot = df.pivot_table(
+                index=["code", "report_date"] if "report_date" in df.columns else ["code"],
+                columns="indicator",
+                values="value",
+                aggfunc="first"
+            )
+            st.dataframe(pivot, width="stretch", height=min(35 * (len(pivot) + 1) + 3, 600))
+        except Exception:
+            st.dataframe(df, width="stretch", height=min(35 * (nrow + 1) + 3, 600))
+    else:
+        st.dataframe(df, width="stretch", height=min(35 * (nrow + 1) + 3, 600))

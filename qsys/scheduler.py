@@ -1437,6 +1437,34 @@ def job_ifind_announce(pool_name: str = "自选股", days: int = 7, **_ignored) 
     return f"公告入库：拉到 {len(df)} 条，新增 {n} 条（seq 去重）"
 
 
+def job_ifind_financial_sync(pool_name: str = "沪深300", **_ignored) -> str:
+    """财务报表自动入库：每日盘后拉取三大报表 + 财务指标写入 ifind_financial 表。
+
+    走 iFinD THS_DateSerial 接口，按报告期去重（INSERT OR REPLACE 幂等）。
+    """
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    # 财务报表通常按季度发布，非交易日也可同步
+    codes = load_watchlist() if pool_name == "自选股" else (all_pools().get(pool_name) or [])
+    if not codes:
+        return f"{pool_name} 为空，跳过"
+
+    # 拉取最近2年的财务数据
+    start = f"{now.year - 2}-01-01"
+    end = now.strftime("%Y-%m-%d")
+
+    total = 0
+    results = []
+    for stmt_type in ["利润表", "资产负债表", "现金流量表", "财务指标"]:
+        n = datasource.ths_financial_to_db(codes, stmt_type, start, end)
+        total += n
+        results.append(f"{stmt_type}:{n}")
+
+    msg = f"{end} 财务报表入库：{len(codes)} 只 · {total} 行（{' + '.join(results)}）"
+    return msg
+
+
 def job_sr_scan(**_ignored) -> str:
     """支撑/阻力扫描（Density-SR）：每交易日 18:10，全市场四信号融合扫描落库 sr_scan_daily。
 
@@ -2095,6 +2123,9 @@ JOBS = {
     "ifind_announce": {"name": "📜 iFinD 公告抓取入库", "func": job_ifind_announce,
                        "default": {"enabled": True, "hour": 16, "minute": 30,
                                    "params": {"pool_name": "自选股", "days": 7}}},
+    "ifind_financial_sync": {"name": "💰 iFinD 财务报表入库", "func": job_ifind_financial_sync,
+                             "default": {"enabled": True, "hour": 17, "minute": 0,
+                                         "params": {"pool_name": "沪深300"}}},
     "ifind_stocklist_sync": {"name": "📋 iFinD A股列表同步（每日）", "func": job_ifind_stocklist_sync,
                              "default": {"enabled": True, "hour": 9, "minute": 0, "params": {}}},
     "sr_scan": {"name": "🧭 支撑阻力扫描（每日盘后）", "func": job_sr_scan,

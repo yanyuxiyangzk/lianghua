@@ -506,17 +506,14 @@ class LoopEngine:
         s["field_weights"].boost_from_factors(sexprs)
         self._save_state()
         
-        # 每轮结束后自动尝试生成策略包（如果有足够高质量因子）
-        pack_msg = self._try_generate_pack()
+        # 策略包生成已剥离到独立任务 job_strategy_gen（scheduler.py）
+        # 不再嵌入每5分钟的演化流水线，避免单次20+分钟的浪费
         
         result = {"iteration": s["iteration"], **stats, "gaps": gaps, "proven": proven,
             "budget": {k: round(v, 2) for k, v in s["budget"].p.items()}}
-        if pack_msg:
-            result["pack_generated"] = pack_msg
         bus.push(EventType.ROUND_COMPLETE, iteration=s["iteration"],
                  stats={k: v for k, v in stats.items() if k != "new"},
-                 new_factors=stats["new"][:5],
-                 pack_generated=pack_msg)
+                 new_factors=stats["new"][:5])
         return result
 
     def _try_generate_pack(self) -> str | None:

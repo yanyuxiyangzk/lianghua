@@ -291,6 +291,27 @@ def compute_pack_picks(pk: dict, codes: list[str], end: str, top_n: int):
         weights[fname] = (f["weight"], f["direction"])
     if not weights:
         raise RuntimeError("策略包因子全部无法解析，未出名单")
+    
+    # 尝试用最新评分卡重算权重（避免使用过时的快照权重）
+    try:
+        sc = library.get_latest_scorecard(pk["pool_name"])
+        if not sc.empty:
+            scm = sc.drop_duplicates(subset=["因子"]).set_index("因子")
+            updated_weights = {}
+            for fname, (old_weight, direction) in weights.items():
+                if fname in scm.index and "ICIR" in scm.columns and pd.notna(scm.loc[fname, "ICIR"]):
+                    # 用最新ICIR重算权重
+                    icir = abs(float(scm.loc[fname, "ICIR"]))
+                    updated_weights[fname] = (max(icir, 0.0), direction)
+                else:
+                    updated_weights[fname] = (old_weight, direction)
+            # 归一化
+            total = sum(w for w, _ in updated_weights.values())
+            if total > 0:
+                weights = {n: (w / total, d) for n, (w, d) in updated_weights.items()}
+    except Exception:
+        pass  # 使用原权重
+    
     score = sig.composite_score(f_series, weights)
     survived = sig.apply_filters(score.index.tolist(), panel, pk.get("filters", []))
     sel = score[score.index.isin(survived)]
@@ -1805,7 +1826,11 @@ def _get_top_factors_for_pack(pool_name: str, top_n: int = 15) -> list[dict]:
                 if icir is None:
                     continue
                 # kind 映射：scorecards 用中文，策略包用英文
-                kind_map = {"内置": "builtin", "技术指标": "tech", "loopengine": "evolved"}
+                kind_map = {
+                    "内置": "builtin", "技术指标": "tech", 
+                    "loopengine": "evolved", "evolved": "evolved",
+                    "进化": "evolved", "演化引擎": "evolved",
+                }
                 factors.append({
                     "name": name,
                     "kind": kind_map.get(kind, "builtin"),

@@ -571,7 +571,7 @@ def build_scorecard_batch(factors: list[dict], codes: list[str], end: str,
 
 
 def _oos_stats(ic_full: pd.Series, first_seen: str | None, train_end: str | None,
-               engine_selected: bool = True) -> dict:
+               engine_selected: bool = True, factor_type: str | None = None) -> dict:
     """OOS 指标：IC 序列在 OOS 窗口内的切片统计（含小样本Bayesian shrinkage）。
 
     窗口起点：引擎选拔过的因子（loopengine/rdagent）取 max(train_end, 首次入库日)——
@@ -579,7 +579,9 @@ def _oos_stats(ic_full: pd.Series, first_seen: str | None, train_end: str | None
     直接用 train_end 起算（约近 250 交易日，2026-09-11 实测否则只剩 ~10 天太噪）。
     
     小样本处理：当 OOS 天数 < 30 时，使用 Bayesian shrinkage 向 0 收缩，
-    避免小样本点估计过噪导致的假阳性/假阴性。"""
+    避免小样本点估计过噪导致的假阳性/假阴性。
+    
+    非量价类型：历史数据短（~45天），无OOS盲区，评分打折处理。"""
     empty = {"IC_OOS": None, "ICIR_OOS": None, "OOS天数": 0, "OOS_confidence": 0.0}
     if ic_full is None or ic_full.empty or not train_end:
         return empty
@@ -596,6 +598,9 @@ def _oos_stats(ic_full: pd.Series, first_seen: str | None, train_end: str | None
     oos_ic = float(seg.mean())
     oos_icir = float(seg.mean() / (seg.std() + 1e-12))
     
+    # 非量价类型标记：历史数据短，无OOS盲区
+    no_oos_blind = factor_type in ("资金流", "板块轮动", "龙虎榜", "盘口异动", "指数", "爆量抢筹")
+    
     # 小样本 Bayesian shrinkage：向 0 收缩（保守估计）
     # 收缩因子 = n / (n + k)，k 为先验强度（默认20，即等效20个先验样本）
     if n_oos < 30:
@@ -604,7 +609,7 @@ def _oos_stats(ic_full: pd.Series, first_seen: str | None, train_end: str | None
         oos_ic_shrunk = oos_ic * shrinkage_factor
         oos_icir_shrunk = oos_icir * shrinkage_factor
         confidence = n_oos / 60  # 60 天满信心
-        return {
+        result = {
             "IC_OOS": round(oos_ic_shrunk, 4),
             "ICIR_OOS": round(oos_icir_shrunk, 4),
             "OOS天数": int(n_oos),
@@ -613,12 +618,19 @@ def _oos_stats(ic_full: pd.Series, first_seen: str | None, train_end: str | None
             "OOS_shrinkage": round(shrinkage_factor, 3)
         }
     else:
-        return {
+        result = {
             "IC_OOS": round(oos_ic, 4),
             "ICIR_OOS": round(oos_icir, 4),
             "OOS天数": int(n_oos),
             "OOS_confidence": 1.0
         }
+    
+    # 非量价类型标记
+    if no_oos_blind:
+        result["no_oos_blind"] = True
+        result["OOS_confidence"] = result["OOS_confidence"] * 0.8  # 评分打折20%
+    
+    return result
 
 
 def _eval_single_factor(args):

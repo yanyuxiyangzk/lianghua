@@ -189,7 +189,7 @@ def evaluate_tree(tree, frames):
         if op == "abs":
             return args[0].abs()
         if op == "sign":
-            return args[0].apply(lambda x: 0) if False else args[0].applymap(lambda x: (x > 0) - (x < 0))
+            return args[0].map(lambda x: (x > 0) - (x < 0))
         if op == "rank_cs":
             return args[0].rank(axis=1, pct=True)
         if op == "ma":
@@ -258,7 +258,7 @@ def _ev(t):
     if op == 'mul': return a[0] * a[1]
     if op == 'div': return a[0] / (a[1] + 1e-12)
     if op == 'abs': return a[0].abs()
-    if op == 'sign': return a[0].applymap(lambda x: (x > 0) - (x < 0))
+    if op == 'sign': return a[0].map(lambda x: (x > 0) - (x < 0))
     if op == 'rank_cs': return a[0].rank(axis=1, pct=True)
     if op == 'ma': return a[0].rolling(w).mean()
     if op == 'ts_min': return a[0].rolling(w).min()

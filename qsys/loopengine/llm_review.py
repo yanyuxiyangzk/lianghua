@@ -26,9 +26,9 @@ _REVIEWER_USER = """审查以下 A 股日频因子表达式：
 
 
 def llm_review(sexpr: str) -> tuple[bool, str]:
-    """独立审查 sub-agent。无 key/调用失败时放行（fail-open，由硬闸门兜底）。"""
+    """独立审查 sub-agent。无 key/调用失败时回退到规则审查（fail-strict，非fail-open）。"""
     if not os.environ.get("DEEPSEEK_API_KEY"):
-        return True, "no-llm"
+        return _rule_review(sexpr), "no-llm-fallback"
     try:
         from litellm import completion
 
@@ -44,4 +44,37 @@ def llm_review(sexpr: str) -> tuple[bool, str]:
         verdict = str(d.get("verdict", "pass")).lower()
         return verdict == "pass", str(d.get("reason", ""))[:120]
     except Exception:
-        return True, "llm-error"
+        return _rule_review(sexpr), "llm-error-fallback"
+
+
+def _rule_review(sexpr: str) -> bool:
+    """规则审查降级：LLM不可用时的增强版规则检查。"""
+    sexpr_lower = sexpr.lower()
+    
+    # 1. 检查深度（简单估算括号嵌套）
+    depth = 0
+    max_depth = 0
+    for ch in sexpr:
+        if ch == '(':
+            depth += 1
+            max_depth = max(max_depth, depth)
+        elif ch == ')':
+            depth -= 1
+    if max_depth > 6:
+        return False
+    
+    # 2. 检查除以排名型分母
+    if 'div' in sexpr_lower and 'rank' in sexpr_lower:
+        return False
+    
+    # 3. 检查是否包含窗口算子（至少一个）
+    window_ops = ['ma', 'ts_min', 'ts_max', 'ts_rank', 'std', 'skew', 
+                  'delta', 'roc', 'ema', 'decay_linear', 'corr']
+    if not any(op in sexpr_lower for op in window_ops):
+        return False
+    
+    # 4. 检查单叶子（无意义）
+    if sexpr_lower.count('(') == 0:
+        return False
+    
+    return True

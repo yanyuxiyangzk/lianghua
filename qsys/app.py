@@ -70,7 +70,8 @@ pages = {
         st.Page("views/p_ifind_kline.py", title="K线数据", icon="📈", url_path="ifind-kline"),
         st.Page("views/p_ifind_lhb.py", title="龙虎榜", icon="🐉", url_path="ifind-lhb"),
         st.Page("views/p_ifind_announce.py", title="公告信息", icon="📜", url_path="ifind-announce"),
-        st.Page("views/p_ifind_fundflow.py", title="资金流向", icon="💰", url_path="ifind-fundflow"),
+        st.Page("views/p_ifind_fundflow.py", title="个股资金流", icon="💰", url_path="ifind-fundflow"),
+        st.Page("views/p_sectorflow.py", title="板块资金流", icon="🌐", url_path="sectorflow"),
         st.Page("views/p_ifind_financial.py", title="财务报表", icon="📊", url_path="ifind-financial"),
 
         st.Page("views/p_newsense.py", title="舆情/新闻", icon="📰", url_path="newsense"),

@@ -205,14 +205,53 @@ _SYSTEM = """你是量化复盘分析师，服务于一位有自己的量化系�
 4. 简洁专业，用 Markdown；风险提示收尾
 5. 量化信号仅供参考，不构成投资建议"""
 
+_SYSTEM_GENERAL = """你是量化投资助手。用户暂时没有选定具体股票，回答一般性量化/市场问题即可。
+如果用户的问题明显针对某只股票但没报代码/名称，提示用户报出代码或名称（支持 600519 / SH600519 / 600519.SH / 股票全称，系统会自动加载该票的数据包）。
+简洁专业，量化信号仅供参考，不构成投资建议。"""
 
-def _send(question: str, code: str):
-    """发送一轮对话：组装消息 → LLM → 落历史。"""
+
+def _extract_code_from_text(text: str) -> str | None:
+    """从自然语言问题里识别股票：6 位代码（任意写法）或股票全称（长名优先防误配）。"""
+    import re
+    m = re.search(r"(?<!\d)(\d{6})(?!\d)", text)
+    if m:
+        d = m.group(1)
+        code = ("SH" if d.startswith("6") else "SZ" if d.startswith(("0", "3")) else "BJ") + d
+        with datasource._conn() as c:
+            hit = c.execute("SELECT code FROM ifind_stocklist WHERE code=?", (code,)).fetchone()
+        if hit:
+            return code
+    with datasource._conn() as c:
+        names = c.execute("SELECT code, name FROM ifind_stocklist WHERE name IS NOT NULL").fetchall()
+    for code, name in sorted(names, key=lambda x: -len(x[1] or "")):
+        if name and len(name) >= 2 and name in text:
+            return code
+    return None
+
+
+def _send(question: str, code: str | None):
+    """发送一轮对话：组装消息 → LLM → 落历史。code=None 走普通问答（无数据包）。"""
+    if not code:
+        hist_key = "chat_hist_general"
+        hist = st.session_state.get(hist_key, [])
+        msgs = [{"role": "system", "content": _SYSTEM_GENERAL}]
+        msgs += hist[-16:]
+        msgs.append({"role": "user", "content": question})
+        with st.spinner("DeepSeek v4-pro 思考中…"):
+            reply = llm_chat_multi(msgs)
+        if not reply:
+            reply = "⚠️ LLM 暂不可用或思考超长，请稍后重试。"
+        hist.append({"role": "user", "content": question})
+        hist.append({"role": "assistant", "content": reply})
+        st.session_state[hist_key] = hist
+        return
     ctx_key = f"chat_ctx_{code}"
     hist_key = f"chat_hist_{code}"
     if ctx_key not in st.session_state:
-        ctx, meta = _build_context(code)
+        with st.spinner("组装数据包…"):
+            ctx, meta = _build_context(code)
         st.session_state[ctx_key] = ctx
+        st.session_state[f"chat_meta_{code}"] = meta
         st.session_state[hist_key] = []
     ctx = st.session_state[ctx_key]
     hist = st.session_state[hist_key]
@@ -240,7 +279,8 @@ _QUICK = [
 # ---------------------------------------------------------------- 页面
 def render():
     st.title("🧠 涨停复盘 · 对话分析")
-    st.caption("DeepSeek v4-pro · 上下文由本系统实时组装（行情/资金/支撑阻力/龙虎榜/公告/选股记录）")
+    st.caption("DeepSeek v4-pro · 上下文由本系统实时组装（行情/资金/支撑阻力/龙虎榜/公告/选股记录）"
+               " · 对话里提到股票名/代码即自动加载该票数据包")
 
     if not llm_available():
         st.error("未配置 LLM Key（DEEPSEEK_API_KEY），对话不可用")
@@ -293,47 +333,75 @@ def render():
         else:
             st.warning("代码格式不对")
             sel_code = ""
-    if not sel_code:
-        st.stop()
 
-    # ---- 数据包摘要卡 ----
-    ctx_key = f"chat_ctx_{sel_code}"
-    if ctx_key not in st.session_state:
-        with st.spinner("组装数据包…"):
-            ctx, meta = _build_context(sel_code)
-        st.session_state[ctx_key] = ctx
-        st.session_state[f"chat_meta_{sel_code}"] = meta
-        st.session_state[f"chat_hist_{sel_code}"] = []
-    meta = st.session_state[f"chat_meta_{sel_code}"]
+    # 活跃分析对象：显式选择优先，否则沿用上次（对话中识别到新股会切换）
+    if sel_code:
+        st.session_state["chat_active_code"] = sel_code
+    active = st.session_state.get("chat_active_code", "")
 
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric(meta.get("name", sel_code), f"{meta.get('price')} 元",
-              f"{meta.get('chg'):+.2f}%" if meta.get("chg") is not None else None)
-    m2.metric("连板", f"{meta.get('streak', '—')} 板")
-    m3.metric("主力净额", f"{(meta.get('main_net') or 0)/1e8:+.2f} 亿")
-    m4.metric("支撑区", meta.get("sr", "—"))
-    m5.metric("系统状态", ("持有" if meta.get("held") else "") +
-              ("已选:" + "、".join(meta.get("picked_by", [])) if meta.get("picked_by") else "未选未持"))
-    with st.expander("📦 查看注入 LLM 的数据包原文", expanded=False):
-        st.text(st.session_state[ctx_key])
+    if active:
+        # ---- 数据包摘要卡 ----
+        ctx_key = f"chat_ctx_{active}"
+        if ctx_key not in st.session_state:
+            with st.spinner("组装数据包…"):
+                ctx, meta = _build_context(active)
+            st.session_state[ctx_key] = ctx
+            st.session_state[f"chat_meta_{active}"] = meta
+            st.session_state[f"chat_hist_{active}"] = []
+        meta = st.session_state.get(f"chat_meta_{active}", {})
 
-    # ---- 快捷提问 ----
-    cols = st.columns(len(_QUICK))
-    for col, (label, q) in zip(cols, _QUICK):
-        with col:
-            if st.button(label, key=f"q_{label}", use_container_width=True):
-                _send(q, sel_code)
-                st.rerun()
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric(meta.get("name", active), f"{meta.get('price')} 元",
+                  f"{meta.get('chg'):+.2f}%" if meta.get("chg") is not None else None)
+        m2.metric("连板", f"{meta.get('streak', '—')} 板")
+        m3.metric("主力净额", f"{(meta.get('main_net') or 0)/1e8:+.2f} 亿")
+        m4.metric("支撑区", meta.get("sr", "—"))
+        m5.metric("系统状态", ("持有" if meta.get("held") else "") +
+                  ("已选:" + "、".join(meta.get("picked_by", [])) if meta.get("picked_by") else "未选未持"))
+        with st.expander("📦 查看注入 LLM 的数据包原文", expanded=False):
+            st.text(st.session_state[ctx_key])
 
-    # ---- 对话区 ----
-    hist = st.session_state.get(f"chat_hist_{sel_code}", [])
+        # ---- 快捷提问 ----
+        cols = st.columns(len(_QUICK))
+        for col, (label, q) in zip(cols, _QUICK):
+            with col:
+                if st.button(label, key=f"q_{label}", use_container_width=True):
+                    _send(q, active)
+                    st.rerun()
+
+    # ---- 对话区（始终渲染；无活跃票=普通问答）----
+    if active:
+        hist = st.session_state.get(f"chat_hist_{active}", [])
+    else:
+        hist = st.session_state.get("chat_hist_general", [])
+        if not hist:
+            st.info("💬 直接提问即可。提到股票名或代码（如“分析一下汉王科技”/“600519 怎么样”）"
+                    "会自动加载该票数据包做深度分析；不提股票就是普通问答。")
     for msg in hist:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    user_q = st.chat_input("追问这只股票…", key="chat_input")
+    user_q = st.chat_input("提问：可提到任意股票（自动加载其数据包）…", key="chat_input")
     if user_q:
-        _send(user_q, sel_code)
+        detected = _extract_code_from_text(user_q)
+        if detected and detected != active:
+            st.session_state["chat_active_code"] = detected
+            hk = f"chat_hist_{detected}"
+            st.session_state.setdefault(hk, [])
+            nm = ""
+            try:
+                with datasource._conn() as c:
+                    row = c.execute("SELECT name FROM ifind_stocklist WHERE code=?", (detected,)).fetchone()
+                    nm = row[0] if row else ""
+            except Exception:
+                pass
+            st.session_state[hk].append(
+                {"role": "assistant", "content": f"🔄 已切换分析对象到 {nm}（{detected}），数据包已就绪。"})
+            _send(user_q, detected)
+        elif active:
+            _send(user_q, active)
+        else:
+            _send(user_q, None)  # 普通问答（无数据包）
         st.rerun()
 
     st.caption("⚠️ AI 分析基于本地数据包与模型推理，仅供参考，不构成投资建议。市场有风险。")

@@ -26,7 +26,8 @@ log = logging.getLogger("loopengine")
 STATE_KEY = "loopengine"
 
 # 默认挖掘顺序：量价（主力）→ 资金流 → 板块轮动 → 指数 → 盘口异动 → 龙虎榜
-DEFAULT_FACTOR_TYPES = ["量价", "资金流", "板块轮动", "指数", "盘口异动", "龙虎榜", "爆量抢筹", "财务"]
+DEFAULT_FACTOR_TYPES = ["量价", "资金流", "板块轮动", "指数", "盘口异动", "龙虎榜", "爆量抢筹", "财务",
+                        "支撑阻力", "事件记忆"]
 
 
 class LoopEngine:

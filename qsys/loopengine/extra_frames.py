@@ -454,6 +454,106 @@ def build_burst_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
     return frames
 
 
+# ---------------------------------------------------------------- 支撑阻力（Density-SR 产出）+ 事件记忆
+def build_sr_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
+    """支撑阻力帧：从 sr_scan_daily 读每日扫描产出（Density-SR 引擎的现成计算），
+    把"距支撑距离/触及守住概率/区间强度/共振/极端波动"变成可挖因子字段。
+    强势因子的位置量度全在这里（2026-09-15 接入挖掘）。
+
+    注意：NaN 表示当日该股不在扫描（流动性过滤下未覆盖）——不填 0，宁可缺不可假。"""
+    from datasource import _qconn
+
+    start = (pd.Timestamp(end) - pd.Timedelta(days=int(lookback * 1.6))).strftime("%Y-%m-%d")
+    try:
+        with _qconn() as c:
+            df = pd.read_sql(
+                "SELECT date, code, sup_dist_atr, res_dist_atr, p_touch, p_hold, "
+                "sup_strength, resonance, vol_extreme, score FROM sr_scan_daily "
+                "WHERE date >= ? AND date <= ?", c, params=(start, end))
+    except Exception:
+        return {}
+    if df.empty:
+        return {}
+    if codes:
+        df = df[df["code"].isin(set(codes))]
+    df["date"] = pd.to_datetime(df["date"])
+    frames = {}
+    for col, name in [("sup_dist_atr", "sr_dist_atr"), ("res_dist_atr", "sr_res_dist"),
+                      ("p_touch", "sr_p_touch"), ("p_hold", "sr_p_hold"),
+                      ("sup_strength", "sr_strength"), ("resonance", "sr_resonance"),
+                      ("vol_extreme", "sr_vol_extr"), ("score", "sr_score")]:
+        p = df.pivot_table(index="date", columns="code", values=col)
+        if not p.empty:
+            frames[name] = p
+    return frames
+
+
+def build_event_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
+    """事件记忆帧：涨停记忆从日线全量算（不依赖 limit_up_watch 的积累深度），
+    公告计数从 ifind_announcements。字段：
+      days_since_limit  距最近涨停的交易日数（cap 60，长期无涨停=60）
+      limit_streak      最近一次涨停时的连板高度（当前连板中则为当前高度）
+      announce_7d       近 7 日公告数（催化强度，0 填充）
+    """
+    from datasource import _qconn
+
+    start = (pd.Timestamp(end) - pd.Timedelta(days=int((lookback + 80) * 1.6))).strftime("%Y-%m-%d")
+    try:
+        with _qconn() as c:
+            px = pd.read_sql(
+                "SELECT code, date, close FROM market_daily WHERE source='ths_ifind' "
+                "AND date >= ? AND date <= ?", c, params=(start, end))
+            ann = pd.read_sql(
+                "SELECT code, report_date FROM ifind_announcements", c)
+    except Exception:
+        return {}
+    if px.empty:
+        return {}
+    if codes:
+        px = px[px["code"].isin(set(codes))]
+
+    def _thr(code):
+        if code.startswith("BJ"):
+            return 29.8
+        if code.startswith(("SZ30", "SH688")):
+            return 19.8
+        return 9.8
+
+    px = px.sort_values(["code", "date"])
+    px["chg"] = px.groupby("code")["close"].pct_change() * 100
+    px["is_limit"] = px["chg"] >= px["code"].map(_thr).astype(float)
+
+    dates_idx = pd.DatetimeIndex(sorted(px["date"].unique()))
+    dsl, streak_f = {}, {}
+    for code, g in px.groupby("code"):
+        g = g.set_index("date")
+        is_lim = g["is_limit"].astype(int)
+        # 距上次涨停天数
+        last_lim = g.index[is_lim.astype(bool)]
+        dser = pd.Series(60, index=g.index)
+        for d in g.index:
+            prev = last_lim[last_lim <= d]
+            if len(prev):
+                dser[d] = int(len(g.loc[:d]) - 1 - g.index.get_loc(prev[-1]))
+        dsl[code] = dser
+        # 连板高度：连续涨停计数
+        streak = is_lim.groupby((is_lim != is_lim.shift()).cumsum()).cumsum()
+        streak_f[code] = streak.where(is_lim.astype(bool), 0).astype(float)
+    days_frame = pd.DataFrame(dsl).reindex(dates_idx).ffill().fillna(60)
+    streak_frame = pd.DataFrame(streak_f).reindex(dates_idx).fillna(0)
+
+    frames = {"days_since_limit": days_frame, "limit_streak": streak_frame}
+
+    # 公告计数（近7日滚动，0 填充）
+    if not ann.empty and codes:
+        ann = ann[ann["code"].isin(set(codes))]
+    if not ann.empty:
+        ann["d"] = pd.to_datetime(ann["report_date"])
+        cnt = ann.groupby(["d", "code"]).size().rename("n").reset_index()
+        pvt = cnt.pivot_table(index="d", columns="code", values="n", aggfunc="sum")
+        pvt = pvt.reindex(dates_idx).fillna(0).rolling(7, min_periods=1).sum()
+        frames["announce_7d"] = pvt
+    return frames
 # 构建器注册表
 BUILDERS = {
     "资金流": build_fundflow_frames,
@@ -463,6 +563,8 @@ BUILDERS = {
     "指数": build_index_frames,
     "爆量抢筹": build_burst_frames,
     "财务": build_financial_frames,
+    "支撑阻力": build_sr_frames,
+    "事件记忆": build_event_frames,
 }
 
 

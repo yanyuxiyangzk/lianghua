@@ -31,6 +31,9 @@ TYPE_FIELDS = {
                 "accumulation_composite"],
     "财务": ["fin_np", "fin_or", "fin_gp", "fin_ncf",
             "fin_np_yoy", "fin_or_yoy", "fin_nm"],
+    "支撑阻力": ["sr_dist_atr", "sr_res_dist", "sr_p_touch", "sr_p_hold",
+                "sr_strength", "sr_resonance", "sr_vol_extr", "sr_score"],
+    "事件记忆": ["days_since_limit", "limit_streak", "announce_7d"],
 }
 
 # 因子类型 → 默认机制族映射（用于新类型因子的族分类）
@@ -41,6 +44,8 @@ TYPE_FAMILY_MAP = {
     "盘口异动": "盘口异动",
     "指数": "指数",
     "财务": "财务",
+    "支撑阻力": "支撑阻力",
+    "事件记忆": "事件记忆",
 }
 
 # 所有可用字段（基础 + 当前类型）
@@ -128,6 +133,8 @@ def parse(s: str, factor_type: str | None = "量价"):
         tok = eat()
         if tok in valid_fields:
             return Leaf(tok)
+        if tok.isdigit():
+            return Leaf(tok)  # 数值常量叶（取负习语 sub(0,x)；emit 运行时按 int 求值）
         if tok not in OPS:
             raise ValueError(f"未知符号 {tok}")
         op = tok
@@ -183,7 +190,9 @@ def evaluate_tree(tree, frames):
     """返回因子值 DataFrame（datetime×instrument）。"""
     def ev(t):
         if isinstance(t, Leaf):
-            return frames[t.field]
+            if t.field in frames:
+                return frames[t.field]
+            return float(t.field)  # 数值常量叶（sub(0,x) 的取负习语等）
         op = t.op
         args = [ev(ch) for ch in t.children]
         w = t.window

@@ -21,7 +21,7 @@ TYPE_FIELDS = {
     "资金流": ["main_net_pct", "super_net_pct", "big_net_pct", "mid_net_pct", "small_net_pct",
               "net_inflow_ratio", "main_small_spread"],
     "板块轮动": ["sector_momentum", "sector_net_flow", "sector_breadth",
-                "sector_rank", "sector_amount_ratio"],
+                "sector_rank", "sector_amount_ratio", "sector_excess_ret"],
     "龙虎榜": ["lhb_net_buy", "lhb_inst_ratio", "lhb_hot_count",
               "lhb_win_rate", "lhb_consecutive"],
     "盘口异动": ["bid_ask_ratio", "outer_inner_ratio", "quantity_ratio_dev",

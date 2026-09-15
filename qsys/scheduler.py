@@ -950,13 +950,14 @@ def job_multitype_mine(batch_per_type: int = 25, pool_name: str = "沪深300",
 
 
 def job_event_mine(kind: str = "涨停", batch: int = 30, horizon: int = 5,
-                   pool_name: str = "沪深300", **_ignored) -> str:
+                   pool_name: str = "沪深300", factor_type: str = "量价", **_ignored) -> str:
     """事件定向挖因子：围绕「涨停/大涨/跌停/创新高」做事件目标演化，
-    入库前缀 ev_（gate_status=2 事件闸门，区别于收益管线）。"""
+    入库前缀 ev_（gate_status=2 事件闸门，区别于收益管线）。
+    factor_type 可切换挖掘字段域（如 资金流——汉王复盘：首板的核心是资金突变）。"""
     from loopengine.engine import LoopEngine
 
     eng = LoopEngine(pool_name)
-    r = eng.run_event_round(kind, batch=batch, horizon=horizon)
+    r = eng.run_event_round(kind, batch=batch, horizon=horizon, factor_type=factor_type)
     return (f"事件[{kind}|{horizon}日] 第{r['iteration']}轮 · 测试{r['tested']} · "
             f"重复{r['dup']} · FSA拦截{r['frozen']} · 入库{r['passed']} {r['new'][:3]}")
 
@@ -1412,8 +1413,32 @@ def job_ifind_basic_daily(pool_name: str = "沪深300", **_ignored) -> str:
 
 
 def job_ifind_announce(pool_name: str = "自选股", days: int = 7, **_ignored) -> str:
-    """公告每日抓取得入 ifind_announcements 表（按 seq 去重，幂等）。"""
+    """公告每日抓取得入 ifind_announcements 表（按 seq 去重，幂等）。
+
+    覆盖范围 = 池内 + 今日涨停 + 今日选股名单（2026-09-15 汉王复盘暴露：
+    涨停票多半不在自选池，数据包"公告未覆盖"）。"""
     codes = load_watchlist() if pool_name == "自选股" else (all_pools().get(pool_name) or [])
+    extra = set()
+    try:  # 今日（或最近交易日）涨停票
+        with datasource._conn() as c:
+            mx = c.execute("SELECT MAX(date) FROM limit_up_watch").fetchone()[0]
+            if mx:
+                extra |= {r[0] for r in c.execute(
+                    "SELECT code FROM limit_up_watch WHERE date=?", (mx,))}
+    except Exception:
+        pass
+    try:  # 最近选股名单
+        import experience
+        with experience._conn() as ec:
+            ld = ec.execute("SELECT MAX(trade_date) FROM picks").fetchone()[0]
+        if ld:
+            for p in experience.picks_on_date(ld).itertuples():
+                with experience._conn() as ec:
+                    extra |= {r[0] for r in ec.execute(
+                        "SELECT code FROM pick_items WHERE pick_id=?", (p.id,))}
+    except Exception:
+        pass
+    codes = list(dict.fromkeys(list(codes) + sorted(extra)))
     if not codes:
         return f"{pool_name} 为空，跳过"
     df, res, err = datasource.ths_announce(codes, days=int(days))
@@ -1434,7 +1459,54 @@ def job_ifind_announce(pool_name: str = "自选股", days: int = 7, **_ignored) 
                              str(r.get("reporttitle", "")), str(r.get("pdfurl", "")),
                              str(r.get("ctime", "")), now))
             n += cur.rowcount
-    return f"公告入库：拉到 {len(df)} 条，新增 {n} 条（seq 去重）"
+    return f"公告入库：{len(codes)} 只拉到 {len(df)} 条，新增 {n} 条（seq 去重）"
+
+
+def job_limit_up_watch(**_ignored) -> str:
+    """涨停/放量异动观察清单（盘后 17:25）：今日涨停 + 量比≥3 且涨幅≥5% 的票落库
+    limit_up_watch 表，供复盘对话页与次日选股体检用（2026-09-15 汉王复盘：首板票次日无系统视角）。"""
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5:
+        return "非交易日，跳过"
+    sl = datasource.get_stocklist_from_db()
+    if sl.empty:
+        return "stocklist 为空，跳过"
+    date = now.strftime("%Y-%m-%d")
+
+    def _thr(code, name):
+        if "ST" in str(name).upper():
+            return 4.8
+        if code.startswith("BJ"):
+            return 29.8
+        if code.startswith(("SZ30", "SH688")):
+            return 19.8
+        return 9.8
+
+    rows = []
+    for r in sl.itertuples():
+        chg = getattr(r, "change_pct", None)
+        if chg is None or pd.isna(chg):
+            continue
+        thr = _thr(r.code, getattr(r, "name", ""))
+        qr = getattr(r, "quantity_ratio", None) or 0
+        if chg >= thr:
+            kind = "涨停"
+        elif (qr and qr >= 3) and chg >= 5:
+            kind = "放量异动"
+        else:
+            continue
+        rows.append((date, r.code, getattr(r, "name", ""), float(chg),
+                     float(getattr(r, "amount", 0) or 0), float(qr or 0), kind, now.strftime("%F %T")))
+
+    with datasource._conn() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS limit_up_watch(
+            date TEXT, code TEXT, name TEXT, chg_pct REAL, amount REAL,
+            quantity_ratio REAL, kind TEXT, created_at TEXT,
+            PRIMARY KEY(date, code, kind))""")
+        c.executemany("INSERT OR REPLACE INTO limit_up_watch VALUES (?,?,?,?,?,?,?,?)", rows)
+    return f"{date} 涨停/异动观察清单：{sum(1 for r in rows if r[6]=='涨停')} 只涨停 + {sum(1 for r in rows if r[6]=='放量异动')} 只放量异动"
 
 
 def job_ifind_financial_sync(pool_name: str = "沪深300", **_ignored) -> str:
@@ -2123,6 +2195,8 @@ JOBS = {
     "ifind_announce": {"name": "📜 iFinD 公告抓取入库", "func": job_ifind_announce,
                        "default": {"enabled": True, "hour": 16, "minute": 30,
                                    "params": {"pool_name": "自选股", "days": 7}}},
+    "limit_up_watch": {"name": "🚀 涨停/放量异动观察清单", "func": job_limit_up_watch,
+                       "default": {"enabled": True, "hour": 17, "minute": 25, "params": {}}},
     "ifind_financial_sync": {"name": "💰 iFinD 财务报表入库", "func": job_ifind_financial_sync,
                              "default": {"enabled": True, "hour": 17, "minute": 0,
                                          "params": {"pool_name": "沪深300"}}},
@@ -2205,6 +2279,10 @@ JOBS = {
     "event_mine": {"name": "🧬 事件定向挖因子（涨停等）", "func": job_event_mine,
                    "default": {"enabled": True, "hour": 22, "minute": 30,
                                "params": {"kind": "涨停", "batch": 30, "horizon": 5}}},
+    "event_mine_fundflow": {"name": "🧬 事件定向挖因子（涨停×资金流）", "func": job_event_mine,
+                            "default": {"enabled": True, "hour": 22, "minute": 50,
+                                        "params": {"kind": "涨停", "batch": 25, "horizon": 5,
+                                                   "factor_type": "资金流"}}},
     "fundflow_sync": {"name": "💰 个股资金流入库（盘后·iFinD）", "func": job_fundflow_sync,
                       "default": {"enabled": True, "hour": 17, "minute": 45,
                                   "params": {"pool_name": "自选股", "lookback_days": 30}}},

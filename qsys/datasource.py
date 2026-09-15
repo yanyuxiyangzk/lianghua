@@ -2754,6 +2754,46 @@ def fetch_lhb_via_ths(date: str) -> int:
     return 0
 
 
+def backfill_history(codes: list[str] | None = None, years: int = 2,
+                     min_bars: int = 400, sleep: float = 0.12, progress=None) -> dict:
+    """全市场日线历史一次性回填（iFinD THS_HQ，SDK 失败自动走 HTTP token 通道）。
+
+    背景：market_daily(ths_ifind) 全市场日线 2026-09-08 才开始同步，
+    3578/5566 只仅有 5 根 bar——支撑阻力扫描/因子面板对它们全部失效
+    （2026-09-15 汉王科技复盘暴露）。
+    幂等可重跑：已有 ≥min_bars 根的票跳过；中断后再跑自动续。
+    优先级：pool 顺序传入即可（建议 沪深300→中证500/1000→自选→涨停→其余）。
+    """
+    if codes is None:
+        with _conn() as c:
+            codes = [r[0] for r in c.execute("SELECT code FROM ifind_stocklist ORDER BY code")]
+    start = f"{datetime.now().year - years}-01-01"
+    end = datetime.now().strftime("%Y-%m-%d")
+
+    done, skipped, failed = 0, 0, []
+    for i, code in enumerate(codes):
+        try:
+            with _conn() as c:
+                n = c.execute(
+                    "SELECT COUNT(*) FROM market_daily WHERE source='ths_ifind' AND code=? AND date>=?",
+                    (code, start)).fetchone()[0]
+            if n >= min_bars:
+                skipped += 1
+                continue
+            w = _ths_fetch_daily(code, start, end)
+            if w > 0:
+                done += 1
+            else:
+                failed.append(code)
+            if sleep:
+                time.sleep(sleep)
+        except Exception:
+            failed.append(code)
+        if progress and i % 100 == 0:
+            progress(i, len(codes), done, skipped, len(failed))
+    return {"done": done, "skipped": skipped, "failed": failed}
+
+
 def fetch_lhb_daily(date: str | None = None) -> int:
     """兼容旧接口：通过 iFinD 获取龙虎榜数据。"""
     if not date:

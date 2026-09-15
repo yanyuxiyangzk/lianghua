@@ -211,6 +211,31 @@ def build_sector_frames(codes: list[str], end: str, lookback: int = 800) -> dict
     frames["sector_breadth"] = (pivot_flow > 0).sum(axis=1) / pivot_flow.shape[1]
     total_flow = pivot_flow.abs().sum(axis=1)
     frames["sector_amount_ratio"] = pivot_flow.div(total_flow + 1e-6, axis=0)
+
+    # 行业超额强度（按股票）：个股日涨幅 − 所属行业等权均涨幅。
+    # 数据用 market_daily 个股日收益 × stock_industry 映射（不依赖 sector_daily 的历史深度），
+    # 个股级帧（列=instrument），与上面板块级帧共存（evaluate_tree 按列名取）。
+    try:
+        import sectorflow
+        imap = sectorflow.industry_map()
+        if not imap.empty:
+            code2sec = dict(zip(imap["code"], imap["sector_name"]))
+            px = pd.read_sql(
+                "SELECT code, date, close FROM market_daily WHERE source='ths_ifind' "
+                "AND date >= ? AND date <= ?", c, params=(start, end))
+            px = px[px["code"].isin(code2sec)]
+            if codes:
+                px = px[px["code"].isin(set(codes))]
+            if not px.empty:
+                px = px.sort_values(["code", "date"])
+                px["chg"] = px.groupby("code")["close"].pct_change()
+                px["sector"] = px["code"].map(code2sec)
+                sec_mean = px.groupby(["date", "sector"])["chg"].transform("mean")
+                px["excess"] = px["chg"] - sec_mean
+                frames["sector_excess_ret"] = px.pivot_table(
+                    index="date", columns="code", values="excess")
+    except Exception:
+        pass
     return frames
 
 

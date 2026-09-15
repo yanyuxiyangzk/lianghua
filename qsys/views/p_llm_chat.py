@@ -229,6 +229,79 @@ def _extract_code_from_text(text: str) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------- 对话持久化（落 experience.db）
+_CHAT_SCHEMA = """
+CREATE TABLE IF NOT EXISTS chat_history(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel TEXT NOT NULL,           -- 股票代码 或 general
+    role TEXT NOT NULL,
+    content TEXT,
+    created_at TEXT);
+CREATE INDEX IF NOT EXISTS idx_chat_channel ON chat_history(channel, id);
+CREATE TABLE IF NOT EXISTS chat_contexts(
+    channel TEXT NOT NULL,           -- 当日注入的数据包留档（回答可复现的依据）
+    date TEXT NOT NULL,
+    ctx TEXT,
+    created_at TEXT,
+    PRIMARY KEY(channel, date));
+"""
+
+
+def _chat_save(channel: str, role: str, content: str):
+    """写一条对话；持久化失败不影响对话本身（fail-open）。"""
+    try:
+        with experience._conn() as c:
+            c.executescript(_CHAT_SCHEMA)
+            c.execute("INSERT INTO chat_history (channel, role, content, created_at) VALUES (?,?,?,?)",
+                      (channel, role, content, datetime.now().strftime("%F %T")))
+    except Exception:
+        pass
+
+
+def _chat_ctx_save(code: str, ctx: str):
+    """数据包按（票, 日）留档——之后复查能知道 AI 当时看到了什么。"""
+    try:
+        with experience._conn() as c:
+            c.executescript(_CHAT_SCHEMA)
+            c.execute("INSERT OR REPLACE INTO chat_contexts (channel, date, ctx, created_at) "
+                      "VALUES (?,?,?,?)",
+                      (code, datetime.now().strftime("%Y-%m-%d"), ctx,
+                       datetime.now().strftime("%F %T")))
+    except Exception:
+        pass
+
+
+def _chat_load(channel: str, limit: int = 200) -> list[dict]:
+    """读历史对话（按时间正序）。"""
+    try:
+        with experience._conn() as c:
+            c.executescript(_CHAT_SCHEMA)
+            rows = c.execute(
+                "SELECT role, content, created_at FROM chat_history WHERE channel=? "
+                "ORDER BY id DESC LIMIT ?", (channel, limit)).fetchall()
+        return [{"role": r, "content": ct, "ts": ts} for r, ct, ts in reversed(rows)]
+    except Exception:
+        return []
+
+
+def _chat_channels() -> list:
+    """历史会话清单（频道, 消息数, 最近时间）。"""
+    try:
+        with experience._conn() as c:
+            c.executescript(_CHAT_SCHEMA)
+            return c.execute(
+                "SELECT channel, COUNT(*), MAX(created_at) FROM chat_history "
+                "GROUP BY channel ORDER BY MAX(id) DESC").fetchall()
+    except Exception:
+        return []
+
+
+def _chat_clear(channel: str):
+    with experience._conn() as c:
+        c.executescript(_CHAT_SCHEMA)
+        c.execute("DELETE FROM chat_history WHERE channel=?", (channel,))
+
+
 def _send(question: str, code: str | None):
     """发送一轮对话：组装消息 → LLM → 落历史。code=None 走普通问答（无数据包）。"""
     if not code:
@@ -244,6 +317,8 @@ def _send(question: str, code: str | None):
         hist.append({"role": "user", "content": question})
         hist.append({"role": "assistant", "content": reply})
         st.session_state[hist_key] = hist
+        _chat_save("general", "user", question)
+        _chat_save("general", "assistant", reply)
         return
     ctx_key = f"chat_ctx_{code}"
     hist_key = f"chat_hist_{code}"
@@ -252,7 +327,8 @@ def _send(question: str, code: str | None):
             ctx, meta = _build_context(code)
         st.session_state[ctx_key] = ctx
         st.session_state[f"chat_meta_{code}"] = meta
-        st.session_state[hist_key] = []
+        st.session_state[hist_key] = _chat_load(code)  # 从库里恢复该股历史对话
+        _chat_ctx_save(code, ctx)                      # 数据包留档（回答可复现）
     ctx = st.session_state[ctx_key]
     hist = st.session_state[hist_key]
 
@@ -266,6 +342,8 @@ def _send(question: str, code: str | None):
     hist.append({"role": "user", "content": question})
     hist.append({"role": "assistant", "content": reply})
     st.session_state[hist_key] = hist
+    _chat_save(code, "user", question)
+    _chat_save(code, "assistant", reply)
 
 
 _QUICK = [
@@ -369,6 +447,36 @@ def render():
                     _send(q, active)
                     st.rerun()
 
+    # ---- 历史会话（持久化在 experience.db，刷新/重启不丢）----
+    channels = _chat_channels()
+    if channels:
+        with st.expander(f"📜 历史会话（{len(channels)} 个频道，点击切换）", expanded=False):
+            codes_in = [ch for ch, _, _ in channels if ch != "general"]
+            name_map = {}
+            if codes_in:
+                try:
+                    with datasource._conn() as c:
+                        name_map = dict(c.execute(
+                            f"SELECT code, name FROM ifind_stocklist WHERE code IN "
+                            f"({','.join('?' * len(codes_in))})", codes_in).fetchall())
+                except Exception:
+                    pass
+            for ch, cnt, last in channels[:20]:
+                label = "💬 普通问答" if ch == "general" else f"{name_map.get(ch, '') or ch}（{ch}）"
+                cc1, cc2 = st.columns([5, 1])
+                with cc1:
+                    if st.button(f"{label} · {cnt}条 · {last[:16]}", key=f"histch_{ch}",
+                                 use_container_width=True):
+                        if ch != "general":
+                            st.session_state["chat_active_code"] = ch
+                            st.session_state[f"chat_hist_{ch}"] = _chat_load(ch)
+                        st.rerun()
+                with cc2:
+                    if st.button("🗑", key=f"histdel_{ch}", help="删除该频道全部对话"):
+                        _chat_clear(ch)
+                        st.session_state.pop(f"chat_hist_{ch}", None)
+                        st.rerun()
+
     # ---- 对话区（始终渲染；无活跃票=普通问答）----
     if active:
         hist = st.session_state.get(f"chat_hist_{active}", [])
@@ -377,7 +485,12 @@ def render():
         if not hist:
             st.info("💬 直接提问即可。提到股票名或代码（如“分析一下汉王科技”/“600519 怎么样”）"
                     "会自动加载该票数据包做深度分析；不提股票就是普通问答。")
+    last_day = None
     for msg in hist:
+        day = (msg.get("ts") or "")[:10]  # 库里的历史带时间戳，按日分隔
+        if day and day != last_day:
+            st.caption(f"—— {day} ——")
+            last_day = day
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 

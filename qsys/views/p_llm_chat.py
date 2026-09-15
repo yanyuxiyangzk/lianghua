@@ -93,7 +93,9 @@ def _build_context(code: str) -> tuple[str, dict]:
         streak = _limit_streak(code)
         meta["streak"] = streak
         last = bars.iloc[-1]
-        open_board = "是（炸板/非一字）" if last["close"] < last["high"] else "否（一字/封死）"
+        # 开板判定看最低价是否跌破当日最高（涨停价）：close==high 但 low 远低于 high
+        # = 盘中开过板后回封（通鼎互联 09-15 正是如此，原来只看 close<high 误判成一字）
+        open_board = "否（一字/封死）" if last["low"] >= last["high"] * 0.9999 else "是（盘中开过板）"
         chg5 = (bars["close"].iloc[-1] / bars["close"].iloc[-6] - 1) * 100 if len(bars) >= 6 else None
         S.append(f"【连板】近10日第{streak}板 · 今日是否开板：{open_board}"
                  + (f" · 近5日涨幅 {chg5:+.1f}%" if chg5 is not None else "（本地日线数据不足5日）"))
@@ -102,14 +104,15 @@ def _build_context(code: str) -> tuple[str, dict]:
     with datasource._conn() as c:
         ff = pd.read_sql(
             "SELECT date, main_net, super_net, big_net, mid_net, small_net FROM stock_fundflow_daily "
-            "WHERE code=? ORDER BY date DESC LIMIT 6", c, params=(code,))
+            "WHERE code=? ORDER BY date DESC LIMIT 5", c, params=(code,))
     if not ff.empty:
         t = ff.iloc[0]
         meta["main_net"] = t["main_net"]
+        flow_days = "/".join(str(d)[5:] for d in ff["date"].iloc[::-1])  # 标注时间轴（LLM 提示过没标）
         S.append(f"【资金流·最新{t['date']}】主力净额{(t['main_net'] or 0)/1e8:+.2f}亿 "
                  f"（超大{(t['super_net'] or 0)/1e8:+.2f} 大{(t['big_net'] or 0)/1e8:+.2f} "
                  f"中{(t['mid_net'] or 0)/1e8:+.2f} 小{(t['small_net'] or 0)/1e8:+.2f}）；"
-                 f"近5日主力净额序列 {[round(x/1e8,2) for x in ff['main_net'].iloc[::-1]]} 亿")
+                 f"近5日主力净额（{flow_days}） {[round(x/1e8,2) for x in ff['main_net'].iloc[::-1]]} 亿")
 
     # 4) 支撑阻力（Density-SR）
     sr_df, sr_date = density_sr.load_scan()
@@ -181,12 +184,13 @@ def _build_context(code: str) -> tuple[str, dict]:
     try:
         with datasource._conn() as c:
             sc = pd.read_sql(
-                "SELECT name, ic_mean, ic_winrate FROM factor_scorecards "
+                "SELECT name, ic_mean, ic_winrate, eval_date FROM factor_scorecards "
                 "WHERE eval_date=(SELECT MAX(eval_date) FROM factor_scorecards)", c)
         if not sc.empty:
+            sc_date = sc["eval_date"].iloc[0]
             top = sc.nlargest(3, "ic_mean")
             bot = sc.nsmallest(3, "ic_mean")
-            S.append("【因子冷热·最新体检】最热：" +
+            S.append(f"【因子冷热·体检日 {sc_date}】最热：" +
                      "、".join(f"{r['name']}({r['ic_mean']:+.3f})" for _, r in top.iterrows()) +
                      "；最冷：" + "、".join(f"{r['name']}({r['ic_mean']:+.3f})" for _, r in bot.iterrows()))
     except Exception:

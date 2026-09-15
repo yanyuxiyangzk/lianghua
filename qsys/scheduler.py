@@ -2319,6 +2319,8 @@ JOBS = {
                                    "params": {"pool_name": "自选股", "days": 7}}},
     "limit_up_watch": {"name": "🚀 涨停/放量异动观察清单", "func": job_limit_up_watch,
                        "default": {"enabled": True, "hour": 17, "minute": 25, "params": {}}},
+    "limit_up_watch_1400": {"name": "🚀 涨停/放量异动观察（盘中14:00）", "func": job_limit_up_watch,
+                            "default": {"enabled": True, "hour": 14, "minute": 0, "params": {}}},
     "ifind_financial_sync": {"name": "💰 iFinD 财务报表入库", "func": job_ifind_financial_sync,
                              "default": {"enabled": True, "hour": 17, "minute": 0,
                                          "params": {"pool_name": "沪深300"}}},

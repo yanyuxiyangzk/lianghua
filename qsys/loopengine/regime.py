@@ -111,7 +111,8 @@ def _fetch_index_panel(codes: list[str], end: str | None, lookback_days: int) ->
     import signals as sig
 
     if end is None:
-        end = datasource.get_last_trade_day_q() or datetime.now().strftime("%Y-%m-%d")
+        from common import get_last_trade_day  # 原引用 datasource.get_last_trade_day_q 不存在（模块+名都错）
+        end = get_last_trade_day() or datetime.now().strftime("%Y-%m-%d")
 
     start = (pd.Timestamp(end) - pd.Timedelta(days=int(lookback_days * 1.6))).strftime("%Y-%m-%d")
 

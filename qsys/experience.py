@@ -110,6 +110,13 @@ def _conn():
         c.execute("ALTER TABLE positions ADD COLUMN buy_amount REAL")  # 买入金额 = 股数×成交价
     if "sell_order_id" not in pcols:
         c.execute("ALTER TABLE positions ADD COLUMN sell_order_id INTEGER")  # 卖出委托号（委托制）
+    # M3（2026-09-15 战报整改）：开仓时登记支撑区/ATR/regime 上下文，供破位/吊灯双腿卖出；
+    # max_close 滚动跟踪入场以来最高收盘（吊灯止盈基准）；extend_count 到期顺延计数
+    for col, ddl in [("sup_lo_entry", "REAL"), ("atr_entry", "REAL"),
+                     ("regime_entry", "TEXT"), ("max_close", "REAL"),
+                     ("extend_count", "INTEGER DEFAULT 0")]:
+        if col not in pcols:
+            c.execute(f"ALTER TABLE positions ADD COLUMN {col} {ddl}")
     return c
 
 
@@ -606,6 +613,18 @@ def position_open_from_picks(trade_date: str, today: str) -> str:
             pass
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     n_new = 0
+    n_defer = n_chase = 0
+    # M3 买点约束（2026-09-15 战报整改）：regime 化的支撑距离许可 + 追高保护
+    theta_entry = 1.0  # 默认（bear/transition/unknown）
+    regime_now = "unknown"
+    try:
+        from loopengine.regime import detect_regime
+        rg = detect_regime()
+        regime_now = rg.get("regime", "unknown")
+        theta_entry = {"bull": 1.5, "sideways": 0.5, "bear": 1.0,
+                       "transition": 1.0}.get(regime_now, 1.0)
+    except Exception:
+        pass
     with _conn() as c:
         for r in picks.itertuples():
             if r.source == "le_shadow":
@@ -615,33 +634,59 @@ def position_open_from_picks(trade_date: str, today: str) -> str:
                 continue
             codes = list(items["code"])
             names = _position_names(codes)
-            # 参考买入价 = 扫描日收盘价（名单生成时的价格）
-            ref_prices = {}
+            # 参考买入价 = 扫描日收盘价（名单生成时的价格）；顺带取当日涨跌幅做追高保护
+            ref_prices, ref_chg = {}, {}
             try:
                 import datasource
                 with datasource._qconn() as dc:
                     for row in dc.execute(
-                            f"SELECT code, price FROM ifind_stocklist"
+                            f"SELECT code, price, change_pct FROM ifind_stocklist"
                             f" WHERE code IN ({','.join('?' * len(codes))})", codes):
                         if row[1]:
                             ref_prices[row[0]] = row[1]
+                            ref_chg[row[0]] = row[2]
             except Exception:
                 pass
+            # 该名单的支撑阻力上下文（≤名单生成日，无未来信息）
+            try:
+                import density_sr
+                sr_map = density_sr.latest_sr_map(codes, asof=trade_date)
+            except Exception:
+                sr_map = None
             for it in items.itertuples():
                 if it.code in avoid:
                     continue
                 limit = ref_prices.get(it.code)
                 if not limit:
                     continue
+                # M3 闸门：距强支撑过远 → 延迟开仓等回踩；当日已涨 >5% → 追高保护
+                sr = sr_map.loc[it.code] if (sr_map is not None and not sr_map.empty
+                                             and it.code in sr_map.index) else None
+                if sr is not None and pd.notna(sr.get("sup_dist_atr")) \
+                        and sr["sup_dist_atr"] > theta_entry:
+                    n_defer += 1
+                    continue
+                chg = ref_chg.get(it.code)
+                if chg is not None and pd.notna(chg) and chg > 5.0:
+                    n_chase += 1
+                    continue
                 cur = c.execute(
                     "INSERT OR IGNORE INTO positions"
                     "(code, name, buy_date, buy_price, buy_ts, pick_id, source, pack_name,"
-                    " status, limit_price, created_at)"
-                    " VALUES (?,?,?,NULL,?,?,?,?, 'pending', ?, ?)",
+                    " status, limit_price, created_at, sup_lo_entry, atr_entry, regime_entry)"
+                    " VALUES (?,?,?,NULL,?,?,?,?, 'pending', ?, ?, ?, ?, ?)",
                     (it.code, names.get(it.code, ""), today, now,
-                     int(r.id), r.source, r.pack_name, float(limit), now))
+                     int(r.id), r.source, r.pack_name, float(limit), now,
+                     float(sr["sup_lo"]) if sr is not None and pd.notna(sr.get("sup_lo")) else None,
+                     float(sr["atr"]) if sr is not None and pd.notna(sr.get("atr")) else None,
+                     regime_now))
                 n_new += cur.rowcount
-    return f"委托挂单：新增 {n_new} 笔限价单" if n_new else "委托挂单：无新增（已挂或竞价回避）"
+    msg = f"委托挂单：新增 {n_new} 笔限价单"
+    if n_defer:
+        msg += f" · 距支撑>{theta_entry}ATR 延迟 {n_defer} 笔"
+    if n_chase:
+        msg += f" · 追高保护拦 {n_chase} 笔"
+    return msg if n_new or n_defer or n_chase else "委托挂单：无新增（已挂或竞价回避）"
 
 
 # 每轨虚拟资金（等分买入）：主轨 7 万 / 卫星轨 2 万（对应今日执行页"主轨7成/卫星2成"的仓位约定）
@@ -693,8 +738,8 @@ def position_fill_check(today: str) -> str:
                 m = re.search(r"@ ([\d.]+)", msg)
                 fill = float(m.group(1)) if m else fill
                 c.execute("UPDATE positions SET status='open', buy_price=?, buy_ts=?,"
-                          " shares=?, buy_amount=? WHERE id=?",
-                          (fill, now, shares, round(shares * fill, 2), int(p["id"])))
+                          " shares=?, buy_amount=?, max_close=? WHERE id=?",
+                          (fill, now, shares, round(shares * fill, 2), fill, int(p["id"])))
                 n_fill += 1
 
                 # 注册 PriceMonitor 事件驱动监控
@@ -819,6 +864,15 @@ def position_close_check(today: str) -> str:
         return "无持仓"
     prices = _latest_prices(list(opens["code"]))
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # M3 逻辑腿要用的强弱三态（持仓股；失败则 None→到期即平，维持现状）
+    _states_map = None
+    try:
+        import signals as sig
+        codes_open = list(opens["code"])
+        panel = sig.get_panel_cached(codes_open, today, 800)
+        _states_map = sig.strength_states(codes_open, panel)
+    except Exception:
+        _states_map = None
     # 双账本一致性：柜台 ai 股数 应等于 经验库同代码 open 股数合计
     import broker
     try:
@@ -829,6 +883,7 @@ def position_close_check(today: str) -> str:
         broker_shares = {}
     open_sum = opens.groupby("code")["shares"].sum()
     n_close = n_skip = n_order = 0
+    _mc_updates = []  # M3 吊灯基准的滚动最高收盘，循环末统一写（防与柜台写锁自锁）
     with _conn() as c:
         for _, p in opens.iterrows():
             if str(p["buy_date"]) >= today:
@@ -860,9 +915,28 @@ def position_close_check(today: str) -> str:
                 # 止损：要务是成交——限价略低于触发价让半步（跌停板上broker会自动转挂等开板）
                 reason, limit_price = "止损", round(cur * 0.995, 2)
             else:
-                hd = _trade_days_between(str(p["buy_date"]), today)
-                if hd >= r["hold_days"]:
-                    reason, limit_price = "到期", round(cur * 0.995, 2)
+                # ---- M3 双腿：破位（跌破入场时登记的支撑区下沿）/ 吊灯止盈（入场最高点回撤）----
+                atr_e = p["atr_entry"] if "atr_entry" in p.index else None
+                sup_e = p["sup_lo_entry"] if "sup_lo_entry" in p.index else None
+                mc_old = p["max_close"] if "max_close" in p.index else None
+                mc = max(x for x in [cur, entry, mc_old] if x and pd.notna(x))  # 滚动最高（快照近似）
+                if mc != mc_old:
+                    _mc_updates.append((mc, int(p["id"])))  # 延迟到循环末统一写（防与柜台写锁自锁）
+                if atr_e is not None and pd.notna(atr_e) and sup_e is not None and pd.notna(sup_e):
+                    if cur < sup_e - 0.5 * atr_e:
+                        reason, limit_price = "破位(SR)", round(cur * 0.995, 2)
+                if not reason and atr_e is not None and pd.notna(atr_e) and mc and cur < mc - 3.0 * atr_e:
+                    reason, limit_price = "吊灯止盈", round(cur * 0.995, 2)
+                if not reason:
+                    hd = _trade_days_between(str(p["buy_date"]), today)
+                    if hd >= r["hold_days"]:
+                        # M3 逻辑腿：到期且转弱才平；仍强则顺延一次（防好票被日历赶下车）
+                        extend = int(p["extend_count"] or 0) if "extend_count" in p.index else 0
+                        if extend < 1 and _states_map is not None and _states_map.get(code, "weak") != "weak":
+                            c.execute("UPDATE positions SET extend_count=? WHERE id=?",
+                                      (extend + 1, int(p["id"])))
+                            continue  # 顺延一个持有期
+                        reason, limit_price = "到期", round(cur * 0.995, 2)
             if reason:
                 # 委托制（实盘规则）：触发只挂单，触及才成交；当日未成交收盘自动撤，次日重估重挂
                 msg = broker.place_order(code, "sell", limit_price, int(p["shares"] or 0),
@@ -892,6 +966,10 @@ def position_close_check(today: str) -> str:
                               (reason, int(mo.group(1)) if mo else None, int(p["id"])))
                     n_order += 1
                 # 其他结果（可卖不足等）→ 保持 open，下个周期再试
+
+        # M3 吊灯基准统一落库（所有柜台写完成后，避免写锁交叉）
+        for mc, pid in _mc_updates:
+            c.execute("UPDATE positions SET max_close=? WHERE id=?", (mc, pid))
 
     parts = [f"平仓 {n_close} 笔"] if n_close else ["持仓检查：无触发"]
     if n_order:
@@ -969,7 +1047,7 @@ def get_position_history(limit: int = 100) -> pd.DataFrame:
 
 
 def position_stats() -> dict:
-    """持仓汇总：胜率/平均收益率/累计收益率（按已平仓）+ 当前持仓数。"""
+    """持仓汇总：胜率/平均收益率/累计收益率（按已平仓）+ 当前持仓数 + 净值口径回撤（M1 修复）。"""
     with _conn() as c:
         row = c.execute(
             "SELECT COUNT(*), AVG(pnl_pct), SUM(pnl_pct),"
@@ -977,8 +1055,146 @@ def position_stats() -> dict:
         ).fetchone()
         n_open = c.execute("SELECT COUNT(*) FROM positions WHERE status='open'").fetchone()[0]
     n, avg, total, wins = row
-    return {"已平仓": n or 0, "胜率": (wins / n if n else None),
-            "平均收益率": avg, "累计收益率": total, "当前持仓": n_open}
+    out = {"已平仓": n or 0, "胜率": (wins / n if n else None),
+           "平均收益率": avg, "累计收益率": total, "当前持仓": n_open}
+    # 净值口径统计（account_nav_daily，2026-09-15 M1 起）——回撤不再是占位的 0
+    nv = nav_stats()
+    if nv:
+        out["最大回撤"] = -nv["最大回撤"]  # 存的是负数，展示用正数口径
+        out["当前净值"] = nv["当前净值"]
+        out["年化收益率"] = nv["年化收益率"]
+    return out
+
+
+# ---------------------------------------------------------------- 净值序列（M1 数据地基）
+_NAV_SCHEMA = """
+CREATE TABLE IF NOT EXISTS account_nav_daily(
+    date TEXT PRIMARY KEY, total_assets REAL, cash REAL, position_mv REAL,
+    nav REAL, daily_ret REAL, drawdown REAL, created_at TEXT);
+"""
+
+
+def rebuild_nav_history() -> int:
+    """回放法重建净值曲线：从首笔成交起，每日 前日持仓×当日收盘 + 当日现金流。
+    现金流水（fills）+ 外部出入金（cashflows 的 入金/初始入金/出金）都参与；
+    净值用时间加权（TWR）链式：r_t = (当日总资产 − 当日净入金)/昨日总资产 − 1，
+    nav_t = nav_{t−1}×(1+r_t)——入金不再虚增收益（2026-09-15 对账发现三次追加入金）。
+    全量重算幂等覆盖。返回写入天数。"""
+    import broker
+
+    with broker._conn() as c:
+        fills = pd.read_sql(
+            "SELECT date, ts, code, side, amount, fee, tax, shares FROM broker_fills ORDER BY ts", c)
+        cfs = pd.read_sql(
+            "SELECT ts, type, amount FROM broker_cashflows ORDER BY ts", c)
+    if fills.empty and cfs.empty:
+        return 0
+    first_day = min(fills["date"].min() if not fills.empty else "9999",
+                    cfs["ts"].str[:10].min() if not cfs.empty else "9999")
+
+    import datasource
+    with datasource._conn() as c:
+        px = pd.read_sql(
+            "SELECT code, date, close FROM market_daily WHERE source='ths_ifind' AND date>=?",
+            c, params=(first_day,))
+    cal = sorted(px["date"].unique())
+    close = px.pivot(index="date", columns="code", values="close").ffill()  # 停牌沿用前收
+
+    cash, hold = 0.0, {}
+    fills_by_date = {d: g for d, g in fills.groupby("date")} if not fills.empty else {}
+    ext_by_date = {}
+    if not cfs.empty:
+        cfs["d"] = cfs["ts"].str[:10]
+        # 只取外部出入金；买入/卖出腿在 fills 里已逐笔处理，不能再算（否则双重计数）
+        ext_types = ("入金", "初始入金", "出金")
+        for d, g in cfs[cfs["type"].isin(ext_types)].groupby("d"):
+            ext_by_date[d] = float(g["amount"].sum())  # 入金为正/出金为负（按表内符号惯例）
+
+    nav, peak_nav, prev_total = 1.0, 1.0, None
+    rows = []
+    now = datetime.now().strftime("%F %T")
+    for day in cal:
+        ext = ext_by_date.get(day, 0.0)
+        g = fills_by_date.get(day)
+        if g is not None:
+            for f in g.itertuples():
+                if f.side == "buy":
+                    cash -= (f.amount or 0) + (f.fee or 0)
+                    hold[f.code] = hold.get(f.code, 0) + (f.shares or 0)
+                else:
+                    cash += (f.amount or 0) - (f.fee or 0) - (f.tax or 0)
+                    hold[f.code] = hold.get(f.code, 0) - (f.shares or 0)
+        cash += ext  # 当日净入金
+        mv = 0.0
+        if day in close.index:
+            prow = close.loc[day]
+            for cd, sh in hold.items():
+                if sh > 0:
+                    p = prow.get(cd)
+                    if pd.notna(p):
+                        mv += p * sh
+        total = cash + mv
+        if prev_total:
+            r = (total - ext) / prev_total - 1
+            nav *= (1 + r)
+        peak_nav = max(peak_nav, nav)
+        dd = nav / peak_nav - 1
+        rows.append((day, round(total, 2), round(cash, 2), round(mv, 2),
+                     round(nav, 6), round(r if prev_total else 0.0, 6), round(dd, 6), now))
+        prev_total = total
+    with _conn() as c:
+        c.executescript(_NAV_SCHEMA)
+        c.execute("DELETE FROM account_nav_daily")
+        c.executemany("INSERT INTO account_nav_daily VALUES (?,?,?,?,?,?,?,?)", rows)
+    return len(rows)
+
+
+def snapshot_nav_today() -> str:
+    """每日收盘后落库当日净值（TWR 口径，与 rebuild 同源）。返回日期。"""
+    import broker
+    acc = broker.get_account()
+    total = acc.get("总资产", 0) or 0
+    cash = acc.get("可用资金", 0) or 0
+    mv = acc.get("持仓市值", 0) or 0
+    day = datetime.now().strftime("%Y-%m-%d")
+    with _conn() as c:
+        c.executescript(_NAV_SCHEMA)
+        prev = c.execute("SELECT total_assets, nav FROM account_nav_daily ORDER BY date DESC LIMIT 1").fetchone()
+        peak_nav = c.execute("SELECT MAX(nav) FROM account_nav_daily").fetchone()[0] or 1.0
+    with broker._conn() as c:
+        ext = c.execute("SELECT COALESCE(SUM(amount),0) FROM broker_cashflows WHERE ts LIKE ?"
+                        " AND type IN ('入金','初始入金','出金')",  # 买卖腿在 fills 里，不重复计
+                        (day + "%",)).fetchone()[0]
+    if prev and prev[0]:
+        r = (total - ext) / prev[0] - 1
+        nav = prev[1] * (1 + r)
+    else:
+        r, nav = 0.0, 1.0
+    peak_nav = max(peak_nav, nav)
+    dd = nav / peak_nav - 1
+    with _conn() as c:
+        c.execute("INSERT OR REPLACE INTO account_nav_daily VALUES (?,?,?,?,?,?,?,?)",
+                  (day, round(total, 2), round(cash, 2), round(mv, 2),
+                   round(nav, 6), round(r, 6), round(dd, 6), datetime.now().strftime("%F %T")))
+    return day
+
+
+def nav_stats() -> dict:
+    """净值统计：当前净值/最大回撤/最大回撤日期/年化（供战报与风控熔断）。"""
+    with _conn() as c:
+        c.executescript(_NAV_SCHEMA)
+        df = pd.read_sql("SELECT * FROM account_nav_daily ORDER BY date", c)
+    if df.empty:
+        return {}
+    mdd_i = df["drawdown"].idxmin()
+    n_days = len(df)
+    nav_last = float(df["nav"].iloc[-1])
+    ann = (nav_last ** (252 / n_days) - 1) if n_days > 1 else 0.0
+    return {"当前净值": nav_last,
+            "最大回撤": float(df["drawdown"].min()),
+            "最大回撤日期": df.loc[mdd_i, "date"],
+            "年化收益率": ann,
+            "净值天数": n_days}
 
 
 # ---------------------------------------------------------------- 每日战报

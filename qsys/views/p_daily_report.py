@@ -158,11 +158,14 @@ def _format_indices(data) -> str:
 def _format_stats(stats: dict) -> str:
     if not stats:
         return "无统计数据"
-    return f"""- 总交易笔数：{stats.get('总交易笔数', 0)}
-- 胜率：{_fmt_pct(stats.get('胜率', 0) * 100)}
-- 平均盈亏：{_fmt_pct(stats.get('平均盈亏', 0) * 100)}
-- 盈亏比：{stats.get('盈亏比', 0):.2f}
-- 最大回撤：{_fmt_pct(stats.get('最大回撤', 0) * 100)}"""
+    lines = [f"- 已平仓交易：{stats.get('已平仓', 0)} 笔 · 当前持仓 {stats.get('当前持仓', 0)} 只",
+             f"- 平仓胜率：{_fmt_pct((stats.get('胜率') or 0) * 100)}",
+             f"- 平均收益率：{_fmt_pct((stats.get('平均收益率') or 0) * 100)}"]
+    if stats.get("当前净值") is not None:
+        lines.append(f"- 当前净值：{stats['当前净值']:.4f}（年化 {_fmt_pct((stats.get('年化收益率') or 0) * 100)}）")
+    if stats.get("最大回撤") is not None:
+        lines.append(f"- 最大回撤：{_fmt_pct(stats['最大回撤'] * 100)}（净值口径，account_nav_daily）")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------- LLM 分析

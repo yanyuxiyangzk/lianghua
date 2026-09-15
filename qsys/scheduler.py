@@ -1537,6 +1537,21 @@ def job_ifind_financial_sync(pool_name: str = "沪深300", **_ignored) -> str:
     return msg
 
 
+def job_account_snapshot(**_ignored) -> str:
+    """账户净值每日快照（盘后 15:35）：总资产/现金/持仓市值/净值/回撤落库
+    account_nav_daily——回撤统计与组合熔断的真值源（M1）。"""
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5:
+        return "非交易日，跳过"
+    import experience
+    day = experience.snapshot_nav_today()
+    nv = experience.nav_stats()
+    return (f"{day} 净值快照完成：净值 {nv.get('当前净值', 0):.4f} · "
+            f"最大回撤 {(nv.get('最大回撤') or 0)*100:.2f}%")
+
+
 def job_daily_report(**_ignored) -> str:
     """每日量化战报自动生成（盘后 18:35）：数据采集 + DeepSeek 分析 + 落库。
     战报同时作为"昨日复盘证据"被 LoopEngine 的 LLM 假设生成引用（复盘→改进闭环）。"""
@@ -2222,6 +2237,8 @@ JOBS = {
                 "default": {"enabled": True, "hour": 18, "minute": 10, "params": {}}},
     "daily_report": {"name": "📊 每日量化战报（自动生成）", "func": job_daily_report,
                      "default": {"enabled": True, "hour": 18, "minute": 35, "params": {}}},
+    "account_snapshot": {"name": "📈 账户净值快照（回撤/熔断真值源）", "func": job_account_snapshot,
+                         "default": {"enabled": True, "hour": 15, "minute": 35, "params": {}}},
     "ifind_indexlist_sync": {"name": "📉 iFinD 指数列表同步（每日）", "func": job_ifind_indexlist_sync,
                              "default": {"enabled": True, "hour": 9, "minute": 5, "params": {}}},
     "ifind_realtime_sync": {"name": "📊 iFinD 实时快照同步（盘中）", "func": job_ifind_realtime_sync,

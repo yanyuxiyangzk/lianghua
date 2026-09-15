@@ -202,7 +202,8 @@ def render():
             st.session_state["pe_chosen"] = [n for n in st.session_state["pe_chosen"] if n in kept]
         chosen = st.multiselect("参与组合的因子（已按去冗余过滤，可再调）", kept,
                                 default=kept[:6], key="pe_chosen")
-        filters = st.multiselect("策略过滤器", list(sig.STRATEGY_FILTERS.keys()), default=["tradable"],
+        filters = st.multiselect("策略过滤器", list(sig.STRATEGY_FILTERS.keys()),
+                                 default=["tradable"],
                                  format_func=lambda k: sig.STRATEGY_FILTERS[k])
         top_n = st.slider("Top-N", 5, 50, 10)
         ind_cap = st.checkbox("行业分散（每行业≤2只，防单一赛道扎堆）", value=True)

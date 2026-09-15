@@ -628,7 +628,65 @@ STRATEGY_FILTERS = {
     "sr_near_support": "贴近强支撑（距最近支撑 ≤0.5 ATR）",
     "sr_hold_high": "支撑守住概率 ≥0.65（Density-SR）",
     "sr_resonant": "支撑多窗共振 ≥2（Density-SR）",
+    # 板块排除器 + 强弱三态（2026-09-15 战报整改 M2）：全部用 ≤panel 末日数据
+    "sector_not_outflow": "板块弱势排除（板块动量+资金流最差20%且净流出）",
+    "not_weak": "弱势股排除（强弱三态：行业超额+趋势质量；强弩之末在震荡市也拦）",
 }
+
+
+def strength_states(codes: list[str], panel: pd.DataFrame) -> dict:
+    """强弱三态分类器（M2/M3 共用）：返回 {code: "weak"|"hot"|"ok"}。
+
+    strength = 0.4·z(20日行业超额) + 0.3·z(60日行业超额) + 0.3·z(60日趋势R²)
+    weak: strength ≤ 池内30%分位；hot: ≥70%分位 且 过热>0.8；其余 ok。
+    全部用 panel ≤末日 的数据，无未来信息。
+    """
+    try:
+        import sectorflow
+        im = sectorflow.industry_map()
+        code2sec = dict(zip(im["code"], im["sector_name"])) if not im.empty else {}
+    except Exception:
+        code2sec = {}
+    gc = panel.groupby(level="instrument")["$close"]
+
+    def _ret_n(gs, n):
+        return gs.iloc[-1] / gs.iloc[-1 - n] - 1 if len(gs) > n else np.nan
+    ret5 = gc.apply(lambda s: _ret_n(s, 5))
+    ret20 = gc.apply(lambda s: _ret_n(s, 20))
+    ret60 = gc.apply(lambda s: _ret_n(s, 60))
+    sec_of = {c: code2sec.get(c) for c in ret20.index}
+    sec_ret20 = ret20.groupby(pd.Series(sec_of)).mean()
+    sec_ret60 = ret60.groupby(pd.Series(sec_of)).mean()
+    ex20 = ret20 - pd.Series({c: sec_ret20.get(sec_of.get(c)) for c in ret20.index})
+    ex60 = ret60 - pd.Series({c: sec_ret60.get(sec_of.get(c)) for c in ret60.index})
+
+    def _trend_r2(gs):
+        y = np.log(gs.dropna().iloc[-60:])
+        if len(y) < 30:
+            return np.nan
+        r = np.corrcoef(np.arange(len(y)), y)[0, 1]
+        return r * r
+    r2 = gc.apply(_trend_r2)
+
+    def _z(s):
+        return (s - s.mean()) / (s.std() + 1e-12)
+    strength = (0.4 * _z(ex20).fillna(0) + 0.3 * _z(ex60).fillna(0)
+                + 0.3 * _z(r2).fillna(0))
+    pos60 = compute_builtin(panel, "price_pos_60d")
+    pos60 = pos60.groupby(level="instrument").last() if len(pos60) else pos60
+    accel = (ret5 - ret20).clip(lower=0) / 0.1
+    overheat = pos60.clip(0, 1) * 0.5 + accel.clip(0, 1) * 0.5
+    th_lo, th_hi = strength.quantile(0.30), strength.quantile(0.70)
+    out = {}
+    for c in strength.index:
+        st_, oh = strength.get(c, 0.0), overheat.get(c, 0.0)
+        if pd.isna(st_) or st_ <= th_lo:
+            out[c] = "weak"
+        elif st_ >= th_hi and (pd.notna(oh) and oh > 0.8):
+            out[c] = "hot"
+        else:
+            out[c] = "ok"
+    return out
 
 
 def apply_filters(codes: list[str], panel: pd.DataFrame, filters: list[str]) -> list[str]:
@@ -668,6 +726,74 @@ def apply_filters(codes: list[str], panel: pd.DataFrame, filters: list[str]) -> 
         if sr_tbl is None or sr_tbl.empty:
             return []  # 无 SR 扫描数据时，SR 条件一律不满足（宁缺毋滥）
 
+    # 板块排除器 + 强弱三态（M2，2026-09-15 战报整改）
+    sec_block, weak_state = {}, {}
+    if "sector_not_outflow" in filters or "not_weak" in filters:
+        try:
+            import sectorflow
+            im = sectorflow.industry_map()
+            code2sec = dict(zip(im["code"], im["sector_name"])) if not im.empty else {}
+        except Exception:
+            code2sec = {}
+        gc = panel.groupby(level="instrument")["$close"]
+
+        def _ret_n(gs, n):
+            return gs.iloc[-1] / gs.iloc[-1 - n] - 1 if len(gs) > n else np.nan
+        c_last = gc.last()
+        # nth(-k) 保留原 MultiIndex，与 last() 相除会错位——逐组取标量返回值，得到 instrument 平索引
+        ret5 = gc.apply(lambda s: _ret_n(s, 5))
+        ret20 = gc.apply(lambda s: _ret_n(s, 20))
+        ret60 = gc.apply(lambda s: _ret_n(s, 60))
+        sec_of = {c: code2sec.get(c) for c in c_last.index}
+
+        # 板块动量（成员等权 5 日收益）+ 板块资金流（sector_daily 近5日净流入/成交额）
+        ret5_sec = ret5.groupby(pd.Series(sec_of)).mean()
+        flow_sign, flow_z = {}, {}
+        try:
+            import datasource
+            with datasource._conn() as c:
+                sdf = pd.read_sql(
+                    "SELECT date, sector_name, flow_net, total_amount FROM sector_daily "
+                    "WHERE date<=? ORDER BY date", c, params=(str(last_day)[:10],))
+            if not sdf.empty:
+                d5 = sdf["date"].unique()[-5:]
+                r5 = sdf[sdf["date"].isin(d5)].groupby("sector_name").agg(
+                    flow=("flow_net", "sum"), amt=("total_amount", "sum"))
+                fr = (r5["flow"] / r5["amt"].replace(0, np.nan)).dropna()
+                if len(fr) > 2:
+                    flow_z = ((fr - fr.mean()) / (fr.std() + 1e-12)).to_dict()
+                    flow_sign = r5["flow"].to_dict()
+        except Exception:
+            pass
+        sec_score = {}
+        for s in ret5_sec.index:
+            if s is None:
+                continue
+            z_mom = (ret5_sec[s] - ret5_sec.mean()) / (ret5_sec.std() + 1e-12)
+            sec_score[s] = z_mom + flow_z.get(s, 0.0)
+        q20 = pd.Series(sec_score).quantile(0.2) if sec_score else None
+        if q20 is not None:
+            for c in c_last.index:
+                s = sec_of.get(c)
+                sec_block[c] = bool(s in sec_score and sec_score[s] <= q20
+                                    and flow_sign.get(s, 0) < 0)
+
+        # 强弱三态（not_weak）：分类与 regime 门控分离——
+        # 牛市 regime：拦弱势（强者恒强）；非牛市（震荡/熊/反转）：拦"强弩之末"
+        # （2026-09-15 回放验证：反转市里拦弱势反而砍掉 +0.686%/期 的反转弹药）
+        regime_now = "unknown"
+        try:
+            from loopengine.regime import detect_regime
+            rg = detect_regime()
+            regime_now = rg.get("regime", "unknown")
+        except Exception:
+            pass
+        if "not_weak" in filters:
+            weak_state = strength_states(list(c_last.index), panel)
+        # 板块排除器仅牛市生效（非牛市里垫底板块恰是反转弹药库，拦了会砍左尾）
+        if regime_now != "bull":
+            sec_block = {}
+
     ok = []
     for c in codes:
         if c not in snap.index:
@@ -701,6 +827,16 @@ def apply_filters(codes: list[str], panel: pd.DataFrame, filters: list[str]) -> 
                     continue
                 if "sr_resonant" in filters and not (pd.notna(srow["resonance"])
                                                      and srow["resonance"] >= 2):
+                    continue
+            # 板块排除器 + 强弱三态（M2，regime 门控见上）
+            if "sector_not_outflow" in filters and sec_block.get(c, False):
+                continue
+            if "not_weak" in filters:
+                stt = weak_state.get(c, "ok")
+                if regime_now == "bull":
+                    if stt == "weak":    # 牛市拦弱势
+                        continue
+                elif stt == "hot":       # 非牛市拦强弩之末
                     continue
         except (TypeError, ValueError):
             continue

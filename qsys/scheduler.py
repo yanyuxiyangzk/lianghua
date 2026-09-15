@@ -216,8 +216,8 @@ def _top_packs(packs: dict, top_n: int = 3) -> list[tuple[str, dict]]:
     
     scored = []
     for name, pk in packs.items():
-        # 退化/归档包不参与投票（此前只查了 OOS 门槛，degraded 也能混进来）
-        if pk.get("status") in ("degraded", "archived"):
+        # 退化/归档/停赛包不参与投票（M6：paused 由 pack_lifecycle 每日评估写入）
+        if pk.get("status") in ("degraded", "archived", "paused"):
             continue
         v = str(pk.get("oos_winrate") or "")
         if not v.endswith("%"):
@@ -1537,6 +1537,97 @@ def job_ifind_financial_sync(pool_name: str = "沪深300", **_ignored) -> str:
     return msg
 
 
+def job_pack_lifecycle(**_ignored) -> str:
+    """策略包生命周期（盘后 21:50）：实盘胜率贝叶斯收缩评估，连败自动停赛（M6）。
+
+    shrunk_wr = (n_live×live_wr + 20×oos_wr)/(n_live+20)；n_live≥10 且 shrunk<0.35 → paused。
+    先验向 OOS 收缩防小样本误杀；paused 包不参与 _top_packs 投票；恢复需人工/重验。
+    """
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5:
+        return "非交易日，跳过"
+    import experience
+    import library
+
+    packs = library.list_strategies()
+    with experience._conn() as c:
+        live = {r[0]: (r[1], r[2]) for r in c.execute(
+            "SELECT pack_name, AVG(CASE WHEN pnl_pct>0 THEN 1.0 ELSE 0 END), COUNT(*) "
+            "FROM positions WHERE status='closed' AND pack_name IS NOT NULL AND pack_name!='' "
+            "GROUP BY pack_name").fetchall()}
+    paused = []
+    for name, pk in packs.items():
+        if pk.get("status") not in (None, "active"):
+            continue
+        n, wr = (0, None)
+        if name in live:
+            wr, n = live[name]
+            n = int(n)
+        if n < 10 or wr is None:
+            continue  # 样本不足不评判
+        oos = pk.get("oos_winrate")
+        try:
+            oos_wr = float(str(oos).rstrip("%")) / 100 if oos is not None else 0.5
+        except (ValueError, AttributeError):
+            oos_wr = 0.5
+        if oos_wr > 1.5:  # 兼容 0-1 与百分数两种存储
+            oos_wr /= 100
+        shrunk = (n * wr + 20 * oos_wr) / (n + 20)
+        if shrunk < 0.35:
+            library.set_strategy_status(name, "paused")
+            paused.append(f"{name}（实盘{n}笔 胜率{wr:.0%} 收缩后{shrunk:.0%}）")
+    return (f"策略包体检：{len(paused)} 个停赛——" + "、".join(paused)) if paused else \
+        "策略包体检：全部在营包通过（无停赛）"
+
+
+def job_factor_direction(**_ignored) -> str:
+    """因子方向状态机日更（21:45，体检之后）：读最新评分卡，磁滞更新方向。
+    （M5：反转需 符号翻转+|ICIR|>0.08+过冷却期，防震荡期 whipsaw 反复横跳）"""
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5:
+        return "非交易日，跳过"
+    import factor_eval as fe
+    with datasource._conn() as c:
+        sc = pd.read_sql(
+            "SELECT name AS 因子, ic_mean AS 'IC均值', icir AS 'ICIR', ic_winrate, top_winrate "
+            "FROM factor_scorecards WHERE eval_date=(SELECT MAX(eval_date) FROM factor_scorecards)", c)
+    if sc.empty:
+        return "无评分卡，跳过"
+    flipped = fe.update_direction_states(sc)
+    dm = fe.direction_map()
+    if flipped:
+        return f"方向状态机：{len(dm)} 因子在册 · 本次反转 {len(flipped)} 个：" + \
+               "、".join(f"{n}({'+' if o>0 else '-'}→{'+' if n_>0 else '-'})" for n, (o, n_) in flipped.items())
+    return f"方向状态机：{len(dm)} 因子在册 · 今日无反转（磁滞生效）"
+
+
+def job_risk_guard(**_ignored) -> str:
+    """组合风控评估（开盘前 09:20）：净值波动率 → 日 VaR + 熔断状态写
+    risk_state.json（开仓闸，position_open_from_picks 每日开盘前读取）。"""
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5:
+        return "非交易日，跳过"
+    import experience
+    today = now.strftime("%Y-%m-%d")
+    rk = experience.portfolio_risk()
+    if not rk.get("ok"):
+        return f"风控评估跳过：{rk.get('reason')}"
+    if rk["circuit"]:
+        experience._write_risk_flag(today, True,
+                                    f"净值回撤 {rk['dd_now']*100:.1f}% 触及熔断线 {rk['circuit_line']*100:.1f}%")
+        return (f"⛔ 熔断：净值回撤 {rk['dd_now']*100:.2f}% ≤ 熔断线 {rk['circuit_line']*100:.2f}%"
+                f"（σ={rk['sigma']*100:.2f}%），今日停止开新仓")
+    experience._write_risk_flag(today, False, "")
+    return (f"风控正常：净值 {rk['nav']:.4f} · 日VaR {rk['var_pct']*100:.2f}% · "
+            f"当前回撤 {rk['dd_now']*100:.2f}% · 熔断线 {rk['circuit_line']*100:.2f}%")
+
+
 def job_account_snapshot(**_ignored) -> str:
     """账户净值每日快照（盘后 15:35）：总资产/现金/持仓市值/净值/回撤落库
     account_nav_daily——回撤统计与组合熔断的真值源（M1）。"""
@@ -2239,6 +2330,12 @@ JOBS = {
                      "default": {"enabled": True, "hour": 18, "minute": 35, "params": {}}},
     "account_snapshot": {"name": "📈 账户净值快照（回撤/熔断真值源）", "func": job_account_snapshot,
                          "default": {"enabled": True, "hour": 15, "minute": 35, "params": {}}},
+    "risk_guard": {"name": "🛡 组合风控评估（开盘前）", "func": job_risk_guard,
+                   "default": {"enabled": True, "hour": 9, "minute": 20, "params": {}}},
+    "factor_direction": {"name": "🧭 因子方向状态机（磁滞日更）", "func": job_factor_direction,
+                         "default": {"enabled": True, "hour": 21, "minute": 45, "params": {}}},
+    "pack_lifecycle": {"name": "📦 策略包生命周期（连败停赛）", "func": job_pack_lifecycle,
+                       "default": {"enabled": True, "hour": 21, "minute": 50, "params": {}}},
     "ifind_indexlist_sync": {"name": "📉 iFinD 指数列表同步（每日）", "func": job_ifind_indexlist_sync,
                              "default": {"enabled": True, "hour": 9, "minute": 5, "params": {}}},
     "ifind_realtime_sync": {"name": "📊 iFinD 实时快照同步（盘中）", "func": job_ifind_realtime_sync,

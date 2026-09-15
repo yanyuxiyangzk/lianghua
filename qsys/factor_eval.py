@@ -829,14 +829,98 @@ def dedup_factors(corr: pd.DataFrame, scorecard: pd.DataFrame, threshold: float 
 
 
 # ---------------------------------------------------------------- 加权
+# ---------------------------------------------------------------- 因子方向状态机（M5：磁滞防抖）
+_DIR_SCHEMA = """
+CREATE TABLE IF NOT EXISTS factor_direction(
+    name TEXT PRIMARY KEY, direction INTEGER NOT NULL,
+    last_flip TEXT, cooldown_until TEXT, updated_at TEXT);
+"""
+DIR_FLIP_ICIR = 0.08   # |ICIR| 超此值才允许反转（防噪声翻转）
+DIR_COOLDOWN_DAYS = 10  # 反转后冷却交易日数
+
+
+def direction_map() -> dict:
+    """读因子方向状态机：{name: ±1}。无记录返回空 dict（调用方回退到 IC 符号）。"""
+    import sqlite3
+    from common import DATA_DIR
+    try:
+        with sqlite3.connect(str(DATA_DIR / "market.db"), timeout=30) as c:
+            c.executescript(_DIR_SCHEMA)
+            return {r[0]: r[1] for r in c.execute("SELECT name, direction FROM factor_direction")}
+    except Exception:
+        return {}
+
+
+def update_direction_states(scorecard: pd.DataFrame) -> dict:
+    """每日体检后更新方向状态机（磁滞：符号翻转 + |ICIR|>阈值 + 冷却期 三重闸门）。
+
+    返回 {name: (old, new)} 本次发生反转的因子。"""
+    import sqlite3
+    from datetime import datetime
+    from common import DATA_DIR, trade_day_offset
+
+    if scorecard.empty or "IC均值" not in scorecard.columns:
+        return {}
+    today = datetime.now().strftime("%Y-%m-%d")
+    sc = scorecard.set_index("因子") if "因子" in scorecard.columns else scorecard
+    cur = direction_map()
+    with sqlite3.connect(str(DATA_DIR / "market.db"), timeout=30) as c:
+        c.executescript(_DIR_SCHEMA)
+        meta = {r[0]: (r[1], r[2]) for r in c.execute("SELECT name, last_flip, cooldown_until FROM factor_direction")}
+        flipped = {}
+        for name in sc.index:
+            ic = sc.loc[name, "IC均值"]
+            icir = sc.loc[name, "ICIR"] if "ICIR" in sc.columns else 0.0
+            if not (np.isfinite(ic) and np.isfinite(icir)):
+                continue
+            sign = 1 if ic >= 0 else -1
+            old_dir = cur.get(name)
+            if old_dir is None:
+                c.execute("INSERT OR REPLACE INTO factor_direction VALUES (?,?,?,?,?)",
+                          (name, sign, None, None, datetime.now().strftime("%F %T")))
+                continue
+            if sign != old_dir and abs(icir) > DIR_FLIP_ICIR:
+                _, cool_until = meta.get(name, (None, None))
+                if cool_until and today <= cool_until:
+                    continue  # 冷却期内不反转
+                cool_until = trade_day_offset(today, DIR_COOLDOWN_DAYS)
+                c.execute("INSERT OR REPLACE INTO factor_direction VALUES (?,?,?,?,?)",
+                          (name, sign, today, cool_until, datetime.now().strftime("%F %T")))
+                flipped[name] = (old_dir, sign)
+    return flipped
+
+
+# ---------------------------------------------------------------- 族级多重检验（M5）
+def apply_family_fdr(scorecard: pd.DataFrame, family_map: dict | None = None) -> pd.DataFrame:
+    """族级 FDR：族内变体高度相关时，逐因子 BH 会放水。按机制族取 |IC| 最大代表，
+    族内成员继承代表因子的 q 值（保守）。新增 family/family_q 列，不改原 q_value。"""
+    if scorecard.empty or "q_value" not in scorecard.columns:
+        return scorecard
+    if "因子" not in scorecard.columns or not family_map:
+        return scorecard
+    sc = scorecard.copy()
+    fam_best = {}
+    for _, r in sc.iterrows():
+        fam = family_map.get(r["因子"], "其他")
+        ic = abs(r.get("IC均值", 0) or 0)
+        if fam not in fam_best or ic > fam_best[fam][0]:
+            fam_best[fam] = (ic, r.get("q_value", 1.0))
+    sc["family"] = sc["因子"].map(lambda n: family_map.get(n, "其他"))
+    sc["family_q"] = sc["family"].map(lambda f: fam_best.get(f, (0, 1.0))[1])
+    return sc
+
+
 def compute_weights(scorecard: pd.DataFrame, method: str, names: list[str],
                     win_col: str = "Top组胜率") -> dict:
     """返回 {因子名: (权重, 方向±1)}。方向自动修正：IC 均值为负 → 负向。
-    win_col 指定胜率来源列（多周期标准下用所选持有期的胜率，如 "1日胜率"）。"""
+    win_col 指定胜率来源列（多周期标准下用所选持有期的胜率，如 "1日胜率"）。
+
+    M5：方向优先读状态机（磁滞防抖），无记录才回退当日 IC 符号。"""
     sc = scorecard.set_index("因子")
     if win_col not in sc.columns:
         win_col = "Top组胜率"
-    direction = {n: (1 if sc.loc[n, "IC均值"] >= 0 else -1) for n in names}
+    dmap = direction_map()
+    direction = {n: dmap.get(n) or (1 if sc.loc[n, "IC均值"] >= 0 else -1) for n in names}
     raw = {}
     for n in names:
         icir = abs(sc.loc[n, "ICIR"]) if np.isfinite(sc.loc[n, "ICIR"]) else 0

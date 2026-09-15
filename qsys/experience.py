@@ -601,6 +601,10 @@ def position_open_from_picks(trade_date: str, today: str) -> str:
     picks = picks_on_date(trade_date)
     if picks.empty:
         return "无名单可委托"
+    # M4 风控熔断：当日净值回撤触及熔断线 → 停止开新仓
+    halt, halt_why = risk_halt_today(today)
+    if halt:
+        return f"⛔ 风控熔断生效（{halt_why}）：今日停止开新仓"
     # 竞价回避名单
     avoid: set = set()
     af = SIGNALS_DIR / f"auction_{today}.parquet"
@@ -728,6 +732,40 @@ def position_fill_check(today: str) -> str:
                 top_n = c.execute("SELECT top_n FROM picks WHERE id=?",
                                   (int(p["pick_id"]),)).fetchone()
                 per = _budget_per_stock(p["source"], top_n[0] if top_n else 10)
+                # M4 波动率倒数 sizing：高波动票预算收缩（clip 0.4×~1.2×，基准 2% 日波动）
+                atr_pct = atr_pct_of(p["code"], today)
+                if atr_pct:
+                    per = per * float(np.clip(0.02 / atr_pct, 0.4, 1.2))
+                # M7 置信度乘数：该票在名单内的分位 → 校准胜率 → 乘数（0.3~1.3）
+                try:
+                    sc_row = c.execute("SELECT score FROM pick_items WHERE pick_id=? AND code=?",
+                                       (int(p["pick_id"]), p["code"])).fetchone()
+                    if sc_row and sc_row[0] is not None:
+                        pct_row = c.execute(
+                            "SELECT COUNT(*) FILTER (WHERE score<=?), COUNT(*) FROM pick_items WHERE pick_id=?",
+                            (sc_row[0], int(p["pick_id"]))).fetchone()
+                        pct = pct_row[0] / pct_row[1] if pct_row and pct_row[1] else None
+                        per = per * conviction_multiplier(calibrated_pwin(pct))
+                except Exception:
+                    pass
+                # M7 单票集中度上限：委托金额 ≤ 总资产 15%
+                try:
+                    import broker as _bk
+                    _total = _bk.get_account().get("总资产", 0) or 0
+                    if _total > 0:
+                        per = min(per, 0.15 * _total)
+                except Exception:
+                    pass
+                # M7 持仓数上限：open+pending ≥8 不再开新仓（防过散）
+                try:
+                    n_open_pending = c.execute(
+                        "SELECT COUNT(DISTINCT code) FROM positions WHERE status IN ('open','pending')").fetchone()[0]
+                    if n_open_pending >= 8 and p["code"] not in {
+                        r[0] for r in c.execute(
+                            "SELECT DISTINCT code FROM positions WHERE status IN ('open','pending')").fetchall()}:
+                        continue
+                except Exception:
+                    pass
                 shares = int(per // fill // 100 * 100)
                 if shares <= 0:
                     continue  # 预算买不起一手就不开（实盘如此：100股整手是硬约束）
@@ -907,6 +945,11 @@ def position_close_check(today: str) -> str:
                 continue
             entry = p["buy_price"]
             tp, sl = entry * (1 + r["take_profit"]), entry * (1 + r["stop_loss"])
+            # M4 自适应止损：有入场 ATR 上下文的仓位，止损收紧到 1.5×ATR%（夹取 [-8%,-2%]）
+            atr_e0 = p["atr_entry"] if "atr_entry" in p.index else None
+            if atr_e0 is not None and pd.notna(atr_e0) and entry:
+                sl_dyn = -min(0.08, max(0.02, 1.5 * atr_e0 / entry))
+                sl = max(sl, entry * (1 + sl_dyn))  # 取更紧（更高）者，更早止血
             reason = limit_price = None
             if cur >= tp:
                 # 止盈：挂止盈价，价格再次触及才成交（回落不成交=继续持有，实盘如此）
@@ -1195,6 +1238,114 @@ def nav_stats() -> dict:
             "最大回撤日期": df.loc[mdd_i, "date"],
             "年化收益率": ann,
             "净值天数": n_days}
+
+
+# ---------------------------------------------------------------- 组合风控（M4）
+_RISK_FLAG = DATA_DIR / "risk_state.json"  # 当日风控状态（开仓闸）
+
+def portfolio_risk() -> dict:
+    """组合风控评估（M4）：账户净值序列波动率 → 日 VaR 近似 + 熔断状态。
+
+    口径：σ = 净值日收益 20 日标准差（含真实持仓结构信息，比 60 日个股全相关矩阵稳——
+    A 股个股两两全相关噪声大、伪相关多）；日 VaR(95%) ≈ 1.65×σ×总资产；
+    熔断线 = −2×σ×√5（约当 95% 置信单周极端损失）。
+    """
+    import broker
+    nv = nav_stats()
+    if not nv or nv["净值天数"] < 5:
+        return {"ok": False, "reason": "净值序列不足 5 日"}
+    with _conn() as c:
+        df = pd.read_sql("SELECT date, daily_ret, drawdown FROM account_nav_daily ORDER BY date", c)
+    acc = broker.get_account()
+    total = acc.get("总资产", 0) or 0
+    sigma = float(df["daily_ret"].iloc[-20:].std())
+    var_day = 1.65 * sigma * total
+    circuit_line = -2 * sigma * np.sqrt(5)
+    dd_now = float(df["drawdown"].iloc[-1])
+    return {"ok": True, "sigma": sigma, "var_day": var_day,
+            "var_pct": 1.65 * sigma, "circuit_line": circuit_line,
+            "dd_now": dd_now, "circuit": bool(dd_now <= circuit_line),
+            "nav": nv["当前净值"], "mdd": nv["最大回撤"]}
+
+
+def risk_halt_today(today: str) -> tuple[bool, str]:
+    """当日是否熔断停止开新仓（读 risk_state.json；当日无记录则不熔断）。"""
+    try:
+        st_ = json.loads(_RISK_FLAG.read_text())
+        if st_.get("date") == today and st_.get("halt"):
+            return True, st_.get("reason", "")
+    except Exception:
+        pass
+    return False, ""
+
+
+def _write_risk_flag(today: str, halt: bool, reason: str):
+    _RISK_FLAG.write_text(json.dumps(
+        {"date": today, "halt": halt, "reason": reason,
+         "ts": datetime.now().strftime("%F %T")}, ensure_ascii=False))
+
+
+def atr_pct_of(code: str, end: str, n: int = 14) -> float | None:
+    """个股的 ATR 占价比（波动率代理）：Wilder ATR(n)/最新收盘。无数据返回 None。"""
+    import datasource
+    with datasource._conn() as c:
+        df = pd.read_sql(
+            "SELECT date, high, low, close FROM market_daily WHERE source='ths_ifind' "
+            "AND code=? AND date<=? ORDER BY date DESC LIMIT ?", c, params=(code, end, n + 40))
+    if len(df) < n + 2:
+        return None
+    df = df.iloc[::-1].reset_index(drop=True)
+    h, l, pc = df["high"], df["low"], df["close"].shift(1)
+    tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1 / n, adjust=False).mean().iloc[-1]
+    close = df["close"].iloc[-1]
+    return float(atr / close) if close > 0 else None
+
+
+# ---------------------------------------------------------------- 分数→胜率校准（M7）
+def score_winrate_calibration() -> dict:
+    """picks 综合分（包内分位归一）→ 实盘胜率的单调校准曲线。
+
+    综合分是序数不是概率，必须先校准再进仓位公式（M7 评审意见）。
+    用 trades 表实盘结果拟合；样本 <30 返回空（调用方回退 0.5 中性）。"""
+    with _conn() as c:
+        df = pd.read_sql(
+            """SELECT pi.pick_id, pi.score, t.pnl_pct FROM pick_items pi
+               JOIN trades t ON t.pick_id=pi.pick_id AND t.code=pi.code
+               WHERE t.pnl_pct IS NOT NULL AND pi.score IS NOT NULL""", c)
+    if len(df) < 30:
+        return {"n": len(df), "curve": []}
+    # 包内分位归一（跨包可比）
+    df["pct"] = df.groupby("pick_id")["score"].rank(pct=True)
+    df["win"] = df["pnl_pct"] > 0
+    df = df.sort_values("pct")
+    # 十分桶胜率 + 单调化（累积最大，近似 isotonic）
+    df["bucket"] = pd.cut(df["pct"], bins=10, labels=False, include_lowest=True)
+    curve = []
+    best = 0.0
+    for b, g in df.groupby("bucket"):
+        wr = float(g["win"].mean())
+        best = max(best, wr)
+        curve.append(((b + 0.5) / 10, best))
+    return {"n": len(df), "curve": curve}
+
+
+def calibrated_pwin(pct: float | None) -> float:
+    """包内分位 → 校准胜率；无曲线/无分位回退 0.5 中性。"""
+    if pct is None:
+        return 0.5
+    cal = score_winrate_calibration()
+    if not cal["curve"]:
+        return 0.5
+    for mid, wr in cal["curve"]:
+        if pct <= mid:
+            return wr
+    return cal["curve"][-1][1]
+
+
+def conviction_multiplier(pwin: float) -> float:
+    """校准胜率 → 仓位置信乘数：0.5→1.0，0.35→0.3，≥0.75→1.3（封顶）。"""
+    return float(np.clip((pwin - 0.35) / 0.3, 0.3, 1.3))
 
 
 # ---------------------------------------------------------------- 每日战报

@@ -294,6 +294,32 @@ def _migrate(c):
 
 
 # ---------------------------------------------------------------- 因子注册表
+def set_strategy_status(name: str, status: str) -> bool:
+    """设置策略包状态（active/paused/retired）——策略生命周期治理用（M6）。"""
+    with _lconn() as c:
+        cur = c.execute("UPDATE strategies SET status=? WHERE name=?", (status, name))
+        return cur.rowcount > 0
+
+
+def family_crowding() -> dict:
+    """机制族拥挤度：Σ 启用中策略包内该族因子的权重绝对值合计（按包数归一）。
+    高拥挤族的新因子入库门槛应提高（同质交易反噬风险）——M5。"""
+    reg = get_factor_registry()
+    fam_map = dict(zip(reg["name"], reg["family"])) if not reg.empty and "family" in reg.columns else {}
+    crowd: dict[str, float] = {}
+    n_active = 0
+    for name, pk in list_strategies().items():
+        if pk.get("status") not in (None, "active"):
+            continue
+        n_active += 1
+        for f in pk.get("factors", []):
+            fam = fam_map.get(f.get("name"), "其他")
+            crowd[fam] = crowd.get(fam, 0.0) + abs(f.get("weight", 0) or 0)
+    if n_active:
+        crowd = {k: v / n_active for k, v in crowd.items()}
+    return dict(sorted(crowd.items(), key=lambda kv: -kv[1]))
+
+
 def delete_factor(name: str) -> bool:
     """从注册表删除因子（在线因子实验室的删除入口）。"""
     with _lconn() as c:

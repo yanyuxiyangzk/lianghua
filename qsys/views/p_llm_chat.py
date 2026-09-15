@@ -122,10 +122,13 @@ def _build_context(code: str) -> tuple[str, dict]:
 
     # 5) 龙虎榜
     with datasource._conn() as c:
+        lhb_cnt = c.execute(
+            "SELECT COUNT(*) FROM lhb_daily WHERE code=? AND date>=date('now','-30 day')",
+            (code,)).fetchone()[0]
         lhb = pd.read_sql("SELECT date, net_buy FROM lhb_daily WHERE code=? ORDER BY date DESC LIMIT 3",
                           c, params=(code,))
     if not lhb.empty:
-        S.append(f"【龙虎榜】近30天上榜{len(lhb)}次，最近 {lhb.iloc[0]['date']} 净买额"
+        S.append(f"【龙虎榜】近30天上榜{lhb_cnt}次，最近 {lhb.iloc[0]['date']} 净买额"
                  f" {(lhb.iloc[0]['net_buy'] or 0)/1e8:+.2f}亿")
     else:
         S.append("【龙虎榜】近30天未上榜（未覆盖=无数据，与未上榜是两回事，此处为后者）")

@@ -1202,8 +1202,10 @@ def snapshot_nav_today() -> str:
     day = datetime.now().strftime("%Y-%m-%d")
     with _conn() as c:
         c.executescript(_NAV_SCHEMA)
-        prev = c.execute("SELECT total_assets, nav FROM account_nav_daily ORDER BY date DESC LIMIT 1").fetchone()
-        peak_nav = c.execute("SELECT MAX(nav) FROM account_nav_daily").fetchone()[0] or 1.0
+        # prev 必须是"今日之前"的最后净值——同日已存在回放行时拿来当基准会把日收益算成 0
+        prev = c.execute("SELECT total_assets, nav FROM account_nav_daily WHERE date<? "
+                         "ORDER BY date DESC LIMIT 1", (day,)).fetchone()
+        peak_nav = c.execute("SELECT MAX(nav) FROM account_nav_daily WHERE date<?", (day,)).fetchone()[0] or 1.0
     with broker._conn() as c:
         ext = c.execute("SELECT COALESCE(SUM(amount),0) FROM broker_cashflows WHERE ts LIKE ?"
                         " AND type IN ('入金','初始入金','出金')",  # 买卖腿在 fills 里，不重复计
@@ -1262,9 +1264,11 @@ def portfolio_risk() -> dict:
     var_day = 1.65 * sigma * total
     circuit_line = -2 * sigma * np.sqrt(5)
     dd_now = float(df["drawdown"].iloc[-1])
+    # σ 地板：净值近乎不动的账户（新建/空仓）熔断线≈0 会永久停开仓——无波动信号不熔断
+    circuit = bool(dd_now <= circuit_line) if sigma >= 0.002 else False
     return {"ok": True, "sigma": sigma, "var_day": var_day,
             "var_pct": 1.65 * sigma, "circuit_line": circuit_line,
-            "dd_now": dd_now, "circuit": bool(dd_now <= circuit_line),
+            "dd_now": dd_now, "circuit": circuit,
             "nav": nv["当前净值"], "mdd": nv["最大回撤"]}
 
 

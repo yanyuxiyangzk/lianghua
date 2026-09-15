@@ -52,18 +52,20 @@ def _load_fundflow_from_db() -> pd.DataFrame:
                 c)
         if df.empty:
             return df
+        # 先并名称再改列名（原顺序相反：rename 后 on="code" 必抛 KeyError，
+        # 一直走 except 兜底 → 名称列显示成代码）
+        try:
+            names = pd.read_sql("SELECT code, name FROM ifind_stocklist", c)
+            df = df.merge(names, on="code", how="left")
+            df.rename(columns={"name": "名称"}, inplace=True)
+        except Exception:
+            df["名称"] = df["code"]
         df.rename(columns={
             "code": "代码", "date": "日期",
             "main_net": "净额(元)", "super_net": "超大单流入(元)",
             "big_net": "大单流入(元)", "mid_net": "中单流入(元)",
             "small_net": "小单流入(元)",
         }, inplace=True)
-        try:
-            names = pd.read_sql("SELECT code, name FROM ifind_stocklist", c)
-            df = df.merge(names, on="code", how="left")
-            df.rename(columns={"name": "名称"}, inplace=True)
-        except Exception:
-            df["名称"] = df["代码"]
         return df
     except Exception:
         return pd.DataFrame()
@@ -97,6 +99,77 @@ def _load_sector_fundflow_from_db(category: str = "同花顺行业") -> pd.DataF
     except Exception:
         pass
     return pd.DataFrame()
+
+
+# ---------------------------------------------------------------- 问财聚合（主通道） ----------------------------------------------------------------
+
+# 概念标签里的泛化标签（非主题概念，聚合时剔除）
+_SECTOR_TAG_STOP = {"融资融券", "转融券标的", "深股通", "沪股通", "MSCI概念",
+                    "富时罗素", "富时罗素概念", "标普道琼斯A股", "同花顺漂亮100"}
+
+
+def _agg_sector_flow(df: pd.DataFrame, tag_col: str, flow_col: str,
+                     chg_col: str, amt_col: str, split: bool = False) -> pd.DataFrame:
+    """个股级资金流向按归属标签聚合为板块资金流。"""
+    d = df.copy()
+    if split:
+        d[tag_col] = d[tag_col].astype(str).str.split(r"[;；]")  # 问财标签混用中英文分号
+        d = d.explode(tag_col)
+        d[tag_col] = d[tag_col].str.strip()
+        d = d[~d[tag_col].isin(_SECTOR_TAG_STOP)]
+    d = d[d[tag_col].notna() & (d[tag_col].astype(str).str.len() > 0)
+          & (d[tag_col] != "不详")]  # 剔除未分类（证监会"不详"等）
+    if d.empty:
+        return pd.DataFrame()
+    d = d.assign(_up=d[chg_col] > 0, _down=d[chg_col] < 0)
+    out = (d.groupby(tag_col)
+            .agg(净流入=(flow_col, "sum"), 涨跌幅=(chg_col, "mean"), 成交额=(amt_col, "sum"),
+                 上涨家数=("_up", "sum"), 下跌家数=("_down", "sum"), 成分股数=(flow_col, "size"))
+            .reset_index().rename(columns={tag_col: "板块"})
+            .sort_values("净流入", ascending=False))
+    return out
+
+
+@st.cache_data(ttl=600, show_spinner="加载板块资金流（问财聚合）…")
+def _fetch_wencai_sector_flow() -> dict:
+    """问财个股资金流向 + 归属标签（概念/省份/证监会行业）→ 三类板块资金流聚合。
+
+    替代 10jqka HTML 爬取（2026-09 起 401 反爬盾不可用）。问财 token 通道、不落库。
+    """
+    from datasource import _conn, _ths_http
+    # 用库内最新交易日，保证周末/假期也能拿到最近有效数据
+    try:
+        with _conn() as c:
+            latest = c.execute("SELECT MAX(date) FROM stock_fundflow_daily").fetchone()[0]
+    except Exception:
+        latest = None
+    day = (latest or datetime.now().strftime("%Y-%m-%d")).replace("-", "")
+    q = f"{day} 资金流向 所属概念 省份 所属证监会行业 涨跌幅 成交额"
+    try:
+        df, _res, err = _ths_http("smart_stock_picking", {"searchstring": q, "searchtype": "block"})
+    except Exception:
+        return {}
+    if err not in (0, None) or df is None or df.empty:
+        return {}
+
+    def _col(sub):
+        return next((c for c in df.columns if sub in str(c)), None)
+
+    flow_col, chg_col, amt_col = _col("资金流向"), _col("涨跌幅"), _col("成交额")
+    con_col, reg_col, csrc_col = _col("所属概念"), _col("省份"), _col("证监会行业")
+    if not all([flow_col, chg_col, amt_col]):
+        return {}
+    for c in (flow_col, chg_col, amt_col):
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    out = {}
+    if con_col:
+        out["概念板块"] = _agg_sector_flow(df, con_col, flow_col, chg_col, amt_col, split=True).head(100)
+    if reg_col:
+        out["地域板块"] = _agg_sector_flow(df, reg_col, flow_col, chg_col, amt_col)
+    if csrc_col:
+        out["证监会板块"] = _agg_sector_flow(df, csrc_col, flow_col, chg_col, amt_col)
+    return out
 
 
 # ---------------------------------------------------------------- HTML 爬取（fallback） ----------------------------------------------------------------
@@ -378,18 +451,33 @@ def render():
                 _render_sector_tab(df_ind, "同花顺行业板块资金流", "ind_html")
 
         with t_con:
-            with st.spinner("加载概念板块数据…"):
-                df_con = _fetch_concept_fundflow()
+            df_con = _fetch_wencai_sector_flow().get("概念板块", pd.DataFrame())
+            if df_con.empty:
+                st.info("问财聚合不可用，尝试同花顺公开页面…")
+                with st.spinner("加载概念板块数据…"):
+                    df_con = _fetch_concept_fundflow()
+            else:
+                st.caption("数据源：问财个股资金流向按所属概念聚合")
             _render_sector_tab(df_con, "同花顺概念板块资金流", "con")
 
         with t_reg:
-            with st.spinner("加载地域板块数据…"):
-                df_reg = _fetch_regional_fundflow()
+            df_reg = _fetch_wencai_sector_flow().get("地域板块", pd.DataFrame())
+            if df_reg.empty:
+                st.info("问财聚合不可用，尝试同花顺公开页面…")
+                with st.spinner("加载地域板块数据…"):
+                    df_reg = _fetch_regional_fundflow()
+            else:
+                st.caption("数据源：问财个股资金流向按所属省份聚合")
             _render_sector_tab(df_reg, "同花顺地域板块资金流", "reg")
 
         with t_csrc:
-            with st.spinner("加载证监会板块数据…"):
-                df_csrc = _fetch_csrc_fundflow()
+            df_csrc = _fetch_wencai_sector_flow().get("证监会板块", pd.DataFrame())
+            if df_csrc.empty:
+                st.info("问财聚合不可用，尝试同花顺公开页面…")
+                with st.spinner("加载证监会板块数据…"):
+                    df_csrc = _fetch_csrc_fundflow()
+            else:
+                st.caption("数据源：问财个股资金流向按证监会行业聚合")
             _render_sector_tab(df_csrc, "同花顺证监会板块资金流", "csrc")
 
 

@@ -581,10 +581,24 @@ def _page_financial_local():
         st.subheader("📊 财务报表查询", anchor=False)
         st.caption("查询本地数据库中的财务报表数据（由定时任务自动同步）")
 
-        with st.expander("⚙️ 查询参数", expanded=False):
+        # Show available codes
+        try:
+            with datasource._conn() as _c:
+                _n_codes = _c.execute(
+                    "SELECT COUNT(DISTINCT code) FROM ifind_financial").fetchone()[0]
+                _latest = _c.execute(
+                    "SELECT MAX(report_date) FROM ifind_financial").fetchone()[0]
+                if _n_codes:
+                    st.info(f"已入库 {_n_codes} 只股票（最新报告期 {_latest}）")
+                else:
+                    st.warning("数据库中暂无财务数据，请等待定时任务同步完成")
+        except Exception:
+            pass
+
+        with st.expander("⚙️ 查询参数", expanded=True):
             c1, c2 = st.columns(2)
-            codes_input = c1.text_input("股票代码", "600519", key="fin_codes",
-                                         help="多只股票用逗号分隔，如 600519,000858")
+            codes_input = c1.text_input("股票代码", "600000", key="fin_codes",
+                                         help="多只股票用逗号分隔，如 600000,600519")
             stmt_type = c2.selectbox("报表类型",
                                      ["利润表", "资产负债表", "现金流量表", "财务指标", "全部"],
                                      key="fin_stmt")

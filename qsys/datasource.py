@@ -812,6 +812,28 @@ FINANCIAL_RATIOS = {
 }
 
 
+# HTTP date_sequence 通道不认 FINANCIAL_INDICATORS 的中文指标码（整批报 -4210），
+# 且财报指标必须 Interval=Q（D 频 + Fill=Previous 在非报告期全 NaN，写库被 notna 过滤成 0 行）。
+# 以下为 2026-09-14 实测有效（err=0 且非空）的拼音指标码；资产负债表/财务指标的
+# HTTP 码暂未找到有效项，那两类仍只能靠 SDK 通道。
+FIN_HTTP_CODES = {
+    "利润表": {
+        "ths_revenue_stock": "营业收入",
+        "ths_operating_cost_stock": "营业成本",
+        "ths_op_stock": "营业利润",
+        "ths_np_stock": "净利润",
+        "ths_np_atoopc_stock": "归母净利润",
+        "ths_gross_profit_stock": "毛利",
+        "ths_basic_eps_stock": "基本每股收益",
+    },
+    "现金流量表": {
+        "ths_ncf_from_oa_stock": "经营现金流净额",
+        "ths_ncf_from_ia_stock": "投资现金流净额",
+        "ths_ncf_from_fa_stock": "筹资现金流净额",
+    },
+}
+
+
 def ths_financial_statement(codes: list[str], statement_type: str = "利润表",
                             start: str = "", end: str = "") -> tuple:
     """获取财务报表数据（三大报表 + 财务指标）。
@@ -839,12 +861,20 @@ def ths_financial_statement(codes: list[str], statement_type: str = "利润表",
     end = end or today
 
     # 使用 THS_DateSerial 获取时序财务数据
+    # SDK 用中文指标码；HTTP 通道换拼音码 + Interval=Q（见 FIN_HTTP_CODES 注释）
+    http_inds = FIN_HTTP_CODES.get(statement_type, {})
+
+    def _http():
+        if not http_inds:
+            return pd.DataFrame(), None, f"HTTP 通道暂不支持{statement_type}（需 SDK 通道）"
+        return _ths_http("date_sequence",
+                         {"codes": codes_s, "startdate": start, "enddate": end,
+                          "functionpara": {"Days": "Tradedays", "Fill": "Previous", "Interval": "Q"},
+                          "indipara": [{"indicator": i, "indiparams": [""]} for i in http_inds]})
+
     return _sdk_or_http(
         lambda: ths_call("THS_DateSerial", codes_s, indicators, "", "", start, end),
-        lambda: _ths_http("date_sequence",
-                          {"codes": codes_s, "startdate": start, "enddate": end,
-                           "functionpara": {"Days": "Tradedays", "Fill": "Previous", "Interval": "D"},
-                           "indipara": [{"indicator": i, "indiparams": [""]} for i in indicators.split(";")]}))
+        _http)
 
 
 def ths_financial_to_db(codes: list[str], statement_type: str = "利润表",
@@ -857,11 +887,12 @@ def ths_financial_to_db(codes: list[str], statement_type: str = "利润表",
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     rows = []
 
-    # 确定报表类型对应的 indicator 映射
+    # 确定报表类型对应的 indicator 映射（合并 SDK 中文码与 HTTP 拼音码两套列名）
     if statement_type == "财务指标":
         ind_map = FINANCIAL_RATIOS
     else:
-        ind_map = FINANCIAL_INDICATORS.get(statement_type, {})
+        ind_map = {**FINANCIAL_INDICATORS.get(statement_type, {}),
+                   **FIN_HTTP_CODES.get(statement_type, {})}
 
     date_col = "date" if "date" in df.columns else ("time" if "time" in df.columns else None)
 
@@ -2487,9 +2518,11 @@ def fetch_fundflow_via_ths(date: str) -> int:
 
     # 分批查询：问财每次返回约 5000 条，全市场 A 股约 5000+ 只
     # 用"主力净流入额"作为筛选条件，分正负两批获取全部股票
+    # 同时请求分档净额（特大/大/中/小单）——2026-09-14 前只取主力净额，
+    # 四个分量列全空导致页面 超大单/大单/中单/小单 全不显示
     queries = [
-        f"{date_compact} 主力净流入额大于0 股票",
-        f"{date_compact} 主力净流出 股票",
+        f"{date_compact} 主力净流入额大于0 超大单净额 大单净额 中单净额 小单净额 股票",
+        f"{date_compact} 主力净流出 超大单净额 大单净额 中单净额 小单净额 股票",
     ]
     for query in queries:
         try:
@@ -2500,6 +2533,12 @@ def fetch_fundflow_via_ths(date: str) -> int:
             code_col = next((c for c in df.columns if "代码" in c), None)
             main_col = next((c for c in df.columns if "主力资金流向" in str(c)), None)
             flow_col = next((c for c in df.columns if "资金流向" in str(c) and "主力" not in str(c)), None)
+            # 分档净额列（问财列名带日期后缀，按子串匹配；特大单含"大单"子串须先排除）
+            super_col = next((c for c in df.columns if "特大单" in str(c) or "超大单" in str(c)), None)
+            big_col = next((c for c in df.columns
+                            if "大单" in str(c) and "特大单" not in str(c) and "超大单" not in str(c)), None)
+            mid_col = next((c for c in df.columns if "中单" in str(c)), None)
+            small_col = next((c for c in df.columns if "小单" in str(c)), None)
             if not code_col:
                 continue
             rows = []
@@ -2510,12 +2549,16 @@ def fetch_fundflow_via_ths(date: str) -> int:
                 code = f"{m.group(2)}{m.group(1)}" if m else raw_code
                 main_net = _safe_float(r.get(main_col)) if main_col else None
                 flow_net = _safe_float(r.get(flow_col)) if flow_col else None
+                super_net = _safe_float(r.get(super_col)) if super_col else None
+                big_net = _safe_float(r.get(big_col)) if big_col else None
+                mid_net = _safe_float(r.get(mid_col)) if mid_col else None
+                small_net = _safe_float(r.get(small_col)) if small_col else None
                 if main_net is None and flow_net is None:
                     continue
                 # iFinD 问财返回的是净额（元），不是百分比
-                # 存入 main_net（主力净流入额），pct 列留空（需要市值数据才能算百分比）
-                rows.append((code, date, main_net, None, None, None, None, None,
-                             None, None, None, None, now))
+                # pct 列留空（需要市值数据才能算百分比）
+                rows.append((code, date, main_net, None, super_net, None, big_net, None,
+                             mid_net, None, small_net, None, now))
             if rows:
                 with _conn() as c:
                     c.executemany(

@@ -105,6 +105,7 @@ services:
       - ./log:/work/log:ro                       # RD-Agent 进化日志/会话（只读）
       - ./git_ignore_folder:/work/git_ignore_folder:ro   # RD-Agent workspace（qlib mlruns 产物）
       - ./data/qlib_home/.qlib/qlib_data:/data/qlib      # Qlib 行情（rw：定时任务"数据更新"要写）
+      - ./qsys:/app                              # QSYS 源码（热更新开发用）
       - ./qsys/data:/data                        # 自选股等看板自身数据（可写）
     ports:
       - "8501:8501"

@@ -279,7 +279,7 @@ class LoopEngine:
                       f"字段: {fields}\n算子: {ops}（窗口算子需带整数窗口，如 ma(close,20)）\n"
                       "规则: 深度≤6，corr/mul/div/sub 两端维度一致，至少含一个窗口算子。\n"
                       "只输出一个 S 表达式，如 sub(ma(overnight,20),delta(ma(overnight,20),5))，不要任何解释。")
-            r = completion(model="deepseek/deepseek-chat",
+            r = completion(model=os.environ.get("CHAT_MODEL") or "deepseek/deepseek-chat",
                            messages=[{"role": "user", "content": prompt}], max_tokens=120)
             text = r.choices[0].message.content.strip().strip("`").split("\n")[0]
             return parse(text, factor_type)

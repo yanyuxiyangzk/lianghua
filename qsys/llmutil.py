@@ -18,7 +18,7 @@ def llm_available() -> bool:
     )
 
 
-def llm_chat(system: str, user: str, max_tokens: int = 1024, model: str | None = None) -> str | None:
+def llm_chat(system: str, user: str, max_tokens: int = 4096, model: str | None = None) -> str | None:  # v4-pro 推理模型：思维链与正文共享配额，预算不能太小
     """调用一次 chat completion，返回纯文本；无 key / 调用异常返回 None。"""
     if not llm_available():
         return None
@@ -31,6 +31,25 @@ def llm_chat(system: str, user: str, max_tokens: int = 1024, model: str | None =
                       {"role": "user", "content": user}],
             max_tokens=max_tokens,
             temperature=0.2,
+        )
+        return (r.choices[0].message.content or "").strip()
+    except Exception:
+        return None
+
+
+def llm_chat_multi(messages: list[dict], max_tokens: int = 6000, model: str | None = None) -> str | None:
+    """多轮对话版：[{"role": "system"|"user"|"assistant", "content": ...}] → 纯文本。
+    同样 fail-open 返回 None。v4-pro 等推理模型的思维链不计入 content。"""
+    if not llm_available():
+        return None
+    try:
+        from litellm import completion
+
+        r = completion(
+            model=model or _DEFAULT_MODEL,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.3,
         )
         return (r.choices[0].message.content or "").strip()
     except Exception:

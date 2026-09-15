@@ -33,7 +33,7 @@ def llm_review(sexpr: str) -> tuple[bool, str]:
         from litellm import completion
 
         r = completion(
-            model="deepseek/deepseek-chat",
+            model=os.environ.get("CHAT_MODEL") or "deepseek/deepseek-chat",
             messages=[{"role": "system", "content": _REVIEWER_SYS},
                       {"role": "user", "content": _REVIEWER_USER.format(sexpr=sexpr)}],
             max_tokens=150, timeout=30)

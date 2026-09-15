@@ -18,7 +18,7 @@ MAX_DEPTH = 6
 # ---------------------------------------------------------------- 多类型因子字段定义
 # 每种 factor_type 对应的字段列表（与 FIELDS 合并使用）
 TYPE_FIELDS = {
-    "资金流": ["main_net_pct", "super_net_pct", "big_net_pct", "small_net_pct",
+    "资金流": ["main_net_pct", "super_net_pct", "big_net_pct", "mid_net_pct", "small_net_pct",
               "net_inflow_ratio", "main_small_spread"],
     "板块轮动": ["sector_momentum", "sector_net_flow", "sector_breadth",
                 "sector_rank", "sector_amount_ratio"],
@@ -29,6 +29,8 @@ TYPE_FIELDS = {
     "指数": ["idx_beta", "idx_rs", "idx_vol_ratio", "idx_corr", "idx_alpha"],
     "爆量抢筹": ["vol_spike", "bid_pressure", "outer_dominance",
                 "accumulation_composite"],
+    "财务": ["fin_np", "fin_or", "fin_gp", "fin_ncf",
+            "fin_np_yoy", "fin_or_yoy", "fin_nm"],
 }
 
 # 因子类型 → 默认机制族映射（用于新类型因子的族分类）
@@ -38,11 +40,15 @@ TYPE_FAMILY_MAP = {
     "龙虎榜": "龙虎榜",
     "盘口异动": "盘口异动",
     "指数": "指数",
+    "财务": "财务",
 }
 
 # 所有可用字段（基础 + 当前类型）
-def all_fields(factor_type: str = "量价") -> list[str]:
-    """返回指定因子类型的完整字段列表。"""
+def all_fields(factor_type: str | None = "量价") -> list[str]:
+    """返回指定因子类型的完整字段列表。factor_type=None/"任意" → 全部类型的并集
+    （评估/回测场景用——类型限制只约束生成端，评估端按 sexpr 实际引用放行）。"""
+    if factor_type in (None, "任意"):
+        return FIELDS + [f for fs in TYPE_FIELDS.values() for f in fs]
     extra = TYPE_FIELDS.get(factor_type, [])
     return FIELDS + extra
 
@@ -100,8 +106,9 @@ class Node:
 
 
 # ---------------------------------------------------------------- S 表达式解析
-def parse(s: str, factor_type: str = "量价"):
-    """解析 S 表达式为树；失败返回 None。factor_type 决定哪些字段名合法。"""
+def parse(s: str, factor_type: str | None = "量价"):
+    """解析 S 表达式为树；失败返回 None。factor_type 决定哪些字段名合法；
+    传 None/"任意" 时不限类型（评估端用——生成端才需要类型约束）。"""
     s = s.strip()
     valid_fields = all_fields(factor_type)
     toks = re.findall(r"[A-Za-z_][A-Za-z0-9_]*|\d+|[(),]", s)

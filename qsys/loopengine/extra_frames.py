@@ -8,20 +8,50 @@ import numpy as np
 import pandas as pd
 
 
+def _norm_code(c: str) -> str:
+    """代码归一到 SH600519 格式：兼容 600519 / 600519.SH / SH600519。"""
+    import re
+    c = str(c).strip().upper()
+    m = re.match(r"^(\d{6})\.(SH|SZ|BJ)$", c)
+    if m:
+        return m.group(2) + m.group(1)
+    if re.match(r"^(SH|SZ|BJ)\d{6}$", c):
+        return c
+    if re.match(r"^\d{6}$", c):
+        if c.startswith("6"):
+            return "SH" + c
+        if c.startswith(("0", "3")):
+            return "SZ" + c
+        if c.startswith(("4", "8", "9")):
+            return "BJ" + c
+    return c
+
+
 def build_fundflow_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
     """个股资金流帧：从 stock_fundflow_daily 表构建（同花顺 iFinD 数据源）。
 
     字段：main_net_inflow（主力净流入额）, net_inflow_ratio（主力/散户净流比）,
-          main_small_spread（主力-散户差）
+          main_small_spread（主力-散户差）,
+          main/super/big/mid/small_net_pct（主力/特大/大/中/小单净额 ÷ 当日成交额%，
+          分量列 2026-09-14 起入库——此前只写主力净额，四个 pct 字段名在 TYPE_FIELDS
+          里挂了名但帧不存在，引用即 KeyError）
     """
     from datasource import _qconn
 
     start = (pd.Timestamp(end) - pd.Timedelta(days=int(lookback * 1.6))).strftime("%Y-%m-%d")
+    in_codes = ",".join("?" * len(codes)) if codes else None
     try:
         with _qconn() as c:
             df = pd.read_sql(
-                "SELECT code, date, main_net FROM stock_fundflow_daily WHERE date >= ? AND date <= ?",
-                c, params=(start, end))
+                "SELECT code, date, main_net, super_net, big_net, mid_net, small_net "
+                f"FROM stock_fundflow_daily WHERE date >= ? AND date <= ?"
+                + (f" AND code IN ({in_codes})" if in_codes else ""),
+                c, params=(start, end, *codes) if in_codes else (start, end))
+            amt = pd.read_sql(
+                "SELECT code, date, amount FROM market_daily "
+                f"WHERE source='ths_ifind' AND date >= ? AND date <= ?"
+                + (f" AND code IN ({in_codes})" if in_codes else ""),
+                c, params=(start, end, *codes) if in_codes else (start, end))
     except Exception:
         return {}
     if df.empty:
@@ -36,6 +66,113 @@ def build_fundflow_frames(codes: list[str], end: str, lookback: int = 800) -> di
     frames["net_inflow_ratio"] = pivot.div(total + 1e-6, axis=0)
     # 主力-散户差
     frames["main_small_spread"] = pivot - pivot.rolling(20, min_periods=5).mean()
+
+    # 分档净额 ÷ 成交额（资金流强度%，市值无关、跨票可比）
+    if not amt.empty:
+        amt_p = amt.pivot_table(index="date", columns="code", values="amount")
+        for col, name in [("main_net", "main_net_pct"), ("super_net", "super_net_pct"),
+                          ("big_net", "big_net_pct"), ("mid_net", "mid_net_pct"),
+                          ("small_net", "small_net_pct")]:
+            net = df.pivot_table(index="date", columns="code", values=col)
+            frames[name] = net.div(amt_p.replace(0, np.nan)).fillna(0) * 100
+    return frames
+
+
+def build_financial_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
+    """财务基本面帧：从 ifind_financial 表构建（iFinD 三大报表，当前覆盖沪深300）。
+
+    防未来函数：每季值从 报告期+45天（法定披露截止近似）起才在日常帧上可见，
+    向前填充至下一季可见日。字段（datetime×instrument）：
+      fin_np（净利润）/ fin_or（营业收入）/ fin_gp（毛利）/ fin_ncf（经营现金流净额）——累计值
+      fin_np_yoy / fin_or_yoy（同比，按同季累计值之比）
+      fin_nm（净利率 = 净利润/营业收入）
+    """
+    from datasource import _qconn
+
+    start = (pd.Timestamp(end) - pd.Timedelta(days=int(lookback * 1.6 + 400))).strftime("%Y-%m-%d")
+    try:
+        with _qconn() as c:
+            df = pd.read_sql(
+                "SELECT code, report_date, statement_type, indicator, value "
+                "FROM ifind_financial WHERE report_date >= ? AND report_date <= ?",
+                c, params=(start, end))
+    except Exception:
+        return {}
+    if df.empty:
+        return {}
+    df["code"] = df["code"].map(_norm_code)  # 财务表存纯数字码，归一到 SH600519 格式
+    if codes:
+        df = df[df["code"].isin(set(codes))]
+    if df.empty:
+        return {}
+
+    IND = {"净利润": "fin_np", "归母净利润": "fin_np_atoopc", "营业收入": "fin_or",
+           "营业利润": "fin_op", "毛利": "fin_gp", "经营现金流净额": "fin_ncf"}
+    df = df[df["indicator"].isin(IND)]
+    if df.empty:
+        return {}
+    df["vis_date"] = (pd.to_datetime(df["report_date"]) + pd.Timedelta(days=45)).dt.strftime("%Y-%m-%d")
+    df = df[df["vis_date"] <= end]  # 只保留已公开（近似）的数据点
+    if df.empty:
+        return {}
+
+    # 指标 → (date, code) 透视后按可见日前向填充到日频
+    frames = {}
+    long_frames = {}
+    for cn, en in IND.items():
+        sub = df[df["indicator"] == cn]
+        if sub.empty:
+            continue
+        # 每 (code, vis_date) 取该可见日值（同 vis_date 多期取最新报告期）
+        sub = sub.sort_values("report_date").drop_duplicates(["code", "vis_date"], keep="last")
+        long_frames[en] = sub[["code", "vis_date", "report_date", "value"]]
+
+    if not long_frames:
+        return {}
+
+    # 日频日历（用 market_daily 的交易日）
+    with _qconn() as c:
+        days = [r[0] for r in c.execute(
+            "SELECT DISTINCT date FROM market_daily WHERE source='ths_ifind' AND date>=? AND date<=? "
+            "ORDER BY date", (start, end))]
+    if not days:
+        return {}
+    day_idx = pd.Index(days, name="date")
+
+    for en, sub in long_frames.items():
+        # 每 code：vis_date → value 的阶梯序列，reindex 到交易日并 ffill
+        per = {}
+        for code, g in sub.groupby("code"):
+            s = g.set_index("vis_date")["value"].sort_index()
+            s = s[~s.index.duplicated(keep="last")]
+            per[code] = s.reindex(s.index.union(day_idx)).sort_index().ffill().reindex(day_idx)
+        if per:
+            frames[en] = pd.DataFrame(per, index=day_idx)
+
+    # 同比：同季累计值之比（report_date 对齐到去年同季）
+    for base, yoy in [("fin_np", "fin_np_yoy"), ("fin_or", "fin_or_yoy")]:
+        if base not in long_frames:
+            continue
+        sub = long_frames[base].copy()
+        sub["prev_date"] = (pd.to_datetime(sub["report_date"]) - pd.DateOffset(years=1)).dt.strftime("%Y-%m-%d")
+        m = sub.merge(sub[["code", "report_date", "value"]].rename(
+            columns={"report_date": "prev_date", "value": "prev"}),
+            on=["code", "prev_date"], how="left")
+        m = m.dropna(subset=["prev"])
+        m["yoy"] = m["value"] / (m["prev"].replace(0, np.nan)) - 1
+        m = m.dropna(subset=["yoy"])
+        per = {}
+        for code, g in m.groupby("code"):
+            s = g.set_index("vis_date")["yoy"].sort_index()
+            s = s[~s.index.duplicated(keep="last")]
+            per[code] = s.reindex(s.index.union(day_idx)).sort_index().ffill().reindex(day_idx)
+        if per:
+            frames[yoy] = pd.DataFrame(per, index=day_idx)
+
+    # 净利率 = 净利润/营业收入（同一可见日的最新值）
+    if "fin_np" in frames and "fin_or" in frames:
+        frames["fin_nm"] = frames["fin_np"] / frames["fin_or"].replace(0, np.nan)
+
     return frames
 
 
@@ -300,12 +437,40 @@ BUILDERS = {
     "盘口异动": build_tick_frames,
     "指数": build_index_frames,
     "爆量抢筹": build_burst_frames,
+    "财务": build_financial_frames,
 }
 
 
 def build_extra_frames(factor_type: str, codes: list[str], end: str,
                        lookback: int = 800) -> dict:
-    """统一入口：根据因子类型构建额外帧。"""
+    """统一入口：根据因子类型构建额外帧。
+    索引统一转 Timestamp——基础帧（panel）用 Timestamp，字符串索引的额外帧
+    直接参与运算会因索引不相交产出全 NaN（2026-09-15 财务树乘积 0 行事故）。"""
     builder = BUILDERS.get(factor_type)
     if builder:
-        return builder(codes, end, lookback)
+        frames = builder(codes, end, lookback) or {}
+        for k, f in frames.items():
+            if hasattr(f, "index") and len(f.index) and isinstance(f.index[0], str):
+                frames[k] = f.set_index(pd.to_datetime(f.index))
+        return frames
+
+
+def frames_with_extras_for(sexpr: str, panel: pd.DataFrame, codes: list[str],
+                           end: str, lookback: int = 800) -> dict:
+    """按 sexpr 实际引用的字段，自动附加对应类型的额外帧（评估/体检/选股共用）。
+
+    基础量价帧之外的字段（资金流/财务/龙虎榜…）若不在帧里，evaluate_tree 会
+    KeyError——此前 factor_eval 的三处树直算都只给基础帧，非量价因子出了引擎就评不了。
+    """
+    import re
+    from loopengine.tree import TYPE_FIELDS, build_field_frames
+
+    leaves = set(re.findall(r"[a-z_]+", sexpr))
+    extra = {}
+    for ftype, fields in TYPE_FIELDS.items():
+        if any(f in leaves for f in fields):
+            try:
+                extra.update(build_extra_frames(ftype, codes, end, lookback) or {})
+            except Exception:
+                continue
+    return build_field_frames(panel, extra or None)

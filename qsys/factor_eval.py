@@ -329,11 +329,13 @@ def get_factor_values(fac: dict, codes: list[str], end: str, lookback_days: int 
         code = fac.get("code") or ""
         if code.startswith("# sexpr: "):
             try:
-                from loopengine.tree import build_field_frames, evaluate_tree, parse
+                from loopengine.tree import evaluate_tree, parse
+                from loopengine.extra_frames import frames_with_extras_for
                 panel = sig.get_panel_cached(codes, end, lookback_days, source=source)
-                frames = build_field_frames(panel)
                 sexpr = code.split("\n", 1)[0][len("# sexpr: "):]
-                tree = parse(sexpr)
+                # 非量价字段（资金流/财务等）按 sexpr 引用自动附加额外帧
+                frames = frames_with_extras_for(sexpr, panel, codes, end, lookback_days)
+                tree = parse(sexpr, "任意")  # 评估端不限类型字段（生成端才约束类型）
                 vals = evaluate_tree(tree, frames).stack().rename(fac["name"]).dropna()
                 vals.index = vals.index.set_names(["datetime", "instrument"])
                 s = vals
@@ -471,8 +473,10 @@ def build_scorecard_batch(factors: list[dict], codes: list[str], end: str,
 
     P2优化：面板只构建1次，帧缓存复用，IC批量计算。
     P4优化：跳过已有缓存的因子值。"""
+    import re
     import datasource
-    from loopengine.tree import build_field_frames, evaluate_tree, parse
+    from loopengine.tree import TYPE_FIELDS, build_field_frames, evaluate_tree, parse
+    from loopengine.extra_frames import build_extra_frames
 
     source = source or _eval_source()
     rows = []
@@ -480,7 +484,20 @@ def build_scorecard_batch(factors: list[dict], codes: list[str], end: str,
     # 1. 一次性构建面板和帧（最大开销；全窗口，IS/OOS 切片在评估循环内做）
     panel = sig.get_panel_cached(codes, end, 800, source=source)
     fwds = {d: forward_returns(panel, d) for d in WIN_HORIZONS.values()}
-    frames = build_field_frames(panel)
+    # 非量价字段（资金流/财务等）按批内 sexpr 引用的并集一次附加
+    need_types = set()
+    for fac in factors:
+        code = fac.get("code") or ""
+        if code.startswith("# sexpr: "):
+            leaves = set(re.findall(r"[a-z_]+", code.split("\n", 1)[0]))
+            need_types |= {t for t, fs in TYPE_FIELDS.items() if any(f in leaves for f in fs)}
+    extra = {}
+    for t in need_types:
+        try:
+            extra.update(build_extra_frames(t, codes, end, 800) or {})
+        except Exception:
+            continue
+    frames = build_field_frames(panel, extra or None)
 
     # 2. 批量计算所有因子的值（树直算快速路径）
     factor_values = {}
@@ -503,7 +520,7 @@ def build_scorecard_batch(factors: list[dict], codes: list[str], end: str,
 
             # 树直算批量计算
             sexpr = code.split("\n", 1)[0][len("# sexpr: "):]
-            tree = parse(sexpr)
+            tree = parse(sexpr, "任意")  # 评估端不限类型字段（生成端才约束类型）
             vals = evaluate_tree(tree, frames).stack().rename(fac["name"]).dropna()
             vals.index = vals.index.set_names(["datetime", "instrument"])
             vals = _norm(vals)
@@ -681,9 +698,11 @@ def build_scorecard_parallel(factors: list[dict], codes: list[str], end: str,
     """并行因子体检表：多进程计算IC和胜率，加速批量评估。
 
     P2+P3优化：面板+帧只构建1次，因子值批量计算，并行评估IC和胜率。"""
+    import re
     import datasource
     from concurrent.futures import ProcessPoolExecutor, as_completed
-    from loopengine.tree import build_field_frames, evaluate_tree, parse
+    from loopengine.tree import TYPE_FIELDS, build_field_frames, evaluate_tree, parse
+    from loopengine.extra_frames import build_extra_frames
 
     source = source or _eval_source()
 
@@ -691,7 +710,20 @@ def build_scorecard_parallel(factors: list[dict], codes: list[str], end: str,
     #    OOS 统计需要 train_end 之后的段——面板不能预截断）
     panel = sig.get_panel_cached(codes, end, 800, source=source)
     fwds = {d: forward_returns(panel, d) for d in WIN_HORIZONS.values()}
-    frames = build_field_frames(panel)
+    # 非量价字段按批内 sexpr 引用并集附加（资金流/财务等）
+    need_types = set()
+    for fac in factors:
+        code = fac.get("code") or ""
+        if code.startswith("# sexpr: "):
+            leaves = set(re.findall(r"[a-z_]+", code.split("\n", 1)[0]))
+            need_types |= {t for t, fs in TYPE_FIELDS.items() if any(f in leaves for f in fs)}
+    extra = {}
+    for t in need_types:
+        try:
+            extra.update(build_extra_frames(t, codes, end, 800) or {})
+        except Exception:
+            continue
+    frames = build_field_frames(panel, extra or None)
 
     # 2. 批量计算所有因子的值
     factor_values = {}
@@ -713,7 +745,7 @@ def build_scorecard_parallel(factors: list[dict], codes: list[str], end: str,
 
             # 树直算
             sexpr = code.split("\n", 1)[0][len("# sexpr: "):]
-            tree = parse(sexpr)
+            tree = parse(sexpr, "任意")  # 评估端不限类型字段（生成端才约束类型）
             vals = evaluate_tree(tree, frames).stack().rename(fac["name"]).dropna()
             vals.index = vals.index.set_names(["datetime", "instrument"])
             vals = _norm(vals)

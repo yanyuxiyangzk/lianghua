@@ -18,7 +18,7 @@ import structure
 import datasource
 from event_bus import EventType, bus
 from loopengine import genetics, review
-from loopengine.tree import all_fields, build_field_frames, emit_code, evaluate_tree, parse
+from loopengine.tree import TYPE_FIELDS, all_fields, build_field_frames, emit_code, evaluate_tree, parse
 from loopengine.regime import detect_regime, get_regime_factor_weight, detect_regime_from_reports
 
 log = logging.getLogger("loopengine")
@@ -26,7 +26,7 @@ log = logging.getLogger("loopengine")
 STATE_KEY = "loopengine"
 
 # 默认挖掘顺序：量价（主力）→ 资金流 → 板块轮动 → 指数 → 盘口异动 → 龙虎榜
-DEFAULT_FACTOR_TYPES = ["量价", "资金流", "板块轮动", "指数", "盘口异动", "龙虎榜", "爆量抢筹"]
+DEFAULT_FACTOR_TYPES = ["量价", "资金流", "板块轮动", "指数", "盘口异动", "龙虎榜", "爆量抢筹", "财务"]
 
 
 class LoopEngine:
@@ -87,6 +87,11 @@ class LoopEngine:
                        regime: str | None = None):
         src = self.state["budget"].choose(rng)
         fw = self.state["field_weights"].w
+        if factor_type != "量价":
+            # 随机/变异/交叉路径的字段采样池需带上该类型的专属字段
+            # （此前 fw 只有基础量价字段，资金流/财务等类型字段永远采不到，
+            #   等于非量价类型的随机生成名存实亡）
+            fw = {**fw, **{f: 1.0 for f in TYPE_FIELDS.get(factor_type, [])}}
         if src == "llm":
             tree = self._llm_generate(rng, gaps, proven, factor_type) or genetics.random_tree(rng, 4, fw)
         elif src == "mutate":

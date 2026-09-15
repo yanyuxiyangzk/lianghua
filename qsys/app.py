@@ -50,6 +50,7 @@ pages = {
         st.Page("views/p_desk.py", title="今日执行", icon="🎯", url_path="today"),
         st.Page("views/p_broker.py", title="资金账号", icon="💹", url_path="broker"),
         st.Page("views/p_daily_report.py", title="每日战报", icon="📊", url_path="daily-report"),
+        st.Page("views/p_llm_chat.py", title="涨停复盘对话", icon="🧠", url_path="chat"),
     ],
     # 「市场数据」菜单已隐藏（2026-09-11 用户要求）：其页面多用腾讯/东财等杂源，
     # 与 📡iFinD数据 菜单（后台统一同花顺落库）重复且口径不一。页面文件保留在

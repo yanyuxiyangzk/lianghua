@@ -2241,7 +2241,7 @@ def fetch_realtime_hot(codes: list[str]) -> int:
                     _safe_float(row.get("low")), _safe_float(row.get("changeRatio")),
                     _safe_float(row.get("volume")), _safe_float(row.get("amount")),
                     _safe_float(row.get("turnoverRatio")),
-                    None, None, None, up, down,
+                    None, None, up, down,
                 ))
         except Exception:
             continue

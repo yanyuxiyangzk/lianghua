@@ -268,6 +268,20 @@ class LoopEngine:
         if not targets:
             return None
         fam, why = rng.choice(targets)
+        # 昨日战报证据（每日 18:35 自动生成的 LLM 复盘）——让假设与最新实盘证据对齐：
+        # 强化验证有效方向、规避失效方向（2026-09-15 复盘→改进闭环）
+        evidence = ""
+        try:
+            import experience
+            with experience._conn() as c:
+                row = c.execute(
+                    "SELECT date, content FROM daily_reports ORDER BY date DESC LIMIT 1").fetchone()
+            if row and row[1]:
+                excerpt = " ".join(str(row[1]).split())[:900]
+                evidence = (f"\n昨日（{row[0]}）实盘复盘证据（自动战报摘要）：\n{excerpt}\n"
+                            "请让新因子与该证据一致：强化其中验证有效的方向，规避失效方向。\n")
+        except Exception:
+            pass
         try:
             from litellm import completion
 
@@ -276,11 +290,12 @@ class LoopEngine:
             type_hint = f"（因子类型：{factor_type}）" if factor_type != "量价" else ""
             prompt = (f"你是量化因子工程师。用以下 S 表达式语法写一个属于「{fam}」机制族的 A 股日频{factor_type}因子。"
                       f"（{why}）{type_hint}\n"
+                      f"{evidence}"
                       f"字段: {fields}\n算子: {ops}（窗口算子需带整数窗口，如 ma(close,20)）\n"
                       "规则: 深度≤6，corr/mul/div/sub 两端维度一致，至少含一个窗口算子。\n"
                       "只输出一个 S 表达式，如 sub(ma(overnight,20),delta(ma(overnight,20),5))，不要任何解释。")
             r = completion(model=os.environ.get("CHAT_MODEL") or "deepseek/deepseek-chat",
-                           messages=[{"role": "user", "content": prompt}], max_tokens=120)
+                           messages=[{"role": "user", "content": prompt}], max_tokens=800)  # v4-pro 推理模型：思考链+正文共享配额，120 会被想完
             text = r.choices[0].message.content.strip().strip("`").split("\n")[0]
             return parse(text, factor_type)
         except Exception:

@@ -36,7 +36,7 @@ def llm_review(sexpr: str) -> tuple[bool, str]:
             model=os.environ.get("CHAT_MODEL") or "deepseek/deepseek-chat",
             messages=[{"role": "system", "content": _REVIEWER_SYS},
                       {"role": "user", "content": _REVIEWER_USER.format(sexpr=sexpr)}],
-            max_tokens=150, timeout=30)
+            max_tokens=1000, timeout=45)  # v4-pro 推理模型：思考链+正文共享配额
         text = r.choices[0].message.content.strip().strip("`")
         if text.startswith("json"):
             text = text[4:]

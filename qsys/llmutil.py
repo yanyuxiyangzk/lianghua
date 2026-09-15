@@ -37,20 +37,29 @@ def llm_chat(system: str, user: str, max_tokens: int = 4096, model: str | None =
         return None
 
 
-def llm_chat_multi(messages: list[dict], max_tokens: int = 6000, model: str | None = None) -> str | None:
+def llm_chat_multi(messages: list[dict], max_tokens: int = 12000, model: str | None = None) -> str | None:
     """多轮对话版：[{"role": "system"|"user"|"assistant", "content": ...}] → 纯文本。
-    同样 fail-open 返回 None。v4-pro 等推理模型的思维链不计入 content。"""
+    fail-open 返回 None。推理模型（v4-pro）思维链与正文共享 max_tokens 配额：
+    预算给足 12000；若思维链烧光配额导致正文为空（finish_reason=length），
+    自动降思考强度（reasoning_effort=low）重试一次。"""
     if not llm_available():
         return None
     try:
         from litellm import completion
 
-        r = completion(
-            model=model or _DEFAULT_MODEL,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=0.3,
-        )
-        return (r.choices[0].message.content or "").strip()
+        def _call(**extra):
+            r = completion(
+                model=model or _DEFAULT_MODEL,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=0.3,
+                **extra)
+            ch = r.choices[0]
+            return (ch.message.content or "").strip(), getattr(ch, "finish_reason", None)
+
+        content, finish = _call()
+        if not content and finish == "length":
+            content, _ = _call(reasoning_effort="low")
+        return content or None
     except Exception:
         return None

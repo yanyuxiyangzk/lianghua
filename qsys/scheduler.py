@@ -1537,6 +1537,22 @@ def job_ifind_financial_sync(pool_name: str = "沪深300", **_ignored) -> str:
     return msg
 
 
+def job_daily_report(**_ignored) -> str:
+    """每日量化战报自动生成（盘后 18:35）：数据采集 + DeepSeek 分析 + 落库。
+    战报同时作为"昨日复盘证据"被 LoopEngine 的 LLM 假设生成引用（复盘→改进闭环）。"""
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5:
+        return "非交易日，跳过"
+    from views.p_daily_report import _collect_all_data, _generate_report
+    data = _collect_all_data()
+    report = _generate_report(data)
+    import experience
+    experience.save_daily_report(data["date"], report, data)
+    return f"{data['date']} 战报已生成入库（{len(report)} 字）· 已入进化引擎证据链"
+
+
 def job_sr_scan(**_ignored) -> str:
     """支撑/阻力扫描（Density-SR）：每交易日 18:10，全市场四信号融合扫描落库 sr_scan_daily。
 
@@ -2204,6 +2220,8 @@ JOBS = {
                              "default": {"enabled": True, "hour": 9, "minute": 0, "params": {}}},
     "sr_scan": {"name": "🧭 支撑阻力扫描（每日盘后）", "func": job_sr_scan,
                 "default": {"enabled": True, "hour": 18, "minute": 10, "params": {}}},
+    "daily_report": {"name": "📊 每日量化战报（自动生成）", "func": job_daily_report,
+                     "default": {"enabled": True, "hour": 18, "minute": 35, "params": {}}},
     "ifind_indexlist_sync": {"name": "📉 iFinD 指数列表同步（每日）", "func": job_ifind_indexlist_sync,
                              "default": {"enabled": True, "hour": 9, "minute": 5, "params": {}}},
     "ifind_realtime_sync": {"name": "📊 iFinD 实时快照同步（盘中）", "func": job_ifind_realtime_sync,

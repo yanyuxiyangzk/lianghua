@@ -204,7 +204,6 @@ def test_typed_dispatch_uses_rank_for_mapped_type():
         exp_z = sig.zscore(fs["f_mf"].droplevel(0))
         pd.testing.assert_series_equal(got.sort_index(), exp_rank.sort_index(), check_names=False)
         assert abs(float(got.max()) - float(exp_rank.max())) < 1e-9
-        assert float(exp_z.max()) > float(exp_rank.max()) or True  # 离群下两法不同（下一行硬断言）
         assert not np.isclose(float(got.max()), float(exp_z.max())), "typed 下不应走 legacy zscore"
     finally:
         _scheme(None)

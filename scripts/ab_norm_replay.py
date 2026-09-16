@@ -65,27 +65,33 @@ def analyze_pack(name: str, weights: dict, pack_factors: list[dict] | None,
     返回 {name, static: {legacy:.., typed_v2:..}, wf: {...}, drift: {...}, sigma: DataFrame}
     """
     step = step or fe.STEP_DAYS
-    names = list(weights)
     vals_norm = {n: fe._norm(s.dropna()) for n, s in fvals.items()
                  if not s.dropna().empty and n in weights}
     weights = {n: weights[n] for n in vals_norm}
     if len(weights) < 2:
         return {"name": name, "error": f"有效因子不足（{len(weights)}<2）"}
+    names = list(weights)
 
     typed = _typed_norms(names, pack_factors)
     fwd = fe.forward_returns(panel, fe.MAIN_FWD)
     ic_full = {n: fe.ic_series(s, fwd) for n, s in vals_norm.items()}  # 归一化不变，两套共用
 
     # ---- 口径A：包固定权重（as-traded）----
-    bt_static = {
-        "legacy": fe.static_backtest(fvals, panel, weights, top_n, step=step, norms=None),
-        "typed_v2": fe.static_backtest(fvals, panel, weights, top_n, step=step, norms=typed),
-    }
+    # legacy 臂必须钉住开关——static_backtest/walk_forward 的 norms=None 会按全局开关
+    # 再解析（冷评审发现：切换 typed_v2 后重跑 AB，两臂会雷同、报告自相矛盾）
+    sig._NORM_SCHEME_OVERRIDE = "legacy"
+    try:
+        bt_static_legacy = fe.static_backtest(fvals, panel, weights, top_n, step=step, norms=None)
+        bt_wf_legacy = fe.walk_forward(fvals, panel, "等权", top_n, step=step,
+                                       ic_full=ic_full, norms=None)
+    finally:
+        sig._NORM_SCHEME_OVERRIDE = None
+    bt_static = {"legacy": bt_static_legacy,
+                 "typed_v2": fe.static_backtest(fvals, panel, weights, top_n, step=step, norms=typed)}
     # ---- 口径B：滚动重估（因子集 OOS 质量）----
-    bt_wf = {
-        "legacy": fe.walk_forward(fvals, panel, "等权", top_n, step=step, ic_full=ic_full, norms=None),
-        "typed_v2": fe.walk_forward(fvals, panel, "等权", top_n, step=step, ic_full=ic_full, norms=typed),
-    }
+    bt_wf = {"legacy": bt_wf_legacy,
+             "typed_v2": fe.walk_forward(fvals, panel, "等权", top_n, step=step,
+                                         ic_full=ic_full, norms=typed)}
 
     # ---- 逐日漂移 + σ 分布（同一调仓网格、包固定权重）----
     days = sorted(set.intersection(*[set(s.index.get_level_values("datetime").unique())
@@ -167,9 +173,12 @@ def render_report(results: list[dict]) -> str:
                 wr = f"{s['胜率']:.1%}" if s["胜率"] is not None else "-"
                 lines.append(f"| {scope} | {scheme} | {wr} | {s['均值']} | {s['夏普']} | {s['调仓点数']} |")
         d = r["drift"]
-        lines.append(f"\n口径漂移：Spearman 均值 {d['spearman_mean']} / 最低 {d['spearman_min']}；"
-                     f"Top-N 重合均值 {d['top_overlap_mean']:.1%}；"
-                     f"低重合日占比 {d['低重合日占比(<50%)']:.1%}\n")
+        if d["spearman_mean"] is not None:
+            lines.append(f"\n口径漂移：Spearman 均值 {d['spearman_mean']} / 最低 {d['spearman_min']}；"
+                         f"Top-N 重合均值 {d['top_overlap_mean']:.1%}；"
+                         f"低重合日占比 {d['低重合日占比(<50%)']:.1%}\n")
+        else:
+            lines.append("\n口径漂移：（无有效调仓日，未计算）\n")
         if not r["sigma"].empty:
             lines.append("各因子实现 σ（逐日均值/最低）与单票最大 |z|：")
             lines.append("```")
@@ -227,7 +236,12 @@ def main():
             print(f"  [error] {e}")
 
     report = render_report(results)
-    out_dir = Path(args.out) if args.out else Path(__file__).resolve().parent.parent / "log"
+    if args.out:
+        out_dir = Path(args.out)
+    elif str(QSYS) == "/app":  # 容器内 /work/log 只读；/data 可写
+        out_dir = Path("/data")
+    else:
+        out_dir = Path(__file__).resolve().parent.parent / "log"
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"ab_norm_report_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.md"
     out.write_text(report)

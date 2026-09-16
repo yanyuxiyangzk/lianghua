@@ -825,9 +825,11 @@ def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "")
     # 经验库落库（不管对错都记，到期由 outcome_backfill 回填战果）
     import experience
     _norms = sig.scoring_norms(list(weights), pk.get("factors") if pk else None) or {}
+    # norm 快照仅在 typed_v2 下写入——legacy 期保持旧 JSON 形状（避免存量包被
+    # "zscore" 快照钉死、切换后享受不到 rank 分派；身份与存储分离见 experience.save_pick）
     fcfg = [{"name": n, "kind": ("builtin" if n in sig.BUILTIN_FACTORS else "evolved"),
              "weight": float(w), "direction": int(d),
-             "norm": _norms.get(n, "zscore")}  # 归一化口径快照随 picks 落库（实战归因可比性）
+             **({"norm": _norms[n]} if _norms else {})}
             for n, (w, d) in weights.items()]
     oos = None
     if pk and pk.get("oos_winrate"):
@@ -902,7 +904,8 @@ def job_auto_scan(pool_name: str = "沪深300", top_n: int = 10, **_ignored) -> 
     import experience
     _norms = sig.scoring_norms(list(weights)) or {}
     fcfg = [{"name": n, "kind": ("builtin" if n in sig.BUILTIN_FACTORS else "evolved"),
-             "weight": float(w), "direction": int(d), "norm": _norms.get(n, "zscore")}
+             "weight": float(w), "direction": int(d),
+             **({"norm": _norms[n]} if _norms else {})}  # norm 快照仅 typed_v2 期写入
             for n, (w, d) in weights.items()]
     experience.save_pick(source="sched_auto_scan", pool_name=pool_name, top_n=top_n,
                          method="auto_select", filters=[], factors=fcfg,

@@ -188,7 +188,7 @@ if auto and auto.get("selected"):
                 "filters": ["tradable"], "horizon": auto["hold_h"],
                 "factors": [{"name": n, "kind": auto["facs"][n]["kind"],
                              "weight": float(w), "direction": int(d),
-                             "norm": _norms.get(n, "zscore")}
+                             **({"norm": _norms[n]} if _norms else {})}  # 快照仅 typed_v2 期写入
                             for n, (w, d) in auto["weights"].items()],
                 "norm_scheme": sig.current_norm_scheme(),
                 "oos_winrate": f"{oos_win:.0%}",
@@ -213,7 +213,10 @@ if auto and auto.get("selected"):
 
         def _reason(c):
             pos = [(n, v) for n, v in
-                   sig.factor_contributions(auto["fvals"], auto["weights"], c) if v > 0][:2]
+                   sig.factor_contributions(auto["fvals"], auto["weights"], c,
+                                            norms=sig.scoring_norms(list(auto["weights"]),
+                                                                    list(auto["facs"].values())))
+                   if v > 0][:2]
             return " · ".join(f"{sig.plain_factor_name(n)}({v:+.2f})" for n, v in pos) or "—"
 
         st.dataframe(pd.DataFrame({
@@ -244,7 +247,7 @@ if auto and auto.get("selected"):
                     method=auto["method"], filters=["tradable"],
                     factors=[{"name": n, "kind": auto["facs"][n]["kind"],
                               "weight": float(w), "direction": int(d),
-                              "norm": _norms.get(n, "zscore")}  # 口径快照随 picks 落库
+                              **({"norm": _norms[n]} if _norms else {})}  # 快照仅 typed_v2 期写入
                              for n, (w, d) in auto["weights"].items()],
                     final_scores=tp,
                     pack_name=(st.session_state.get("pc_pname")

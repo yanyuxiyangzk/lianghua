@@ -297,8 +297,11 @@ def render():
                         sel = sig.industry_cap_select(sel, cap=2)
                     st.session_state["pe_final"] = sel.head(top_n)
                     # 经验库落库（不管对错，到期自动回填战果）
+                    _norms = sig.scoring_norms(list(weights), facs) or {}
                     fcfg = [{"name": n, "kind": next(f for f in facs if f["name"] == n)["kind"],
-                             "weight": float(w), "direction": int(d)} for n, (w, d) in weights.items()]
+                             "weight": float(w), "direction": int(d),
+                             **({"norm": _norms[n]} if _norms else {})}  # 快照仅 typed_v2 期写入
+                            for n, (w, d) in weights.items()]
                     experience.save_pick(source="manual_picker", pool_name=pool_name, top_n=top_n,
                                          method=method, filters=filters, factors=fcfg,
                                          final_scores=st.session_state["pe_final"], trade_date=end)

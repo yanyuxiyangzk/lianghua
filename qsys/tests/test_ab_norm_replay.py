@@ -104,6 +104,24 @@ def test_render_report_smoke():
     assert "渲染包" in md and "坏包" in md and "legacy" in md and "typed_v2" in md
 
 
+def test_legacy_arm_immune_to_global_switch():
+    """冷评审回归：全局开关打到 typed_v2 时，analyze_pack 的 legacy 臂必须仍等于
+    钉住 legacy 的直接回测（否则切换后重跑 AB，两臂雷同、报告自相矛盾）。"""
+    import signals as real_sig
+    panel, fvals = _synthetic()
+    weights = {"f_fat": (0.5, 1), "f_mom": (0.5, 1)}
+    try:
+        real_sig._NORM_SCHEME_OVERRIDE = "typed_v2"   # 模拟切换后重跑 AB
+        r = ab.analyze_pack("抗污染包", weights, None, fvals, panel, top_n=10, step=10)
+        real_sig._NORM_SCHEME_OVERRIDE = "legacy"
+        direct = fe.static_backtest(fvals, panel, weights, 10, step=10, norms=None)
+    finally:
+        real_sig._NORM_SCHEME_OVERRIDE = None
+    assert r["static"]["legacy"] == ab._bt_stats(direct, "组合扣费超额")
+    # 且 typed 臂确实不同（重尾因子走 rank，排序漂移应显著）
+    assert r["drift"]["spearman_min"] < 0.9999, "typed 臂与 legacy 臂不应雷同"
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0

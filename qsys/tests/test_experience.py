@@ -62,8 +62,38 @@ def test_dynamic_tp_logic():
     print(f"PASS: test_dynamic_tp_logic (ATR={atr:.2f}, ATR止盈={atr_tp:.1%}, 最终止盈={dynamic_tp:.1%})")
 
 
+def test_save_pick_norm_not_identity():
+    """冷评审发现1回归：factors 带不带 norm 快照键不影响组合身份——
+    同日同组合应覆盖落库而非双行（否则 outcome_backfill 双计战果）。"""
+    import os
+    db = Path("/tmp/qsys_test/experience.db")
+    if db.exists():
+        os.remove(db)
+    sys.modules["common"].all_pools = lambda: {}
+    sys.modules["datasource"].get_source = lambda: "test"
+    sys.modules["common"].load_json = lambda *a, **kw: {}
+    import experience
+
+    scores = pd.Series({"S001": 1.5, "S002": 0.9})
+    base = [{"name": "mom_5d", "kind": "builtin", "weight": 1.0, "direction": 1}]
+    id1 = experience.save_pick(source="t", pool_name="p", top_n=2, method="m",
+                               filters=[], factors=base, final_scores=scores,
+                               trade_date="2026-09-16")
+    with_norm = [dict(f, norm="rank") for f in base]
+    id2 = experience.save_pick(source="t", pool_name="p", top_n=2, method="m",
+                               filters=[], factors=with_norm, final_scores=scores,
+                               trade_date="2026-09-16")
+    assert id1 == id2, "norm 快照差异不应改变组合身份"
+    with experience._conn() as c:
+        n = c.execute("SELECT COUNT(*) FROM picks WHERE trade_date='2026-09-16'").fetchone()[0]
+        stored = c.execute("SELECT factors FROM picks WHERE id=?", (id2,)).fetchone()[0]
+    assert n == 1, "同日同组合只应一行"
+    assert '"norm"' in stored, "norm 快照应保留在存储列（只是不进身份）"
+    print("PASS: test_save_pick_norm_not_identity")
+
+
 if __name__ == "__main__":
-    tests = [test_default_rules_contain_atr, test_dynamic_tp_logic]
+    tests = [test_default_rules_contain_atr, test_dynamic_tp_logic, test_save_pick_norm_not_identity]
     passed = failed = 0
     for t in tests:
         try:

@@ -706,8 +706,8 @@ class LoopEngine:
             
             pack_name = f"LE_{self.pool_name}_{datetime.now().strftime('%m%d')}"
 
-            # 归一化口径快照：typed_v2 下按因子类型解析（回放复现以快照为准，不随
-            # registry 后续改动漂移）；legacy 下为全 zscore。上方 WF 验证与快照同口径。
+            # 归一化口径快照：typed_v2 下按因子类型解析并随包落盘（回放复现以快照为准）；
+            # legacy 下不写 norm 键——避免存量包被 "zscore" 快照钉死、切换后享受不到分派。
             import signals as sig
             _norms = sig.scoring_norms(selected) or {}
 
@@ -716,7 +716,7 @@ class LoopEngine:
                 "top_n": 10,
                 "method": "等权",
                 "factors": [{"name": n, "kind": factor_kind.get(n, "builtin"), "weight": w,
-                             "direction": d, "norm": _norms.get(n, "zscore")}
+                             "direction": d, **({"norm": _norms[n]} if _norms else {})}
                            for n, (w, d) in weights.items()],
                 "filters": ["tradable"],
                 "oos_winrate": f"{oos_wr:.0%}",

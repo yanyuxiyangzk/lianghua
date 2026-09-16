@@ -117,6 +117,11 @@ def _conn():
                      ("extend_count", "INTEGER DEFAULT 0")]:
         if col not in pcols:
             c.execute(f"ALTER TABLE positions ADD COLUMN {col} {ddl}")
+    # 迁移：picks 增加 data_source（生产库为历史手工添加，全新建库走不到——
+    # 2026-09-16 测试暴露；补上后新环境 save_pick 不再炸）
+    pkcols = [r[1] for r in c.execute("PRAGMA table_info(picks)")]
+    if "data_source" not in pkcols:
+        c.execute("ALTER TABLE picks ADD COLUMN data_source TEXT")
     return c
 
 
@@ -132,8 +137,11 @@ def save_pick(source: str, pool_name: str, top_n: int, method: str,
         return None
     trade_date = trade_date or get_last_trade_day()
     data_source = data_source or datasource.get_source()
+    # norm 是归一化口径快照（存储用），不是组合身份——含它会让同组合在口径切换
+    # 前后 hash 不同 → 同日双行落库、outcome 双计（2026-09-16 冷评审发现）
+    fac_identity = [{k: v for k, v in f.items() if k != "norm"} for f in factors]
     combo_key = json.dumps({"s": source, "p": pool_name, "n": top_n, "m": method,
-                            "f": filters, "fac": factors, "pk": pack_name, "ds": data_source},
+                            "f": filters, "fac": fac_identity, "pk": pack_name, "ds": data_source},
                            sort_keys=True, ensure_ascii=False)
     combo_hash = hashlib.md5(combo_key.encode()).hexdigest()[:16]
     with _conn() as c:

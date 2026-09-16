@@ -640,7 +640,10 @@ def composite_score(factor_series: dict[str, pd.Series], weights: dict[str, tupl
     """factor_series: {name: 长表 Series((instrument, datetime) 或 (datetime, instrument))}
     weights: {name: (权重, 方向±1)}。返回 asof（默认最新日）横截面综合分。
     norms: {name: "zscore"|"rank"}；None=按全局开关解析（legacy=原 zscore 口径，
-    typed_v2=cs_norm 分派）。有 pack 快照时由调用方经 scoring_norms 解析后传入。"""
+    typed_v2=cs_norm 分派）。有 pack 快照时由调用方经 scoring_norms 解析后传入。
+    注：cs_norm N<3 熔断的因子当日整列 NaN 不贡献分子，但 w_total 仍满额计入其权重
+    （当日总分等比缩水，日内排序不变；与 _score_at 不除 w_total 的相对口径在熔断日
+    有分歧——可接受，ranking 用途不受影响）。"""
     if norms is None:
         norms = scoring_norms(list(factor_series.keys()))
     z_list, w_total = [], 0.0

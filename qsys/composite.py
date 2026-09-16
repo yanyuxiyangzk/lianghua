@@ -95,7 +95,8 @@ def build_top5_composite(pool_name: str = "沪深300", top_n: int = 5) -> dict:
         comp = z if comp is None else comp.add(z, fill_value=0)
         members.append({"name": r["name"], "kind": r["kind"], "weight": 1.0 / len(top),
                         "direction": direction, "sharpe": round(r["sharpe"], 2),
-                        "norm": nv or "zscore"})
+                        # norm 快照仅 typed_v2 期写入（legacy 期写死 zscore 会钉死存量包）
+                        **({"norm": nv} if nv else {})})
     comp = comp / len(top)
 
     # 复合指标
@@ -106,7 +107,8 @@ def build_top5_composite(pool_name: str = "沪深300", top_n: int = 5) -> dict:
                for y in sorted(set(x.index.year)) if (x.index.year == y).sum() > 20}
 
     factors = [{"name": m["name"], "kind": m["kind"], "weight": m["weight"],
-                "direction": m["direction"], "norm": m["norm"]} for m in members]
+                "direction": m["direction"],
+                **({"norm": m["norm"]} if m.get("norm") else {})} for m in members]
     library.save_strategy(PACK_NAME, {
         "pool_name": pool_name, "top_n": 20, "method": "等权复合(方向修正)",
         "filters": ["tradable"], "factors": factors,

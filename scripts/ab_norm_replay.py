@@ -156,9 +156,9 @@ def fetch_pack_inputs(pack: dict, codes: list[str], end: str, lookback: int):
     return weights, fvals, panel
 
 
-def render_report(results: list[dict]) -> str:
+def render_report(results: list[dict], with_header: bool = True) -> str:
     lines = ["# 归一化 A/B 回放报告（legacy vs typed_v2）",
-             f"\n生成时间：{pd.Timestamp.now()}\n"]
+             f"\n生成时间：{pd.Timestamp.now()}\n"] if with_header else []
     for r in results:
         if "error" in r:
             lines.append(f"## {r['name']}\n\n> {r['error']}\n")
@@ -216,13 +216,25 @@ def main():
 
     end = get_last_trade_day()
     pools = all_pools()
+    # 增量报告：每包完成即落盘（长任务中断了也留有已算部分；print 全部 flush）
+    if args.out:
+        out_dir = Path(args.out)
+    elif str(QSYS) == "/app":  # 容器内 /work/log 只读；/data 可写
+        out_dir = Path("/data")
+    else:
+        out_dir = Path(__file__).resolve().parent.parent / "log"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"ab_norm_report_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.md"
+    out.write_text(f"# 归一化 A/B 回放报告（legacy vs typed_v2）\n\n生成时间：{pd.Timestamp.now()}\n\n")
+    print(f"报告文件：{out}（逐包追加）", flush=True)
+
     results = []
     for name in wanted:
         pk = saved.get(name)
         if not pk:
-            print(f"[skip] 包 {name} 不在 strategies 表")
+            print(f"[skip] 包 {name} 不在 strategies 表", flush=True)
             continue
-        print(f"[ab] {name}（{len(pk['factors'])} 因子）…")
+        print(f"[ab] {name}（{len(pk['factors'])} 因子）…", flush=True)
         t0 = time.time()
         try:
             codes = pools.get(pk["pool_name"]) or pools.get("沪深300")
@@ -230,10 +242,18 @@ def main():
             r = analyze_pack(name, weights, pk.get("factors"), fvals, panel,
                              int(pk.get("top_n", 10)), step=args.step)
             results.append(r)
-            print(f"  完成（{time.time() - t0:.0f}s）")
+            print(f"  完成（{time.time() - t0:.0f}s）", flush=True)
         except Exception as e:
             results.append({"name": name, "error": f"回放失败: {e}"})
-            print(f"  [error] {e}")
+            print(f"  [error] {e}", flush=True)
+        with out.open("a") as fh:  # 增量落盘
+            fh.write(render_report([results[-1]], with_header=False) + "\n\n---\n\n")
+
+    report = render_report(results)
+    out.write_text(report)  # 末尾覆写为完整报告（含汇总头）
+    print(f"\n报告已写入 {out}\n", flush=True)
+    print(report[:3000], flush=True)
+    return 0
 
     report = render_report(results)
     if args.out:

@@ -7,6 +7,7 @@
 import json
 import logging
 import random
+import re
 from datetime import datetime
 
 import pandas as pd
@@ -18,12 +19,54 @@ import structure
 import datasource
 from event_bus import EventType, bus
 from loopengine import genetics, review
-from loopengine.tree import TYPE_FIELDS, all_fields, build_field_frames, emit_code, evaluate_tree, parse
+from loopengine.tree import TYPE_FIELDS, all_fields, build_field_frames, emit_code, evaluate_tree, field_table, parse
 from loopengine.regime import detect_regime, get_regime_factor_weight, detect_regime_from_reports
 
 log = logging.getLogger("loopengine")
 
 STATE_KEY = "loopengine"
+
+
+# ---------------------------------------------------------------- LLM 出题辅助（纯函数，可单测）
+def _extract_sexpr(text: str) -> str | None:
+    """从 LLM 输出鲁棒抽取第一个 S 表达式——容忍代码围栏、"答案是："前缀、行内注释、
+    多余解释行。抽取失败返回 None（调用方回退随机生成并计数）。"""
+    text = (text or "").strip()
+    for line in text.split("\n"):
+        line = line.strip().strip("`").strip()
+        m = re.search(r"[a-z_][a-z0-9_]*\(", line)
+        if not m:
+            continue
+        depth = 0
+        for j in range(m.start(), len(line)):
+            ch = line[j]
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return line[m.start():j + 1]
+    return None
+
+
+def _build_llm_prompt(fam: str, why: str, factor_type: str, evidence: str,
+                      fewshots: list[str]) -> str:
+    """LLM 出题 prompt（纯函数）。字段带含义与量纲（防新类型量纲瞎猜）；
+    fewshots 把闸门口味前置到生成端。"""
+    ops = "sub,mul,div,abs,sign,rank_cs,ma,ts_min,ts_max,ts_rank,decay_linear,std,skew,delta,roc,corr,ema,zscore"
+    type_hint = f"（因子类型：{factor_type}）" if factor_type != "量价" else ""
+    fs = ""
+    if fewshots:
+        fs = ("以下为该族已入库并通过统计闸门的真实因子（参考其结构与口味，不要照抄）：\n"
+              + "\n".join(f"  {s}" for s in fewshots) + "\n")
+    return (f"你是量化因子工程师。用以下 S 表达式语法写一个属于「{fam}」机制族的 A 股日频{factor_type}因子。"
+            f"（{why}）{type_hint}\n"
+            f"{evidence}"
+            f"字段（含含义与量纲）:\n{field_table(factor_type)}\n"
+            f"算子: {ops}（窗口算子需带整数窗口，如 ma(close,20)）\n"
+            f"{fs}"
+            "规则: 深度≤6，corr/mul/div/sub 两端维度一致，至少含一个窗口算子。\n"
+            "只输出一个 S 表达式，如 sub(ma(overnight,20),delta(ma(overnight,20),5))，不要任何解释。")
 
 # 默认挖掘顺序：量价（主力）→ 资金流 → 板块轮动 → 指数 → 盘口异动 → 龙虎榜
 DEFAULT_FACTOR_TYPES = ["量价", "资金流", "板块轮动", "指数", "盘口异动", "龙虎榜", "爆量抢筹", "财务",
@@ -85,7 +128,7 @@ class LoopEngine:
 
     # ---------------- 生成 ----------------
     def _gen_candidate(self, rng, gaps, proven, live_boost, factor_type: str = "量价",
-                       regime: str | None = None):
+                       regime: str | None = None, stats: dict | None = None):
         src = self.state["budget"].choose(rng)
         fw = self.state["field_weights"].w
         if factor_type != "量价":
@@ -94,7 +137,8 @@ class LoopEngine:
             #   等于非量价类型的随机生成名存实亡）
             fw = {**fw, **{f: 1.0 for f in TYPE_FIELDS.get(factor_type, [])}}
         if src == "llm":
-            tree = self._llm_generate(rng, gaps, proven, factor_type) or genetics.random_tree(rng, 4, fw)
+            tree = self._llm_generate(rng, gaps, proven, factor_type, stats=stats) \
+                or genetics.random_tree(rng, 4, fw)
         elif src == "mutate":
             parent = self._pick_parent(rng, live_boost, factor_type, regime)
             tree = genetics.mutate(parent, rng, fw) if parent else genetics.random_tree(rng, 4, fw)
@@ -254,9 +298,10 @@ class LoopEngine:
             return parse(first[len("# sexpr: "):], factor_type)
         return None
 
-    def _llm_generate(self, rng, gaps, proven, factor_type: str = "量价"):
+    def _llm_generate(self, rng, gaps, proven, factor_type: str = "量价", stats: dict | None = None):
         """LLM 机制引导，双目标轮转（无 key/失败则回退 None）：
-        探索——补最空缺机制族；开采——深挖实战验证过的强族（经验库回喂）。"""
+        探索——补最空缺机制族；开采——深挖实战验证过的强族（经验库回喂）。
+        stats 传入时计数 llm_gen_fail（抽取/解析失败，prompt 质量的核心度量）。"""
         import os
 
         if not os.environ.get("DEEPSEEK_API_KEY"):
@@ -286,21 +331,45 @@ class LoopEngine:
         try:
             from litellm import completion
 
-            fields = ",".join(all_fields(factor_type))
-            ops = "sub,mul,div,abs,sign,rank_cs,ma,ts_min,ts_max,ts_rank,decay_linear,std,skew,delta,roc,corr,ema,zscore"
-            type_hint = f"（因子类型：{factor_type}）" if factor_type != "量价" else ""
-            prompt = (f"你是量化因子工程师。用以下 S 表达式语法写一个属于「{fam}」机制族的 A 股日频{factor_type}因子。"
-                      f"（{why}）{type_hint}\n"
-                      f"{evidence}"
-                      f"字段: {fields}\n算子: {ops}（窗口算子需带整数窗口，如 ma(close,20)）\n"
-                      "规则: 深度≤6，corr/mul/div/sub 两端维度一致，至少含一个窗口算子。\n"
-                      "只输出一个 S 表达式，如 sub(ma(overnight,20),delta(ma(overnight,20),5))，不要任何解释。")
+            prompt = _build_llm_prompt(fam, why, factor_type, evidence,
+                                       self._family_fewshots(fam, factor_type))
             r = completion(model=os.environ.get("CHAT_MODEL") or "deepseek/deepseek-chat",
-                           messages=[{"role": "user", "content": prompt}], max_tokens=800)  # v4-pro 推理模型：思考链+正文共享配额，120 会被想完
-            text = r.choices[0].message.content.strip().strip("`").split("\n")[0]
-            return parse(text, factor_type)
+                           messages=[{"role": "user", "content": prompt}],
+                           max_tokens=800, temperature=1.1)  # 生成端要多样性（审查端则钉 0）
+            text = r.choices[0].message.content or ""
+            cand = _extract_sexpr(text)
+            if cand is None:
+                if stats is not None:
+                    stats["llm_gen_fail"] = stats.get("llm_gen_fail", 0) + 1
+                log.info(f"LLM 出题抽取失败: {text[:100]!r}")
+                return None
+            tree = parse(cand, factor_type)
+            if tree is None:
+                if stats is not None:
+                    stats["llm_gen_fail"] = stats.get("llm_gen_fail", 0) + 1
+                log.info(f"LLM 出题解析失败: {cand[:100]!r}")
+            return tree
         except Exception:
             return None
+
+    def _family_fewshots(self, fam: str, factor_type: str, limit: int = 3) -> list[str]:
+        """捞同族已入库且过统计闸门的真实因子 sexpr 作 few-shot（把闸门口味前置到生成端）。"""
+        try:
+            with library._lconn() as c:
+                rows = c.execute(
+                    "SELECT code FROM factor_registry WHERE engine='loopengine' AND family=?"
+                    " AND gate_status=1 AND factor_type=?"
+                    " ORDER BY multi_objective_score DESC LIMIT ?",
+                    (fam, factor_type, limit)).fetchall()
+            out = []
+            for (code,) in rows:
+                if code and code.startswith("# sexpr:"):
+                    sx = code.split("\n", 1)[0][len("# sexpr: "):].strip()
+                    if sx:
+                        out.append(sx)
+            return out
+        except Exception:
+            return []
 
     # ---------------- 单轮 ----------------
     def run_round(self, batch: int = 30, factor_type: str = "量价") -> dict:
@@ -309,7 +378,8 @@ class LoopEngine:
         rng = random.Random(s["iteration"] * 7919 + 13)
         s["iteration"] += 1
 
-        stats = {"tested": 0, "rejected_review": 0, "llm_rejected": 0, "dup": 0, "frozen": 0, "passed": 0, "new": [],
+        stats = {"tested": 0, "rejected_review": 0, "llm_rejected": 0, "dup": 0, "frozen": 0,
+                 "passed": 0, "new": [], "llm_gen_fail": 0, "llm_review_fallback": 0,
                  "factor_type": factor_type}
         bus.push(EventType.ROUND_START, iteration=s["iteration"], batch=batch,
                  factor_type=factor_type)
@@ -376,7 +446,8 @@ class LoopEngine:
         llm_review_budget = 10
         for _ in range(batch):
             # Step 4: 生成候选
-            src, tree = self._gen_candidate(rng, gaps, proven, live_boost, factor_type, regime)
+            src, tree = self._gen_candidate(rng, gaps, proven, live_boost, factor_type, regime,
+                                            stats=stats)
             bus.push(EventType.STEP_UPDATE, step=4, name="生成候选", status="done",
                      source=src, batch_left=batch - _)
 
@@ -401,6 +472,8 @@ class LoopEngine:
                 from loopengine.llm_review import llm_review
                 llm_review_budget -= 1
                 passed_review, reason = llm_review(sexpr)
+                if reason.endswith("-fallback"):  # LLM 不可用/JSON 解析失败的回退率（可观测性）
+                    stats["llm_review_fallback"] = stats.get("llm_review_fallback", 0) + 1
                 bus.push(EventType.STEP_UPDATE, step=6, name="LLM审查",
                          status="pass" if passed_review else "fail", source=src, reason=reason if not passed_review else None)
                 if not passed_review:
@@ -789,6 +862,8 @@ class LoopEngine:
 
                 llm_review_budget -= 1
                 passed_review, reason = llm_review(sexpr)
+                if reason.endswith("-fallback"):  # LLM 不可用/JSON 解析失败的回退率
+                    stats["llm_review_fallback"] = stats.get("llm_review_fallback", 0) + 1
                 if not passed_review:
                     stats["llm_rejected"] += 1
                     sk0 = review.skeleton_of(tree)

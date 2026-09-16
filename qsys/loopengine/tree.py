@@ -57,6 +57,80 @@ def all_fields(factor_type: str | None = "量价") -> list[str]:
     extra = TYPE_FIELDS.get(factor_type, [])
     return FIELDS + extra
 
+
+# ---------------------------------------------------------------- 字段语义/值域表
+# LLM 出题 prompt 注入用：裸字段名会让模型对新类型（财务/事件记忆等）的量纲瞎猜，
+# 产出"语法对但经济学无意义"的表达式，全靠下游闸门兜底（2026-09-16 prompt 审查发现 ①）。
+FIELD_INFO = {
+    # 基础量价
+    "open": ("开盘价", "价格/元"), "high": ("最高价", "价格/元"),
+    "low": ("最低价", "价格/元"), "close": ("收盘价", "价格/元"),
+    "volume": ("成交量", "股数，重尾"), "amount": ("成交额", "元，重尾"),
+    "vwap": ("成交均价", "价格/元"),
+    "overnight": ("隔夜跳空收益（今开/昨收-1）", "比率，±0.1 内"),
+    "amplitude": ("振幅（(高-低)/昨收）", "比率，0~0.2"),
+    "upper_shadow": ("上影线比率", "比率，≥0"), "lower_shadow": ("下影线比率", "比率，≥0"),
+    "hl_ratio": ("最高/最低价之比", "比率，≥1"),
+    "body_ratio": ("实体比率（收-开）/（高-低）", "比率，-1~1"),
+    # 资金流（占比类已归一；净额类重尾）
+    "main_net_pct": ("主力净流入占比", "百分比，-100~100"),
+    "super_net_pct": ("超大单净流入占比", "百分比，-100~100"),
+    "big_net_pct": ("大单净流入占比", "百分比"), "mid_net_pct": ("中单净流入占比", "百分比"),
+    "small_net_pct": ("小单（散户）净流入占比", "百分比"),
+    "net_inflow_ratio": ("主力净流入/当日总成交", "比率，-1~1"),
+    "main_small_spread": ("主力-散户净流差（20 日偏离）", "元，重尾"),
+    # 板块轮动
+    "sector_momentum": ("所属板块动量", "比率"), "sector_net_flow": ("板块净流入额", "元，重尾"),
+    "sector_breadth": ("板块上涨家数占比", "0~1"), "sector_rank": ("板块全市场排名分位", "0~1"),
+    "sector_amount_ratio": ("板块成交额占全市场比", "比率"),
+    "sector_excess_ret": ("个股相对板块超额收益", "比率"),
+    # 龙虎榜（计数/金额类：稀疏、多数票多数日为 0）
+    "lhb_net_buy": ("龙虎榜净买入额", "元，重尾，多数为 0"),
+    "lhb_inst_ratio": ("龙虎榜机构买入占比", "0~1，稀疏"),
+    "lhb_hot_count": ("近 20 日上榜次数", "计数，多数为 0"),
+    "lhb_win_rate": ("近 20 日上榜后净买为正占比", "0~1"),
+    "lhb_consecutive": ("近 5 日连续上榜计数", "计数，多数为 0"),
+    # 盘口异动
+    "bid_ask_ratio": ("买盘/卖盘金额比", "比率>0，1 为均衡"),
+    "outer_inner_ratio": ("外盘/内盘比", "比率>0"),
+    "quantity_ratio_dev": ("量比相对其 20 日均值偏离", "比率，0 居中"),
+    "tick_vol_ratio": ("逐笔量比（/20 日均值）", "比率，1 居中"),
+    "bid_ask_spread": ("买卖价差", "元，重尾"),
+    # 指数
+    "idx_beta": ("对沪深300的β", "无量纲，1 居中"),
+    "idx_rs": ("相对强弱（个股/基准累计收益比）", "比率，1 居中"),
+    "idx_vol_ratio": ("个股成交量/基准量比", "比率，1 居中"),
+    "idx_corr": ("与基准日收益 60 日相关", "-1~1"),
+    "idx_alpha": ("年化α（剔β后）", "比率"),
+    # 爆量抢筹
+    "vol_spike": ("爆量倍数（当日量/均量）", "倍数，1 居中"),
+    "bid_pressure": ("买盘压力", "比率"), "outer_dominance": ("外盘主导度", "比率"),
+    "accumulation_composite": ("抢筹合成强度", "综合分"),
+    # 财务（季度前值填充；货币类极重尾）
+    "fin_np": ("净利润", "元，极重尾"), "fin_or": ("营业收入", "元，极重尾"),
+    "fin_gp": ("毛利", "元，极重尾"), "fin_ncf": ("经营现金流", "元，可负，极重尾"),
+    "fin_np_yoy": ("净利润同比", "百分比，可负"), "fin_or_yoy": ("营收同比", "百分比，可负"),
+    "fin_nm": ("净利率（净利/营收）", "百分比"),
+    # 支撑阻力（density_sr 产出，多数已归一）
+    "sr_dist_atr": ("距最近支撑位", "ATR 倍数，≥0"), "sr_res_dist": ("距最近阻力位", "ATR 倍数，≥0"),
+    "sr_p_touch": ("触及支撑概率", "0~1"), "sr_p_hold": ("支撑守住概率", "0~1"),
+    "sr_strength": ("区间强度", "综合分"), "sr_resonance": ("多周期共振度", "综合分"),
+    "sr_vol_extr": ("极端波动率标记", "比率"), "sr_score": ("支撑阻力机会分", "综合分"),
+    # 事件记忆
+    "days_since_limit": ("距上次涨停天数", "计数，≥1"),
+    "limit_streak": ("当前连板高度", "计数，≥0，多数为 0"),
+    "announce_7d": ("近 7 日公告数", "计数，≥0"),
+}
+
+
+def field_table(factor_type: str | None = "量价") -> str:
+    """当前类型可用字段的"名称: 含义（量纲/值域）"清单文本，供 LLM 出题 prompt 注入。"""
+    lines = []
+    for f in all_fields(factor_type):
+        info = FIELD_INFO.get(f)
+        lines.append(f"  {f}: {info[0]}（{info[1]}）" if info else f"  {f}")
+    return "\n".join(lines)
+
 # 算子表：name: (arity, windowed, dim_out)
 OPS = {
     "sub": (2, False, "same"), "mul": (2, False, "same"), "div": (2, False, "same"),

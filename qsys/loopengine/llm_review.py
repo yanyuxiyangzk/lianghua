@@ -6,6 +6,7 @@
 
 import json
 import os
+import re
 
 _REVIEWER_SYS = (
     "你是量化表达式审查员，职责是【挑剔地】审查量化因子 S 表达式的工程与经济合理性。"
@@ -25,6 +26,17 @@ _REVIEWER_USER = """审查以下 A 股日频因子表达式：
 只输出 JSON。"""
 
 
+def _extract_json(text: str) -> dict | None:
+    """从 LLM 输出抽取第一个扁平 JSON 对象——容忍代码围栏与推理模型的前置思考文本。"""
+    m = re.search(r"\{[^{}]*\}", text or "", re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+
 def llm_review(sexpr: str) -> tuple[bool, str]:
     """独立审查 sub-agent。无 key/调用失败时回退到规则审查（fail-strict，非fail-open）。"""
     if not os.environ.get("DEEPSEEK_API_KEY"):
@@ -36,11 +48,11 @@ def llm_review(sexpr: str) -> tuple[bool, str]:
             model=os.environ.get("CHAT_MODEL") or "deepseek/deepseek-chat",
             messages=[{"role": "system", "content": _REVIEWER_SYS},
                       {"role": "user", "content": _REVIEWER_USER.format(sexpr=sexpr)}],
-            max_tokens=1000, timeout=45)  # v4-pro 推理模型：思考链+正文共享配额
-        text = r.choices[0].message.content.strip().strip("`")
-        if text.startswith("json"):
-            text = text[4:]
-        d = json.loads(text)
+            max_tokens=1000, timeout=45,
+            temperature=0)  # 审查端要判决稳定：同一表达式不应两次调用一过一拒
+        d = _extract_json(r.choices[0].message.content or "")
+        if d is None:
+            return _rule_review(sexpr), "llm-error-fallback"
         verdict = str(d.get("verdict", "pass")).lower()
         return verdict == "pass", str(d.get("reason", ""))[:120]
     except Exception:

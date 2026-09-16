@@ -281,7 +281,8 @@ def render():
                 try:
                     fvals = {n: fe.get_factor_values(next(f for f in facs if f["name"] == n), codes, end)
                              for n in chosen}
-                    score = sig.composite_score(fvals, weights)
+                    score = sig.composite_score(fvals, weights,
+                                                norms=sig.scoring_norms(list(weights), facs))
                     panel_now = sig.get_panel_cached(codes, end, 800)
                     survived = sig.apply_filters(score.index.tolist(), panel_now, filters)
                     if resonance:

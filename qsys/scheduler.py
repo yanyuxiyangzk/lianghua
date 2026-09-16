@@ -312,7 +312,8 @@ def compute_pack_picks(pk: dict, codes: list[str], end: str, top_n: int):
     except Exception:
         pass  # 使用原权重
     
-    score = sig.composite_score(f_series, weights)
+    score = sig.composite_score(f_series, weights,
+                                norms=sig.scoring_norms(list(weights), pk.get("factors")))
     survived = sig.apply_filters(score.index.tolist(), panel, pk.get("filters", []))
     sel = score[score.index.isin(survived)]
     reso_note = ""
@@ -823,8 +824,11 @@ def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "")
 
     # 经验库落库（不管对错都记，到期由 outcome_backfill 回填战果）
     import experience
+    _norms = sig.scoring_norms(list(weights), pk.get("factors") if pk else None) or {}
     fcfg = [{"name": n, "kind": ("builtin" if n in sig.BUILTIN_FACTORS else "evolved"),
-             "weight": float(w), "direction": int(d)} for n, (w, d) in weights.items()]
+             "weight": float(w), "direction": int(d),
+             "norm": _norms.get(n, "zscore")}  # 归一化口径快照随 picks 落库（实战归因可比性）
+            for n, (w, d) in weights.items()]
     oos = None
     if pk and pk.get("oos_winrate"):
         try:
@@ -896,8 +900,9 @@ def job_auto_scan(pool_name: str = "沪深300", top_n: int = 10, **_ignored) -> 
 
     # 经验库落库
     import experience
+    _norms = sig.scoring_norms(list(weights)) or {}
     fcfg = [{"name": n, "kind": ("builtin" if n in sig.BUILTIN_FACTORS else "evolved"),
-             "weight": float(w), "direction": int(d)}
+             "weight": float(w), "direction": int(d), "norm": _norms.get(n, "zscore")}
             for n, (w, d) in weights.items()]
     experience.save_pick(source="sched_auto_scan", pool_name=pool_name, top_n=top_n,
                          method="auto_select", filters=[], factors=fcfg,

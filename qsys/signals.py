@@ -14,7 +14,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from common import DATA_DIR, QLIB_DATA_DIR, init_qlib
+from common import DATA_DIR, QLIB_DATA_DIR, init_qlib, load_json
 
 PV_FIELDS = ["$open", "$close", "$high", "$low", "$volume", "$amount", "$factor"]  # RD-Agent 字段 + $amount（演化引擎 vwap/amount 需要）
 CACHE_DIR = DATA_DIR / "cache" / "factorruns"
@@ -556,10 +556,93 @@ def zscore(s: pd.Series) -> pd.Series:
     return z.clip(-3, 3)
 
 
+# 截面有效票数低于此数时 zscore 自动降级 rank（小截面均值/方差噪声大，
+# 涨停观察 14:00 盘中场等十几只票的场景是真实受益者）。静态阈值，不做自适应
+# （自适应非平稳、回放不可复现——专家评审裁决）。
+CS_ZSCORE_MIN_N = 30
+
+# cs_norm 认识的归一化方法（resolve_norms 按此白名单消毒 registry 人工覆盖值）
+CS_NORM_METHODS = ("zscore", "rank")
+
+
+def cs_norm(cross: pd.Series, method: str = "zscore") -> pd.Series:
+    """截面归一化统一分派（合成打分唯一入口，typed_v2）。
+
+    method:
+      "zscore" : (x-μ)/σ，clip(±3)——近似对称/有界因子（量价/技术指标/指数/支撑阻力）。
+      "rank"   : rank(pct=True) → 对秩再做 z-score → clip(±3)——重尾/计数/货币/比值类
+                 （财务/资金流/龙虎榜/盘口异动/爆量抢筹/事件记忆）。
+                 秩的 z 分相比线性定标 (p-0.5)×2√3 的优势：天然居中（线性定标有
+                 +√3/N 偏差，小截面不可忽略）；并列日按实现离散度自动重标定
+                 （事件记忆/龙虎榜大量 ties 不再缩水有效权重）；尾部与 zscore 列
+                 同为 ±3，Top-N 选拔的头部影响力对称。
+
+    截面稳健性（专家评审裁决）：
+      - N < CS_ZSCORE_MIN_N 时 zscore 自动降级 rank；
+      - N < 3 熔断：返回全 NaN（当日该因子不参与合成）——rank N=1 会白送满分榜一，
+        zscore N=1 时 std(ddof=1)=NaN 列静默消失，两种失败模式都不可接受。
+
+    未知 method 抛 ValueError——调用方（resolve_norms）负责白名单消毒，
+    这里静默兜底会把配置笔误藏成行为漂移。
+    """
+    cross = cross.dropna()
+    n = len(cross)
+    if n < 3:
+        return pd.Series(np.nan, index=cross.index, dtype=float)
+    if method == "zscore" and n < CS_ZSCORE_MIN_N:
+        method = "rank"
+    if method == "rank":
+        r = cross.rank(pct=True)
+        return zscore(r)  # 秩的 z 分（zscore 内含 clip±3）
+    if method == "zscore":
+        return zscore(cross)
+    raise ValueError(f"未知归一化方法: {method}（合法值: {CS_NORM_METHODS}）")
+
+
+# ---------------------------------------------------------------- 归一化方案开关（typed_v2 灰度）
+_NORM_SCHEME_OVERRIDE: str | None = None  # A/B 回放/测试的进程内覆盖；生产勿动
+
+
+def current_norm_scheme() -> str:
+    """全局归一化方案：DATA_DIR/norm_scheme.json 的 {"scheme": "legacy"|"typed_v2"}，
+    缺文件/异常一律 legacy（=现状口径）。每次调用重读——长驻调度器切换即时生效，
+    避免"切换了但当天任务仍用旧映射"（双进程 owner 锁同族坑）。"""
+    if _NORM_SCHEME_OVERRIDE:
+        return _NORM_SCHEME_OVERRIDE
+    return (load_json(DATA_DIR / "norm_scheme.json", {}) or {}).get("scheme", "legacy")
+
+
+def scoring_norms(names: list[str], pack_factors: list[dict] | None = None
+                  ) -> dict[str, str] | None:
+    """合成打分的归一化分派。
+
+    legacy → 返回 None：调用方走原 zscore 路径，行为与历史逐字节一致（A/B 与回滚的基准）。
+    typed_v2 → {name: "zscore"|"rank"}：pack 快照（pack_factors 条目的 norm 键，打包时刻
+    的解析结果）优先，其余走 library.resolve_norms 自动映射；library 不可用兜底 zscore。
+    """
+    if current_norm_scheme() != "typed_v2":
+        return None
+    snap = {f["name"]: f["norm"].strip() for f in (pack_factors or [])
+            if f.get("name") and (f.get("norm") or "").strip() in CS_NORM_METHODS}
+    missing = [n for n in names if n not in snap]
+    auto: dict[str, str] = {}
+    if missing:
+        try:
+            import library
+            auto = library.resolve_norms(missing)
+        except Exception:
+            auto = {}
+    return {n: snap.get(n) or auto.get(n, "zscore") for n in names}
+
+
 def composite_score(factor_series: dict[str, pd.Series], weights: dict[str, tuple[float, int]],
-                    asof: str | None = None) -> pd.Series:
+                    asof: str | None = None, norms: dict[str, str] | None = None) -> pd.Series:
     """factor_series: {name: 长表 Series((instrument, datetime) 或 (datetime, instrument))}
-    weights: {name: (权重, 方向±1)}。返回 asof（默认最新日）横截面综合分。"""
+    weights: {name: (权重, 方向±1)}。返回 asof（默认最新日）横截面综合分。
+    norms: {name: "zscore"|"rank"}；None=按全局开关解析（legacy=原 zscore 口径，
+    typed_v2=cs_norm 分派）。有 pack 快照时由调用方经 scoring_norms 解析后传入。"""
+    if norms is None:
+        norms = scoring_norms(list(factor_series.keys()))
     z_list, w_total = [], 0.0
     for name, s in factor_series.items():
         w, direction = weights.get(name, (1.0, 1))
@@ -572,7 +655,8 @@ def composite_score(factor_series: dict[str, pd.Series], weights: dict[str, tupl
         day = asof or s.index.get_level_values(dt_level).max()
         cross = s[s.index.get_level_values(dt_level) == day]
         cross.index = cross.index.get_level_values("instrument")
-        z_list.append(zscore(cross) * w * direction)
+        nv = norms.get(name) if norms else None
+        z_list.append((cs_norm(cross, nv) if nv else zscore(cross)) * w * direction)
         w_total += w
     if not z_list:
         return pd.Series(dtype=float)
@@ -879,9 +963,13 @@ def forward_hit_stats(codes: list[str], end: str, weights: dict[str, tuple[float
 
 # ---------------------------------------------------------------- 「为什么选它」白话解释
 def factor_contributions(f_series: dict[str, pd.Series], weights: dict[str, tuple[float, int]],
-                         code: str, asof: str | None = None) -> list[tuple[str, float]]:
+                         code: str, asof: str | None = None,
+                         norms: dict[str, str] | None = None) -> list[tuple[str, float]]:
     """某只股票综合分的因子贡献分解：z_i(c)×w_i×d_i，按贡献降序。
-    与 composite_score 同口径（z-score 截面标准化），正负号=该因子推/拉这只票上榜。"""
+    与 composite_score 同口径（cs_norm 分派；legacy 开关下为原 zscore），
+    正负号=该因子推/拉这只票上榜。typed_v2 下贡献值域按因子类型为 ±3w。"""
+    if norms is None:
+        norms = scoring_norms(list(f_series.keys()))
     out = []
     for name, s in f_series.items():
         w, direction = weights.get(name, (0.0, 1))
@@ -896,7 +984,12 @@ def factor_contributions(f_series: dict[str, pd.Series], weights: dict[str, tupl
         cross.index = cross.index.get_level_values("instrument")
         if code not in cross.index:
             continue
-        out.append((name, float(zscore(cross)[code]) * w * direction))
+        nv = norms.get(name) if norms else None
+        zc = cs_norm(cross, nv) if nv else zscore(cross)
+        zv = zc.get(code)
+        if pd.isna(zv):  # cs_norm N<3 熔断：当日该因子无贡献
+            continue
+        out.append((name, float(zv) * w * direction))
     return sorted(out, key=lambda x: -x[1])
 
 

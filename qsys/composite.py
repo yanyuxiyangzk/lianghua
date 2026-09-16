@@ -17,6 +17,23 @@ from common import all_pools, get_last_trade_day
 PACK_NAME = "Top5复合因子"
 
 
+def _daily_cs_z(v: pd.Series, direction: int = 1, method: str | None = None) -> pd.Series:
+    """逐日截面归一 × 方向（与 _score_at/composite_score 同口径）。
+
+    method=None=legacy 纯 zscore（sig.zscore 逐日应用，含 clip±3）；
+    "zscore"/"rank"=typed_v2 走 cs_norm 分派（含小截面降级/N<3 熔断——熔断日
+    该因子取 NaN，合成时按 fill_value=0 中性处理）。
+
+    2026-09-16 修复前视：曾写成 (v-v.mean())/(v.std()) 对整条 ~800 日序列取
+    全局均值方差——复合因子历史值被未来数据污染，下游 ic_series/_overall_sharpe
+    验证指标虚高（docs/feature-normalization-plan.md 第 0 阶段）。
+    """
+    if method is None:
+        return v.groupby(level="datetime", group_keys=False).apply(sig.zscore) * direction
+    return v.groupby(level="datetime", group_keys=False).apply(
+        lambda g: sig.cs_norm(g, method)) * direction
+
+
 def _overall_sharpe(vals: pd.Series, panel: pd.DataFrame) -> tuple[float, pd.Series]:
     """整体夏普（日度超额序列年化）+ 返回超额序列。"""
     fwd = fe.forward_returns(panel, G.GATE["FWD_DAYS"])
@@ -66,19 +83,19 @@ def build_top5_composite(pool_name: str = "沪深300", top_n: int = 5) -> dict:
     if not top:
         return {"ok": False, "msg": "无有效因子"}
 
-    # 方向修正 z-score 等权合成
+    # 方向修正 z-score 等权合成（逐日截面归一，与 _score_at/composite_score 同口径）
+    # norms=None(legacy) → 纯 zscore；typed_v2 → 按因子类型分派（快照写入下方 payload）
+    norms = sig.scoring_norms([r["name"] for r in top])
     comp = None
     members = []
     for r in top:
         direction = 1 if r["ic_mean"] >= 0 else -1
-        v = fe._norm(r["vals"].dropna())
-        dt_level = "datetime"
-        day = v.index.get_level_values(dt_level).max()
-        cross = v[v.index.get_level_values(dt_level) == day]
-        z = (v - v.mean()) / (v.std() + 1e-12) * direction
+        nv = norms.get(r["name"]) if norms else None
+        z = _daily_cs_z(fe._norm(r["vals"].dropna()), direction, method=nv)
         comp = z if comp is None else comp.add(z, fill_value=0)
         members.append({"name": r["name"], "kind": r["kind"], "weight": 1.0 / len(top),
-                        "direction": direction, "sharpe": round(r["sharpe"], 2)})
+                        "direction": direction, "sharpe": round(r["sharpe"], 2),
+                        "norm": nv or "zscore"})
     comp = comp / len(top)
 
     # 复合指标
@@ -89,10 +106,11 @@ def build_top5_composite(pool_name: str = "沪深300", top_n: int = 5) -> dict:
                for y in sorted(set(x.index.year)) if (x.index.year == y).sum() > 20}
 
     factors = [{"name": m["name"], "kind": m["kind"], "weight": m["weight"],
-                "direction": m["direction"]} for m in members]
+                "direction": m["direction"], "norm": m["norm"]} for m in members]
     library.save_strategy(PACK_NAME, {
         "pool_name": pool_name, "top_n": 20, "method": "等权复合(方向修正)",
         "filters": ["tradable"], "factors": factors,
+        "norm_scheme": sig.current_norm_scheme(),  # 打包时口径快照（回放复现用）
         "oos_winrate": f"{shp:.2f}夏普",
         "updated": pd.Timestamp.now().strftime("%Y-%m-%d %H:%M")})
     return {"ok": True, "members": members, "IC": round(float(ic.mean()), 4) if len(ic) else 0.0,

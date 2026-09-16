@@ -135,7 +135,8 @@ if st.button("🤖 自动组建因子组合", type="primary", key="pc_build"):
             out["facs"] = {n: facs[n] for n in reco["selected"]}
             out["fvals"] = sel_fvals
             # 组建的最终目的是出股——顺手用这个组合算出今日 Top-N 名单
-            score = sig.composite_score(sel_fvals, weights)
+            score = sig.composite_score(sel_fvals, weights,
+                                        norms=sig.scoring_norms(list(weights), list(facs.values())))
             survived = sig.apply_filters(score.index.tolist(), panel, ["tradable"])
             out["today_picks"] = sig.industry_cap_select(
                 score[score.index.isin(survived)], cap=2).head(top_n)
@@ -181,12 +182,15 @@ if auto and auto.get("selected"):
         pn = st.text_input("存为策略包名", value=f"自动组合_{pool_name}_{hold_h}", key="pc_pname")
         if st.button("💾 保存为策略包", disabled=not ok_save, key="pc_save",
                      help=None if ok_save else "OOS 胜率 <55% 或过拟合的组合不允许固化"):
+            _norms = sig.scoring_norms(list(auto["weights"])) or {}
             library.save_strategy(pn, {
                 "pool_name": auto["pool"], "top_n": auto["top_n"], "method": auto["method"],
                 "filters": ["tradable"], "horizon": auto["hold_h"],
                 "factors": [{"name": n, "kind": auto["facs"][n]["kind"],
-                             "weight": float(w), "direction": int(d)}
+                             "weight": float(w), "direction": int(d),
+                             "norm": _norms.get(n, "zscore")}
                             for n, (w, d) in auto["weights"].items()],
+                "norm_scheme": sig.current_norm_scheme(),
                 "oos_winrate": f"{oos_win:.0%}",
                 "is_winrate": (f"{(auto['is_bt']['组合扣费超额'] > 0).mean():.0%}"
                                if auto.get("is_bt") is not None and not auto["is_bt"].empty else None),
@@ -234,11 +238,13 @@ if auto and auto.get("selected"):
         with b2:
             if st.button("📥 名单落库（开始实战跟踪）", key="pc_auto_log"):
                 saved = library.list_strategies()
+                _norms = sig.scoring_norms(list(auto["weights"])) or {}
                 experience.save_pick(
                     source="auto_combo", pool_name=auto["pool"], top_n=len(tp),
                     method=auto["method"], filters=["tradable"],
                     factors=[{"name": n, "kind": auto["facs"][n]["kind"],
-                              "weight": float(w), "direction": int(d)}
+                              "weight": float(w), "direction": int(d),
+                              "norm": _norms.get(n, "zscore")}  # 口径快照随 picks 落库
                              for n, (w, d) in auto["weights"].items()],
                     final_scores=tp,
                     pack_name=(st.session_state.get("pc_pname")

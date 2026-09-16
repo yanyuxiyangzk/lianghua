@@ -35,6 +35,9 @@ _ds.get_loop_source = lambda: "custom"
 _sig = sys.modules["signals"]
 _sig.fetch_panel = lambda *a, **kw: None
 _sig.zscore = lambda s: (s - s.mean()) / (s.std() + 1e-12)  # 简单 z-score
+# typed_v2 接线后 factor_eval 入口会调 scoring_norms；返回 None=legacy（原 zscore 口径）
+_sig.scoring_norms = lambda names, pack_factors=None: None
+_sig.cs_norm = lambda cross, method="zscore": _sig.zscore(cross)  # typed 路径本套件不触及，防御性补齐
 
 # ---- 现在可以导入 factor_eval ----
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))

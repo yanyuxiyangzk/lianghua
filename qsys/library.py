@@ -133,7 +133,8 @@ def _lconn():
     # 迁移：factor_registry 加骨架/机制族/闸门列
     cols = [r[1] for r in c.execute("PRAGMA table_info(factor_registry)")]
     for col, ddl in [("skeleton", "TEXT"), ("family", "TEXT"), ("gate_status", "INTEGER"),
-                     ("engine", "TEXT DEFAULT 'rdagent'"), ("factor_type", "TEXT DEFAULT '量价'")]:
+                     ("engine", "TEXT DEFAULT 'rdagent'"), ("factor_type", "TEXT DEFAULT '量价'"),
+                     ("norm", "TEXT")]:  # norm: 截面归一化人工覆盖（NULL=按类型自动映射）
         if col not in cols:
             c.execute(f"ALTER TABLE factor_registry ADD COLUMN {col} {ddl}")
     # 迁移：factor_registry 加多目标评分/风险指标/衰减状态列
@@ -353,6 +354,76 @@ def sync_factor_registry(factors: list[dict]):
 def get_factor_registry() -> pd.DataFrame:
     with _lconn() as c:
         return pd.read_sql("SELECT * FROM factor_registry", c)
+
+
+# ---------------------------------------------------------------- 截面归一化分派（typed_v2）
+# factor_type → 默认归一化方法：重尾/计数/货币/比值类用 rank（秩的 z 分），
+# 近似对称/有界/已归一类维持 zscore。人工覆盖：factor_registry.norm 列。
+NORM_BY_TYPE = {
+    "财务": "rank", "资金流": "rank", "龙虎榜": "rank",
+    "盘口异动": "rank", "爆量抢筹": "rank", "事件记忆": "rank",
+    "量价": "zscore", "板块轮动": "zscore", "指数": "zscore", "支撑阻力": "zscore",
+}
+_VALID_NORMS = {"zscore", "rank"}
+
+# 注册表行按日缓存：_lconn 每次连接跑全量迁移检查，UI/调度器高频调用不能都走一遍；
+# 按日刷新兼顾"调度器长驻进程当天切换当天生效"（双进程 owner 锁同族坑）。
+_reg_rows_cache: dict = {"date": None, "rows": {}}
+
+
+def _registry_rows() -> dict:
+    """{name: {kind, factor_type, norm}}，按日缓存。查询失败返回空表且**不缓存日期**
+    （DB 临时被锁时下次调用重试，不致全天静默兜底）。"""
+    today = datetime.now().strftime("%Y-%m-%d")
+    if _reg_rows_cache["date"] == today:
+        return _reg_rows_cache["rows"]
+    try:
+        with _lconn() as c:
+            rows = c.execute("SELECT name, kind, factor_type, norm FROM factor_registry").fetchall()
+        _reg_rows_cache["rows"] = {
+            r[0]: {"kind": r[1], "factor_type": r[2], "norm": r[3]} for r in rows}
+        _reg_rows_cache["date"] = today
+    except Exception as e:
+        logging.warning(f"resolve_norms: 注册表读取失败，本次全部兜底 zscore: {e}")
+    return _reg_rows_cache["rows"]
+
+
+def _resolve_one_norm(name: str, rows: dict) -> str:
+    """单个因子的归一化方法：registry.norm 人工覆盖 > factor_type 默认映射
+    > NAME2CAT/tech 名称推断 > 兜底 zscore。任何环节都不允许报错。"""
+    r = rows.get(name)
+    if r is not None:
+        norm = (r.get("norm") or "").strip()
+        if norm:
+            if norm in _VALID_NORMS:
+                return norm
+            logging.warning(f"resolve_norms: {name} 的 norm 覆盖值非法（{norm!r}），回退自动映射")
+        m = NORM_BY_TYPE.get(r.get("factor_type") or "")
+        if m:
+            return m
+        if r.get("kind") == "tech":
+            return "zscore"
+    try:  # registry 无记录时的名称推断（内置目录/技术指标全是 zscore 口径）
+        import signals as _sig
+        if name in _sig.TECH_INDICATORS or name in _sig.NAME2CAT:
+            return "zscore"
+    except Exception:
+        pass
+    return "zscore"
+
+
+def resolve_norms(names: list[str]) -> dict[str, str]:
+    """{因子名: "zscore"|"rank"}，供合成打分（composite_score/_score_at）分派。
+
+    注意：本映射非 PIT——回放读到的是**当前** registry；复现以 pack payload
+    的 norm 快照为准（engine._try_generate_pack 打包时写入）。
+    """
+    try:
+        rows = _registry_rows()
+    except Exception as e:  # 缓存层之外的意外也不允许炸掉合成打分
+        logging.warning(f"resolve_norms: 注册表读取异常，本次全部兜底 zscore: {e}")
+        rows = {}
+    return {n: _resolve_one_norm(n, rows) for n in names}
 
 
 # ---------------------------------------------------------------- 因子体检表

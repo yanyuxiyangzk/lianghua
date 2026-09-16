@@ -154,7 +154,8 @@ def _render_strategy_detail(name: str, pk: dict, reg_map: dict):
     if run_picks:
         with st.spinner("计算今日名单…"):
             weights = {f["name"]: (f["weight"], f["direction"]) for f in pk["factors"]}
-            score = sig.composite_score(_fvals(), weights)
+            score = sig.composite_score(_fvals(), weights,
+                                        norms=sig.scoring_norms(list(weights), pk.get("factors")))
             panel = sig.get_panel_cached(codes, end, 800)
             survived = sig.apply_filters(score.index.tolist(), panel, pk.get("filters", []))
             final = score[score.index.isin(survived)].head(pk["top_n"])

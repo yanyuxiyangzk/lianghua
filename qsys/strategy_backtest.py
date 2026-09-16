@@ -74,6 +74,9 @@ def backtest_strategy(strategy_name: str, pool_name: str = "沪深300",
         if not s2.empty:
             vals_norm[name] = s2
 
+    # 归一化分派：pack 快照（factors 条目的 norm 键）> 全局开关自动映射；legacy → None
+    norms = sig.scoring_norms(list(weights), factors)
+
     # 获取所有交易日
     all_dates = sorted(set(
         dt for vals in vals_norm.values()
@@ -97,8 +100,8 @@ def backtest_strategy(strategy_name: str, pool_name: str = "沪深300",
         dt = all_dates[i]
         dt_str = str(dt)[:10]
 
-        # 截面打分：z-score × 权重 × 方向（与 walk_forward 一致）
-        sc = fe._score_at(vals_norm, weights, dt)
+        # 截面打分：cs_norm 分派 × 权重 × 方向（与 walk_forward 一致；legacy 开关下为原 zscore）
+        sc = fe._score_at(vals_norm, weights, dt, norms=norms)
         if sc.empty:
             continue
 

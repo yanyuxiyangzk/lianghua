@@ -990,15 +990,18 @@ def factor_group_backtest(vals: pd.Series, panel: pd.DataFrame, n_groups: int = 
     return {"group_mean": group_mean, "ls_ret": ls_ret, "ls_nav": nav, "ls_stats": stats,
             "ic": ic_series(vals, forward_returns(panel, fwd_days))}
 # ---------------------------------------------------------------- 截面打分（walk_forward / static_backtest 共用）
-def _score_at(vals_norm: dict[str, pd.Series], weights: dict, t) -> pd.Series:
-    """调仓日 t 的截面综合分（z-score × 权重 × 方向）。"""
+def _score_at(vals_norm: dict[str, pd.Series], weights: dict, t,
+              norms: dict[str, str] | None = None) -> pd.Series:
+    """调仓日 t 的截面综合分（归一化 × 权重 × 方向）。
+    norms=None=legacy 原 zscore 口径；传映射=typed_v2 cs_norm 分派（含小截面降级/熔断）。"""
     zl = []
     for n, (w, d) in weights.items():
         if w <= 0:
             continue
         cross = vals_norm[n][vals_norm[n].index.get_level_values("datetime") == t]
         cross.index = cross.index.get_level_values("instrument")
-        zl.append(sig.zscore(cross) * w * d)
+        nv = norms.get(n) if norms else None
+        zl.append((sig.cs_norm(cross, nv) if nv else sig.zscore(cross)) * w * d)
     return pd.concat(zl, axis=1).mean(axis=1).dropna() if zl else pd.Series(dtype=float)
 
 
@@ -1007,7 +1010,8 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
                  top_n: int, est: int = EST_WINDOW, step: int = STEP_DAYS,
                  fwd_days: int = MAIN_FWD, cost: float = 0.0025,
                  buffer_n: int = 0, ic_full: dict[str, pd.Series] | None = None,
-                 min_factors: int = 2) -> pd.DataFrame:
+                 min_factors: int = 2,
+                 norms: dict[str, str] | None = None) -> pd.DataFrame:
     """滚动样本外：每个应用点 t，用 [t-est, t-fwd] 的 IC 统计定权重与方向，
     在 t 截面打分取 Top-N，记录随后 fwd_days 的超额收益。
 
@@ -1018,6 +1022,7 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
     是降换手的标准做法（实测可把 1 日口径 80%/日的换手压到 ~30%）。
     ic_full 可传入预计算的全历史 IC 序列（贪心搜索批量评估时避免重复计算）。
     min_factors：估计窗内有效因子的最少个数（贪心搜索单因子起步时用 1）。
+    norms=None 时按全局开关解析（legacy=原 zscore 口径；typed_v2=cs_norm 自动映射）。
     """
     fwd = forward_returns(panel, fwd_days)
     # 全历史 IC 序列（每个因子算一次，应用点只做切片统计 → 快）
@@ -1027,6 +1032,8 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
         if s2.empty:
             continue
         vals_norm[name] = s2
+    if norms is None:
+        norms = sig.scoring_norms(list(vals_norm))
     if ic_full is None:
         ic_full = {name: ic_series(s, fwd) for name, s in vals_norm.items()}
     days = sorted(set.intersection(*[set(s.index.get_level_values("datetime").unique())
@@ -1065,7 +1072,7 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
         # 基准改为等权均值（消除中位数低估超额的偏差）
         row = {"调仓日": str(t)[:10], "池内均值收益": fr.mean()}
         for label, weights in [("优化组合", w_opt), ("等权组合", w_eq)]:
-            sc_t = _score_at(vals_norm, weights, t)
+            sc_t = _score_at(vals_norm, weights, t, norms=norms)
             ranked = sc_t[sc_t.index.isin(fr.index)].sort_values(ascending=False)
             prev = prev_picks[label]
             if buffer_n > 0 and prev:
@@ -1140,17 +1147,21 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
 def static_backtest(factor_vals: dict[str, pd.Series], panel: pd.DataFrame,
                     weights: dict, top_n: int, fwd_days: int = MAIN_FWD,
                     step: int = STEP_DAYS, cost: float = 0.0025,
-                    upto: str | None = None, collect_picks: bool = False) -> pd.DataFrame:
+                    upto: str | None = None, collect_picks: bool = False,
+                    norms: dict[str, str] | None = None) -> pd.DataFrame:
     """样本内对照回测：用 ② 组合构建算好的**固定权重**（不滚动重估），
     在 upto（默认全历史）之前的调仓点上截面打分取 Top-N。
 
     输出与 walk_forward 同构，用于 ③ 的 IS/OOS 双轨对比：
     IS 胜率高、OOS 胜率低 = 权重过拟合样本内的直接证据。
-    collect_picks=True 时附 "picks" 列（每点名单），供策略组合投票复用。"""
+    collect_picks=True 时附 "picks" 列（每点名单），供策略组合投票复用。
+    norms=None 时按全局开关解析（legacy=原 zscore 口径）。"""
     fwd = forward_returns(panel, fwd_days)
     vals_norm = {n: _norm(s.dropna()) for n, s in factor_vals.items() if not s.dropna().empty}
     if not vals_norm:
         return pd.DataFrame()
+    if norms is None:
+        norms = sig.scoring_norms(list(vals_norm))
     days = sorted(set.intersection(*[set(s.index.get_level_values("datetime").unique())
                                      for s in vals_norm.values()]))
     if upto:
@@ -1163,7 +1174,7 @@ def static_backtest(factor_vals: dict[str, pd.Series], panel: pd.DataFrame,
         fr = fwd.loc[t].dropna()
         if fr.empty:
             continue
-        sc_t = _score_at(vals_norm, weights, t)
+        sc_t = _score_at(vals_norm, weights, t, norms=norms)
         ranked = sc_t[sc_t.index.isin(fr.index)].sort_values(ascending=False)
         picks = ranked.head(top_n)
         if len(picks) < max(3, top_n // 2):
@@ -1452,8 +1463,10 @@ def combo_backtest(pack_defs: list[dict], panel: pd.DataFrame, min_votes: int = 
     for pd_ in pack_defs:
         vals = {n: _norm(s.dropna()) for n, s in pd_["fvals"].items() if not s.dropna().empty}
         if vals:
+            # 包快照（pack_defs 带 factors 条目时）> 全局开关自动映射；legacy → None
             packs.append({"name": pd_["name"], "weights": pd_["weights"],
-                          "top_n": int(pd_["top_n"]), "vals": vals})
+                          "top_n": int(pd_["top_n"]), "vals": vals,
+                          "norms": sig.scoring_norms(list(vals), pd_.get("factors"))})
     if len(packs) < 2:
         return pd.DataFrame()
     days = list(panel.index.get_level_values("datetime").unique())
@@ -1469,7 +1482,7 @@ def combo_backtest(pack_defs: list[dict], panel: pd.DataFrame, min_votes: int = 
         row = {"调仓日": str(t)[:10], "池内中位收益": med}
         votes: dict[str, int] = {}
         for p in packs:
-            sc_t = _score_at(p["vals"], p["weights"], t)
+            sc_t = _score_at(p["vals"], p["weights"], t, norms=p["norms"])
             ranked = sc_t[sc_t.index.isin(fr.index)].sort_values(ascending=False)
             picks = list(ranked.head(p["top_n"]).index)
             if len(picks) < max(3, p["top_n"] // 2):

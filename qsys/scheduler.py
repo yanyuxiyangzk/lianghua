@@ -1667,6 +1667,152 @@ def job_daily_report(**_ignored) -> str:
     return f"{data['date']} 战报已生成入库（{len(report)} 字）· 已入进化引擎证据链"
 
 
+# ---------------------------------------------------------------- 战报蒸馏 → 进化信号
+# 方案 docs/report-distill-evolution-plan.md v2。铁律：信号只影响出题分布，永不改闸门；
+# fail-quiet——蒸馏失败/校验不过 = 当天无信号，引擎照常跑。
+def _distill_leaderboard_txt(top: int = 10, flop: int = 5) -> str:
+    """因子实战榜（outcome_backfill 之后从 DB 重取——战报落库时的快照是回填前算的）。"""
+    import experience
+    try:
+        flb = experience.factor_leaderboard(fwd=5)
+        if flb is None or flb.empty:
+            return "（空）"
+        win_col = next((c for c in flb.columns if "胜率" in str(c)), None)
+        name_col = next((c for c in flb.columns if str(c) in ("因子", "name")), None)
+        if not win_col or not name_col:
+            return f"（列结构不符: {list(flb.columns)[:6]}）"
+        df = flb.dropna(subset=[win_col]).sort_values(win_col, ascending=False)
+        lines = ["TOP: " + ", ".join(f"{r[name_col]}({float(r[win_col]):.0%})"
+                                     for _, r in df.head(top).iterrows())]
+        if len(df) > top:
+            lines.append("FLOP: " + ", ".join(f"{r[name_col]}({float(r[win_col]):.0%})"
+                                              for _, r in df.tail(flop).iterrows()))
+        return "\n".join(lines)
+    except Exception as e:
+        return f"（获取失败: {e}）"
+
+
+def _distill_watch_txt(today: str, limit: int = 15) -> str:
+    """涨停/放量异动观察清单摘要（14:00 盘中场 + 17:25 盘后场）——hypotheses 最肥原料。"""
+    try:
+        with datasource._conn() as c:
+            rows = c.execute(
+                "SELECT kind, name, chg_pct, quantity_ratio FROM limit_up_watch"
+                " WHERE date=? ORDER BY amount DESC LIMIT ?", (today, limit)).fetchall()
+        if not rows:
+            return "（当日无清单）"
+        by_kind: dict[str, list[str]] = {}
+        for kind, name, chg, qr in rows:
+            by_kind.setdefault(kind, []).append(f"{name}({float(chg):+.1f}%,量比{float(qr):.1f})")
+        return "\n".join(f"{k} {len(v)}只: " + "、".join(v[:10]) for k, v in by_kind.items())
+    except Exception as e:
+        return f"（读取失败: {e}）"
+
+
+def _distill_sr_txt(today: str, limit: int = 8) -> str:
+    """支撑阻力共振 Top（18:10 sr_scan 落库）。"""
+    try:
+        with datasource._conn() as c:
+            rows = c.execute(
+                "SELECT code, score, resonance, p_hold, sup_dist_atr FROM sr_scan_daily"
+                " WHERE date=? ORDER BY score DESC LIMIT ?", (today, limit)).fetchall()
+        if not rows:
+            return "（当日无扫描）"
+        return "\n".join(f"{c_}: score={float(s):.1f} 共振{int(bool(rz))} "
+                         f"守住概率{float(p):.2f} 距支撑{float(dd):.1f}ATR"
+                         for c_, s, rz, p, dd in rows)
+    except Exception as e:
+        return f"（读取失败: {e}）"
+
+
+def _distill_sector_txt(today: str, limit: int = 5) -> str:
+    """板块资金流 Top/Bottom（sector_daily 盘后聚合）。"""
+    try:
+        with datasource._conn() as c:
+            tops = c.execute(
+                "SELECT sector_name, flow_net, avg_chg_pct FROM sector_daily"
+                " WHERE date=? ORDER BY flow_net DESC LIMIT ?", (today, limit)).fetchall()
+            bots = c.execute(
+                "SELECT sector_name, flow_net, avg_chg_pct FROM sector_daily"
+                " WHERE date=? ORDER BY flow_net ASC LIMIT ?", (today, limit)).fetchall()
+        if not tops:
+            return "（当日无板块数据）"
+        fmt = lambda rs: "、".join(f"{n}({float(f) / 1e8:+.1f}亿,{float(c_):+.1f}%)" for n, f, c_ in rs)
+        return f"流入: {fmt(tops)}\n流出: {fmt(bots)}"
+    except Exception as e:
+        return f"（读取失败: {e}）"
+
+
+def _distill_chat_index_txt(today: str) -> str:
+    """复盘数据包索引（当日哪些票被复盘组装过数据包——纯结构化，无 LLM 二手失真）。"""
+    try:
+        with datasource._conn() as c:
+            rows = c.execute(
+                "SELECT channel FROM chat_contexts WHERE date=?", (today,)).fetchall()
+        if not rows:
+            return "（当日无复盘数据包）"
+        return "今日已复盘: " + "、".join(sorted({r[0] for r in rows})[:20])
+    except Exception as e:
+        return f"（读取失败: {e}）"
+
+
+def job_evolution_distill(**_ignored) -> str:
+    """战报蒸馏 → 进化信号（盘后 18:55，必须在 outcome_backfill(18:45) 之后——
+    战报 18:35 生成时当天战果尚未回填，排行榜要从 DB 重取；专家评审必修 1）。
+
+    模式开关 /data/evolution_signals.json {"mode": off|shadow|prompt|weights}，缺省 shadow
+    （shadow=蒸馏照常落库、引擎只记偏置快照不改行为）。
+    """
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5:
+        return "非交易日，跳过"
+    from loopengine import evolution_signals as es
+    mode = es.get_mode()
+    if mode == "off":
+        return "进化信号已关闭（mode=off）"
+    import os
+    if not os.environ.get("DEEPSEEK_API_KEY"):
+        return "无 DEEPSEEK_API_KEY，跳过蒸馏"
+
+    import experience
+    today = now.strftime("%Y-%m-%d")
+    rep = experience.get_daily_report(today)
+    content = (rep or {}).get("content") or ""
+    if es.is_degenerate_report(content):
+        return f"{today} 战报缺失或退化（LLM 不可用/过短），跳过蒸馏"
+
+    payload = {
+        "report_date": today,
+        "report_text": " ".join(content.split())[:3000],
+        "leaderboard_txt": _distill_leaderboard_txt(),
+        "watch_txt": _distill_watch_txt(today),
+        "sr_txt": _distill_sr_txt(today),
+        "sector_txt": _distill_sector_txt(today),
+        "chat_index_txt": _distill_chat_index_txt(today),
+    }
+    try:
+        from litellm import completion
+
+        r = completion(model=os.environ.get("CHAT_MODEL") or "deepseek/deepseek-chat",
+                       messages=[{"role": "user", "content": es.build_distill_prompt(payload)}],
+                       max_tokens=1500, timeout=60, temperature=0)  # 蒸馏要稳定，不要创意
+        d = es.extract_json_obj(r.choices[0].message.content or "")
+        if d is None:
+            return f"{today} 蒸馏输出无法抽取 JSON（当天无信号）"
+        ok, why, clean = es.validate_signals(d)
+        if not ok:
+            return f"{today} 信号 schema 未过（{why}；当天无信号）"
+        import signals as sig
+        experience.save_evolution_signal(today, today, clean, norm_scheme=sig.current_norm_scheme())
+        return (f"{today} 进化信号已落库（mode={mode}）：effective {len(clean['effective'])} · "
+                f"decaying {len(clean['decaying'])} · hypotheses {len(clean['hypotheses'])} · "
+                f"confidence {clean['confidence']:.2f}")
+    except Exception as e:
+        return f"蒸馏调用失败（当天无信号）: {e}"
+
+
 def job_sr_scan(**_ignored) -> str:
     """支撑/阻力扫描（Density-SR）：每交易日 18:10，全市场四信号融合扫描落库 sr_scan_daily。
 
@@ -2372,6 +2518,8 @@ JOBS = {
                               "params": {"pool_name": "沪深300", "top_n": 10}}},
     "outcome_backfill": {"name": "🎯 战果回填（经验库）", "func": job_outcome_backfill,
                          "default": {"enabled": True, "hour": 18, "minute": 45, "params": {}}},
+    "evolution_distill": {"name": "🧬 进化信号蒸馏（战报→引擎）", "func": job_evolution_distill,
+                          "default": {"enabled": True, "hour": 18, "minute": 55, "params": {}}},
     "gate_check": {"name": "🛡 硬闸门筛查（因子库）", "func": job_gate_check,
                    "default": {"enabled": True, "hour": 18, "minute": 0,
                                "params": {"pool_name": "沪深300"}}},

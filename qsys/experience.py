@@ -91,6 +91,19 @@ CREATE TABLE IF NOT EXISTS daily_reports (
 );
 """
 
+# 进化信号（战报蒸馏，docs/report-distill-evolution-plan.md v2）：
+# 蒸馏 job 写 signals；引擎 shadow 挂钩回写 shadow_bias_json（若启用会怎么偏置的快照）。
+_EVOLUTION_SIGNALS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS evolution_signals (
+    date TEXT PRIMARY KEY,          -- 信号生成日
+    report_date TEXT,               -- 蒸馏依据的战报日期（消费端新鲜度校验）
+    signals TEXT,                   -- 蒸馏 JSON（已过 schema 校验）
+    shadow_bias_json TEXT,          -- shadow 期偏置快照（引擎侧回写）
+    norm_scheme TEXT,               -- 落库时归一化口径（lift 分层用）
+    created_at TEXT
+);
+"""
+
 
 def _conn():
     c = sqlite3.connect(DB_PATH, timeout=30)
@@ -100,6 +113,7 @@ def _conn():
     c.executescript(_TRADES_SCHEMA)
     c.executescript(_POSITIONS_SCHEMA)
     c.executescript(_DAILY_REPORTS_SCHEMA)
+    c.executescript(_EVOLUTION_SIGNALS_SCHEMA)
     # 迁移：positions 增加限价字段（委托买入用，老库无此列则补上）
     pcols = [r[1] for r in c.execute("PRAGMA table_info(positions)")]
     if "limit_price" not in pcols:
@@ -1414,4 +1428,48 @@ def list_daily_reports(limit: int = 30) -> pd.DataFrame:
     with _conn() as c:
         return pd.read_sql(
             "SELECT date, pnl_today, pnl_total, generated_at FROM daily_reports ORDER BY date DESC LIMIT ?",
+            c, params=(limit,))
+
+
+# ---------------------------------------------------------------- 进化信号（战报蒸馏）
+def save_evolution_signal(date: str, report_date: str, signals: dict,
+                          norm_scheme: str = "legacy") -> None:
+    """蒸馏 job 落库一条进化信号（同日覆盖，幂等）。"""
+    with _conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO evolution_signals (date, report_date, signals, norm_scheme, created_at)"
+            " VALUES (?,?,?,?,?)",
+            (date, report_date, json.dumps(signals, ensure_ascii=False), norm_scheme,
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+
+
+def get_latest_evolution_signal() -> dict | None:
+    """取最新一条信号（新鲜度/有效期校验在调用方）。返回 {date, report_date, signals(dict),
+    shadow_bias_json, norm_scheme} 或 None。任何异常返回 None（无信号不是错误）。"""
+    try:
+        with _conn() as c:
+            r = c.execute(
+                "SELECT date, report_date, signals, shadow_bias_json, norm_scheme"
+                " FROM evolution_signals ORDER BY date DESC LIMIT 1").fetchone()
+        if not r:
+            return None
+        return {"date": r[0], "report_date": r[1], "signals": json.loads(r[2] or "{}"),
+                "shadow_bias_json": r[3], "norm_scheme": r[4]}
+    except Exception:
+        return None
+
+
+def update_signal_shadow_bias(date: str, shadow_bias: dict) -> None:
+    """引擎 shadow 挂钩回写偏置快照（仅当该日有信号行）。"""
+    with _conn() as c:
+        c.execute("UPDATE evolution_signals SET shadow_bias_json=? WHERE date=?",
+                  (json.dumps(shadow_bias, ensure_ascii=False), date))
+
+
+def list_evolution_signals(limit: int = 30) -> pd.DataFrame:
+    """最近 N 条信号（shadow 评估脚本用）。"""
+    with _conn() as c:
+        return pd.read_sql(
+            "SELECT date, report_date, signals, shadow_bias_json, norm_scheme, created_at"
+            " FROM evolution_signals ORDER BY date DESC LIMIT ?",
             c, params=(limit,))

@@ -50,21 +50,28 @@ def _extract_sexpr(text: str) -> str | None:
 
 
 def _build_llm_prompt(fam: str, why: str, factor_type: str, evidence: str,
-                      fewshots: list[str]) -> str:
+                      fewshots: list[str], hypotheses: list[str] | None = None) -> str:
     """LLM 出题 prompt（纯函数）。字段带含义与量纲（防新类型量纲瞎猜）；
-    fewshots 把闸门口味前置到生成端。"""
+    fewshots 把闸门口味前置到生成端；hypotheses 与 fewshots 分槽渲染——
+    fewshots 是"过闸结构范例"，hypotheses 是"待验证机制想法"（混排会让模型
+    误以为假设也是已验证口味——专家评审补充）。"""
     ops = "sub,mul,div,abs,sign,rank_cs,ma,ts_min,ts_max,ts_rank,decay_linear,std,skew,delta,roc,corr,ema,zscore"
     type_hint = f"（因子类型：{factor_type}）" if factor_type != "量价" else ""
     fs = ""
     if fewshots:
         fs = ("以下为该族已入库并通过统计闸门的真实因子（参考其结构与口味，不要照抄）：\n"
               + "\n".join(f"  {s}" for s in fewshots) + "\n")
+    hy = ""
+    if hypotheses:
+        hy = ("待验证机制假设（来自最新复盘蒸馏——是想法、不是已验证口味，可择优落地）：\n"
+              + "\n".join(f"  - {h}" for h in hypotheses) + "\n")
     return (f"你是量化因子工程师。用以下 S 表达式语法写一个属于「{fam}」机制族的 A 股日频{factor_type}因子。"
             f"（{why}）{type_hint}\n"
             f"{evidence}"
             f"字段（含含义与量纲）:\n{field_table(factor_type)}\n"
             f"算子: {ops}（窗口算子需带整数窗口，如 ma(close,20)）\n"
             f"{fs}"
+            f"{hy}"
             "规则: 深度≤6，corr/mul/div/sub 两端维度一致，至少含一个窗口算子。\n"
             "只输出一个 S 表达式，如 sub(ma(overnight,20),delta(ma(overnight,20),5))，不要任何解释。")
 
@@ -78,6 +85,7 @@ class LoopEngine:
         self.pool_name = pool_name
         self.state = self._load_state()
         self._last_extra_frames = True
+        self._signal_id_in_prompt = None  # 进化信号打标（record_tested 用），每候选重置
 
     # ---------------- 状态 ----------------
     def _load_state(self) -> dict:
@@ -130,6 +138,7 @@ class LoopEngine:
     def _gen_candidate(self, rng, gaps, proven, live_boost, factor_type: str = "量价",
                        regime: str | None = None, stats: dict | None = None):
         src = self.state["budget"].choose(rng)
+        self._signal_id_in_prompt = None  # 每候选重置；仅 LLM 真正产出且 prompt 含信号时挂标
         fw = self.state["field_weights"].w
         if factor_type != "量价":
             # 随机/变异/交叉路径的字段采样池需带上该类型的专属字段
@@ -137,8 +146,10 @@ class LoopEngine:
             #   等于非量价类型的随机生成名存实亡）
             fw = {**fw, **{f: 1.0 for f in TYPE_FIELDS.get(factor_type, [])}}
         if src == "llm":
-            tree = self._llm_generate(rng, gaps, proven, factor_type, stats=stats) \
-                or genetics.random_tree(rng, 4, fw)
+            tree = self._llm_generate(rng, gaps, proven, factor_type, stats=stats)
+            if tree is None:  # LLM 失败回退随机树——随机产物不挂信号标
+                tree = genetics.random_tree(rng, 4, fw)
+                self._signal_id_in_prompt = None
         elif src == "mutate":
             parent = self._pick_parent(rng, live_boost, factor_type, regime)
             tree = genetics.mutate(parent, rng, fw) if parent else genetics.random_tree(rng, 4, fw)
@@ -314,25 +325,47 @@ class LoopEngine:
         if not targets:
             return None
         fam, why = rng.choice(targets)
-        # 昨日战报证据（每日 18:35 自动生成的 LLM 复盘）——让假设与最新实盘证据对齐：
-        # 强化验证有效方向、规避失效方向（2026-09-15 复盘→改进闭环）
+        # 实盘证据注入（两档，进化信号优先）：
+        # - mode=prompt/weights 且有未过期蒸馏信号 → 结构化信号 + hypotheses 种子
+        #   （战报蒸馏方案阶段 1，docs/report-distill-evolution-plan.md v2）；
+        # - 否则回退到昨日战报原文 900 字截断（每日 18:35 战报，复盘→改进闭环）。
         evidence = ""
+        hypotheses: list[str] = []
+        sig_used = None
         try:
-            import experience
-            with experience._conn() as c:
-                row = c.execute(
-                    "SELECT date, content FROM daily_reports ORDER BY date DESC LIMIT 1").fetchone()
-            if row and row[1]:
-                excerpt = " ".join(str(row[1]).split())[:900]
-                evidence = (f"\n昨日（{row[0]}）实盘复盘证据（自动战报摘要）：\n{excerpt}\n"
-                            "请让新因子与该证据一致：强化其中验证有效的方向，规避失效方向。\n")
+            from loopengine import evolution_signals as es
+            if es.get_mode() in ("prompt", "weights"):
+                import experience
+                from common import get_last_trade_day
+                row = experience.get_latest_evolution_signal()
+                if row and es.usable_layer(row["signals"], get_last_trade_day(),
+                                           report_date=row["report_date"]) != "none":
+                    rendered = es.render_for_prompt(row["signals"])
+                    if rendered:
+                        evidence = (f"\n进化信号（{row['report_date']} 战报蒸馏，结构化）：\n{rendered}\n"
+                                    "请让新因子与这些方向一致：强化验证有效方向，规避失效方向。\n")
+                        hypotheses = es.hypotheses_of(row["signals"])
+                        sig_used = row["date"]
         except Exception:
             pass
+        if not evidence:
+            try:
+                import experience
+                with experience._conn() as c:
+                    row = c.execute(
+                        "SELECT date, content FROM daily_reports ORDER BY date DESC LIMIT 1").fetchone()
+                if row and row[1]:
+                    excerpt = " ".join(str(row[1]).split())[:900]
+                    evidence = (f"\n昨日（{row[0]}）实盘复盘证据（自动战报摘要）：\n{excerpt}\n"
+                                "请让新因子与该证据一致：强化其中验证有效的方向，规避失效方向。\n")
+            except Exception:
+                pass
         try:
             from litellm import completion
 
             prompt = _build_llm_prompt(fam, why, factor_type, evidence,
-                                       self._family_fewshots(fam, factor_type))
+                                       self._family_fewshots(fam, factor_type),
+                                       hypotheses=hypotheses)
             r = completion(model=os.environ.get("CHAT_MODEL") or "deepseek/deepseek-chat",
                            messages=[{"role": "user", "content": prompt}],
                            max_tokens=800, temperature=1.1)  # 生成端要多样性（审查端则钉 0）
@@ -348,6 +381,8 @@ class LoopEngine:
                 if stats is not None:
                     stats["llm_gen_fail"] = stats.get("llm_gen_fail", 0) + 1
                 log.info(f"LLM 出题解析失败: {cand[:100]!r}")
+            else:
+                self._signal_id_in_prompt = sig_used  # 仅 LLM 成功产出时挂信号标（lift 度量）
             return tree
         except Exception:
             return None
@@ -370,6 +405,34 @@ class LoopEngine:
             return out
         except Exception:
             return []
+
+    def _signal_shadow_hook(self, gaps: list, proven: list) -> None:
+        """进化信号 shadow 挂钩（战报蒸馏方案 rollout 第 1 周）：读最新信号，计算
+        "若启用会怎么偏置"的快照回写 evolution_signals.shadow_bias_json——
+        供 shadow_eval 量化验收（偏置方向 vs 当日实际过闸族分布的 rank 相关）。
+        绝不改变任何行为：不碰 gaps/proven/字段权重/预算。"""
+        from loopengine import evolution_signals as es
+        if es.get_mode() == "off":
+            return
+        import experience
+        row = experience.get_latest_evolution_signal()
+        if not row:
+            return
+        from common import get_last_trade_day
+        steer = (row["signals"].get("steer") or {})
+        snapshot = {
+            "mode": es.get_mode(), "signal_date": row["date"], "report_date": row["report_date"],
+            "usable_layer": es.usable_layer(row["signals"], get_last_trade_day(),
+                                            report_date=row["report_date"]),
+            # usable_layer=none 时偏置本就为零，照样记录（验收分母）
+            "would_boost_families": steer.get("families_boost") or {},
+            "would_boost_fields": steer.get("fields_boost") or {},
+            "would_boost_types": steer.get("types_boost") or {},
+            "gaps_now": list(gaps), "proven_now": list(proven),
+            "round": self.state["iteration"],
+            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        experience.update_signal_shadow_bias(row["date"], snapshot)
 
     # ---------------- 单轮 ----------------
     def run_round(self, batch: int = 30, factor_type: str = "量价") -> dict:
@@ -424,6 +487,13 @@ class LoopEngine:
         live_boost = {f: min(1.0, max(0.0, (w - 0.5) * 4)) for f, w in live.items()}
         bus.push(EventType.STEP_UPDATE, step=2, name="机制族引导", status="done",
                  gaps=gaps, proven=proven)
+
+        # Step 2.5: 进化信号 shadow 挂钩——只记"若启用会怎么偏置"的快照回写
+        # （shadow 期量化验收数据积累），绝不改变任何行为
+        try:
+            self._signal_shadow_hook(gaps, proven)
+        except Exception as e:
+            log.debug(f"进化信号 shadow 挂钩失败（不影响本轮）: {e}")
 
         # Step 3: FSA重算
         bus.push(EventType.STEP_UPDATE, step=3, name="FSA重算", status="running")
@@ -535,7 +605,8 @@ class LoopEngine:
                      stats_snapshot={k: v for k, v in stats.items() if k != "new"})
 
             library.record_tested(h, sexpr[:60], "loopengine", "loopengine", end, result["pass"],
-                                   result["metrics"].get("IC"))
+                                   result["metrics"].get("IC"),
+                                   signal_id=getattr(self, "_signal_id_in_prompt", None))
             s["budget"].record(src, result["pass"])
 
             # Step 10: 入库（含多目标评分）
@@ -891,7 +962,8 @@ class LoopEngine:
                 result = {"pass": False, "reasons": ["eval error"], "metrics": {}}
 
             library.record_tested(h, sexpr[:60], "loopengine", "loopengine", end,
-                                  result["pass"], result["metrics"].get("事件IC"))
+                                  result["pass"], result["metrics"].get("事件IC"),
+                                  signal_id=getattr(self, "_signal_id_in_prompt", None))
             s["budget"].record(src, result["pass"])
             if result["pass"]:
                 fam = structure.assign_family(sexpr, sk)

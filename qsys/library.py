@@ -147,6 +147,10 @@ def _lconn():
     sc_cols = [r[1] for r in c.execute("PRAGMA table_info(factor_scorecards)")]
     if "winrates" not in sc_cols:
         c.execute("ALTER TABLE factor_scorecards ADD COLUMN winrates TEXT")
+    # 迁移：tested_hashes 加进化信号引导标记（战报蒸馏 lift 度量用，2026-09-16）
+    th_cols = [r[1] for r in c.execute("PRAGMA table_info(tested_hashes)")]
+    if "signal_id" not in th_cols:
+        c.execute("ALTER TABLE tested_hashes ADD COLUMN signal_id TEXT")
     # 迁移：factor_scorecards 加 OOS 列（因子被发现后的纯净样本外表现，2026-09-11）
     for col, ddl in [("ic_oos", "REAL"), ("icir_oos", "REAL"), ("oos_days", "INTEGER")]:
         if col not in sc_cols:
@@ -555,16 +559,19 @@ def delete_combo(name: str):
 
 # ---------------------------------------------------------------- P1：哈希检查点
 def record_tested(hash_: str, name: str, kind: str, engine: str,
-                  eval_date: str, passed: bool, ic: float | None):
-    """记录一个已测因子哈希（原子 upsert）。"""
+                  eval_date: str, passed: bool, ic: float | None,
+                  signal_id: str | None = None):
+    """记录一个已测因子哈希（原子 upsert）。
+    signal_id: 进化信号引导标记（evolution_signals.date，战报蒸馏方案的 lift 度量用）。
+    signal_id 列由 _lconn 迁移保证存在。"""
     with _lconn() as c:
         c.execute(
-            "INSERT INTO tested_hashes (hash, name, kind, engine, eval_date, passed, ic, created_at)"
-            " VALUES (?,?,?,?,?,?,?,?)"
+            "INSERT INTO tested_hashes (hash, name, kind, engine, eval_date, passed, ic, created_at, signal_id)"
+            " VALUES (?,?,?,?,?,?,?,?,?)"
             " ON CONFLICT(hash) DO UPDATE SET eval_date=excluded.eval_date,"
             " passed=excluded.passed, ic=excluded.ic",
             (hash_, name, kind, engine, eval_date, int(passed), ic,
-             datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+             datetime.now().strftime("%Y-%m-%d %H:%M:%S"), signal_id))
 
 
 def is_tested(hash_: str) -> bool:

@@ -1,6 +1,6 @@
 # 特征归一化改进方案 v2（合成打分层）——已过专家评审
 
-> **实施进度（2026-09-16）**：第 0 阶段（composite.py 前视修复）✅；cs_norm/resolve_norms ✅（14 测）；接线 ✅（全部打分路径含归因，legacy 开关默认不变行为，20 测）；A/B 回放脚本 ✅（`scripts/ab_norm_replay.py`，3 个合成数据冒烟测）。**待办：容器内跑 A/B 报告 → 人工审阅 → 灰度切换（写 norm_scheme.json + 清 SIGNALS_DIR 扫描缓存）。**
+> **实施进度（2026-09-16）**：第 0 阶段（composite.py 前视修复）✅；cs_norm/resolve_norms ✅（14 测）；接线 ✅（全部打分路径含归因，legacy 开关默认不变行为）；冷评审 8 项发现全修 ✅（含 combo_hash 身份污染、picks.data_source 缺迁移存量 Bug，54 测全绿）。**A/B 回放：内置因子包批次完成（4 包零漂移，符合设计；amihud/vol比率/kurt 等内置重尾因子每天被 clip 钉死、σ 缩到 ~0.5，是人工覆盖 rank 的实证候选）；演化因子包白天两次被宿主 OOM 杀 + market.db 锁竞争致因子执行失败——需收盘后调度器空闲时重跑。** 待办：演化包 A/B 报告 → 人工审阅 → 灰度切换（写 norm_scheme.json + 清 SIGNALS_DIR 扫描缓存）。附两个回放中暴露的基建优化点：get_factor_values 对 sexpr 树因子应走进程内 evaluate_tree 快速路径（绕开子进程+h5 写盘+锁竞争）；_score_at 逐日布尔全扫描应改 groupby 预分组。
 
 > 背景：对照"特征归一化"主题视频体检后确认——本系统因子选拔（RankIC，尺度不变）与 RD-Agent 闭环（LGBM 树模型）天然免疫量纲问题；缺口集中在**多因子合成打分层**对重尾因子一刀切 Z-Score、小截面稳健性，以及评审发现的**一条被遗漏的第三条打分路径（带现存前视 Bug）**。
 > v2 已并入专家评审（有条件通过）的全部必修项与裁决。

@@ -11,12 +11,13 @@
 
 人工审阅报告通过后才允许把 DATA_DIR/norm_scheme.json 切到 typed_v2。
 
-用法（容器内）：
-  python scripts/ab_norm_replay.py                      # 全部 active 包
-  python scripts/ab_norm_replay.py --packs LE_沪深300_current,Top5复合因子
-  python scripts/ab_norm_replay.py --max-packs 5 --lookback 800
+用法（容器内，lh-qsys 只挂载了 /app 与 /data）：
+  docker cp scripts/ab_norm_replay.py lh-qsys:/tmp/
+  docker exec lh-qsys python /tmp/ab_norm_replay.py --out /data   # 全部 active 包
+  docker exec lh-qsys python /tmp/ab_norm_replay.py --packs LE_沪深300_current,Top5复合因子 --out /data
 """
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -24,7 +25,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-QSYS = Path(__file__).resolve().parent.parent / "qsys"
+# 容器内 /app（qsys 热更新挂载）；宿主机则取 ../qsys
+QSYS = Path(os.environ.get("QSYS_APP_DIR") or (
+    "/app" if Path("/app/signals.py").exists() else Path(__file__).resolve().parent.parent / "qsys"))
 sys.path.insert(0, str(QSYS))
 
 import datasource  # noqa: E402
@@ -188,6 +191,7 @@ def main():
     ap.add_argument("--max-packs", type=int, default=8, help="最多评估包数（控制取值耗时）")
     ap.add_argument("--lookback", type=int, default=800)
     ap.add_argument("--step", type=int, default=None)
+    ap.add_argument("--out", default=None, help="报告输出目录（缺省=log/；容器内 /work/log 只读，用 /data）")
     args = ap.parse_args()
 
     import library
@@ -223,7 +227,7 @@ def main():
             print(f"  [error] {e}")
 
     report = render_report(results)
-    out_dir = Path(__file__).resolve().parent.parent / "log"
+    out_dir = Path(args.out) if args.out else Path(__file__).resolve().parent.parent / "log"
     out_dir.mkdir(parents=True, exist_ok=True)
     out = out_dir / f"ab_norm_report_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.md"
     out.write_text(report)

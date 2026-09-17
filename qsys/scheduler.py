@@ -2703,22 +2703,33 @@ class SchedulerManager:
             return  # 被动实例不注册任务，避免双进程双跑
         state = self._state()
         for key, cfg in state.items():
-            try:
-                self.sched.remove_job(key)
-            except Exception:
-                pass
+            existing = self.sched.get_job(key)
             if not cfg["enabled"]:
+                if existing:
+                    self.sched.remove_job(key)
                 continue
             if cfg.get("trigger") == "interval":
-                # loopengine 等重任务走独立 "le" 线程池，避免霸占 interval 池
                 executor = "le" if key in ("loopengine",) else "interval"
+                params = {"seconds": int(cfg["params"].get("interval_sec", 30)),
+                          "executor": executor}
+                if existing:
+                    try:
+                        self.sched.modify_job(key, **params)
+                        continue
+                    except Exception:
+                        self.sched.remove_job(key)
                 self.sched.add_job(lambda k=key: self._run(k), "interval", id=key,
-                                   seconds=int(cfg["params"].get("interval_sec", 30)),
-                                   executor=executor, replace_existing=True)
+                                   **params, replace_existing=True)
             else:
+                params = {"day_of_week": "mon-fri", "hour": cfg["hour"], "minute": cfg["minute"]}
+                if existing:
+                    try:
+                        self.sched.modify_job(key, **params)
+                        continue
+                    except Exception:
+                        self.sched.remove_job(key)
                 self.sched.add_job(lambda k=key: self._run(k), "cron", id=key,
-                                   day_of_week="mon-fri", hour=cfg["hour"], minute=cfg["minute"],
-                                   replace_existing=True)
+                                   **params, replace_existing=True)
 
     # ---- 运行与记录 ----
     def _run(self, key: str):

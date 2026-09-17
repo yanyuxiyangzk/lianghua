@@ -889,7 +889,7 @@ def position_reconcile(today: str) -> str:
     exp_shares = {r["code"]: int(r["sh"]) for _, r in opens.iterrows()} if not opens.empty else {}
     fixed = []
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with _conn() as c:
+    with _conn() as c, broker._conn() as bc:
         for _, bp in bposs.iterrows():
             if (bp["source"] or "") != "ai":
                 continue
@@ -898,13 +898,22 @@ def position_reconcile(today: str) -> str:
             cost = float(bp["cost"] or 0)
             if diff <= 0 or cost <= 0:
                 continue
+            actual_buy_ts = now
+            try:
+                fill_row = bc.execute(
+                    "SELECT ts FROM broker_fills WHERE code=? AND side='buy'"
+                    " AND source='ai' ORDER BY id DESC LIMIT 1", (code,)).fetchone()
+                if fill_row and fill_row[0]:
+                    actual_buy_ts = fill_row[0]
+            except Exception:
+                pass
             c.execute(
                 "INSERT INTO positions (code, name, buy_date, buy_price, buy_ts, pick_id,"
                 " source, pack_name, status, limit_price, shares, buy_amount, created_at)"
                 " VALUES (?,?,?,?,?,?,?,?, 'open', NULL, ?, ?, ?)",
                 (code, bp.get("name") or code, str(bp.get("last_buy_date") or today),
-                 cost, now, None, "reconcile_fix", "对账补记",
-                 diff, round(diff * cost, 2), now))
+                 cost, actual_buy_ts, None, "reconcile_fix", "对账补记",
+                 diff, round(diff * cost, 2), actual_buy_ts))
             fixed.append(f"{bp.get('name') or code}×{diff}")
     head = "对账补记：" + ",".join(fixed) if fixed else "对账一致"
     return head + (" · closing结算：" + ",".join(settled) if settled else "")

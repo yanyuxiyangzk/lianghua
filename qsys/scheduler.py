@@ -1847,9 +1847,21 @@ def job_evolution_distill(**_ignored) -> str:
     try:
         from litellm import completion
 
+        system_prompt, user_prompt = es.build_distill_prompt(payload)
         r = completion(model=os.environ.get("CHAT_MODEL") or "deepseek/deepseek-chat",
-                       messages=[{"role": "user", "content": es.build_distill_prompt(payload)}],
+                       messages=[{"role": "system", "content": system_prompt},
+                                 {"role": "user", "content": user_prompt}],
                        max_tokens=1500, timeout=60, temperature=0)  # 蒸馏要稳定，不要创意
+        # 缓存命中监控
+        try:
+            usage = getattr(r, "usage", None) or {}
+            hit = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
+            miss = getattr(usage, "prompt_cache_miss_tokens", 0) or 0
+            if hit + miss > 0:
+                logging.getLogger("scheduler").debug(
+                    "distill cache: hit=%d miss=%d rate=%.0f%%", hit, miss, hit / (hit + miss) * 100)
+        except Exception:
+            pass
         d = es.extract_json_obj(r.choices[0].message.content or "")
         if d is None:
             return f"{today} 蒸馏输出无法抽取 JSON（当天无信号）"

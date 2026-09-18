@@ -170,42 +170,8 @@ def _format_stats(stats: dict) -> str:
 
 # ---------------------------------------------------------------- LLM 分析
 SYSTEM_PROMPT = """你是一位专业的量化投资分析师，负责每日战果汇报。
-请深入分析以下数据，重点回答：
-1. 今天为什么赚钱/亏钱？根本原因是什么？
-2. 哪些方面存在不足？（选股/择时/仓位/风控/因子/策略）
-3. 具体如何改进？（可执行的行动项）
 
-用 Markdown 格式，包含标题、列表、表格。语言简洁专业。"""
-
-
-def _build_prompt(data: dict) -> str:
-    return f"""
-# 日期：{data['date']}
-
-## 一、账户概况
-{_format_account(data['account'])}
-
-## 二、持仓明细
-{_format_positions(data['positions'])}
-
-## 三、今日成交记录
-{_format_fills(data['fills'])}
-
-## 四、因子表现
-{_format_factors(data['factors'])}
-
-## 五、策略表现
-{_format_strategies(data['strategies'])}
-
-## 六、市场环境
-{_format_indices(data['indices'])}
-
-## 七、历史统计
-{_format_stats(data['stats'])}
-
----
-
-请从以下维度深入分析：
+分析维度：
 
 ### 1. 盈亏原因分析
 - **技术面**：买入/卖出时机是否合理？是否追高/抄底？
@@ -231,13 +197,44 @@ def _build_prompt(data: dict) -> str:
 - **持仓处理**：哪些股票继续持有？哪些需要卖出？
 - **关注方向**：明日关注哪些板块/因子？
 - **风险提示**：需要注意哪些风险？
-"""
+
+用 Markdown 格式，包含标题、列表、表格。语言简洁专业。"""
+
+
+def _build_prompt(data: dict) -> str:
+    """构建战报 prompt——数据部分放入 user message，分析框架在 system message 中。"""
+    return f"""# 日期：{data['date']}
+
+## 一、账户概况
+{_format_account(data['account'])}
+
+## 二、持仓明细
+{_format_positions(data['positions'])}
+
+## 三、今日成交记录
+{_format_fills(data['fills'])}
+
+## 四、因子表现
+{_format_factors(data['factors'])}
+
+## 五、策略表现
+{_format_strategies(data['strategies'])}
+
+## 六、市场环境
+{_format_indices(data['indices'])}
+
+## 七、历史统计
+{_format_stats(data['stats'])}
+
+---
+
+请基于以上数据，按分析维度深入分析今日表现。"""
 
 
 def _generate_report(data: dict) -> str:
     """调用 LLM 生成分析报告"""
     prompt = _build_prompt(data)
-    result = llm_chat(SYSTEM_PROMPT, prompt, max_tokens=9000)
+    result = llm_chat(SYSTEM_PROMPT, prompt, max_tokens=9000, label="daily_report")
     if result:
         return result
     return "⚠️ LLM 服务不可用，请检查 DEEPSEEK_API_KEY 配置。"

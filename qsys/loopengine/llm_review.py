@@ -9,21 +9,24 @@ import os
 import re
 
 _REVIEWER_SYS = (
-    "你是量化表达式审查员，职责是【挑剔地】审查量化因子 S 表达式的工程与经济合理性。"
-    "只输出 JSON：{\"verdict\": \"pass\" 或 \"reject\", \"reason\": \"一句话\"}。"
+    "你是量化表达式审查员，职责是【挑剔地】审查量化因子 S 表达式的工程与经济合理性。\n\n"
+    "检查项（任一不满足即 reject）：\n"
+    "1. 量纲一致性：mul/div/sub 两端维度必须一致。价格型（close, open, high, low, vwap, "
+    "prev_close, overnight）不得与排名型（rank_cs 输出）混算。rank_cs 输出维度为 rank，"
+    "其他算子保持输入维度。\n"
+    "2. 除零/爆炸风险：div 的分母是否可能恒近零。若分母含 std(close,N) 且 N≤5，"
+    "或分母含 ts_rank(x, N) 且 N≤3，存在除零风险。\n"
+    "3. 窗口合理性：窗口参数与字段语义是否匹配。ts_rank 窗口≤5 意义有限；"
+    "ma/delta/roc 窗口应≥5；corr 窗口应≥20。\n"
+    "4. 经济含义：表达式是否有可解释的因果/行为金融逻辑，还是纯噪声拼凑。"
+    "例如：动量因子（delta/roc）、反转因子（sub 与 ma 的差）、波动率因子（std）、"
+    "流动性因子（volume 与 amount 的关系）。\n"
+    "5. 结构冗余：是否存在可化简的重复结构，如 ma(ma(x,N),N) 嵌套无增量，"
+    "或 sub(x,x) 恒为零。\n\n"
+    "输出格式：{\"verdict\": \"pass\" 或 \"reject\", \"reason\": \"一句话\"}。"
 )
 
-_REVIEWER_USER = """审查以下 A 股日频因子表达式：
-{sexpr}
-
-检查项（任一不满足即 reject）：
-1. 量纲：mul/div/sub 两端维度是否一致（价格型不得与排名型混算）
-2. 除零/爆炸风险：分母是否可能恒近零
-3. 窗口合理性：窗口参数与字段语义是否匹配（如 ts_rank 窗口≤5 意义有限）
-4. 经济含义：表达式是否有可解释的因果/行为金融逻辑，还是纯噪声拼凑
-5. 结构冗余：是否存在可化简的重复结构（如 ma(ma(x,N),N) 嵌套无增量）
-
-只输出 JSON。"""
+_REVIEWER_USER = "审查以下 A 股日频因子表达式：\n{sexpr}"
 
 
 def _extract_json(text: str) -> dict | None:
@@ -50,6 +53,17 @@ def llm_review(sexpr: str) -> tuple[bool, str]:
                       {"role": "user", "content": _REVIEWER_USER.format(sexpr=sexpr)}],
             max_tokens=1000, timeout=45,
             temperature=0)  # 审查端要判决稳定：同一表达式不应两次调用一过一拒
+        # 缓存命中监控
+        try:
+            usage = getattr(r, "usage", None) or {}
+            hit = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
+            miss = getattr(usage, "prompt_cache_miss_tokens", 0) or 0
+            if hit + miss > 0:
+                import logging
+                logging.getLogger("llm_review").debug(
+                    "review cache: hit=%d miss=%d rate=%.0f%%", hit, miss, hit / (hit + miss) * 100)
+        except Exception:
+            pass
         d = _extract_json(r.choices[0].message.content or "")
         if d is None:
             return _rule_review(sexpr), "llm-error-fallback"

@@ -1753,11 +1753,22 @@ def satellite_llm_decide(candidates: list[dict], market_context: dict) -> dict:
 {{"decisions": [{{"code": "SH600XXX", "conviction": 0.8, "weight": 0.4, "reason": "一句话理由"}}],
   "market_view": "看多/中性/看空", "risk_note": "风险提示"}}"""
 
-    system_prompt = """你是卫星轨量化交易决策者。
-卫星轨特点：高风险高回报，止损-5%，止盈+12%，持有≤15天。
-你必须输出合法 JSON，不要任何额外文字。"""
+    system_prompt = (
+        "你是卫星轨量化交易决策者。\n\n"
+        "卫星轨特点：\n"
+        "- 高风险高回报，止损-5%，止盈+12%，持有≤15天\n"
+        "- 从候选票中选0-5只买入\n"
+        "- 必须输出合法 JSON，不要任何额外文字\n\n"
+        "输出格式：\n"
+        '{"decisions": [{"code": "SH600XXX", "conviction": 0.8, "weight": 0.4, "reason": "一句话理由"}], '
+        '"market_view": "看多/中性/看空", "risk_note": "风险提示"}\n\n'
+        "约束：\n"
+        "- 单只仓位上限30%\n"
+        "- 总仓位不超过可用资金\n"
+        "- 不买涨停/追高票（已剔除）"
+    )
 
-    reply = llmutil.llm_chat(system_prompt, user_prompt, max_tokens=2000)
+    reply = llmutil.llm_chat(system_prompt, user_prompt, max_tokens=2000, label="satellite")
 
     # 解析 + 校验
     if not reply:

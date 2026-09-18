@@ -181,9 +181,28 @@ def llm_enhance(df: pd.DataFrame, max_items: int = _MAX_ITEMS_PER_CALL) -> dict:
         for start in range(0, len(items), max_items):
             chunk = items[start:start + max_items]
             out = llm_chat(
-                system="你是严谨的 A 股舆情分析师，输出严格 JSON。",
+                system=(
+                    "你是严谨的 A 股舆情分析师，输出严格 JSON。\n\n"
+                    "情绪标签定义：\n"
+                    "- 利好：对公司股价有正面影响\n"
+                    "- 中性：对公司股价影响有限\n"
+                    "- 利空：对公司股价有负面影响\n\n"
+                    "维度定义：\n"
+                    "- 业绩面：营收、利润、业绩预告\n"
+                    "- 资本运作：增发、回购、并购\n"
+                    "- 分红回购：分红、回购\n"
+                    "- 监管：处罚、问询、合规\n"
+                    "- 人事：高管变动、股权激励\n"
+                    "- 行业：行业政策、竞争格局\n"
+                    "- 其他：不属于以上维度\n\n"
+                    "输出格式：\n"
+                    '{"summary": "一句话摘要", "score": -5~5, "themes": ["主题1"], '
+                    '"sentiments": {"1": {"label": "利好/中性/利空", "reason": "一句话", '
+                    '"impact": "高/中/低", "theme": "主题", "dimension": "维度"}}}'
+                ),
                 user=_build_prompt(chunk, code=code),
-                max_tokens=1500)
+                max_tokens=1500,
+                label="newsense")
             parsed = _parse_llm(out, len(chunk))
             for local_i, sd in parsed["sentiments"].items():
                 sentiments[chunk[local_i - 1]["gi"]] = sd

@@ -112,12 +112,18 @@ def validate_signals(d: dict) -> tuple[bool, str, dict | None]:
     return True, "", out
 
 
-def build_distill_prompt(payload: dict) -> str:
-    """蒸馏 prompt（纯函数）。payload 键：report_date/report_text/leaderboard_txt/
-    watch_txt/sr_txt/sector_txt/chat_index_txt。"""
-    return (
-        "你是量化研究助理。把以下「每日量化战报 + 结构化原料」蒸馏成明日因子进化的结构化信号。\n"
-        "只输出一个 JSON 对象，不要任何解释。schema：\n"
+def build_distill_prompt(payload: dict) -> tuple[str, str]:
+    """蒸馏 prompt（纯函数）——返回 (system, user) 元组，优化 DeepSeek 前缀缓存命中。
+
+    System: 稳定内容（角色、schema、要求），跨调用不变，可被缓存。
+    User: 变化内容（战报、排行榜、观察清单等），每次不同。
+
+    payload 键：report_date/report_text/leaderboard_txt/watch_txt/sr_txt/sector_txt/chat_index_txt。"""
+    # System: 稳定内容（~400 tokens），跨调用不变，可被 DeepSeek 前缀缓存
+    system = (
+        "你是量化研究助理。把「每日量化战报 + 结构化原料」蒸馏成明日因子进化的结构化信号。\n"
+        "只输出一个 JSON 对象，不要任何解释。\n\n"
+        "schema：\n"
         '{"regime_hint": "bull|bear|sideways|transition|null",'
         ' "insufficient_evidence": false,'
         ' "effective": [{"target": "机制族/因子类型/字段名", "evidence": "一句话",'
@@ -126,13 +132,17 @@ def build_distill_prompt(payload: dict) -> str:
         ' "hypotheses": ["1~3 条前瞻机制假设"],'
         ' "steer": {"families_boost": {"族名": -0.5~0.5}, "fields_boost": {"字段名": ...},'
         ' "types_boost": {"因子类型名": ...}},'
-        ' "confidence": 0.0~1.0}\n'
+        ' "confidence": 0.0~1.0}\n\n'
         "要求：\n"
         "1. 宁空勿编：原料里没有依据的方向不要写；证据不足就设 insufficient_evidence=true；\n"
         "2. support 标注来源：data=能对上排行榜/清单数字，narrative=战报叙事，hypothesis=推测；\n"
         "3. steer 的 key 必须是机制族名（动量/反转/资金流/爆量抢筹/支撑阻力…）、字段名或因子类型名，"
         "数值为明日出题加/减权强度（-0.5~0.5，不偏置可省略）；\n"
-        "4. hypotheses 要具体到可检验的机制（如“开板回封次日缩量企稳的溢价”），不要泛泛而谈。\n\n"
+        '4. hypotheses 要具体到可检验的机制（如"开板回封次日缩量企稳的溢价"），不要泛泛而谈。'
+    )
+
+    # User: 变化内容（~1000-1500 tokens），每次不同
+    user = (
         f"=== 战报（{payload.get('report_date', '')}）===\n{payload.get('report_text', '')}\n\n"
         f"=== 因子实战榜（重取自 DB，近5日口径）===\n{payload.get('leaderboard_txt', '')}\n\n"
         f"=== 涨停/异动观察清单（当日）===\n{payload.get('watch_txt', '')}\n\n"
@@ -140,6 +150,8 @@ def build_distill_prompt(payload: dict) -> str:
         f"=== 板块资金流 Top/Bottom ===\n{payload.get('sector_txt', '')}\n\n"
         f"=== 复盘数据包索引（当日）===\n{payload.get('chat_index_txt', '')}\n"
     )
+
+    return system, user
 
 
 def render_for_prompt(sig: dict) -> str:

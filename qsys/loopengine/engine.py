@@ -50,30 +50,43 @@ def _extract_sexpr(text: str) -> str | None:
 
 
 def _build_llm_prompt(fam: str, why: str, factor_type: str, evidence: str,
-                      fewshots: list[str], hypotheses: list[str] | None = None) -> str:
-    """LLM 出题 prompt（纯函数）。字段带含义与量纲（防新类型量纲瞎猜）；
-    fewshots 把闸门口味前置到生成端；hypotheses 与 fewshots 分槽渲染——
-    fewshots 是"过闸结构范例"，hypotheses 是"待验证机制想法"（混排会让模型
-    误以为假设也是已验证口味——专家评审补充）。"""
+                      fewshots: list[str], hypotheses: list[str] | None = None
+                      ) -> tuple[str, str]:
+    """LLM 出题 prompt（纯函数）——返回 (system, user) 元组，优化 DeepSeek 前缀缓存命中。
+
+    System: 稳定内容（角色、字段表、算子、规则、输出格式），跨调用不变，可被缓存。
+    User: 变化内容（机制族、证据、few-shot、hypotheses），每次不同。
+
+    字段带含义与量纲（防新类型量纲瞎猜）；fewshots 把闸门口味前置到生成端；
+    hypotheses 与 fewshots 分槽渲染——fewshots 是"过闸结构范例"，
+    hypotheses 是"待验证机制想法"（混排会让模型误以为假设也是已验证口味）。"""
     ops = "sub,mul,div,abs,sign,rank_cs,ma,ts_min,ts_max,ts_rank,decay_linear,std,skew,delta,roc,corr,ema,zscore"
     type_hint = f"（因子类型：{factor_type}）" if factor_type != "量价" else ""
-    fs = ""
+
+    # System: 稳定内容（~600-800 tokens），跨调用不变，可被 DeepSeek 前缀缓存
+    system = (
+        "你是量化因子工程师。用以下 S 表达式语法写 A 股日频因子。\n"
+        f"{type_hint}\n"
+        f"字段（含含义与量纲）:\n{field_table(factor_type)}\n"
+        f"算子: {ops}（窗口算子需带整数窗口，如 ma(close,20)）\n"
+        "规则: 深度≤6，corr/mul/div/sub 两端维度一致，至少含一个窗口算子。\n"
+        "只输出一个 S 表达式，如 sub(ma(overnight,20),delta(ma(overnight,20),5))，不要任何解释。"
+    )
+
+    # User: 变化内容（~100-300 tokens），每次不同
+    user_parts = [f"写一个属于「{fam}」机制族的因子。（{why}）"]
+    if evidence:
+        user_parts.append(evidence)
     if fewshots:
-        fs = ("以下为该族已入库并通过统计闸门的真实因子（参考其结构与口味，不要照抄）：\n"
-              + "\n".join(f"  {s}" for s in fewshots) + "\n")
-    hy = ""
+        user_parts.append(
+            "以下为该族已入库并通过统计闸门的真实因子（参考其结构与口味，不要照抄）：\n"
+            + "\n".join(f"  {s}" for s in fewshots))
     if hypotheses:
-        hy = ("待验证机制假设（来自最新复盘蒸馏——是想法、不是已验证口味，可择优落地）：\n"
-              + "\n".join(f"  - {h}" for h in hypotheses) + "\n")
-    return (f"你是量化因子工程师。用以下 S 表达式语法写一个属于「{fam}」机制族的 A 股日频{factor_type}因子。"
-            f"（{why}）{type_hint}\n"
-            f"{evidence}"
-            f"字段（含含义与量纲）:\n{field_table(factor_type)}\n"
-            f"算子: {ops}（窗口算子需带整数窗口，如 ma(close,20)）\n"
-            f"{fs}"
-            f"{hy}"
-            "规则: 深度≤6，corr/mul/div/sub 两端维度一致，至少含一个窗口算子。\n"
-            "只输出一个 S 表达式，如 sub(ma(overnight,20),delta(ma(overnight,20),5))，不要任何解释。")
+        user_parts.append(
+            "待验证机制假设（来自最新复盘蒸馏——是想法、不是已验证口味，可择优落地）：\n"
+            + "\n".join(f"  - {h}" for h in hypotheses))
+
+    return system, "\n\n".join(user_parts)
 
 # 默认挖掘顺序：量价（主力）→ 资金流 → 板块轮动 → 指数 → 盘口异动 → 龙虎榜
 DEFAULT_FACTOR_TYPES = ["量价", "资金流", "板块轮动", "指数", "盘口异动", "龙虎榜", "爆量抢筹", "财务",
@@ -372,12 +385,24 @@ class LoopEngine:
         try:
             from litellm import completion
 
-            prompt = _build_llm_prompt(fam, why, factor_type, evidence,
-                                       self._family_fewshots(fam, factor_type),
-                                       hypotheses=hypotheses)
+            system_prompt, user_prompt = _build_llm_prompt(
+                fam, why, factor_type, evidence,
+                self._family_fewshots(fam, factor_type),
+                hypotheses=hypotheses)
             r = completion(model=os.environ.get("CHAT_MODEL") or "deepseek/deepseek-chat",
-                           messages=[{"role": "user", "content": prompt}],
+                           messages=[{"role": "system", "content": system_prompt},
+                                     {"role": "user", "content": user_prompt}],
                            max_tokens=800, temperature=1.1)  # 生成端要多样性（审查端则钉 0）
+            # 缓存命中监控
+            try:
+                usage = getattr(r, "usage", None) or {}
+                hit = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
+                miss = getattr(usage, "prompt_cache_miss_tokens", 0) or 0
+                if hit + miss > 0:
+                    log.debug("LE gen cache: hit=%d miss=%d rate=%.0f%% fam=%s",
+                              hit, miss, hit / (hit + miss) * 100, fam)
+            except Exception:
+                pass
             text = r.choices[0].message.content or ""
             cand = _extract_sexpr(text)
             if cand is None:

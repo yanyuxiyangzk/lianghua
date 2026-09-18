@@ -312,7 +312,7 @@ def _send(question: str, code: str | None):
         hist_key = "chat_hist_general"
         hist = st.session_state.get(hist_key, [])
         msgs = [{"role": "system", "content": _SYSTEM_GENERAL}]
-        msgs += hist[-16:]
+        msgs += hist[-8:]
         msgs.append({"role": "user", "content": question})
         with st.spinner("DeepSeek v4-pro 思考中…"):
             reply = llm_chat_multi(msgs)
@@ -337,7 +337,7 @@ def _send(question: str, code: str | None):
     hist = st.session_state[hist_key]
 
     msgs = [{"role": "system", "content": _SYSTEM + "\n\n# 数据包\n" + ctx}]
-    msgs += hist[-16:]  # 最近 8 轮（user+assistant 各 8 条）
+    msgs += hist[-8:]  # 最近 4 轮（user+assistant 各 4 条）
     msgs.append({"role": "user", "content": question})
     with st.spinner("DeepSeek v4-pro 思考中…（推理模型，约 5-15 秒）"):
         reply = llm_chat_multi(msgs)

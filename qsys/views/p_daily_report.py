@@ -234,7 +234,7 @@ def _build_prompt(data: dict) -> str:
 def _generate_report(data: dict) -> str:
     """调用 LLM 生成分析报告"""
     prompt = _build_prompt(data)
-    result = llm_chat(SYSTEM_PROMPT, prompt, max_tokens=9000, label="daily_report")
+    result = llm_chat(SYSTEM_PROMPT, prompt, max_tokens=4000, label="daily_report")
     if result:
         return result
     return "⚠️ LLM 服务不可用，请检查 DEEPSEEK_API_KEY 配置。"

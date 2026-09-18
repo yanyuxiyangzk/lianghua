@@ -383,7 +383,7 @@ S表达式格式要求（严格遵守）：
                     {"role": "system", "content": HypothesisGenerator.SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
                 ],
-                max_tokens=2000,
+                max_tokens=1000,
                 temperature=0.9,  # 高温度增加创意
             )
             

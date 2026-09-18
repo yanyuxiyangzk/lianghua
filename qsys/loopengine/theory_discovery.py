@@ -152,16 +152,28 @@ class PatternDiscovery:
     """从数据中发现未知模式——无监督方法。"""
     
     @staticmethod
+    def _col(panel: pd.DataFrame, name: str) -> str:
+        """兼容 $close 和 close 两种列名。"""
+        if name in panel.columns:
+            return name
+        if f"${name}" in panel.columns:
+            return f"${name}"
+        return name
+
+    @staticmethod
     def discover_anomalies(panel: pd.DataFrame, codes: list[str], end: str) -> list[dict]:
         """发现异常模式：量价异动、波动率突变、相关性断裂等。"""
         patterns = []
-        
+        col = PatternDiscovery._col
+
         try:
             # 1. 量价异动：成交量突然放大但价格不动
-            if "volume" in panel.columns and "close" in panel.columns:
-                vol_ma = panel["volume"].rolling(20).mean()
-                vol_ratio = panel["volume"] / (vol_ma + 1e-12)
-                price_change = panel["close"].pct_change(5).abs()
+            vol_col = col(panel, "volume")
+            close_col = col(panel, "close")
+            if vol_col in panel.columns and close_col in panel.columns:
+                vol_ma = panel[vol_col].rolling(20).mean()
+                vol_ratio = panel[vol_col] / (vol_ma + 1e-12)
+                price_change = panel[close_col].pct_change(5).abs()
                 
                 # 量涨价不涨（可能吸筹）
                 anomaly = (vol_ratio > 2.0) & (price_change < 0.02)
@@ -174,8 +186,8 @@ class PatternDiscovery:
                     })
             
             # 2. 波动率突变：波动率突然放大
-            if "close" in panel.columns:
-                ret = panel["close"].pct_change()
+            if close_col in panel.columns:
+                ret = panel[close_col].pct_change()
                 vol_20 = ret.rolling(20).std()
                 vol_5 = ret.rolling(5).std()
                 vol_ratio = vol_5 / (vol_20 + 1e-12)
@@ -190,9 +202,9 @@ class PatternDiscovery:
                     })
             
             # 3. 趋势加速：价格偏离均线加速
-            if "close" in panel.columns:
-                ma20 = panel["close"].rolling(20).mean()
-                deviation = (panel["close"] - ma20) / (ma20 + 1e-12)
+            if close_col in panel.columns:
+                ma20 = panel[close_col].rolling(20).mean()
+                deviation = (panel[close_col] - ma20) / (ma20 + 1e-12)
                 accel = deviation.diff(5)
                 
                 surge = accel.abs() > 0.05
@@ -205,8 +217,8 @@ class PatternDiscovery:
                     })
             
             # 4. 流动性枯竭：成交量持续萎缩
-            if "volume" in panel.columns:
-                vol_ma = panel["volume"].rolling(20).mean()
+            if vol_col in panel.columns:
+                vol_ma = panel[vol_col].rolling(20).mean()
                 vol_trend = vol_ma.pct_change(10)
                 
                 drought = vol_trend < -0.3
@@ -219,17 +231,20 @@ class PatternDiscovery:
                     })
             
             # 5. 相关性断裂：量价相关性突然改变
-            if "close" in panel.columns and "volume" in panel.columns:
-                corr_20 = panel["close"].rolling(20).corr(panel["volume"])
-                corr_5 = panel["close"].rolling(5).corr(panel["volume"])
+            if close_col in panel.columns and vol_col in panel.columns:
+                corr_20 = panel[close_col].rolling(20).corr(panel[vol_col])
+                corr_5 = panel[close_col].rolling(5).corr(panel[vol_col])
                 corr_change = (corr_5 - corr_20).abs()
                 
                 break_ = corr_change > 0.5
                 if break_.any():
+                    severity = float(corr_change[break_].mean())
+                    if not np.isfinite(severity):
+                        severity = 0.5
                     patterns.append({
                         "type": "相关性断裂",
                         "description": "量价关系突然改变，市场结构可能变化",
-                        "severity": float(corr_change[break_].mean()),
+                        "severity": severity,
                         "candidates": list(panel.index[break_][:5]),
                     })
                     
@@ -242,39 +257,38 @@ class PatternDiscovery:
     def discover_regimes(panel: pd.DataFrame, codes: list[str]) -> list[dict]:
         """发现市场状态转换模式。"""
         patterns = []
+        col = PatternDiscovery._col
+        close_col = col(panel, "close")
         
         try:
-            if "close" not in panel.columns:
+            if close_col not in panel.columns:
                 return patterns
             
-            # 计算市场整体指标
-            market_ret = panel["close"].groupby(level="datetime").mean().pct_change()
+            # 计算市场整体指标（按日期聚合）
+            market_ret = panel[close_col].groupby(level="datetime").mean().pct_change()
             market_vol = market_ret.rolling(20).std()
             
             # 状态转换检测
             bull = market_ret.rolling(5).mean() > 0
-            bear = market_ret.rolling(5).mean() < 0
             transition = bull != bull.shift(1)
             
             if transition.any():
-                trans_dates = list(panel.index.get_level_values("datetime")[transition])
+                trans_dates = list(bull.index[transition])
                 patterns.append({
                     "type": "市场状态转换",
                     "description": f"检测到{len(trans_dates)}次牛熊转换",
-                    "severity": len(trans_dates) / len(market_ret),
+                    "severity": len(trans_dates) / max(len(market_ret), 1),
                     "candidates": trans_dates[:5],
                 })
             
             # 波动率状态
             high_vol = market_vol > market_vol.quantile(0.8)
-            low_vol = market_vol < market_vol.quantile(0.2)
-            
             vol_regime_change = high_vol != high_vol.shift(1)
             if vol_regime_change.any():
                 patterns.append({
                     "type": "波动率状态转换",
                     "description": "波动率从高到低或从低到高转换",
-                    "severity": float(vol_regime_change.sum() / len(vol_regime_change)),
+                    "severity": float(vol_regime_change.sum() / max(len(vol_regime_change), 1)),
                     "candidates": [],
                 })
                 

@@ -34,3 +34,4 @@ build/
 qsys/ifind_sdk/*.tar.gz
 qsys/ifind_sdk/*.tgz
 qsys/ifind_sdk/*.zip
+*.db

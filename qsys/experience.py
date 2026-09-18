@@ -1628,10 +1628,10 @@ def satellite_open_from_picks(picks_df: pd.DataFrame, available_cash: float,
             limit_up = pr[3] if pr and len(pr) > 3 else None
             if limit_up and cur >= limit_up * 0.999:
                 continue
-            # 追高检查
+            # 追高检查（阈值从8%放宽至15%，与卫星轨事件增强逻辑一致）
             prev_close = pr[1] if pr and len(pr) > 1 else None
             chg = ((cur / prev_close - 1) * 100) if prev_close and prev_close > 0 else None
-            if chg is not None and pd.notna(chg) and chg > 8.0:
+            if chg is not None and pd.notna(chg) and chg > 15.0:
                 continue
         except Exception:
             continue

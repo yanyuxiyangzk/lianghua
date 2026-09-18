@@ -715,7 +715,12 @@ def auto_select_factors(pool_name: str = "沪深300", top_n: int = 10,
 
 
 def _satellite_pack_name(packs: dict) -> str | None:
-    """卫星轨策略包：含 ev_ 事件因子最多的包；其次名字含 涨停/事件 的包。"""
+    """卫星轨策略包：优先名字含'卫星'的包；其次含 ev_ 事件因子最多的包；最后名字含涨停/事件的包。"""
+    # 优先：名字含"卫星"的包（新策略包命名规范）
+    for n in packs:
+        if "卫星" in n:
+            return n
+    # 其次：含 ev_ 事件因子最多的包
     best, best_n = None, 0
     for n, pk in packs.items():
         k = sum(1 for f in pk.get("factors", []) if str(f["name"]).startswith("ev_"))

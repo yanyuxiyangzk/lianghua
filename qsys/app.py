@@ -86,6 +86,7 @@ pages = {
         st.Page("views/p_picker.py", title="选股工作台", icon="🪄", url_path="picker"),
         st.Page("views/p_density_sr.py", title="支撑阻力扫描", icon="🧭", url_path="density-sr"),
         st.Page("views/p_factor_lab.py", title="在线因子实验室", icon="🧪", url_path="factor-lab"),
+        st.Page("views/p_theory_discovery.py", title="理论发现引擎", icon="🧠", url_path="theory-discovery"),
         st.Page("views/p_trades.py", title="模拟交易", icon="📈", url_path="trades"),
         st.Page("views/p_backtest.py", title="回测浏览", icon="📊", url_path="backtest"),
     ],

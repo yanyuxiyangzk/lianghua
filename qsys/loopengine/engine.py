@@ -201,14 +201,14 @@ class LoopEngine:
         with library._lconn() as c:
             rows = c.execute(
                 "SELECT code, family, name FROM factor_registry WHERE engine='loopengine'"
-                " AND gate_status=1 AND (factor_type=? OR factor_type IS NULL)",
+                " AND gate_status IN (1, 3) AND (factor_type=? OR factor_type IS NULL)",
                 (factor_type,)).fetchall()
         if not rows:
             # 回退到任意类型
             with library._lconn() as c:
                 rows = c.execute(
                     "SELECT code, family, name FROM factor_registry WHERE engine='loopengine'"
-                    " AND gate_status=1").fetchall()
+                    " AND gate_status IN (1, 3)").fetchall()
         if not rows:
             return None
 
@@ -237,6 +237,15 @@ class LoopEngine:
                 regime_weight = get_regime_factor_weight(regime, r[2])
 
             final_score = max(0.1, score) * decay_weight * regime_weight
+
+            # 复杂度惩罚（奥卡姆剃刀：表达式越复杂越容易过拟合）
+            try:
+                code_text = r[0] or ""
+                if "# sexpr: " in code_text.split("\n", 1)[0]:
+                    from factor_eval import complexity_penalty
+                    final_score *= complexity_penalty(code_text)
+            except Exception:
+                pass
 
             # 提取骨架用于小生境
             try:
@@ -393,7 +402,7 @@ class LoopEngine:
             with library._lconn() as c:
                 rows = c.execute(
                     "SELECT code FROM factor_registry WHERE engine='loopengine' AND family=?"
-                    " AND gate_status=1 AND factor_type=?"
+                    " AND gate_status IN (1, 3) AND factor_type=?"
                     " ORDER BY multi_objective_score DESC LIMIT ?",
                     (fam, factor_type, limit)).fetchall()
             out = []
@@ -665,17 +674,34 @@ class LoopEngine:
         with library._lconn() as c:
             sexprs = []
             for r in c.execute(
-                    "SELECT code FROM factor_registry WHERE engine='loopengine' AND gate_status=1").fetchall():
+                    "SELECT code FROM factor_registry WHERE engine='loopengine' AND gate_status IN (1, 3)").fetchall():
                 if r[0] and r[0].startswith("# sexpr: "):
                     sexprs.append(r[0].split("\n", 1)[0][len("# sexpr: "):])
         s["field_weights"].boost_from_factors(sexprs)
+
+        # ---- 事件定向挖掘（每 4 轮插入 1 轮，轮转 3 种事件）----
+        _EVENT_KINDS_ROTATION = ["涨停", "大涨>=7%", "跌停"]
+        _EVENT_MINE_BATCH = 15
+        _EVENT_MINE_HORIZON = 5
+        ev_result = None
+        if s["iteration"] % 4 == 0:
+            ev_kind = _EVENT_KINDS_ROTATION[s["iteration"] % len(_EVENT_KINDS_ROTATION)]
+            try:
+                ev_result = self.run_event_round(ev_kind, batch=_EVENT_MINE_BATCH,
+                                                 horizon=_EVENT_MINE_HORIZON,
+                                                 factor_type=factor_type)
+            except Exception as e:
+                log.warning(f"事件定向挖掘失败[{ev_kind}]: {e}")
+
         self._save_state()
-        
+
         # 策略包生成已剥离到独立任务 job_strategy_gen（scheduler.py）
         # 不再嵌入每5分钟的演化流水线，避免单次20+分钟的浪费
-        
+
         result = {"iteration": s["iteration"], **stats, "gaps": gaps, "proven": proven,
             "budget": {k: round(v, 2) for k, v in s["budget"].p.items()}}
+        if ev_result:
+            result["event_round"] = ev_result
         bus.push(EventType.ROUND_COMPLETE, iteration=s["iteration"],
                  stats={k: v for k, v in stats.items() if k != "new"},
                  new_factors=stats["new"][:5])

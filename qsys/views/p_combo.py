@@ -122,6 +122,8 @@ if st.button("🤖 自动组建因子组合", type="primary", key="pc_build"):
             reco = fe.greedy_combo(fvals, panel, method, top_n, kept,
                                    fwd_days=hdays, step=step, buffer_n=buffer_n)
         out = {"selected": reco["selected"], "history": reco["history"], "wf": reco["wf"],
+               "wf_test": reco.get("wf_test"), "oos_winrate_test": reco.get("oos_winrate_test"),
+               "combo_fdr": reco.get("combo_fdr"),
                "hold_h": hold_h, "top_n": top_n, "method": method, "pool": pool_name,
                "algo": algo, "samples": reco.get("samples")}
         if reco["selected"]:
@@ -176,9 +178,30 @@ if auto and auto.get("selected"):
             st.line_chart(pd.concat([cum_is, cum_oos], axis=1), height=260)
         else:
             st.line_chart(cum_oos.to_frame(), height=260)
+        # 测试段 OOS 胜率（留出验证集的独立评估）
+        oos_test = auto.get("oos_winrate_test")
+        test_note = ""
+        if oos_test is not None:
+            test_note = f" · 测试段 **{oos_test:.0%}**（独立验证）"
+            if oos_win - oos_test > 0.10:
+                gap_bad = True
+                test_note += " ⚠️ 选择偏差大"
+        # 组合级多重检验 p-value
+        combo_fdr = auto.get("combo_fdr")
+        fdr_note = ""
+        if combo_fdr is not None:
+            if combo_fdr < 0.05:
+                fdr_note = f" · 组合 p={combo_fdr:.3f} ✅"
+            elif combo_fdr < 0.20:
+                fdr_note = f" · 组合 p={combo_fdr:.3f} 🟡"
+            else:
+                fdr_note = f" · 组合 p={combo_fdr:.3f} ⚠️ 多重检验"
         light = "🟢" if (oos_win >= 0.60 and not gap_bad) else ("🔴" if (oos_win < 0.55 or gap_bad) else "🟡")
-        st.markdown(f"{light} **组合净值（扣费）**：OOS 胜率 **{oos_win:.0%}** · 平均净超额 {oos_avg:+.2%}/期{gap_note}")
+        st.markdown(f"{light} **组合净值（扣费）**：验证段 OOS 胜率 **{oos_win:.0%}** · 平均净超额 {oos_avg:+.2%}/期{gap_note}{test_note}{fdr_note}")
         ok_save = oos_win >= 0.55 and not gap_bad
+        # 若有测试段 OOS，用测试段胜率判断（更保守）
+        if oos_test is not None and oos_test < oos_win:
+            ok_save = oos_test >= 0.55 and not gap_bad
         pn = st.text_input("存为策略包名", value=f"自动组合_{pool_name}_{hold_h}", key="pc_pname")
         if st.button("💾 保存为策略包", disabled=not ok_save, key="pc_save",
                      help=None if ok_save else "OOS 胜率 <55% 或过拟合的组合不允许固化"):

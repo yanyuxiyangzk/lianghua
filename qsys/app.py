@@ -49,6 +49,7 @@ pages = {
         st.Page("views/p_dash.py", title="量化驾驶舱", icon="🚀", url_path="dash"),
         st.Page("views/p_desk.py", title="今日执行", icon="🎯", url_path="today"),
         st.Page("views/p_broker.py", title="资金账号", icon="💹", url_path="broker"),
+        st.Page("views/p_satellite.py", title="卫星轨·事件策略", icon="🎲", url_path="satellite"),
         st.Page("views/p_daily_report.py", title="每日战报", icon="📊", url_path="daily-report"),
         st.Page("views/p_llm_chat.py", title="涨停复盘对话", icon="🧠", url_path="chat"),
     ],
@@ -104,6 +105,7 @@ pages = {
         st.Page("views/p_factor_usage.py", title="因子使用率", icon="📊", url_path="factor-usage"),
         st.Page("views/p_factor_scores.py", title="5维因子评分", icon="💯", url_path="factor-scores"),
         st.Page("views/p_combo_detail.py", title="组合策略详情", icon="🧩", url_path="combo-detail"),
+        st.Page("views/p_overfitting.py", title="过拟合诊断", icon="🛡️", url_path="overfitting"),
     ],
     "系统": [
         st.Page("views/p_settings.py", title="设置", icon="⚙️", url_path="settings"),

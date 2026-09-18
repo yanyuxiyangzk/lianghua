@@ -729,7 +729,7 @@ def factor_value_scores(factor_type: str = None, min_days: int = 5) -> pd.DataFr
     """
     with _lconn() as c:
         # 获取所有活跃因子
-        where = "WHERE gate_status=1"
+        where = "WHERE gate_status IN (1, 3)"
         params = []
         if factor_type:
             where += " AND factor_type=?"

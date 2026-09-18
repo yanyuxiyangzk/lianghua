@@ -44,7 +44,7 @@ def _overall_sharpe(vals: pd.Series, panel: pd.DataFrame) -> tuple[float, pd.Ser
 
 def build_top5_composite(pool_name: str = "沪深300", top_n: int = 5) -> dict:
     registry = library.get_factor_registry()
-    passed = registry[registry["gate_status"] == 1]
+    passed = registry[registry["gate_status"].isin([1, 3])]
     if len(passed) < 3:
         return {"ok": False, "msg": f"过闸因子不足（{len(passed)}<3），暂无法合成"}
 

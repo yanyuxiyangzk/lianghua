@@ -93,11 +93,10 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
     if ic_abs < GATE["IC_MIN"]:
         reasons.append(f"|IC| {ic_abs:.3f} < {GATE['IC_MIN']}")
 
-    # 多重检验校正：计算 IC 的统计显著性 p-value
+    # 多重检验校正：Newey-West HAC 标准误的 p-value（处理 IC 自相关）
     n_days = len(ic)
-    ic_std = float(ic.std()) if len(ic) > 1 else 1.0
-    if n_days >= 10 and ic_std > 1e-12:
-        p_val = fe.ic_pvalue(float(ic.mean()), ic_std, n_days)
+    if n_days >= 20:
+        p_val = fe.ic_pvalue_robust(ic)
         metrics["p_value"] = round(p_val, 6)
         # 使用更严格的显著性阈值（考虑多重检验）
         if p_val > 0.01:
@@ -187,6 +186,118 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
     
     # Gate 14: 因子复杂度检测（表达式越复杂过拟合风险越高）
     # 此闸门由调用方在因子代码可用时单独调用 check_complexity_gate
+
+    return {"pass": len(reasons) == 0, "reasons": reasons, "metrics": metrics}
+
+
+# 放宽版闸门：给 ev_ 因子做收益口径验证用
+# 与标准版的区别：p-value 阈值从 0.01 放宽到 0.05（事件因子样本天然稀少）
+_RELAXED_PVALUE = 0.05
+
+
+def evaluate_gates_relaxed(vals: pd.Series, panel: pd.DataFrame,
+                           library_ics: dict[str, pd.Series] | None = None) -> dict:
+    """放宽版收益闸门：p-value 阈值 0.05（vs 标准 0.01），其余 11 项不变。
+    用于 ev_ 因子的双闸门验证——事件因子样本稀少，统计显著性门槛适当降低。"""
+    vals = fe._norm(vals.dropna())
+    if GATE["LOOKBACK_DAYS"]:
+        unique_dates = vals.index.get_level_values("datetime").unique()
+        if len(unique_dates) >= GATE["LOOKBACK_DAYS"]:
+            cutoff = unique_dates[-GATE["LOOKBACK_DAYS"]:][0]
+            vals = vals[vals.index.get_level_values("datetime") >= cutoff]
+    fwd = fe.forward_returns(panel, GATE["FWD_DAYS"])
+    ic = fe.ic_series(vals, fwd)
+    metrics = {}
+    reasons = []
+
+    ic_abs = abs(float(ic.mean())) if len(ic) else 0.0
+    metrics["IC"] = round(float(ic.mean()), 4) if len(ic) else 0.0
+    if ic_abs < GATE["IC_MIN"]:
+        reasons.append(f"|IC| {ic_abs:.3f} < {GATE['IC_MIN']}")
+
+    n_days = len(ic)
+    if n_days >= 20:
+        p_val = fe.ic_pvalue_robust(ic)
+        metrics["p_value"] = round(p_val, 6)
+        if p_val > _RELAXED_PVALUE:
+            reasons.append(f"IC p-value {p_val:.4f} > {_RELAXED_PVALUE}（放宽版）")
+    else:
+        metrics["p_value"] = 1.0
+
+    x = _daily_excess(vals, fwd)
+    nav = (1 + x).cumprod()
+
+    def _year_stats(year: int):
+        if len(x) == 0 or not hasattr(x.index, 'year'):
+            return 0.0, 0.0
+        xy = x[x.index.year == year]
+        if len(xy) < 20:
+            return 0.0, 0.0
+        return float(xy.mean() * 252), _sharpe(xy)
+
+    now_year = datetime.now().year
+    for year in range(now_year - 1, now_year + 1):
+        tag = str(year)
+        exc, shp = _year_stats(year)
+        metrics[f"超额{tag}"] = round(exc, 4)
+        metrics[f"夏普{tag}"] = round(shp, 2)
+        if exc <= 0:
+            reasons.append(f"{tag}年超额 {exc:.2%} ≤ 0")
+        if shp < GATE["SHARPE_MIN"]:
+            reasons.append(f"{tag}夏普 {shp:.2f} < {GATE['SHARPE_MIN']}")
+
+    ann = float(x.mean() * 252) if len(x) else 0.0
+    mdd = _max_dd(nav)
+    calmar = abs(ann / mdd) if mdd < 0 else 0.0
+    metrics["Calmar"] = round(calmar, 2)
+    if calmar < GATE["CALMAR_MIN"]:
+        reasons.append(f"Calmar {calmar:.2f} < {GATE['CALMAR_MIN']}")
+
+    for months, tag in [(9, "近9月"), (12, "近12月")]:
+        if len(x):
+            cut = x.index.max() - pd.Timedelta(days=months * 30)
+            xm = x[x.index >= cut]
+            exc_m = float(xm.sum()) if len(xm) else 0.0
+            metrics[tag] = round(exc_m, 4)
+            if exc_m <= 0:
+                reasons.append(f"{tag}超额 {exc_m:.2%} ≤ 0")
+
+    max_corr = 0.0
+    if library_ics:
+        for name, other_ic in library_ics.items():
+            both = pd.concat([ic, other_ic], axis=1, keys=["a", "b"]).dropna()
+            if len(both) > 30:
+                from scipy import stats as sp_stats
+                c = abs(float(sp_stats.spearmanr(both["a"], both["b"])[0]))
+                max_corr = max(max_corr, c)
+    metrics["最大IC相关"] = round(max_corr, 2)
+    if max_corr >= GATE["CORR_MAX"]:
+        reasons.append(f"IC相关 {max_corr:.2f} ≥ {GATE['CORR_MAX']}")
+
+    if len(ic) >= 20:
+        split_idx = int(len(ic) * 0.8)
+        ic_oos = ic.iloc[split_idx:]
+        oos_ic_mean = float(ic_oos.mean())
+        oos_ic_wr = float((ic_oos > 0).mean())
+        metrics["OOS_IC"] = round(oos_ic_mean, 4)
+        metrics["OOS_IC胜率"] = round(oos_ic_wr, 2)
+        if oos_ic_mean < 0.01:
+            reasons.append(f"OOS IC {oos_ic_mean:.4f} < 0.01")
+        if oos_ic_wr < 0.50:
+            reasons.append(f"OOS IC胜率 {oos_ic_wr:.1%} < 50%")
+
+    if len(ic) >= 60:
+        split_70 = int(len(ic) * 0.7)
+        ic_is = ic.iloc[:split_70]
+        ic_oos_gap = ic.iloc[split_70:]
+        is_mean = float(ic_is.mean())
+        oos_mean_gap = float(ic_oos_gap.mean())
+        gap = is_mean - oos_mean_gap
+        metrics["IS_IC"] = round(is_mean, 4)
+        metrics["OOS_IC_gap"] = round(oos_mean_gap, 4)
+        metrics["IS_OOS_gap"] = round(gap, 4)
+        if gap > 0.015 and is_mean > 0.03:
+            reasons.append(f"IS/OOS gap {gap:.4f} > 0.015，过拟合风险")
 
     return {"pass": len(reasons) == 0, "reasons": reasons, "metrics": metrics}
 

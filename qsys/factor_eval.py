@@ -81,6 +81,48 @@ def ic_pvalue(ic_mean: float, ic_std: float, n_days: int) -> float:
     return float(2.0 * min(p, 1.0 - p))
 
 
+def ic_pvalue_robust(ic_series: pd.Series, max_lag: int | None = None) -> float:
+    """Newey-West HAC 标准误的 p-value。
+
+    金融因子 IC 序列存在自相关（波动聚集），简单标准误会低估不确定性，
+    导致 p-value 偏小、假阳性增加。Newey-West 在方差估计中加入自相关项，
+    给出更保守（更诚实）的 p-value。
+
+    Args:
+        ic_series: IC 时间序列（非 IC 均值/标准差）
+        max_lag: 最大滞后阶数，默认 int(n^(1/3))（Newey-West 经典选择）
+    """
+    ic = ic_series.dropna()
+    n = len(ic)
+    if n < 20:
+        return 1.0
+    mean = float(ic.mean())
+    demeaned = ic.values - mean
+    if max_lag is None:
+        max_lag = max(1, int(n ** (1.0 / 3.0)))
+    # Newey-West variance with Bartlett kernel
+    gamma_0 = float(np.mean(demeaned ** 2))
+    nw_var = gamma_0
+    for lag in range(1, max_lag + 1):
+        weight = 1.0 - lag / (max_lag + 1)  # Bartlett kernel（保证正定）
+        gamma_lag = float(np.mean(demeaned[:-lag] * demeaned[lag:]))
+        nw_var += 2.0 * weight * gamma_lag
+    se = np.sqrt(max(nw_var, 0.0) / n)
+    if se < 1e-12:
+        return 1.0
+    t_stat = mean / se
+    # 正态分布 CDF 近似
+    import math
+    x = abs(t_stat)
+    t = 1.0 / (1.0 + 0.2316419 * x)
+    phi = math.exp(-x * x / 2.0) / math.sqrt(2.0 * math.pi)
+    p = phi * (0.319381530 * t - 0.356563782 * t**2 + 1.781477937 * t**3
+               - 1.821255978 * t**4 + 1.330274429 * t**5)
+    if t_stat < 0:
+        p = 1.0 - p
+    return float(2.0 * min(p, 1.0 - p))
+
+
 def apply_fdr_correction(scorecard: pd.DataFrame, alpha: float = 0.05) -> pd.DataFrame:
     """对因子体检表应用 FDR 校正，新增 p_value 和 q_value（校正后）列。
     
@@ -1011,7 +1053,9 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
                  fwd_days: int = MAIN_FWD, cost: float = 0.0025,
                  buffer_n: int = 0, ic_full: dict[str, pd.Series] | None = None,
                  min_factors: int = 2,
-                 norms: dict[str, str] | None = None) -> pd.DataFrame:
+                 norms: dict[str, str] | None = None,
+                 start_idx: int | None = None,
+                 end_idx: int | None = None) -> pd.DataFrame:
     """滚动样本外：每个应用点 t，用 [t-est, t-fwd] 的 IC 统计定权重与方向，
     在 t 截面打分取 Top-N，记录随后 fwd_days 的超额收益。
 
@@ -1023,6 +1067,8 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
     ic_full 可传入预计算的全历史 IC 序列（贪心搜索批量评估时避免重复计算）。
     min_factors：估计窗内有效因子的最少个数（贪心搜索单因子起步时用 1）。
     norms=None 时按全局开关解析（legacy=原 zscore 口径；typed_v2=cs_norm 自动映射）。
+    start_idx/end_idx：可选，限制 walk-forward 仅使用 days[start_idx:end_idx] 区间，
+    用于将 OOS 数据切分为验证段和测试段（防过拟合：选择用验证段，评估用测试段）。
     """
     fwd = forward_returns(panel, fwd_days)
     # 全历史 IC 序列（每个因子算一次，应用点只做切片统计 → 快）
@@ -1038,15 +1084,21 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
         ic_full = {name: ic_series(s, fwd) for name, s in vals_norm.items()}
     days = sorted(set.intersection(*[set(s.index.get_level_values("datetime").unique())
                                      for s in vals_norm.values()])) if vals_norm else []
-    if len(days) < est + fwd_days + step:
+    # 切割 OOS 区间（start_idx/end_idx 用于验证/测试段分离）
+    oos_start = start_idx if start_idx is not None else 0
+    oos_end = end_idx if end_idx is not None else len(days)
+    oos_days = days[oos_start:oos_end]
+    if len(oos_days) < est + fwd_days + step:
         return pd.DataFrame()
 
     prev_picks: dict[str, set] = {"优化组合": set(), "等权组合": set()}
     rows = []
-    for t_idx in range(est, len(days) - fwd_days, step):
-        t = days[t_idx]
-        est_lo = days[t_idx - est]
-        est_hi = days[t_idx - fwd_days]  # IC 可观测右端（防未来函数）
+    for t_idx in range(est, len(oos_days) - fwd_days, step):
+        t = oos_days[t_idx]
+        # 估计窗右端：t 之前的 fwd_days 天（IC 观测端点回退防未来函数）
+        t_global = days.index(t)
+        est_lo = days[t_global - est]
+        est_hi = days[t_global - fwd_days]  # IC 可观测右端（防未来函数）
         # 切片统计 → 权重
         stats = {}
         for name, ic in ic_full.items():
@@ -1143,6 +1195,108 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
     return df
 
 
+# ---------------------------------------------------------------- 组合级多重检验校正
+def combo_false_discovery_rate(n_candidates: int, n_rounds: int,
+                                selected_winrate: float, n_oos_periods: int) -> float:
+    """估计组合选择的假发现率（简化版 White's Reality Check）。
+
+    greedy_combo 每轮评估 ~n_candidates 个因子，共 n_rounds 轮，
+    等效于做了大量隐式多次检验。此函数估计"在 H0 下（所有因子真实胜率=50%），
+    看到当前最优胜率"的概率。
+
+    Args:
+        n_candidates: 候选因子数
+        n_rounds: 贪心迭代轮数（≈len(selected)）
+        selected_winrate: 最终 OOS 胜率（0-1）
+        n_oos_periods: OOS 应用点数
+    """
+    if n_oos_periods < 5 or selected_winrate <= 0.5:
+        return 1.0
+    import math
+    # 有效检验数：贪心逐轮收敛，有效 < 全排列
+    effective_tests = max(1, n_candidates * n_rounds / 2)
+    # H0 下：每个因子胜率=50%，max(WR) 的分布近似
+    # P(WR >= observed | H0) via binomial tail
+    k = int(selected_winrate * n_oos_periods)
+    # 用正态近似 binomial tail
+    mu = n_oos_periods * 0.5
+    sigma = math.sqrt(n_oos_periods * 0.25)
+    if sigma < 1e-12:
+        return 1.0
+    z = (k - mu) / sigma
+    # 单侧 p-value（正态近似）
+    x = abs(z)
+    t = 1.0 / (1.0 + 0.2316419 * x)
+    phi = math.exp(-x * x / 2.0) / math.sqrt(2.0 * math.pi)
+    p_one = phi * (0.319381530 * t - 0.356563782 * t**2 + 1.781477937 * t**3
+                   - 1.821255978 * t**4 + 1.330274429 * t**5)
+    p_single = min(1.0, p_one)
+    # Bonferroni 上界
+    p_combo = min(1.0, p_single * effective_tests)
+    return p_combo
+
+
+# ---------------------------------------------------------------- 时间序列交叉验证
+def time_series_cv(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method: str,
+                   top_n: int, n_folds: int = 5, fwd_days: int = MAIN_FWD,
+                   step: int = STEP_DAYS, cost: float = 0.0025,
+                   buffer_n: int = 0, min_points: int = 8) -> dict:
+    """时间序列交叉验证：n_folds 个时间切分，每个切分独立 walk-forward。
+
+    返回各 fold 的 OOS 胜率分布，用中位数（而非均值）作为稳健估计。
+    比单次 walk-forward 更稳健：结果不依赖于单一时间切分。
+    """
+    vals_norm = {n: _norm(s.dropna()) for n, s in factor_vals.items()
+                 if not s.dropna().empty}
+    if not vals_norm:
+        return {"median_winrate": 0, "median_excess": 0, "folds": []}
+    fwd = forward_returns(panel, fwd_days)
+    days_all = sorted(set.intersection(*[set(s.index.get_level_values("datetime").unique())
+                                         for s in vals_norm.values()]))
+    ic_full = {n: ic_series(vals_norm[n], fwd) for n in vals_norm}
+
+    fold_size = len(days_all) // (n_folds + 1)
+    if fold_size < EST_WINDOW + fwd_days + min_points * step:
+        return {"median_winrate": 0, "median_excess": 0, "folds": [],
+                "error": "样本不足"}
+
+    results = []
+    for fold in range(n_folds):
+        # 每个 fold：估计窗从 fold_size*(fold) 开始，OOS 从 fold_size*(fold+1) 开始
+        test_start = fold_size * (fold + 1)
+        test_end = min(test_start + fold_size, len(days_all))
+        est_start = max(0, test_start - EST_WINDOW)
+
+        wf = walk_forward(
+            vals_norm, panel, method, top_n,
+            est=test_start - est_start,
+            step=step, fwd_days=fwd_days, cost=cost,
+            buffer_n=buffer_n, ic_full=ic_full, min_factors=1,
+            start_idx=test_start, end_idx=test_end,
+        )
+        if not wf.empty and "优化组合扣费超额" in wf and len(wf) >= min_points:
+            net = wf["优化组合扣费超额"]
+            results.append({
+                "fold": fold,
+                "winrate": round(float((net > 0).mean()), 3),
+                "mean_excess": round(float(net.mean()), 4),
+                "n_periods": len(net),
+            })
+
+    if not results:
+        return {"median_winrate": 0, "median_excess": 0, "folds": []}
+
+    df = pd.DataFrame(results)
+    return {
+        "median_winrate": round(float(df["winrate"].median()), 3),
+        "median_excess": round(float(df["mean_excess"].median()), 4),
+        "std_winrate": round(float(df["winrate"].std()), 3) if len(df) > 1 else 0,
+        "worst_fold_winrate": round(float(df["winrate"].min()), 3),
+        "best_fold_winrate": round(float(df["winrate"].max()), 3),
+        "folds": df.to_dict("records"),
+    }
+
+
 # ---------------------------------------------------------------- 样本内对照（固定权重）
 def static_backtest(factor_vals: dict[str, pd.Series], panel: pd.DataFrame,
                     weights: dict, top_n: int, fwd_days: int = MAIN_FWD,
@@ -1197,37 +1351,59 @@ def static_backtest(factor_vals: dict[str, pd.Series], panel: pd.DataFrame,
 def greedy_combo(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method: str,
                  top_n: int, candidates: list[str], fwd_days: int = MAIN_FWD,
                  step: int = STEP_DAYS, cost: float = 0.0025, max_n: int = 8,
-                 min_points: int = 8, buffer_n: int = 0) -> dict:
+                 min_points: int = 8, buffer_n: int = 0,
+                 oos_test_ratio: float = 0.20) -> dict:
     """前向贪心选因子：从空集开始，每轮把使 walk-forward **扣费胜率**提升最大
     的因子加入组合（胜率并列时比平均净超额），直到无提升或满 max_n 个。
 
     IC 全序列只预计算一次并注入 walk_forward，单轮评估亚秒级；
-    候选建议先去冗余再截到 ~12 个（调用方负责）。选择本身用了 OOS 信息，
-    属于"用验证集选模型"——配合 ③ 的多重检验提示解读，别当作无偏胜率。
+    候选建议先去冗余再截到 ~12 个（调用方负责）。
+
+    防过拟合：OOS 数据切为验证段（前 80%）和测试段（后 20%）。
+    贪心选择在验证段上进行，最终 OOS 胜率以测试段为准——
+    避免"用验证集选模型"导致的 OOS 胜率虚高。
+    oos_test_ratio: 测试段占比（默认 20%），设为 0 则退化为原始行为。
     """
     vals_norm = {n: _norm(factor_vals[n].dropna()) for n in candidates
                  if n in factor_vals and not factor_vals[n].dropna().empty}
     avail = [n for n in candidates if n in vals_norm]
     if not avail:
-        return {"selected": [], "history": pd.DataFrame(), "wf": pd.DataFrame()}
+        return {"selected": [], "history": pd.DataFrame(), "wf": pd.DataFrame(),
+                "wf_test": pd.DataFrame(), "oos_winrate_test": None}
     fwd = forward_returns(panel, fwd_days)
     ic_full = {n: ic_series(vals_norm[n], fwd) for n in avail}
 
-    def _eval(names: list[str]):
+    # --- 计算验证段/测试段边界 ---
+    days_all = sorted(set.intersection(*[set(s.index.get_level_values("datetime").unique())
+                                         for s in vals_norm.values()])) if vals_norm else []
+    split_idx = int(len(days_all) * (1 - oos_test_ratio)) if oos_test_ratio > 0 else len(days_all)
+    # 验证段：0..split_idx（用于 greedy 选择）
+    # 测试段：split_idx..end（用于最终评估）
+    n_val = split_idx
+    n_test = len(days_all) - split_idx
+    # 验证段需要足够的样本：est + fwd_days + step
+    min_val = EST_WINDOW + fwd_days + step + min_points * step
+    if n_val < min_val or n_test < fwd_days + step + min_points * step:
+        # 样本不足，退化为全量 OOS
+        split_idx = len(days_all)
+
+    def _eval_segment(names: list[str], si: int | None, ei: int | None):
         wf = walk_forward({n: vals_norm[n] for n in names}, panel, method, top_n,
                           step=step, fwd_days=fwd_days, cost=cost,
-                          buffer_n=buffer_n, ic_full=ic_full, min_factors=1)
+                          buffer_n=buffer_n, ic_full=ic_full, min_factors=1,
+                          start_idx=si, end_idx=ei)
         if wf.empty or len(wf) < min_points or "优化组合扣费超额" not in wf:
             return None, wf
         net = wf["优化组合扣费超额"]
         return (float((net > 0).mean()), float(net.mean())), wf
 
+    # --- 阶段 1：在验证段上贪心选择 ---
     selected, history = [], []
     best, best_wf = (-1.0, -9e9), pd.DataFrame()
     while avail and len(selected) < max_n:
         round_best, round_name, round_wf = None, None, None
         for n in avail:
-            obj, wf = _eval(selected + [n])
+            obj, wf = _eval_segment(selected + [n], 0, split_idx if split_idx < len(days_all) else None)
             if obj and (round_best is None or obj > round_best):
                 round_best, round_name, round_wf = obj, n, wf
         if round_name is None or (selected and round_best <= best):
@@ -1236,9 +1412,29 @@ def greedy_combo(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
         avail.remove(round_name)
         best, best_wf = round_best, round_wf
         history.append({"步骤": len(selected), "加入因子": round_name,
-                        "OOS扣费胜率": f"{round_best[0]:.0%}",
-                        "平均净超额": f"{round_best[1]:+.2%}"})
-    return {"selected": selected, "history": pd.DataFrame(history), "wf": best_wf}
+                        "验证段胜率": f"{round_best[0]:.0%}",
+                        "验证段净超额": f"{round_best[1]:+.2%}"})
+
+    # --- 阶段 2：在测试段上最终评估 ---
+    oos_winrate_test = None
+    wf_test = pd.DataFrame()
+    if selected and split_idx < len(days_all):
+        obj_test, wf_test = _eval_segment(selected, split_idx, None)
+        if obj_test:
+            oos_winrate_test = obj_test[0]
+
+    # 组合级多重检验 p-value
+    n_oos = len(best_wf) if not best_wf.empty else 0
+    final_wr = oos_winrate_test if oos_winrate_test is not None else (
+        float((best_wf["优化组合扣费超额"] > 0).mean()) if not best_wf.empty and "优化组合扣费超额" in best_wf else 0.5)
+    combo_fdr = combo_false_discovery_rate(
+        n_candidates=len(candidates), n_rounds=len(selected),
+        selected_winrate=final_wr, n_oos_periods=n_oos)
+
+    return {"selected": selected, "history": pd.DataFrame(history),
+            "wf": best_wf, "wf_test": wf_test,
+            "oos_winrate_test": oos_winrate_test,
+            "combo_fdr": combo_fdr}
 
 
 # ---------------------------------------------------------------- MMR 组合选择
@@ -1297,19 +1493,21 @@ def mmr_combo(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method: st
               corr: pd.DataFrame | None = None, k_max: int = 5, tau: float = 0.2,
               lam: float = 1.0, num_samples: int = 12,
               fwd_days: int = MAIN_FWD, step: int = STEP_DAYS, cost: float = 0.0025,
-              min_points: int = 8, buffer_n: int = 0, seed: int = 42) -> dict:
+              min_points: int = 8, buffer_n: int = 0, seed: int = 42,
+              oos_test_ratio: float = 0.20) -> dict:
     """MMR 迭代采样选因子组合：软最大化采样（胜率/ICIR 高的入选概率大）+
     相关性软惩罚（与已选因子越像概率越低），采样多组后各自 walk-forward 验证，
     取 OOS 扣费胜率最高（并列比平均净超额）的一组；贪心结果作为保底候选之一。
 
-    与 greedy_combo 同输入输出形态（selected/history/wf），另加 samples（采样组数）。
-    scorecard/corr 缺任一即退化为 greedy_combo。
+    与 greedy_combo 同输入输出形态（selected/history/wf/wf_test/oos_winrate_test），
+    另加 samples（采样组数）。scorecard/corr 缺任一即退化为 greedy_combo。
     """
     # 退化路径：缺评分卡/相关性矩阵，或候选太少，直接贪心
     if scorecard is None or corr is None or len(candidates) < 2:
         g = greedy_combo(factor_vals, panel, method, top_n, candidates,
                          fwd_days=fwd_days, step=step, cost=cost,
-                         min_points=min_points, buffer_n=buffer_n)
+                         min_points=min_points, buffer_n=buffer_n,
+                         oos_test_ratio=oos_test_ratio)
         g["samples"] = 1
         return g
     vals_norm = {n: _norm(factor_vals[n].dropna()) for n in candidates
@@ -1318,7 +1516,8 @@ def mmr_combo(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method: st
     if len(avail) < 2:
         g = greedy_combo(factor_vals, panel, method, top_n, avail,
                          fwd_days=fwd_days, step=step, cost=cost,
-                         min_points=min_points, buffer_n=buffer_n)
+                         min_points=min_points, buffer_n=buffer_n,
+                         oos_test_ratio=oos_test_ratio)
         g["samples"] = 1
         return g
 
@@ -1329,10 +1528,16 @@ def mmr_combo(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method: st
     fwd = forward_returns(panel, fwd_days)
     ic_full = {n: ic_series(vals_norm[n], fwd) for n in avail}
 
-    def _eval(names: list[str]):
+    # --- 计算验证段/测试段边界 ---
+    days_all = sorted(set.intersection(*[set(s.index.get_level_values("datetime").unique())
+                                         for s in vals_norm.values()])) if vals_norm else []
+    split_idx = int(len(days_all) * (1 - oos_test_ratio)) if oos_test_ratio > 0 else len(days_all)
+
+    def _eval_segment(names: list[str], si: int | None, ei: int | None):
         wf = walk_forward({n: vals_norm[n] for n in names}, panel, method, top_n,
                           step=step, fwd_days=fwd_days, cost=cost,
-                          buffer_n=buffer_n, ic_full=ic_full, min_factors=1)
+                          buffer_n=buffer_n, ic_full=ic_full, min_factors=1,
+                          start_idx=si, end_idx=ei)
         if wf.empty or len(wf) < min_points or "优化组合扣费超额" not in wf:
             return None, wf
         net = wf["优化组合扣费超额"]
@@ -1340,9 +1545,11 @@ def mmr_combo(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method: st
 
     rng = random.Random(seed)
     combos: list[list[str]] = []
+    # 贪心保底（在验证段上选）
     g = greedy_combo(factor_vals, panel, method, top_n, candidates,
                      fwd_days=fwd_days, step=step, cost=cost,
-                     min_points=min_points, buffer_n=buffer_n)
+                     min_points=min_points, buffer_n=buffer_n,
+                     oos_test_ratio=oos_test_ratio)
     if g.get("selected"):
         combos.append(list(g["selected"]))  # 贪心结果保底参与竞争
     for _ in range(num_samples):
@@ -1356,15 +1563,34 @@ def mmr_combo(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method: st
     for names in combos:
         key = tuple(names)
         if key not in memo:
-            memo[key] = _eval(list(names))
+            memo[key] = _eval_segment(list(names), 0, split_idx if split_idx < len(days_all) else None)
         obj, wf = memo[key]
         eval_rows.append({"组合": " + ".join(names), "因子数": len(names),
-                          "OOS扣费胜率": f"{obj[0]:.0%}" if obj else "评估失败",
-                          "平均净超额": f"{obj[1]:+.2%}" if obj else "-"})
+                          "验证段胜率": f"{obj[0]:.0%}" if obj else "评估失败",
+                          "验证段净超额": f"{obj[1]:+.2%}" if obj else "-"})
         if obj and obj > best_obj:
             best_obj, best_names, best_wf = obj, list(names), wf
+
+    # --- 测试段最终评估 ---
+    oos_winrate_test = None
+    wf_test = pd.DataFrame()
+    if best_names and split_idx < len(days_all):
+        obj_test, wf_test = _eval_segment(best_names, split_idx, None)
+        if obj_test:
+            oos_winrate_test = obj_test[0]
+
+    # 组合级多重检验 p-value
+    n_oos = len(best_wf) if not best_wf.empty else 0
+    final_wr = oos_winrate_test if oos_winrate_test is not None else (
+        float((best_wf["优化组合扣费超额"] > 0).mean()) if not best_wf.empty and "优化组合扣费超额" in best_wf else 0.5)
+    combo_fdr = combo_false_discovery_rate(
+        n_candidates=len(avail), n_rounds=len(combos),
+        selected_winrate=final_wr, n_oos_periods=n_oos)
+
     history = pd.DataFrame(eval_rows)
     return {"selected": best_names or [], "history": history, "wf": best_wf,
+            "wf_test": wf_test, "oos_winrate_test": oos_winrate_test,
+            "combo_fdr": combo_fdr,
             "samples": len(combos), "obj": best_obj}
 
 
@@ -1425,6 +1651,9 @@ def event_premonition(factor_vals: dict[str, pd.Series], events: pd.DataFrame,
     if len(pairs) < min_n:
         return pd.DataFrame()
     pdf = pd.DataFrame(list(pairs), columns=["datetime", "instrument"])
+    # 统一 datetime 列类型（防止 datetime64 vs object 合并不兼容）
+    if pdf["datetime"].dtype != "datetime64[ns]":
+        pdf["datetime"] = pd.to_datetime(pdf["datetime"])
     rows = []
     for name, s in factor_vals.items():
         s = _norm(s.dropna())
@@ -1434,7 +1663,10 @@ def event_premonition(factor_vals: dict[str, pd.Series], events: pd.DataFrame,
             cs = s.groupby(level="instrument", group_keys=False).apply(lambda x: x.rank(pct=True))
         else:
             cs = s.groupby(level="datetime").rank(pct=True)
-        j = pdf.merge(cs.rename("cs").reset_index(), on=["datetime", "instrument"])["cs"].dropna()
+        cs_df = cs.rename("cs").reset_index()
+        if cs_df["datetime"].dtype != "datetime64[ns]":
+            cs_df["datetime"] = pd.to_datetime(cs_df["datetime"])
+        j = pdf.merge(cs_df, on=["datetime", "instrument"])["cs"].dropna()
         if len(j) < min_n:
             continue
         diff = float(j.mean() - 0.5)
@@ -1632,6 +1864,34 @@ def _calc_crowding_score(vals: pd.Series, panel: pd.DataFrame, lookback: int = 6
     return float(dispersion_signal * 0.4 + crowding_from_turnover * 0.3 + ic_signal * 0.3)
 
 
+def complexity_penalty(code: str) -> float:
+    """复杂度惩罚：基于奥卡姆剃刀，复杂因子需要更高 IC 才能获得同等评分。
+
+    depth=2→1.0, depth=4→0.9, depth=6→0.7, depth=7→0.5
+    ops=3→1.0, ops=8→0.85, ops=12→0.65, ops=18→0.5
+    """
+    if not code:
+        return 0.95
+    try:
+        from loopengine.tree import parse
+        sexpr = code.split("\n", 1)[0].replace("# sexpr: ", "") if "# sexpr:" in code else code
+        tree = parse(sexpr)
+        depth = tree.depth()
+        ops_count = 0
+        def _count_ops(node):
+            nonlocal ops_count
+            if hasattr(node, "op"):
+                ops_count += 1
+                for ch in node.children:
+                    _count_ops(ch)
+        _count_ops(tree)
+        depth_pen = max(0.5, 1.0 - (depth - 2) * 0.1)
+        ops_pen = max(0.5, 1.0 - max(0, ops_count - 5) * 0.05)
+        return depth_pen * ops_pen
+    except Exception:
+        return 0.95  # 无法解析时轻微惩罚
+
+
 def multi_objective_score(factor_name: str, codes: list[str], end: str,
                          weights: dict | None = None, code: str | None = None) -> dict:
     """
@@ -1742,12 +2002,14 @@ def multi_objective_score(factor_name: str, codes: list[str], end: str,
         # 5. 稳定性评分 (0-1)：IC稳定性（作为辅助维度）
         stability_score = max(0.0, min(1.0, stability))
         
-        # 综合评分
-        score = (ic_score * weights['ic'] + 
-                 risk_score * weights['risk'] + 
-                 sharpe_score * weights['sharpe'] +
-                 crowding_score * weights['crowding'] +
-                 stability_score * weights['stability'])
+        # 综合评分 × 复杂度惩罚（奥卡姆剃刀：复杂因子打折）
+        raw_score = (ic_score * weights['ic'] + 
+                     risk_score * weights['risk'] + 
+                     sharpe_score * weights['sharpe'] +
+                     crowding_score * weights['crowding'] +
+                     stability_score * weights['stability'])
+        pen = complexity_penalty(code or "")
+        score = raw_score * pen
         
         return {
             'score': round(score, 4),

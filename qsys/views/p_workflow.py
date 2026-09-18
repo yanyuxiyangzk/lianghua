@@ -351,7 +351,7 @@ def _render_stage_status_bar(data):
 
     stages_json = json.dumps([
         {"id": "gen", "label": "因子生成", "icon": "🧬",
-         "jobs": ["loopengine", "event_mine", "fundflow_sync", "lhb_sync"]},
+         "jobs": ["loopengine", "fundflow_sync", "lhb_sync"]},
         {"id": "eval", "label": "因子回测", "icon": "📊",
          "jobs": ["le_factor_eval", "gate_check"]},
         {"id": "pick", "label": "自动选股", "icon": "🎯",
@@ -580,7 +580,7 @@ def _render_timeline(data):
 
     jobs = [("update_data", "数据更新"), ("ifind_daily_sync", "iFinD入库"),
             ("gate_check", "硬闸门"), ("top5_composite", "Top5"),
-            ("pool_scan", "选股"), ("le_factor_eval", "体检"), ("event_mine", "事件")]
+            ("pool_scan", "选股"), ("le_factor_eval", "体检")]
 
     items = ""
     for key, label in jobs:

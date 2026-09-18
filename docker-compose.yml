@@ -109,6 +109,7 @@ services:
       - ./qsys/data:/data                        # 自选股等看板自身数据（可写）
     ports:
       - "8501:8501"
+      - "8502:8502"
     restart: unless-stopped
 
 volumes:

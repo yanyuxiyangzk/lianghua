@@ -930,14 +930,19 @@ def job_gate_check(pool_name: str = "沪深300") -> str:
 
 def job_loopengine(batch: int = 50, **_ignored) -> str:
     """LoopEngine 演化引擎：每轮 生成→审查→验证→入库（检查点自动保存）。
-    按 iteration 轮转7种因子类型：量价/资金流/板块轮动/指数/盘口异动/龙虎榜/爆量抢筹。"""
+    按 iteration 轮转7种因子类型：量价/资金流/板块轮动/指数/盘口异动/龙虎榜/爆量抢筹。
+    每 4 轮自动插入 1 轮事件定向挖掘（涨停/大涨/跌停轮转）。"""
     from loopengine.engine import LoopEngine, DEFAULT_FACTOR_TYPES
 
     eng = LoopEngine("沪深300")
     factor_type = DEFAULT_FACTOR_TYPES[eng.state["iteration"] % len(DEFAULT_FACTOR_TYPES)]
     r = eng.run_round(batch=batch, factor_type=factor_type)
-    return (f"第{r['iteration']}轮[{factor_type}] · 测试{r['tested']} · 过审拒绝{r.get('rejected_review', 0)} · "
-            f"LLM否决{r.get('llm_rejected', 0)} · 重复{r.get('dup', 0)} · FSA拦截{r.get('frozen', 0)} · 入库{r.get('passed', 0)} {r.get('new', [])[:3]}")
+    msg = (f"第{r['iteration']}轮[{factor_type}] · 测试{r['tested']} · 过审拒绝{r.get('rejected_review', 0)} · "
+           f"LLM否决{r.get('llm_rejected', 0)} · 重复{r.get('dup', 0)} · FSA拦截{r.get('frozen', 0)} · 入库{r.get('passed', 0)} {r.get('new', [])[:3]}")
+    ev = r.get("event_round")
+    if ev:
+        msg += f" | 事件[{ev['kind']}]:测试{ev['tested']}·重复{ev['dup']}·入库{ev['passed']} {ev.get('new', [])[:2]}"
+    return msg
 
 
 def job_multitype_mine(batch_per_type: int = 25, pool_name: str = "沪深300",
@@ -968,6 +973,53 @@ def job_event_mine(kind: str = "涨停", batch: int = 30, horizon: int = 5,
     r = eng.run_event_round(kind, batch=batch, horizon=horizon, factor_type=factor_type)
     return (f"事件[{kind}|{horizon}日] 第{r['iteration']}轮 · 测试{r['tested']} · "
             f"重复{r['dup']} · FSA拦截{r['frozen']} · 入库{r['passed']} {r['new'][:3]}")
+
+
+def job_ev_dual_gate(pool_name: str = "沪深300", **_ignored) -> str:
+    """ev_ 因子双闸门评估：对事件闸门已通过（gate_status=2）的因子，
+    跑放宽版收益闸门（p-value 0.05），通过者升级为 gate_status=3（双闸门通过），
+    可进入主选股管线。"""
+    import signals as sig
+    import gates as G
+    from loopengine.tree import build_field_frames, evaluate_tree, parse
+
+    codes = all_pools().get(pool_name, [])
+    end = get_last_trade_day()
+    panel = sig.get_panel_cached(codes, end, 800, source=datasource.get_loop_source())
+
+    with library._lconn() as c:
+        ev_rows = c.execute(
+            "SELECT name, code FROM factor_registry WHERE gate_status=2 AND name LIKE 'ev_%'"
+        ).fetchall()
+
+    if not ev_rows:
+        return "无 gate_status=2 的 ev_ 因子需要评估"
+
+    n_passed = 0
+    n_failed = 0
+    passed_names = []
+    for name, code in ev_rows:
+        if not code or not code.startswith("# sexpr:"):
+            continue
+        try:
+            sexpr = code.split("\n", 1)[0][len("# sexpr: "):]
+            tree = parse(sexpr)
+            vals = evaluate_tree(tree, build_field_frames(panel)).stack().rename("f")
+            vals.index = vals.index.set_names(["datetime", "instrument"])
+            r = G.evaluate_gates_relaxed(vals, panel)
+            if r["pass"]:
+                with library._lconn() as c:
+                    c.execute("UPDATE factor_registry SET gate_status=3 WHERE name=?", (name,))
+                n_passed += 1
+                passed_names.append(name)
+            else:
+                n_failed += 1
+        except Exception:
+            n_failed += 1
+
+    return (f"ev_双闸门评估：{len(ev_rows)}个因子 · "
+            f"通过{n_passed}个 → gate_status=3 · 未通过{n_failed}个" +
+            (f" · {', '.join(passed_names[:5])}" if passed_names else ""))
 
 
 def job_top5_composite() -> str:
@@ -2455,6 +2507,123 @@ def job_strategy_revalidate(pool_name: str = "沪深300") -> str:
     return f"策略包重验完成：{len(results)}个 → " + "; ".join(results[:10])
 
 
+# ====================================================================
+# 🎲 卫星轨 · 独立交易系统
+# ====================================================================
+
+def job_satellite_scan(pool_name: str = "沪深300", top_n: int = 5, **_ignored) -> str:
+    """卫星轨独立选股：Top5 候选 → 剔除涨停/追高 → LLM 决策（规则兜底）→ 真实资金下单。"""
+    import experience
+    import broker as bk
+    import signals as sig
+    import llmutil
+    end = get_last_trade_day()
+    today = end
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1. 取卫星包
+    import library
+    packs = library.list_strategies()
+    sat_name = _satellite_pack_name(packs)
+    if not sat_name:
+        return "卫星轨：无可用事件策略包"
+
+    pk = packs[sat_name]
+    pools = all_pools()
+    codes = pools.get(pk["pool_name"]) or pools.get(pool_name) or pools.get("沪深300")
+
+    # 2. 选股（Top5）
+    try:
+        spicks, _sn, _sw, _sf = compute_pack_picks(pk, codes, end, int(top_n))
+    except Exception as e:
+        return f"卫星轨选股失败：{e}"
+
+    if spicks.empty:
+        return "卫星轨：无候选票"
+
+    # 3. 保存 picks 到经验库
+    experience.save_pick(source="satellite_scan", pool_name=pk["pool_name"],
+                         top_n=int(top_n), method=pk.get("method"),
+                         filters=pk.get("filters", []), factors=pk["factors"],
+                         final_scores=spicks, pack_name=sat_name, trade_date=end)
+
+    # 4. 组装 LLM 决策数据包
+    candidates = []
+    try:
+        panel = sig.get_panel_cached(codes, end)
+        for code in spicks.index:
+            item = {"code": code, "name": "", "score": float(spicks[code])}
+            # 附加因子值
+            if panel is not None and code in panel.index:
+                row = panel.loc[code]
+                fv = {}
+                for f in pk.get("factors", []):
+                    fn = f["name"] if isinstance(f, dict) else str(f)
+                    if fn in row.index:
+                        v = row[fn]
+                        if pd.notna(v):
+                            fv[fn] = float(v)
+                item["factors"] = fv
+                # 涨跌幅
+                if "close" in row.index and "open" in row.index:
+                    try:
+                        item["change_pct"] = (float(row["close"]) / float(row["open"]) - 1) * 100
+                    except Exception:
+                        item["change_pct"] = 0
+            candidates.append(item)
+    except Exception:
+        # 组装失败，直接给 LLM 纯列表
+        for code in spicks.index:
+            candidates.append({"code": code, "name": "", "score": float(spicks[code]),
+                               "factors": {}, "change_pct": 0})
+
+    # 5. 市场上下文
+    cash = bk._get_cash()
+    hold_count = 0
+    try:
+        hold_count = len(experience.satellite_positions("open"))
+    except Exception:
+        pass
+    market_context = {
+        "regime": "未知",
+        "sentiment": 0.5,
+        "cash": cash,
+        "hold_count": hold_count
+    }
+
+    # 6. LLM 决策（失败回退到规则决策）
+    llm_result = experience.satellite_llm_decide(candidates, market_context)
+    decisions = llm_result.get("decisions", [])
+    is_fallback = llm_result.get("fallback", True)
+
+    if decisions and not is_fallback:
+        # LLM 决策成功 → 用 satellite_open_from_llm
+        msg = experience.satellite_open_from_llm(decisions, cash, today)
+        return (f"{end} 卫星轨扫描完成 · {sat_name} · LLM决策 · "
+                f"选中{len(decisions)}只 · {msg}")
+    else:
+        # LLM 失败或未选中 → 规则兜底 Top3
+        picks_df = pd.DataFrame({"code": spicks.index, "name": "", "score": spicks.values})
+        msg = experience.satellite_open_from_picks(picks_df, cash, today)
+        return (f"{end} 卫星轨扫描完成 · {sat_name} · 规则兜底 · {msg}")
+
+
+def job_satellite_fill(**_ignored) -> str:
+    """卫星轨盘中撮合：pending 限价单触及即成交。"""
+    import experience
+    today = get_last_trade_day()
+    return experience.satellite_fill_check(today)
+
+
+def job_satellite_close(**_ignored) -> str:
+    """卫星轨止损/止盈/到期平仓 + 净值更新。"""
+    import experience
+    today = get_last_trade_day()
+    close_msg = experience.satellite_close_check(today)
+    nav_msg = experience.satellite_nav_update(today)
+    return f"{close_msg} | {nav_msg}"
+
+
 # ---------------------------------------------------------------- 调度器
 JOBS = {
     "update_data": {"name": "📥 每日数据更新", "func": job_update_data,
@@ -2566,16 +2735,12 @@ JOBS = {
     "le_factor_eval": {"name": "🧪 LoopEngine 因子滚动体检", "func": job_le_factor_eval,
                        "default": {"enabled": True, "hour": 21, "minute": 30,
                                    "params": {"batch": 1000, "pool_name": "沪深300"}}},
-    "event_mine": {"name": "🧬 事件定向挖因子（涨停等）", "func": job_event_mine,
-                   "default": {"enabled": True, "hour": 22, "minute": 30,
-                               "params": {"kind": "涨停", "batch": 30, "horizon": 5}}},
-    "event_mine_fundflow": {"name": "🧬 事件定向挖因子（涨停×资金流）", "func": job_event_mine,
-                            "default": {"enabled": True, "hour": 22, "minute": 50,
-                                        "params": {"kind": "涨停", "batch": 25, "horizon": 5,
-                                                   "factor_type": "资金流"}}},
     "fundflow_sync": {"name": "💰 个股资金流入库（盘后·iFinD）", "func": job_fundflow_sync,
-                      "default": {"enabled": True, "hour": 17, "minute": 45,
-                                  "params": {"pool_name": "自选股", "lookback_days": 30}}},
+                       "default": {"enabled": True, "hour": 17, "minute": 45,
+                                   "params": {"pool_name": "自选股", "lookback_days": 30}}},
+    "ev_dual_gate": {"name": "🔬 ev_因子双闸门评估（事件→收益）", "func": job_ev_dual_gate,
+                     "default": {"enabled": True, "hour": 23, "minute": 0,
+                                 "params": {"pool_name": "沪深300"}}},
     "lhb_sync": {"name": "🐉 龙虎榜入库（盘后·iFinD）", "func": job_lhb_sync,
                  "default": {"enabled": True, "hour": 17, "minute": 50,
                              "params": {"lookback_days": 30}}},
@@ -2592,9 +2757,18 @@ JOBS = {
                      "default": {"enabled": True, "hour": 18, "minute": 30,
                                  "params": {"pool_name": "沪深300", "top_n": 10, "max_packs": 3}}},
     "strategy_revalidate": {"name": "♻️ 策略包重验（每周）", "func": job_strategy_revalidate,
-                            "default": {"enabled": True, "hour": 3, "minute": 0,
-                                        "params": {"pool_name": "沪深300"},
-                                        "day_of_week": "sun"}},
+                             "default": {"enabled": True, "hour": 3, "minute": 0,
+                                         "params": {"pool_name": "沪深300"},
+                                         "day_of_week": "sun"}},
+    "satellite_scan": {"name": "🎲 卫星轨选股（独立）", "func": job_satellite_scan,
+                       "default": {"enabled": True, "hour": 19, "minute": 10,
+                                   "params": {"pool_name": "沪深300", "top_n": 5}}},
+    "satellite_fill": {"name": "🎲 卫星轨盘中撮合", "func": job_satellite_fill,
+                       "default": {"enabled": True, "hour": 9, "minute": 30,
+                                   "params": {"interval_sec": 300},
+                                   "trigger": "interval"}},
+    "satellite_close": {"name": "🎲 卫星轨止损/结算（盘后）", "func": job_satellite_close,
+                        "default": {"enabled": True, "hour": 15, "minute": 35, "params": {}}},
 }
 
 

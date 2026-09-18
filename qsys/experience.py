@@ -388,6 +388,9 @@ def expected_eval_dates(trade_date: str, source: str | None = None) -> dict:
 # ---------------------------------------------------------------- 模拟交易（买入价→卖出价→平仓→盈亏）
 DEFAULT_RULES = {"take_profit": 0.15, "stop_loss": -0.08, "hold_days": 20, "cost": 0.0025,
                   "atr_period": 14, "atr_tp_multiplier": 2.5, "use_atr_tp": True}
+# 事件增强票规则：止损更紧（-5% vs -8%）、止盈更保守（+12% vs +15%）
+EVENT_RULES = {"take_profit": 0.12, "stop_loss": -0.05, "hold_days": 15, "cost": 0.0025,
+               "atr_period": 14, "atr_tp_multiplier": 2.0, "use_atr_tp": True}
 # 规则：信号日次日开盘价买入；盘中先触止损按止损价、先触止盈按止盈价（同日双触按保守止损）；
 # 到期未触发则第 N 日收盘卖出。成本按往返 0.25% 计。
 
@@ -693,7 +696,9 @@ def position_open_from_picks(trade_date: str, today: str) -> str:
                     n_defer += 1
                     continue
                 chg = ref_chg.get(it.code)
-                if chg is not None and pd.notna(chg) and chg > 5.0:
+                # 追高保护分层：事件增强票容忍更高涨幅（追强逻辑）
+                chase_thr = CHASE_THRESHOLD_EVENT if _is_event_enhanced_pick(r.pack_name) else CHASE_THRESHOLD_DEFAULT
+                if chg is not None and pd.notna(chg) and chg > chase_thr:
                     n_chase += 1
                     continue
                 cur = c.execute(
@@ -715,14 +720,32 @@ def position_open_from_picks(trade_date: str, today: str) -> str:
     return msg if n_new or n_defer or n_chase else "委托挂单：无新增（已挂或竞价回避）"
 
 
-# 每轨虚拟资金（等分买入）：主轨 7 万 / 卫星轨 2 万（对应今日执行页"主轨7成/卫星2成"的仓位约定）
+# 每轨虚拟资金（等分买入）：主轨 7 万 / 卫星轨 2 万 / 双闸门事件票 1.5 万（高风险更小仓位）
 TRACK_BUDGET = {"sched_satellite_scan": 20000.0}
+
+# 事件增强票的追高保护阈值（放宽：追强逻辑允许更高涨幅进入）
+CHASE_THRESHOLD_DEFAULT = 5.0
+CHASE_THRESHOLD_EVENT = 8.0
 
 
 def _budget_per_stock(source: str, top_n: int) -> float:
     """每股预算 = 轨道虚拟资金 / 名单只数。"""
     budget = TRACK_BUDGET.get(source, 70000.0)
     return budget / max(int(top_n or 10), 1)
+
+
+def _is_event_enhanced_pick(pack_name: str) -> bool:
+    """判断是否为事件增强包（含 ev_ 因子的策略包）。"""
+    if not pack_name:
+        return False
+    try:
+        import library
+        packs = library.list_strategies()
+        pk = packs.get(pack_name, {})
+        factors = pk.get("factors", [])
+        return any(f.get("name", "").startswith("ev_") for f in factors)
+    except Exception:
+        return False
 
 
 def position_fill_check(today: str) -> str:
@@ -926,7 +949,7 @@ def position_close_check(today: str) -> str:
     记账（不按触发价）；卖出前做双账本校验（经验库 open 股数 vs 柜台 ai 持仓
     股数，不一致则跳过该代码并计入消息，避免账本漂移后卖错数量）。
     """
-    r = DEFAULT_RULES
+    r = DEFAULT_RULES  # 默认规则；事件增强票在循环内切换为 EVENT_RULES
     with _conn() as c:
         opens = pd.read_sql("SELECT * FROM positions WHERE status='open'", c)
     if opens.empty:
@@ -974,6 +997,9 @@ def position_close_check(today: str) -> str:
             cur = pr[0] if pr and pr[0] else None
             if not cur:
                 continue
+            # 每个仓位独立选规则：事件增强票用更紧的止损/止盈
+            pk_name = str(p.get("pack_name") or "")
+            r = EVENT_RULES if _is_event_enhanced_pick(pk_name) else DEFAULT_RULES
             entry = p["buy_price"]
             tp, sl = entry * (1 + r["take_profit"]), entry * (1 + r["stop_loss"])
             # M4 自适应止损：有入场 ATR 上下文的仓位，止损收紧到 1.5×ATR%（夹取 [-8%,-2%]）
@@ -1482,3 +1508,612 @@ def list_evolution_signals(limit: int = 30) -> pd.DataFrame:
             "SELECT date, report_date, signals, shadow_bias_json, norm_scheme, created_at"
             " FROM evolution_signals ORDER BY date DESC LIMIT ?",
             c, params=(limit,))
+
+
+# ====================================================================
+# 🎲 卫星轨 · 独立交易系统
+# ====================================================================
+
+_SATELLITE_POSITIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS satellite_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL, name TEXT,
+    buy_date TEXT NOT NULL, buy_price REAL, buy_shares INTEGER,
+    buy_amount REAL,
+    sell_date TEXT, sell_price REAL, sell_amount REAL,
+    status TEXT DEFAULT 'pending',
+    limit_price REAL,
+    tp_price REAL, sl_price REAL,
+    pnl REAL, pnl_pct REAL,
+    hold_days INTEGER,
+    llm_conviction REAL,
+    llm_reason TEXT,
+    created_at TEXT, closed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sat_pos_status ON satellite_positions(status);
+CREATE INDEX IF NOT EXISTS idx_sat_pos_date ON satellite_positions(buy_date);
+"""
+
+_SATELLITE_OUTCOMES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS satellite_outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    code TEXT NOT NULL, name TEXT,
+    buy_date TEXT, buy_price REAL, buy_shares INTEGER,
+    sell_date TEXT, sell_price REAL,
+    pnl REAL, pnl_pct REAL,
+    hold_days INTEGER,
+    fwd_1d_ret REAL, fwd_5d_ret REAL,
+    llm_conviction REAL,
+    exit_reason TEXT,
+    created_at TEXT
+);
+"""
+
+_SATELLITE_NAV_SCHEMA = """
+CREATE TABLE IF NOT EXISTS satellite_nav (
+    date TEXT PRIMARY KEY,
+    nav REAL,
+    cash REAL,
+    positions_value REAL,
+    daily_pnl REAL,
+    daily_return REAL,
+    cumulative_return REAL,
+    max_drawdown REAL
+);
+"""
+
+
+def _sat_conn():
+    """卫星轨专用连接（复用 experience.db）。"""
+    conn = sqlite3.connect(str(DB_PATH), timeout=30)
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.executescript(_SATELLITE_POSITIONS_SCHEMA)
+    conn.executescript(_SATELLITE_OUTCOMES_SCHEMA)
+    conn.executescript(_SATELLITE_NAV_SCHEMA)
+    return conn
+
+
+def satellite_positions(status: str = None) -> pd.DataFrame:
+    """读卫星轨仓位。status=None 返回全部。"""
+    with _sat_conn() as c:
+        if status:
+            return pd.read_sql(
+                "SELECT * FROM satellite_positions WHERE status=? ORDER BY id DESC",
+                c, params=(status,))
+        return pd.read_sql("SELECT * FROM satellite_positions ORDER BY id DESC", c)
+
+
+def satellite_outcomes(limit: int = 100) -> pd.DataFrame:
+    """读卫星轨战果。"""
+    with _sat_conn() as c:
+        return pd.read_sql(
+            "SELECT * FROM satellite_outcomes ORDER BY id DESC LIMIT ?",
+            c, params=(limit,))
+
+
+def satellite_nav_history(limit: int = 60) -> pd.DataFrame:
+    """读卫星轨净值曲线。"""
+    with _sat_conn() as c:
+        return pd.read_sql(
+            "SELECT * FROM satellite_nav ORDER BY date DESC LIMIT ?",
+            c, params=(limit,))
+
+
+def satellite_open_from_picks(picks_df: pd.DataFrame, available_cash: float,
+                              today: str) -> str:
+    """卫星轨独立开仓：真实资金下单。
+
+    picks_df: 含 code, name, score 列的 DataFrame（已按 score 降序）
+    available_cash: broker 可用资金
+    today: 交易日
+    返回: 操作消息
+    """
+    import broker as bk
+
+    if picks_df.empty:
+        return "卫星轨：无候选票"
+    if available_cash < 1000:
+        return f"卫星轨：可用资金不足（{available_cash:.0f}元）"
+
+    # 剔除涨停/追高票
+    eligible = []
+    for _, row in picks_df.iterrows():
+        code = row["code"]
+        try:
+            pr = bk._latest_prices([code]).get(code)
+            cur = pr[0] if pr else None
+            if cur is None:
+                continue
+            # 涨停检查
+            limit_up = pr[3] if pr and len(pr) > 3 else None
+            if limit_up and cur >= limit_up * 0.999:
+                continue
+            # 追高检查
+            prev_close = pr[1] if pr and len(pr) > 1 else None
+            chg = ((cur / prev_close - 1) * 100) if prev_close and prev_close > 0 else None
+            if chg is not None and pd.notna(chg) and chg > 8.0:
+                continue
+        except Exception:
+            continue
+        eligible.append(row)
+
+    if not eligible:
+        return "卫星轨：全部候选被剔除（涨停/追高）"
+
+    # Phase1 规则决策：取 Top3 等权
+    top = eligible[:3]
+    per_stock = available_cash / len(top)
+    cash = bk._get_cash()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    n_order = 0
+
+    with _sat_conn() as c:
+        for row in top:
+            code = row["code"]
+            name = row.get("name", "")
+            pr = bk._latest_prices([code]).get(code)
+            cur = pr[0] if pr else None
+            if cur is None or cur <= 0:
+                continue
+            shares = int(per_stock // cur // 100 * 100)
+            if shares < 100:
+                continue
+            need = cur * shares + max(5.0, cur * shares * 0.00025)
+            if need > cash:
+                shares = int(cash * 0.95 // cur // 100 * 100)
+                if shares < 100:
+                    continue
+                need = cur * shares + max(5.0, cur * shares * 0.00025)
+
+            # 下单
+            msg = bk.place_order(code, "buy", None, shares, source="satellite")
+            if "已报" in msg or "已成" in msg:
+                cost = cur * shares + max(5.0, cur * shares * 0.00025)
+                cash -= cost
+                # 止损止盈价（EVENT_RULES）
+                tp = round(cur * 1.12, 2)
+                sl = round(cur * 0.95, 2)
+                c.execute(
+                    "INSERT INTO satellite_positions"
+                    "(code, name, buy_date, buy_price, buy_shares, buy_amount,"
+                    " status, limit_price, tp_price, sl_price, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (code, name, today, cur, shares, cur * shares,
+                     "pending" if "已报" in msg else "open", cur, tp, sl, now))
+                n_order += 1
+
+    return f"卫星轨：委托 {n_order} 笔（合格候选 {len(eligible)} 只，可用资金 {available_cash:.0f}元）"
+
+
+def satellite_llm_decide(candidates: list[dict], market_context: dict) -> dict:
+    """LLM 决策：从候选票中选 0-5 只买入。
+
+    candidates: [{"code": "SH600XXX", "name": "xxx", "price": 25.3, "change_pct": 3.2,
+                  "score": 0.82, "factors": {...}}]
+    market_context: {"regime": "sideways", "sentiment": 0.6, "sector_flow": ...}
+
+    返回: {"decisions": [...], "raw": "...", "fallback": bool}
+    """
+    import broker as bk
+    import llmutil
+
+    # 硬约束前置：剔除涨停/追高（LLM 不可见这些票）
+    eligible = []
+    for c in candidates:
+        code = c["code"]
+        try:
+            pr = bk._latest_prices([code]).get(code)
+            cur = pr[0] if pr else None
+            if cur is None:
+                continue
+            limit_up = pr[3] if pr and len(pr) > 3 else None
+            if limit_up and cur >= limit_up * 0.999:
+                continue
+            prev_close = pr[1] if pr and len(pr) > 1 else None
+            chg = ((cur / prev_close - 1) * 100) if prev_close and prev_close > 0 else None
+            if chg is not None and pd.notna(chg) and chg > 8.0:
+                continue
+        except Exception:
+            continue
+        c["price"] = cur
+        eligible.append(c)
+
+    if not eligible:
+        return {"decisions": [], "raw": "全部被剔除", "fallback": True}
+
+    # 组装 prompt
+    lines = []
+    for i, c in enumerate(eligible, 1):
+        line = (f"{i}. {c['code']} {c.get('name','')}\n"
+                f"   现价 {c['price']:.2f} | 涨跌 {c.get('change_pct',0):+.2f}% | "
+                f"综合评分 {c.get('score',0):.3f}")
+        if c.get("factors"):
+            fv = " | ".join(f"{k}={v:.3f}" for k, v in list(c["factors"].items())[:5])
+            line += f"\n   因子值: {fv}"
+        lines.append(line)
+
+    stock_block = "\n".join(lines)
+    regime = market_context.get("regime", "未知")
+    sentiment = market_context.get("sentiment", 0.5)
+    cash = market_context.get("cash", 0)
+    hold_count = market_context.get("hold_count", 0)
+
+    user_prompt = f"""当前市场环境：{regime}，大盘情绪 {sentiment:.2f}（0=恐慌 1=贪婪）
+当前可用资金：{cash:,.0f}元 | 已持仓 {hold_count} 只
+
+今日卫星轨候选票（已剔除涨停/追高）：
+{stock_block}
+
+卫星轨规则：止损-5%，止盈+12%，持有≤15天。
+
+请决定买哪几只（从以上候选中选0-5只），每只的置信度(0-1)和仓位比例。
+如果全部不值得买，输出空列表。
+
+输出严格 JSON（不要其他文字）：
+{{"decisions": [{{"code": "SH600XXX", "conviction": 0.8, "weight": 0.4, "reason": "一句话理由"}}],
+  "market_view": "看多/中性/看空", "risk_note": "风险提示"}}"""
+
+    system_prompt = """你是卫星轨量化交易决策者。
+卫星轨特点：高风险高回报，止损-5%，止盈+12%，持有≤15天。
+你必须输出合法 JSON，不要任何额外文字。"""
+
+    reply = llmutil.llm_chat(system_prompt, user_prompt, max_tokens=2000)
+
+    # 解析 + 校验
+    if not reply:
+        return {"decisions": [], "raw": "LLM 无响应", "fallback": True}
+
+    try:
+        import json
+        # 尝试提取 JSON 块
+        m = re.search(r'\{[\s\S]*\}', reply)
+        if not m:
+            return {"decisions": [], "raw": reply, "fallback": True}
+        data = json.loads(m.group())
+    except Exception:
+        return {"decisions": [], "raw": reply, "fallback": True}
+
+    decisions = data.get("decisions", [])
+    if not isinstance(decisions, list):
+        return {"decisions": [], "raw": reply, "fallback": True}
+
+    # 校验：每只票必须在候选列表中，权重归一化
+    valid_codes = {c["code"] for c in eligible}
+    cleaned = []
+    for d in decisions:
+        if not isinstance(d, dict):
+            continue
+        code = d.get("code", "")
+        if code not in valid_codes:
+            continue
+        w = max(0.0, min(0.30, float(d.get("weight", 0.3))))  # 单只上限 30%
+        conv = max(0.0, min(1.0, float(d.get("conviction", 0.5))))
+        cleaned.append({
+            "code": code,
+            "conviction": conv,
+            "weight": w,
+            "reason": str(d.get("reason", ""))[:100]
+        })
+
+    # 归一化权重
+    total_w = sum(d["weight"] for d in cleaned)
+    if total_w > 0 and abs(total_w - 1.0) > 0.01:
+        for d in cleaned:
+            d["weight"] = d["weight"] / total_w
+
+    return {
+        "decisions": cleaned[:5],  # 最多 5 只
+        "raw": reply,
+        "market_view": data.get("market_view", ""),
+        "risk_note": data.get("risk_note", ""),
+        "fallback": False
+    }
+
+
+def satellite_open_from_llm(decisions: list[dict], available_cash: float,
+                             today: str) -> str:
+    """按 LLM 决策用真实资金下单。
+
+    decisions: [{"code": "SH600XXX", "conviction": 0.8, "weight": 0.4, "reason": "..."}]
+    """
+    import broker as bk
+
+    if not decisions:
+        return "卫星轨 LLM：未选中任何票"
+    if available_cash < 1000:
+        return f"卫星轨 LLM：可用资金不足（{available_cash:.0f}元）"
+
+    total_weight = sum(d["weight"] for d in decisions)
+    if total_weight <= 0:
+        return "卫星轨 LLM：总权重为0"
+
+    cash = bk._get_cash()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    n_order = 0
+
+    with _sat_conn() as c:
+        for d in decisions:
+            code = d["code"]
+            pr = bk._latest_prices([code]).get(code)
+            cur = pr[0] if pr else None
+            if cur is None or cur <= 0:
+                continue
+
+            # 按权重分配资金
+            alloc = available_cash * (d["weight"] / total_weight)
+            shares = int(alloc // cur // 100 * 100)
+            if shares < 100:
+                continue
+            need = cur * shares + max(5.0, cur * shares * 0.00025)
+            if need > cash:
+                shares = int(cash * 0.95 // cur // 100 * 100)
+                if shares < 100:
+                    continue
+                need = cur * shares + max(5.0, cur * shares * 0.00025)
+
+            msg = bk.place_order(code, "buy", None, shares, source="satellite")
+            if "已报" in msg or "已成" in msg:
+                cost = cur * shares + max(5.0, cur * shares * 0.00025)
+                cash -= cost
+                tp = round(cur * 1.12, 2)
+                sl = round(cur * 0.95, 2)
+                c.execute(
+                    "INSERT INTO satellite_positions"
+                    "(code, name, buy_date, buy_price, buy_shares, buy_amount,"
+                    " status, limit_price, tp_price, sl_price,"
+                    " llm_conviction, llm_reason, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (code, "", today, cur, shares, cur * shares,
+                     "pending" if "已报" in msg else "open", cur, tp, sl,
+                     d.get("conviction", 0), d.get("reason", ""), now))
+                n_order += 1
+
+    return f"卫星轨 LLM：委托 {n_order} 笔（选中 {len(decisions)} 只，可用资金 {available_cash:.0f}元）"
+
+
+def satellite_fill_check(today: str) -> str:
+    """卫星轨盘中撮合：pending 限价单触及即成交。"""
+    import broker as bk
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now_hm = datetime.now().strftime("%H%M")
+
+    with _sat_conn() as c:
+        pend = pd.read_sql(
+            "SELECT * FROM satellite_positions WHERE status='pending'", c)
+    if pend.empty:
+        return "卫星轨：无挂单"
+
+    prices = bk._latest_prices(list(pend["code"]))
+    n_fill = n_expire = 0
+    with _sat_conn() as c:
+        for _, p in pend.iterrows():
+            if str(p["buy_date"]) < today or (str(p["buy_date"]) == today and now_hm >= "1500"):
+                c.execute("UPDATE satellite_positions SET status='expired', closed_at=? WHERE id=?",
+                          (now, int(p["id"])))
+                n_expire += 1
+                continue
+            pr = prices.get(p["code"])
+            cur = pr[0] if pr else None
+            if cur is None or not p["limit_price"]:
+                continue
+            if cur <= p["limit_price"]:
+                fill_price = min(cur, float(p["limit_price"]))
+                c.execute(
+                    "UPDATE satellite_positions SET status='open', buy_price=?, buy_amount=? WHERE id=?",
+                    (fill_price, fill_price * int(p["buy_shares"]), int(p["id"])))
+                n_fill += 1
+
+    return f"卫星轨撮合：成交 {n_fill} 笔，过期 {n_expire} 笔" if (n_fill or n_expire) else "卫星轨：无变动"
+
+
+def satellite_close_check(today: str) -> str:
+    """卫星轨独立止损/止盈/到期（EVENT_RULES: -5%/+12%/15天）。"""
+    import broker as bk
+
+    with _sat_conn() as c:
+        opens = pd.read_sql(
+            "SELECT * FROM satellite_positions WHERE status='open'", c)
+    if opens.empty:
+        return "卫星轨：无持仓"
+
+    prices = bk._latest_prices(list(opens["code"]))
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    n_close = 0
+
+    with _sat_conn() as c:
+        for _, p in opens.iterrows():
+            pr = prices.get(p["code"])
+            cur = pr[0] if pr and pr[0] else None
+            if cur is None:
+                continue
+
+            entry = p["buy_price"]
+            tp = entry * 1.12   # EVENT_RULES
+            sl = entry * 0.95
+            hold = _count_trade_days(str(p["buy_date"])[:10], today)
+
+            reason = None
+            if cur <= sl:
+                reason = "止损"
+            elif cur >= tp:
+                reason = "止盈"
+            elif hold >= 15:
+                reason = "到期"
+
+            if reason:
+                shares = int(p["buy_shares"])
+                msg = bk.place_order(p["code"], "sell", None, shares, source="satellite")
+                if "已报" in msg or "已成" in msg:
+                    pnl = (cur - entry) * shares
+                    pnl_pct = (cur / entry - 1) if entry else 0
+                    c.execute(
+                        "UPDATE satellite_positions SET status='closed', sell_date=?,"
+                        " sell_price=?, sell_amount=?, pnl=?, pnl_pct=?, hold_days=?,"
+                        " closed_at=? WHERE id=?",
+                        (today, cur, cur * shares, pnl, pnl_pct, hold, now, int(p["id"])))
+                    # 写战果
+                    c.execute(
+                        "INSERT INTO satellite_outcomes"
+                        "(code, name, buy_date, buy_price, buy_shares, sell_date, sell_price,"
+                        " pnl, pnl_pct, hold_days, exit_reason, created_at)"
+                        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (p["code"], p["name"], str(p["buy_date"])[:10], entry, shares,
+                         today, cur, pnl, pnl_pct, hold, reason, now))
+                    n_close += 1
+
+    return f"卫星轨平仓：{n_close} 笔（止损/止盈/到期）" if n_close else "卫星轨：无触发"
+
+
+_SATELLITE_INIT_CASH = 20000.0  # 卫星轨初始资金
+
+
+def satellite_nav_update(today: str) -> str:
+    """更新卫星轨净值：持仓市值 + 卫星轨专属现金（非全账户现金）。"""
+    import broker as bk
+
+    with _sat_conn() as c:
+        opens = pd.read_sql(
+            "SELECT code, buy_shares, buy_price, buy_amount"
+            " FROM satellite_positions WHERE status='open'", c)
+        outcomes = pd.read_sql(
+            "SELECT COALESCE(SUM(pnl), 0) AS total_pnl FROM satellite_outcomes", c)
+
+    positions_value = 0.0
+    open_cost = 0.0
+    if not opens.empty:
+        prices = bk._latest_prices(list(opens["code"]))
+        for _, p in opens.iterrows():
+            pr = prices.get(p["code"])
+            cur = pr[0] if pr and pr[0] else p["buy_price"]
+            shares = int(p["buy_shares"])
+            positions_value += cur * shares
+            open_cost += p["buy_amount"] if p["buy_amount"] else p["buy_price"] * shares
+
+    total_pnl = float(outcomes.iloc[0]["total_pnl"]) if not outcomes.empty else 0.0
+    cash = _SATELLITE_INIT_CASH + total_pnl - open_cost
+    nav = cash + positions_value
+
+    with _sat_conn() as c:
+        prev = c.execute(
+            "SELECT nav, cumulative_return, max_drawdown FROM satellite_nav"
+            " ORDER BY date DESC LIMIT 1").fetchone()
+
+    daily_pnl = 0.0
+    daily_ret = 0.0
+    cum_ret = 0.0
+    mdd = 0.0
+    if prev:
+        daily_pnl = nav - prev[0]
+        daily_ret = daily_pnl / prev[0] if prev[0] else 0
+        cum_ret = nav / _SATELLITE_INIT_CASH - 1
+        mdd = min(prev[2] or 0, nav / max(prev[0], 1) - 1)
+    else:
+        cum_ret = nav / _SATELLITE_INIT_CASH - 1
+
+    with _sat_conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO satellite_nav"
+            "(date, nav, cash, positions_value, daily_pnl, daily_return,"
+            " cumulative_return, max_drawdown) VALUES (?,?,?,?,?,?,?,?)",
+            (today, nav, cash, positions_value, daily_pnl, daily_ret, cum_ret, mdd))
+
+    return f"卫星轨净值：{nav:.0f}元（现金{cash:.0f}+持仓{positions_value:.0f}）"
+
+
+def satellite_leaderboard() -> pd.DataFrame:
+    """卫星轨战绩统计：按持有天数分组的胜率/收益。"""
+    with _sat_conn() as c:
+        df = pd.read_sql("SELECT * FROM satellite_outcomes ORDER BY id DESC", c)
+    if df.empty:
+        return pd.DataFrame()
+    # 按 hold_days 分组
+    stats = []
+    for days, grp in df.groupby("hold_days"):
+        stats.append({
+            "持有天数": int(days),
+            "交易笔数": len(grp),
+            "平均收益": f"{grp['pnl_pct'].mean():+.2%}",
+            "胜率": f"{(grp['pnl_pct'] > 0).mean():.0%}",
+            "平均盈亏": f"{grp['pnl'].mean():+,.0f}元",
+            "总盈亏": f"{grp['pnl'].sum():+,.0f}元",
+        })
+    return pd.DataFrame(stats)
+
+
+def _count_trade_days(d1: str, d2: str) -> int:
+    """计算两个日期间的交易日数（近似：自然日 × 5/7）。"""
+    try:
+        dt1 = pd.Timestamp(d1)
+        dt2 = pd.Timestamp(d2)
+        cal_days = (dt2 - dt1).days
+        return max(1, int(cal_days * 5 / 7))
+    except Exception:
+        return 1
+
+
+# ---------------------------------------------------------------- OOS-实盘偏差追踪
+def track_oos_vs_live(window_days: int = 90) -> dict:
+    """追踪回测 OOS 胜率 vs 实盘胜率的偏差。
+
+    当偏差持续扩大时，说明回测模型失效或过拟合加重。
+    返回: {avg_oos_winrate, avg_live_winrate, bias, status, n_samples, details}
+    """
+    with _conn() as c:
+        # 最近 window_days 天的选股记录及其保存时的 OOS 胜率
+        rows = c.execute(f"""
+            SELECT p.id, p.pack_name, p.oos_winrate_at_save, p.trade_date,
+                   o.fwd_days, o.hit
+            FROM picks p
+            JOIN outcomes o ON o.pick_id = p.id
+            WHERE p.trade_date >= date('now', '-{window_days} days')
+              AND p.oos_winrate_at_save IS NOT NULL
+              AND o.fwd_days = 5
+            ORDER BY p.trade_date
+        """).fetchall()
+
+    if not rows:
+        return {"status": "数据不足", "avg_oos_winrate": None,
+                "avg_live_winrate": None, "bias": None, "n_samples": 0, "details": []}
+
+    df = pd.DataFrame(rows, columns=["pick_id", "pack_name", "oos_wr", "trade_date",
+                                      "fwd_days", "hit"])
+
+    # 按策略包分组统计
+    pack_stats = []
+    for pack, grp in df.groupby("pack_name"):
+        oos_wr = float(grp["oos_wr"].mean()) if grp["oos_wr"].notna().any() else None
+        live_wr = float(grp["hit"].mean()) if len(grp) > 0 else None
+        if oos_wr is not None and live_wr is not None:
+            pack_stats.append({
+                "pack_name": pack,
+                "oos_winrate": round(oos_wr, 3),
+                "live_winrate": round(live_wr, 3),
+                "bias": round(oos_wr - live_wr, 3),
+                "n_trades": len(grp),
+            })
+
+    if not pack_stats:
+        return {"status": "数据不足", "avg_oos_winrate": None,
+                "avg_live_winrate": None, "bias": None, "n_samples": 0, "details": []}
+
+    ps_df = pd.DataFrame(pack_stats)
+    avg_oos = float(ps_df["oos_winrate"].mean())
+    avg_live = float(ps_df["live_winrate"].mean())
+    bias = avg_oos - avg_live
+
+    if bias < 0.03:
+        status = "正常"
+    elif bias < 0.08:
+        status = "注意"
+    else:
+        status = "⚠️ 过拟合加剧"
+
+    return {
+        "avg_oos_winrate": round(avg_oos, 3),
+        "avg_live_winrate": round(avg_live, 3),
+        "bias": round(bias, 3),
+        "status": status,
+        "n_samples": len(df),
+        "n_packs": len(pack_stats),
+        "details": pack_stats,
+    }

@@ -54,6 +54,22 @@ def render():
         st.warning("股票池太小（<30 只），截面统计没有意义，请换大一点的池子。")
         return
     end = get_last_trade_day()
+
+    # ---- OOS-实盘偏差追踪（过拟合信号灯） ----
+    bias_info = experience.track_oos_vs_live(90)
+    if bias_info.get("n_samples", 0) >= 5:
+        bi = bias_info
+        if bi["status"] == "⚠️ 过拟合加剧":
+            st.error(f"⚠️ **回测-实盘偏差 {bi['bias']:+.1%}** — 回测 OOS {bi['avg_oos_winrate']:.0%} vs "
+                     f"实盘 {bi['avg_live_winrate']:.0%}（{bi['n_samples']} 笔），"
+                     "过拟合信号！建议：减因子数、换低相关因子、延长持有期。")
+        elif bi["status"] == "注意":
+            st.warning(f"🔍 **回测-实盘偏差 {bi['bias']:+.1%}** — 回测 OOS {bi['avg_oos_winrate']:.0%} vs "
+                       f"实盘 {bi['avg_live_winrate']:.0%}（{bi['n_samples']} 笔），持续观察。")
+        else:
+            st.caption(f"✅ 回测-实盘偏差 {bi['bias']:+.1%}（回测 {bi['avg_oos_winrate']:.0%} vs "
+                       f"实盘 {bi['avg_live_winrate']:.0%}，{bi['n_samples']} 笔）")
+
     facs = _factor_universe()
 
     # ---- 体检范围收敛：全宇宙 8000+ 因子全评不现实，按来源圈定范围 ----
@@ -178,7 +194,7 @@ def render():
 
     # ================= ② 组合构建 =================
     st.markdown("### ② 组合构建")
-    corr = fe.ic_corr_matrix([f for f in facs if f["name"] in set(valid["因子"])], codes, end)
+    corr = fe.ic_corr_matrix([f for f in eval_facs if f["name"] in set(valid["因子"])], codes, end)
     try:
         _fam_map = dict(zip(library.get_factor_registry()["name"],
                             library.get_factor_registry()["family"].fillna("其他")))

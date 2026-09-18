@@ -26,6 +26,8 @@ GATE = {
     "TOP_PCT": 0.10,
     "COST": 0.001,          # 单边千一
     "LOOKBACK_DAYS": 600,   # 近600个交易日
+    "MAX_TURNOVER": 0.80,   # Top组相邻调仓平均替换率上限
+    "NET_ANN_MIN": 0.03,    # 扣费后组合年化超额最低 3%
 }
 
 # 类型特定门控阈值：不同因子类型使用不同的IC阈值
@@ -71,6 +73,18 @@ def _sharpe(x: pd.Series) -> float:
     return float(x.mean() / (x.std() + 1e-12) * np.sqrt(252)) if len(x) > 5 else 0.0
 
 
+def _top_turnover(vals: pd.Series) -> float:
+    """估算相邻调仓日 Top 组替换率，作为交易成本/容量代理。"""
+    v = fe._norm(vals.dropna())
+    tops = []
+    for _, g in v.groupby(level="datetime"):
+        k = max(1, int(len(g) * GATE["TOP_PCT"]))
+        tops.append(set(g.nlargest(k).index.get_level_values("instrument")))
+    if len(tops) < 2:
+        return 1.0
+    return float(np.mean([1 - len(a & b) / max(1, len(b)) for a, b in zip(tops, tops[1:])]))
+
+
 def _max_dd(nav: pd.Series) -> float:
     return float(((nav - nav.cummax()) / nav.cummax()).min()) if len(nav) else 0.0
 
@@ -106,7 +120,15 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
         metrics["p_value"] = 1.0
 
     x = _daily_excess(vals, fwd)
+    turnover = _top_turnover(vals)
+    metrics["Top组平均换手率"] = round(turnover, 4)
+    if turnover > GATE["MAX_TURNOVER"]:
+        reasons.append(f"Top组平均换手率 {turnover:.1%} > {GATE['MAX_TURNOVER']:.1%}")
     nav = (1 + x).cumprod()
+    net_ann = float(x.mean() * 252) if len(x) else 0.0
+    metrics["扣费后年化超额"] = round(net_ann, 4)
+    if net_ann < GATE["NET_ANN_MIN"]:
+        reasons.append(f"扣费后年化超额 {net_ann:.2%} < {GATE['NET_ANN_MIN']:.2%}")
 
     def _year_stats(year: int):
         if len(x) == 0 or not hasattr(x.index, 'year'):

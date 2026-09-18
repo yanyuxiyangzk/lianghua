@@ -1900,34 +1900,45 @@ def job_evolution_distill(**_ignored) -> str:
     if es.is_degenerate_report(content):
         return f"{today} 战报缺失或退化（LLM 不可用/过短），跳过蒸馏"
 
+    def _clip(value, limit):
+        raw = str(value or "").strip()
+        # 保留换行，优先按完整段落/表格行裁剪；仅在单行过长时再压缩空白
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        text = "\n".join(lines)
+        if len(text) <= limit:
+            return text
+        kept_lines = []
+        used = 0
+        for line in lines:
+            extra = len(line) + (1 if kept_lines else 0)
+            if used + extra > limit:
+                break
+            kept_lines.append(line)
+            used += extra
+        if kept_lines:
+            return "\n".join(kept_lines) + "\n[其余段落已截断]"
+        # 单行本身超过预算时，按空白边界兜底；中文无空格时按字符截断
+        one = " ".join(raw.split())
+        cut = one[:max(0, limit - 8)]
+        if " " in cut:
+            cut = cut.rsplit(" ", 1)[0]
+        return cut + " [截断]"
+
     payload = {
         "report_date": today,
-        "report_text": " ".join(content.split())[:3000],
-        "leaderboard_txt": _distill_leaderboard_txt(),
-        "watch_txt": _distill_watch_txt(today),
-        "sr_txt": _distill_sr_txt(today),
-        "sector_txt": _distill_sector_txt(today),
-        "chat_index_txt": _distill_chat_index_txt(today),
+        "report_text": _clip(content, 3000),
+        "leaderboard_txt": _clip(_distill_leaderboard_txt(), 1200),
+        "watch_txt": _clip(_distill_watch_txt(today), 900),
+        "sr_txt": _clip(_distill_sr_txt(today), 900),
+        "sector_txt": _clip(_distill_sector_txt(today), 900),
+        "chat_index_txt": _clip(_distill_chat_index_txt(today), 700),
     }
     try:
-        from litellm import completion
+        from llmutil import llm_chat
 
         system_prompt, user_prompt = es.build_distill_prompt(payload)
-        r = completion(model=os.environ.get("CHAT_MODEL") or "deepseek/deepseek-chat",
-                       messages=[{"role": "system", "content": system_prompt},
-                                 {"role": "user", "content": user_prompt}],
-                       max_tokens=1500, timeout=60, temperature=0)  # 蒸馏要稳定，不要创意
-        # 缓存命中监控
-        try:
-            usage = getattr(r, "usage", None) or {}
-            hit = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
-            miss = getattr(usage, "prompt_cache_miss_tokens", 0) or 0
-            if hit + miss > 0:
-                logging.getLogger("scheduler").debug(
-                    "distill cache: hit=%d miss=%d rate=%.0f%%", hit, miss, hit / (hit + miss) * 100)
-        except Exception:
-            pass
-        d = es.extract_json_obj(r.choices[0].message.content or "")
+        text = llm_chat(system_prompt, user_prompt, max_tokens=800, label="distill")
+        d = es.extract_json_obj(text or "")
         if d is None:
             return f"{today} 蒸馏输出无法抽取 JSON（当天无信号）"
         ok, why, clean = es.validate_signals(d)

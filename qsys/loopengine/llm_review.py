@@ -45,26 +45,10 @@ def llm_review(sexpr: str) -> tuple[bool, str]:
     if not os.environ.get("DEEPSEEK_API_KEY"):
         return _rule_review(sexpr), "no-llm-fallback"
     try:
-        from litellm import completion
-
-        r = completion(
-            model=os.environ.get("CHAT_MODEL") or "deepseek/deepseek-chat",
-            messages=[{"role": "system", "content": _REVIEWER_SYS},
-                      {"role": "user", "content": _REVIEWER_USER.format(sexpr=sexpr)}],
-            max_tokens=1000, timeout=45,
-            temperature=0)  # 审查端要判决稳定：同一表达式不应两次调用一过一拒
-        # 缓存命中监控
-        try:
-            usage = getattr(r, "usage", None) or {}
-            hit = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
-            miss = getattr(usage, "prompt_cache_miss_tokens", 0) or 0
-            if hit + miss > 0:
-                import logging
-                logging.getLogger("llm_review").debug(
-                    "review cache: hit=%d miss=%d rate=%.0f%%", hit, miss, hit / (hit + miss) * 100)
-        except Exception:
-            pass
-        d = _extract_json(r.choices[0].message.content or "")
+        from llmutil import llm_chat
+        text = llm_chat(_REVIEWER_SYS, _REVIEWER_USER.format(sexpr=sexpr),
+                        max_tokens=350, label="loopengine_review")
+        d = _extract_json(text or "")
         if d is None:
             return _rule_review(sexpr), "llm-error-fallback"
         verdict = str(d.get("verdict", "pass")).lower()

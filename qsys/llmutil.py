@@ -43,6 +43,8 @@ def _resolve_model(model: str) -> str:
 # LLM 响应缓存
 _CACHE_DB = DATA_DIR / "experience.db"
 _CACHE_TTL = 86400  # 24小时
+_DAILY_CALL_LIMIT = int(os.environ.get("LLM_DAILY_CALL_LIMIT", "30"))
+_DAILY_TOKEN_LIMIT = int(os.environ.get("LLM_DAILY_TOKEN_LIMIT", "30000"))
 
 
 def _ensure_cache_table():
@@ -57,6 +59,44 @@ def _ensure_cache_table():
                 label TEXT
             )
         """)
+        c.execute("""CREATE TABLE IF NOT EXISTS llm_usage (
+            day TEXT PRIMARY KEY, calls INTEGER NOT NULL DEFAULT 0,
+            reserved_tokens INTEGER NOT NULL DEFAULT 0)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS llm_usage_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, created_at REAL NOT NULL,
+            day TEXT NOT NULL, label TEXT, model TEXT, cache_hit INTEGER NOT NULL DEFAULT 0,
+            input_tokens INTEGER, output_tokens INTEGER, reserved_tokens INTEGER)""")
+
+
+def _record_usage(label, model, cache_hit=False, input_tokens=None,
+                  output_tokens=None, reserved_tokens=0):
+    try:
+        _ensure_cache_table()
+        with sqlite3.connect(str(_CACHE_DB), timeout=10) as c:
+            c.execute("INSERT INTO llm_usage_log(created_at,day,label,model,cache_hit,input_tokens,output_tokens,reserved_tokens) VALUES(?,?,?,?,?,?,?,?)",
+                      (time.time(), time.strftime("%Y-%m-%d"), label, model, int(cache_hit),
+                       input_tokens, output_tokens, reserved_tokens))
+    except Exception:
+        pass
+
+
+def _budget_reserve(max_tokens: int) -> bool:
+    """Reserve a daily request/output budget. Cache hits never consume budget."""
+    day = time.strftime("%Y-%m-%d")
+    try:
+        _ensure_cache_table()
+        with sqlite3.connect(str(_CACHE_DB), timeout=10) as c:
+            row = c.execute("SELECT calls, reserved_tokens FROM llm_usage WHERE day=?", (day,)).fetchone()
+            calls, tokens = row if row else (0, 0)
+            if calls >= _DAILY_CALL_LIMIT or tokens + max_tokens > _DAILY_TOKEN_LIMIT:
+                log.warning("LLM daily budget exceeded: calls=%d/%d tokens=%d/%d",
+                            calls, _DAILY_CALL_LIMIT, tokens, _DAILY_TOKEN_LIMIT)
+                return False
+            c.execute("INSERT OR REPLACE INTO llm_usage(day,calls,reserved_tokens) VALUES(?,?,?)",
+                      (day, calls + 1, tokens + max_tokens))
+            return True
+    except Exception:
+        return False
 
 
 def _get_cache_key(model: str, messages: list[dict], max_tokens: int, temperature: float) -> str:
@@ -144,10 +184,14 @@ def llm_chat(system: str, user: str, max_tokens: int = 4096, model: str | None =
         cache_key = _get_cache_key(model, messages, max_tokens, 0.2)
         cached = _get_cached(cache_key)
         if cached is not None:
+            _record_usage(label, model, cache_hit=True)
             return cached
     
     try:
         from litellm import completion
+
+        if not _budget_reserve(max_tokens):
+            return None
 
         r = completion(
             model=model,
@@ -157,6 +201,9 @@ def llm_chat(system: str, user: str, max_tokens: int = 4096, model: str | None =
         )
         _log_cache_usage(r, label or "chat")
         response = (r.choices[0].message.content or "").strip()
+        usage = getattr(r, "usage", None) or {}
+        _record_usage(label, model, input_tokens=getattr(usage, "prompt_tokens", None),
+                      output_tokens=getattr(usage, "completion_tokens", None), reserved_tokens=max_tokens)
         
         # 缓存响应
         if use_cache and response:
@@ -184,10 +231,14 @@ def llm_chat_multi(messages: list[dict], max_tokens: int = 4000, model: str | No
         cache_key = _get_cache_key(model, messages, max_tokens, 0.3)
         cached = _get_cached(cache_key)
         if cached is not None:
+            _record_usage(label, model, cache_hit=True)
             return cached
     
     try:
         from litellm import completion
+
+        if not _budget_reserve(max_tokens):
+            return None
 
         def _call(**extra):
             r = completion(
@@ -198,11 +249,16 @@ def llm_chat_multi(messages: list[dict], max_tokens: int = 4000, model: str | No
                 **extra)
             _log_cache_usage(r, label or "chat_multi")
             ch = r.choices[0]
-            return (ch.message.content or "").strip(), getattr(ch, "finish_reason", None)
+            return ((ch.message.content or "").strip(), getattr(ch, "finish_reason", None),
+                    getattr(r, "usage", None) or {})
 
-        content, finish = _call()
+        content, finish, usage = _call()
         if not content and finish == "length":
-            content, _ = _call(reasoning_effort="low")
+            content, _, usage = _call(reasoning_effort="low")
+        # 记录实际用量；缓存命中在入口处单独记录
+        _record_usage(label, model, input_tokens=getattr(usage, "prompt_tokens", None),
+                      output_tokens=getattr(usage, "completion_tokens", None),
+                      reserved_tokens=max_tokens)
         
         # 缓存响应
         if use_cache and content:

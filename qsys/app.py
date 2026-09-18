@@ -52,6 +52,7 @@ pages = {
         st.Page("views/p_satellite.py", title="卫星轨·事件策略", icon="🎲", url_path="satellite"),
         st.Page("views/p_daily_report.py", title="每日战报", icon="📊", url_path="daily-report"),
         st.Page("views/p_llm_chat.py", title="涨停复盘对话", icon="🧠", url_path="chat"),
+        st.Page("views/p_llm_usage.py", title="LLM 用量与缓存", icon="🧾", url_path="llm-usage"),
     ],
     # 「市场数据」菜单已隐藏（2026-09-11 用户要求）：其页面多用腾讯/东财等杂源，
     # 与 📡iFinD数据 菜单（后台统一同花顺落库）重复且口径不一。页面文件保留在

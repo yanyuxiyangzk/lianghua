@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS daily_reports (
     strategies_json TEXT,
     market_json TEXT,
     stats_json TEXT,
+    data_hash TEXT,
     pnl_today REAL,
     pnl_total REAL,
     generated_at TEXT
@@ -118,6 +119,13 @@ def _conn():
     c.executescript(_TRADES_SCHEMA)
     c.executescript(_POSITIONS_SCHEMA)
     c.executescript(_DAILY_REPORTS_SCHEMA)
+    # 兼容旧库：日报输入快照哈希用于同日幂等缓存
+    try:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(daily_reports)").fetchall()}
+        if "data_hash" not in cols:
+            c.execute("ALTER TABLE daily_reports ADD COLUMN data_hash TEXT")
+    except Exception:
+        pass
     c.executescript(_EVOLUTION_SIGNALS_SCHEMA)
     # 迁移：positions 增加限价字段（委托买入用，老库无此列则补上）
     pcols = [r[1] for r in c.execute("PRAGMA table_info(positions)")]
@@ -1596,7 +1604,7 @@ def conviction_multiplier(pwin: float) -> float:
 
 
 # ---------------------------------------------------------------- 每日战报
-def save_daily_report(date: str, content: str, data: dict) -> None:
+def save_daily_report(date: str, content: str, data: dict, data_hash: str | None = None) -> None:
     """保存每日战报到 DB。同日覆盖。"""
     account = data.get("account", {})
     pnl_today = account.get("今日盈亏", 0) or 0
@@ -1605,9 +1613,9 @@ def save_daily_report(date: str, content: str, data: dict) -> None:
         c.execute("""
             INSERT OR REPLACE INTO daily_reports
             (date, content, account_json, positions_json, fills_json,
-             factors_json, strategies_json, market_json, stats_json,
+             factors_json, strategies_json, market_json, stats_json, data_hash,
              pnl_today, pnl_total, generated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             date,
             content,
@@ -1618,6 +1626,7 @@ def save_daily_report(date: str, content: str, data: dict) -> None:
             json.dumps(data.get("strategies"), ensure_ascii=False, default=str) if hasattr(data.get("strategies"), 'to_json') else json.dumps(data.get("strategies"), ensure_ascii=False, default=str),
             json.dumps(data.get("indices"), ensure_ascii=False, default=str),
             json.dumps(data.get("stats"), ensure_ascii=False, default=str),
+            data_hash,
             pnl_today,
             pnl_total,
             datetime.now().isoformat(),
@@ -1627,11 +1636,14 @@ def save_daily_report(date: str, content: str, data: dict) -> None:
 def get_daily_report(date: str) -> dict | None:
     """读取指定日期的战报。"""
     with _conn() as c:
-        row = c.execute("SELECT * FROM daily_reports WHERE date=?", (date,)).fetchone()
+        row = c.execute(
+            "SELECT date, content, account_json, positions_json, fills_json, factors_json, "
+            "strategies_json, market_json, stats_json, data_hash, pnl_today, pnl_total, generated_at "
+            "FROM daily_reports WHERE date=?", (date,)).fetchone()
     if not row:
         return None
     cols = ["date", "content", "account_json", "positions_json", "fills_json",
-            "factors_json", "strategies_json", "market_json", "stats_json",
+            "factors_json", "strategies_json", "market_json", "stats_json", "data_hash",
             "pnl_today", "pnl_total", "generated_at"]
     d = dict(zip(cols, row))
     for k in ["account_json", "positions_json", "fills_json", "factors_json",
@@ -1956,7 +1968,8 @@ def satellite_llm_decide(candidates: list[dict], market_context: dict) -> dict:
         "- 不买涨停/追高票（已剔除）"
     )
 
-    reply = llmutil.llm_chat(system_prompt, user_prompt, max_tokens=2000, label="satellite")
+    # 卫星轨只需返回候选决策 JSON，限制输出避免无关解释
+    reply = llmutil.llm_chat(system_prompt, user_prompt, max_tokens=700, label="satellite")
 
     # 解析 + 校验
     if not reply:

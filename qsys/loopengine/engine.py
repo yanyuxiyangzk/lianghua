@@ -403,28 +403,15 @@ class LoopEngine:
             pass
         
         try:
-            from litellm import completion
+            from llmutil import llm_chat
 
             system_prompt, user_prompt = _build_llm_prompt(
                 fam, why, factor_type, evidence,
                 self._family_fewshots(fam, factor_type),
                 hypotheses=hypotheses,
                 theories=theories)
-            r = completion(model=os.environ.get("CHAT_MODEL") or "deepseek/deepseek-chat",
-                           messages=[{"role": "system", "content": system_prompt},
-                                     {"role": "user", "content": user_prompt}],
-                            max_tokens=800, temperature=0.9)  # 生成端要多样性但避免语法无效输出
-            # 缓存命中监控
-            try:
-                usage = getattr(r, "usage", None) or {}
-                hit = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
-                miss = getattr(usage, "prompt_cache_miss_tokens", 0) or 0
-                if hit + miss > 0:
-                    log.debug("LE gen cache: hit=%d miss=%d rate=%.0f%% fam=%s",
-                              hit, miss, hit / (hit + miss) * 100, fam)
-            except Exception:
-                pass
-            text = r.choices[0].message.content or ""
+            text = llm_chat(system_prompt, user_prompt, max_tokens=500,
+                            label="loopengine_generate") or ""
             cand = _extract_sexpr(text)
             if cand is None:
                 if stats is not None:
@@ -589,7 +576,8 @@ class LoopEngine:
             bus.push(EventType.STEP_UPDATE, step=3, name="衰减检测", status="error",
                      error=str(e))
 
-        llm_review_budget = 10
+        # 成本闸门：每轮最多 3 次 LLM 审查；规则审查仍覆盖全部候选
+        llm_review_budget = 3
         for _ in range(batch):
             # Step 4: 生成候选
             src, tree = self._gen_candidate(rng, gaps, proven, live_boost, factor_type, regime,
@@ -610,7 +598,8 @@ class LoopEngine:
                 continue
             sexpr = tree.sexpr()
 
-            # Step 6: LLM审查（抽样50%，预算10个/轮）
+            # Step 6: LLM语义审查（仅作风险标注，不覆盖硬规则/统计闸门）
+            # 优先审查候选，预算用尽后跳过；LLM 不再直接淘汰因子。
             do_llm = llm_review_budget > 0 and rng.random() < 0.5
             bus.push(EventType.STEP_UPDATE, step=6, name="LLM审查", status="running",
                      source=src, sampled=do_llm)
@@ -623,14 +612,12 @@ class LoopEngine:
                 bus.push(EventType.STEP_UPDATE, step=6, name="LLM审查",
                          status="pass" if passed_review else "fail", source=src, reason=reason if not passed_review else None)
                 if not passed_review:
-                    stats["llm_rejected"] += 1
-                    sk0 = review.skeleton_of(tree)
-                    library.record_failure(sexpr[:60], sk0, structure.assign_family(sexpr, sk0),
-                                           f"llm_review: {reason}", "loopengine")
-                    s["budget"].record(src, False)
-                    bus.push(EventType.LLM_RESULT, iteration=s["iteration"],
-                             source=src, passed=False, reason=reason)
-                    continue
+                    stats["llm_rejected"] += 1  # 兼容旧统计：表示风险标记，不是硬拒绝
+                stats.setdefault("llm_flags", []).append({"sexpr": sexpr[:120],
+                                                            "passed": passed_review,
+                                                            "reason": reason})
+                bus.push(EventType.LLM_RESULT, iteration=s["iteration"],
+                         source=src, passed=passed_review, reason=reason)
             else:
                 bus.push(EventType.STEP_UPDATE, step=6, name="LLM审查",
                          status="skip", source=src)
@@ -1029,12 +1016,10 @@ class LoopEngine:
                 if reason.endswith("-fallback"):  # LLM 不可用/JSON 解析失败的回退率
                     stats["llm_review_fallback"] = stats.get("llm_review_fallback", 0) + 1
                 if not passed_review:
-                    stats["llm_rejected"] += 1
-                    sk0 = review.skeleton_of(tree)
-                    library.record_failure(sexpr[:60], sk0, structure.assign_family(sexpr, sk0),
-                                           f"llm_review: {reason}", "loopengine")
-                    s["budget"].record(src, False)
-                    continue
+                    stats["llm_rejected"] += 1  # 兼容旧统计：表示风险标记，不是硬拒绝
+                stats.setdefault("llm_flags", []).append({"sexpr": sexpr[:120],
+                                                            "passed": passed_review,
+                                                            "reason": reason})
             h = f"ev:{kind}:" + G.factor_hash(sexpr)
             if library.is_tested(h):
                 stats["dup"] += 1

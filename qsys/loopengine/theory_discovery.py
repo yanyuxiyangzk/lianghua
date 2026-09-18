@@ -351,7 +351,7 @@ S表达式格式要求（严格遵守）：
         
         try:
             import os
-            from litellm import completion
+            from llmutil import llm_chat
             
             # 模型名映射：deepseek-v4.1-flash → deepseek-chat（flash模型返回空）
             model = os.environ.get("CHAT_MODEL") or "deepseek/deepseek-chat"
@@ -377,17 +377,8 @@ S表达式格式要求（严格遵守）：
 
 请为每个模式提出1-2个可检验的假说，并形式化为S表达式。"""
             
-            r = completion(
-                model=model,
-                messages=[
-                    {"role": "system", "content": HypothesisGenerator.SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                max_tokens=1000,
-                temperature=0.9,  # 高温度增加创意
-            )
-            
-            text = r.choices[0].message.content or ""
+            text = llm_chat(HypothesisGenerator.SYSTEM_PROMPT, user_prompt,
+                            max_tokens=600, label="theory_hypothesis") or ""
             
             # 提取JSON
             import re
@@ -596,13 +587,7 @@ class TheoryNamer:
     def name_theory(sexpr: str, validation_result: dict, pattern: dict) -> dict:
         """命名理论。"""
         try:
-            import os
-            from litellm import completion
-            
-            # 模型名映射：deepseek-v4.1-flash → deepseek-chat（flash模型返回空）
-            model = os.environ.get("CHAT_MODEL") or "deepseek/deepseek-chat"
-            if "v4.1" in model or "flash" in model:
-                model = "deepseek/deepseek-chat"
+            from llmutil import llm_chat
             
             user_prompt = f"""因子表达式: {sexpr}
 验证结果:
@@ -613,17 +598,8 @@ class TheoryNamer:
 
 发现模式: {pattern.get('type', 'N/A')} - {pattern.get('description', 'N/A')}"""
             
-            r = completion(
-                model=model,
-                messages=[
-                    {"role": "system", "content": TheoryNamer.SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                max_tokens=500,
-                temperature=0.7,
-            )
-            
-            text = r.choices[0].message.content or ""
+            text = llm_chat(TheoryNamer.SYSTEM_PROMPT, user_prompt,
+                            max_tokens=350, label="theory_name") or ""
             import re
             m = re.search(r"\{.*\}", text, re.S)
             if m:

@@ -151,7 +151,8 @@ def _parse_llm(out: str | None, n: int) -> dict:
             "themes": themes, "sentiments": sentiments}
 
 
-_MAX_ITEMS_PER_CALL = 40
+# 单次只分析最新公告，避免多股票/长公告列表造成请求和上下文爆炸
+_MAX_ITEMS_PER_CALL = 15
 
 
 def llm_enhance(df: pd.DataFrame, max_items: int = _MAX_ITEMS_PER_CALL) -> dict:
@@ -172,6 +173,9 @@ def llm_enhance(df: pd.DataFrame, max_items: int = _MAX_ITEMS_PER_CALL) -> dict:
     by_code_items: dict[str, list[dict]] = defaultdict(list)
     for it in rows:
         by_code_items[it["code"]].append(it)
+    # 每只股票当天最多取最新 15 条；更早公告对盘中决策边际价值低
+    for code in list(by_code_items):
+        by_code_items[code] = by_code_items[code][-_MAX_ITEMS_PER_CALL:]
     sentiments: dict[int, dict] = {}
     by_code: dict[str, dict] = {}
     for code, items in by_code_items.items():
@@ -201,7 +205,7 @@ def llm_enhance(df: pd.DataFrame, max_items: int = _MAX_ITEMS_PER_CALL) -> dict:
                     '"impact": "高/中/低", "theme": "主题", "dimension": "维度"}}}'
                 ),
                 user=_build_prompt(chunk, code=code),
-                max_tokens=1500,
+                max_tokens=800,
                 label="newsense")
             parsed = _parse_llm(out, len(chunk))
             for local_i, sd in parsed["sentiments"].items():

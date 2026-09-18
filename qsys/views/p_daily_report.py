@@ -1,6 +1,8 @@
 """📊 每日量化战报：点击生成 AI 深度分析报告。"""
 
 from datetime import datetime
+import hashlib
+import json
 import pandas as pd
 import streamlit as st
 
@@ -37,6 +39,40 @@ def _collect_all_data() -> dict:
 
     # 7. 交易统计
     stats = experience.position_stats()
+
+    def top_rows(frame, n, sort_cols=()):
+        if frame is None:
+            return frame
+        # 兼容 leaderboard 返回 list[dict] 的情况
+        if isinstance(frame, list):
+            rows = list(frame)
+            for col in sort_cols:
+                if rows and any(isinstance(x, dict) and col in x for x in rows):
+                    def _sort_key(x):
+                        try:
+                            return float(x.get(col))
+                        except (TypeError, ValueError, AttributeError):
+                            return float("-inf")
+                    rows.sort(key=_sort_key, reverse=True)
+                    break
+            return rows[:n]
+        # 兼容字典映射型结果：保留前 N 个键值对
+        if isinstance(frame, dict):
+            return dict(list(frame.items())[:n])
+        if not hasattr(frame, "empty") or frame.empty:
+            return frame
+        out = frame
+        for col in sort_cols:
+            if col in out.columns:
+                out = out.sort_values(col, ascending=False, na_position="last")
+                break
+        return out.head(n).copy()
+
+    # 先做结构化裁剪，再交给 prompt formatter，保证保留的是完整记录
+    positions = top_rows(positions, 20, ("市值", "持仓盈亏"))
+    fills = top_rows(fills, 30, ("ts", "date", "id"))
+    factors = top_rows(factors, 30, ("IC均值", "ic_mean", "score"))
+    strategies = top_rows(strategies, 20, ("胜率", "胜率_5", "score"))
 
     return {
         "account": account,
@@ -203,28 +239,35 @@ SYSTEM_PROMPT = """你是一位专业的量化投资分析师，负责每日战�
 
 def _build_prompt(data: dict) -> str:
     """构建战报 prompt——数据部分放入 user message，分析框架在 system message 中。"""
+    def clip(v, n):
+        text = str(v or "")
+        if len(text) <= n:
+            return text
+        # 最后兜底也按完整行保留，避免破坏 Markdown 表格
+        kept = text[:n].rsplit("\n", 1)[0]
+        return kept + "\n[其余记录已截断]"
     return f"""# 日期：{data['date']}
 
 ## 一、账户概况
-{_format_account(data['account'])}
+{clip(_format_account(data['account']), 1200)}
 
 ## 二、持仓明细
-{_format_positions(data['positions'])}
+{clip(_format_positions(data['positions']), 2200)}
 
 ## 三、今日成交记录
-{_format_fills(data['fills'])}
+{clip(_format_fills(data['fills']), 1600)}
 
 ## 四、因子表现
-{_format_factors(data['factors'])}
+{clip(_format_factors(data['factors']), 1800)}
 
 ## 五、策略表现
-{_format_strategies(data['strategies'])}
+{clip(_format_strategies(data['strategies']), 1400)}
 
 ## 六、市场环境
-{_format_indices(data['indices'])}
+{clip(_format_indices(data['indices']), 1000)}
 
 ## 七、历史统计
-{_format_stats(data['stats'])}
+{clip(_format_stats(data['stats']), 1200)}
 
 ---
 
@@ -234,10 +277,25 @@ def _build_prompt(data: dict) -> str:
 def _generate_report(data: dict) -> str:
     """调用 LLM 生成分析报告"""
     prompt = _build_prompt(data)
-    result = llm_chat(SYSTEM_PROMPT, prompt, max_tokens=4000, label="daily_report")
+    # 日报只需结构化结论，限制输出避免长篇重复分析
+    result = llm_chat(SYSTEM_PROMPT, prompt, max_tokens=1600, label="daily_report")
     if result:
         return result
     return "⚠️ LLM 服务不可用，请检查 DEEPSEEK_API_KEY 配置。"
+
+
+def _data_hash(data: dict) -> str:
+    """对日报输入做稳定哈希；DataFrame 转 JSON，避免对象 repr 不稳定。"""
+    def norm(v):
+        if hasattr(v, "to_dict"):
+            return v.to_dict(orient="records")
+        if isinstance(v, dict):
+            return {str(k): norm(x) for k, x in sorted(v.items(), key=lambda kv: str(kv[0]))}
+        if isinstance(v, (list, tuple)):
+            return [norm(x) for x in v]
+        return v
+    raw = json.dumps(norm(data), ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 # ---------------------------------------------------------------- 页面渲染
@@ -300,8 +358,14 @@ def page_daily_report():
     if generate:
         with st.spinner("📊 正在采集数据..."):
             data = _collect_all_data()
-        with st.spinner("🤖 AI 分析中（约10秒）..."):
-            report = _generate_report(data)
+        digest = _data_hash(data)
+        cached = experience.get_daily_report(data["date"])
+        if cached and cached.get("data_hash") == digest and cached.get("content"):
+            report = cached["content"]
+            st.toast("已复用今日战报缓存")
+        else:
+            with st.spinner("🤖 AI 分析中（约10秒）..."):
+                report = _generate_report(data)
         st.session_state["daily_report"] = report
         st.session_state["daily_report_data"] = data
         st.session_state["daily_report_meta"] = {
@@ -309,7 +373,7 @@ def page_daily_report():
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M")}
         # 保存战报到 DB
         try:
-            experience.save_daily_report(data["date"], report, data)
+            experience.save_daily_report(data["date"], report, data, data_hash=digest)
         except Exception as e:
             st.warning(f"战报保存失败: {e}")
 

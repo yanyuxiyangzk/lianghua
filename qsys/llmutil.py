@@ -27,6 +27,19 @@ log = logging.getLogger("llmutil")
 
 _DEFAULT_MODEL = os.environ.get("CHAT_MODEL") or "deepseek/deepseek-chat"
 
+# 模型名映射：某些环境变量中的模型名不是有效的API模型名
+_MODEL_ALIAS = {
+    "deepseek/deepseek-v4.1-flash": "deepseek/deepseek-chat",
+    "deepseek-v4.1-flash": "deepseek/deepseek-chat",
+    "deepseek/deepseek-flash": "deepseek/deepseek-chat",
+    "deepseek-flash": "deepseek/deepseek-chat",
+}
+
+
+def _resolve_model(model: str) -> str:
+    """解析模型名，处理别名映射。"""
+    return _MODEL_ALIAS.get(model, model)
+
 # LLM 响应缓存
 _CACHE_DB = DATA_DIR / "experience.db"
 _CACHE_TTL = 86400  # 24小时
@@ -122,7 +135,7 @@ def llm_chat(system: str, user: str, max_tokens: int = 4096, model: str | None =
     if not llm_available():
         return None
     
-    model = model or _DEFAULT_MODEL
+    model = _resolve_model(model or _DEFAULT_MODEL)
     messages = [{"role": "system", "content": system},
                 {"role": "user", "content": user}]
     
@@ -164,7 +177,7 @@ def llm_chat_multi(messages: list[dict], max_tokens: int = 4000, model: str | No
     if not llm_available():
         return None
     
-    model = model or _DEFAULT_MODEL
+    model = _resolve_model(model or _DEFAULT_MODEL)
     
     # 检查缓存
     if use_cache:

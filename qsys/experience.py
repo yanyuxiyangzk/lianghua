@@ -1711,7 +1711,7 @@ def satellite_llm_decide(candidates: list[dict], market_context: dict) -> dict:
                 continue
             prev_close = pr[1] if pr and len(pr) > 1 else None
             chg = ((cur / prev_close - 1) * 100) if prev_close and prev_close > 0 else None
-            if chg is not None and pd.notna(chg) and chg > 8.0:
+            if chg is not None and pd.notna(chg) and chg > 15.0:
                 continue
         except Exception:
             continue

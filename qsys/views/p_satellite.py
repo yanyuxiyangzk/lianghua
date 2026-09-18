@@ -12,6 +12,11 @@ import broker as bk
 import library
 from common import get_last_trade_day
 
+# 卫星轨常量
+LIMIT_UP_THRESHOLD = 0.999  # 涨停判断阈值（相对涨停价）
+CHASE_HIGH_THRESHOLD = 15.0  # 追高阈值（涨幅百分比）
+SL_SAMPLE_SIZE = 200  # 止损记录样本量
+
 
 def _get_satellite_pack_info() -> dict | None:
     """获取卫星轨策略包信息。"""
@@ -75,24 +80,33 @@ def _render_tab_today():
         st.info("今日卫星轨无选股结果，请等待 19:10 扫描完成")
         return
 
+    # 批量获取价格（减少API调用）
+    codes = picks["code"].tolist()
+    try:
+        all_prices = bk._latest_prices(codes)
+    except Exception as e:
+        st.warning(f"获取价格失败: {e}")
+        all_prices = {}
+
     # 剔除涨停/追高后的候选
     eligible = []
     for _, row in picks.iterrows():
         code = row["code"]
+        pr = all_prices.get(code)
+        if pr is None:
+            continue
         try:
-            pr = bk._latest_prices([code]).get(code)
-            if pr is None:
-                continue
             cur = pr[0]
             prev_close = pr[1] if len(pr) > 1 else None
             limit_up = pr[3] if len(pr) > 3 else None
             chg = ((cur / prev_close - 1) * 100) if prev_close and prev_close > 0 else None
-            is_lu = limit_up and cur >= limit_up * 0.999
-            is_chase = chg is not None and pd.notna(chg) and chg > 15.0
+            is_lu = limit_up and cur >= limit_up * LIMIT_UP_THRESHOLD
+            is_chase = chg is not None and pd.notna(chg) and chg > CHASE_HIGH_THRESHOLD
             if not is_lu and not is_chase:
                 eligible.append({"code": code, "score": row["score"],
                                  "price": cur, "change_pct": chg})
-        except Exception:
+        except Exception as e:
+            st.warning(f"处理 {code} 价格时出错: {e}")
             continue
 
     if not eligible:
@@ -179,7 +193,7 @@ def _render_tab_history():
     if outcomes.empty:
         st.info("暂无已平仓记录")
     else:
-        # 筛选条件
+        # 筛选条件（移到顶部）
         col1, col2 = st.columns(2)
         with col1:
             exit_reasons = ["全部"] + sorted(outcomes["exit_reason"].dropna().unique().tolist())
@@ -194,6 +208,7 @@ def _render_tab_history():
         if min_hold > 0:
             filtered = filtered[filtered["hold_days"] >= min_hold]
 
+        # 显示数据
         display = filtered[["code", "name", "buy_date", "buy_price",
                             "sell_date", "sell_price", "pnl", "pnl_pct",
                             "hold_days", "exit_reason"]].copy()
@@ -220,8 +235,8 @@ def _render_tab_risk():
     try:
         cash = bk._get_cash()
         st.metric("可用资金", f"{cash:,.0f}元")
-    except Exception:
-        st.warning("无法读取资金账号")
+    except Exception as e:
+        st.warning(f"无法读取资金账号: {e}")
 
     st.subheader("持仓明细")
     opens = exp.satellite_positions("open")
@@ -241,7 +256,8 @@ def _render_tab_risk():
                 st.write(f"**{p['code']}** {p['name']} | "
                          f"买入 {p['buy_price']:.2f} × {int(p['buy_shares'])}股 | "
                          f"现价 {cur:.2f} | {pnl_pct:+.2%}")
-            except Exception:
+            except Exception as e:
+                st.warning(f"获取 {p['code']} 价格失败: {e}")
                 st.write(f"**{p['code']}** {p['name']}")
 
         if total_value > 0:
@@ -249,7 +265,7 @@ def _render_tab_risk():
             st.metric("持仓成本", f"{total_cost:,.0f}元")
 
     st.subheader("止损触发记录")
-    outcomes = exp.satellite_outcomes(200)  # 增加样本量
+    outcomes = exp.satellite_outcomes(SL_SAMPLE_SIZE)  # 使用常量
     if not outcomes.empty:
         sl_records = outcomes[outcomes["exit_reason"] == "止损"]
         if not sl_records.empty:
@@ -257,9 +273,12 @@ def _render_tab_risk():
             total_sl = len(sl_records)
             avg_sl_pct = sl_records["pnl_pct"].mean()
             st.caption(f"共 {total_sl} 笔止损 | 平均亏损 {avg_sl_pct:+.2%}")
-            st.dataframe(sl_records[["code", "name", "buy_date", "buy_price",
-                                     "sell_date", "sell_price", "pnl", "pnl_pct"]],
-                         use_container_width=True, hide_index=True)
+            # 显示完整字段
+            display_cols = ["code", "name", "buy_date", "buy_price", "buy_shares",
+                           "sell_date", "sell_price", "pnl", "pnl_pct", "hold_days",
+                           "llm_conviction", "exit_reason"]
+            available_cols = [col for col in display_cols if col in sl_records.columns]
+            st.dataframe(sl_records[available_cols], use_container_width=True, hide_index=True)
         else:
             st.info("暂无止损记录")
     else:

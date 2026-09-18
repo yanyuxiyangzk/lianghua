@@ -1998,7 +1998,10 @@ def satellite_nav_update(today: str) -> str:
             cur = pr[0] if pr and pr[0] else p["buy_price"]
             shares = int(p["buy_shares"])
             positions_value += cur * shares
-            open_cost += p["buy_amount"] if p["buy_amount"] else p["buy_price"] * shares
+            # buy_amount 含手续费（和下单时一致）
+            cost_base = p["buy_amount"] if p["buy_amount"] else p["buy_price"] * shares
+            fee = max(5.0, cost_base * 0.00025)
+            open_cost += cost_base + fee
 
     total_pnl = float(outcomes.iloc[0]["total_pnl"]) if not outcomes.empty else 0.0
     cash = _SATELLITE_INIT_CASH + total_pnl - open_cost

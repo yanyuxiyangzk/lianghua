@@ -3,12 +3,46 @@
 独立仓位、独立结算、独立净值。Top5 候选 → 剔除涨停/追高 → 规则/LLM 决策 → 真实资金下单。
 """
 
+import json
 import pandas as pd
 import streamlit as st
 
 import experience as exp
 import broker as bk
+import library
 from common import get_last_trade_day
+
+
+def _get_satellite_pack_info() -> dict | None:
+    """获取卫星轨策略包信息。"""
+    packs = library.list_strategies()
+    for name in packs:
+        if "卫星" in name:
+            return {"name": name, **packs[name]}
+    # fallback: 涨停/事件
+    for name in packs:
+        if "涨停" in name or "事件" in name:
+            return {"name": name, **packs[name]}
+    return None
+
+
+def _render_pack_info(pack: dict):
+    """渲染策略包信息卡片。"""
+    st.caption(f"策略包: **{pack['name']}** | 股票池: {pack.get('pool_name', '沪深300')} | "
+               f"Top-N: {pack.get('top_n', 5)} | 加权: {pack.get('method', 'ICIR加权')}")
+    oos = pack.get("oos_winrate")
+    if oos:
+        st.caption(f"OOS胜率: {oos}")
+    factors = pack.get("factors", [])
+    if factors:
+        rows = []
+        for f in factors:
+            rows.append({
+                "因子": f["name"],
+                "权重": f"{f['weight']:.2%}",
+                "方向": "正向" if f["direction"] == 1 else "反向",
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 def _get_todays_satellite_pick() -> pd.DataFrame:
@@ -30,6 +64,11 @@ def _render_tab_today():
     today = get_last_trade_day()
     st.caption(f"交易日 {today}")
 
+    # 策略包信息
+    pack = _get_satellite_pack_info()
+    if pack:
+        _render_pack_info(pack)
+
     # 今日选股结果
     picks = _get_todays_satellite_pick()
     if picks.empty:
@@ -49,7 +88,7 @@ def _render_tab_today():
             limit_up = pr[3] if len(pr) > 3 else None
             chg = ((cur / prev_close - 1) * 100) if prev_close and prev_close > 0 else None
             is_lu = limit_up and cur >= limit_up * 0.999
-            is_chase = chg is not None and pd.notna(chg) and chg > 8.0
+            is_chase = chg is not None and pd.notna(chg) and chg > 15.0
             if not is_lu and not is_chase:
                 eligible.append({"code": code, "score": row["score"],
                                  "price": cur, "change_pct": chg})
@@ -136,17 +175,37 @@ def _render_tab_performance():
 def _render_tab_history():
     """Tab 3: 历史决策"""
     st.subheader("已平仓记录")
-    outcomes = exp.satellite_outcomes(50)
+    outcomes = exp.satellite_outcomes(100)
     if outcomes.empty:
         st.info("暂无已平仓记录")
     else:
-        display = outcomes[["code", "name", "buy_date", "buy_price",
+        # 筛选条件
+        col1, col2 = st.columns(2)
+        with col1:
+            exit_reasons = ["全部"] + sorted(outcomes["exit_reason"].dropna().unique().tolist())
+            selected_reason = st.selectbox("退出原因", exit_reasons)
+        with col2:
+            min_hold = st.number_input("最少持有天数", min_value=0, max_value=30, value=0)
+
+        # 应用筛选
+        filtered = outcomes.copy()
+        if selected_reason != "全部":
+            filtered = filtered[filtered["exit_reason"] == selected_reason]
+        if min_hold > 0:
+            filtered = filtered[filtered["hold_days"] >= min_hold]
+
+        display = filtered[["code", "name", "buy_date", "buy_price",
                             "sell_date", "sell_price", "pnl", "pnl_pct",
                             "hold_days", "exit_reason"]].copy()
         display.columns = ["代码", "名称", "买入日", "买入价",
                            "卖出日", "卖出价", "盈亏(元)", "盈亏(%)",
                            "持有天数", "退出原因"]
         st.dataframe(display, use_container_width=True, hide_index=True)
+
+        # 统计摘要
+        if not filtered.empty:
+            st.caption(f"共 {len(filtered)} 笔 | 平均持有 {filtered['hold_days'].mean():.1f} 天 | "
+                       f"胜率 {(filtered['pnl_pct'] > 0).mean():.0%}")
 
     st.subheader("过期/未成交")
     expired = exp.satellite_positions("expired")
@@ -190,10 +249,14 @@ def _render_tab_risk():
             st.metric("持仓成本", f"{total_cost:,.0f}元")
 
     st.subheader("止损触发记录")
-    outcomes = exp.satellite_outcomes(20)
+    outcomes = exp.satellite_outcomes(200)  # 增加样本量
     if not outcomes.empty:
         sl_records = outcomes[outcomes["exit_reason"] == "止损"]
         if not sl_records.empty:
+            # 止损统计
+            total_sl = len(sl_records)
+            avg_sl_pct = sl_records["pnl_pct"].mean()
+            st.caption(f"共 {total_sl} 笔止损 | 平均亏损 {avg_sl_pct:+.2%}")
             st.dataframe(sl_records[["code", "name", "buy_date", "buy_price",
                                      "sell_date", "sell_price", "pnl", "pnl_pct"]],
                          use_container_width=True, hide_index=True)

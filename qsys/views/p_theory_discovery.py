@@ -229,38 +229,56 @@ def _render_tab_lab():
     with col2:
         max_hypotheses = st.slider("最大假说数", 1, 30, 10)
     
+    # 使用 session_state 保存结果
+    if 'theory_result' not in st.session_state:
+        st.session_state.theory_result = None
+    
     if st.button("🚀 开始发现", type="primary"):
-        with st.spinner("正在运行理论发现引擎..."):
+        with st.spinner("正在运行理论发现引擎（约30秒）..."):
             try:
+                import traceback
                 from loopengine.theory_discovery import TheoryDiscoveryEngine
                 
+                st.info("Step 1/4: 模式发现...")
                 engine = TheoryDiscoveryEngine()
+                
+                st.info("Step 2/4: 假说生成（调用LLM）...")
                 result = engine.run(
                     max_patterns=max_patterns,
                     max_hypotheses=max_hypotheses,
                     max_validate=5,
                 )
                 
+                # 保存到 session_state
+                st.session_state.theory_result = result
                 st.success(f"发现完成!")
-                
-                # 显示结果
-                cols = st.columns(4)
-                cols[0].metric("模式", result["patterns"])
-                cols[1].metric("假说", result["hypotheses"])
-                cols[2].metric("验证通过", result["validated"])
-                cols[3].metric("入库", len(result["discovered"]))
-                
-                # 显示发现的理论
-                if result["discovered"]:
-                    st.subheader("新发现理论")
-                    for d in result["discovered"]:
-                        st.write(f"**{d['name']}** ({d['family']})")
-                        st.write(f"  IC: {d.get('ic_mean', 'N/A'):.4f} | ICIR: {d.get('icir', 'N/A'):.3f}")
-                        st.write(f"  `{d['sexpr']}`")
-                        st.write(f"  {d.get('description', '')}")
                         
             except Exception as e:
                 st.error(f"发现失败: {e}")
+                st.code(traceback.format_exc())
+    
+    # 显示结果（从 session_state）
+    if st.session_state.theory_result:
+        result = st.session_state.theory_result
+        cols = st.columns(4)
+        cols[0].metric("模式", result["patterns"])
+        cols[1].metric("假说", result["hypotheses"])
+        cols[2].metric("验证通过", result["validated"])
+        cols[3].metric("入库", len(result["discovered"]))
+        
+        if result["discovered"]:
+            st.subheader("新发现理论")
+            for d in result["discovered"]:
+                st.write(f"**{d['name']}** ({d['family']})")
+                ic = d.get('ic_mean')
+                icir = d.get('icir')
+                ic_str = f"{ic:.4f}" if ic is not None else "N/A"
+                icir_str = f"{icir:.3f}" if icir is not None else "N/A"
+                st.write(f"  IC: {ic_str} | ICIR: {icir_str}")
+                st.write(f"  `{d['sexpr']}`")
+                st.write(f"  {d.get('description', '')}")
+        else:
+            st.warning("本轮未发现通过验证的理论，可调整参数重试")
 
 
 def render():

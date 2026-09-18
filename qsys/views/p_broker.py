@@ -115,7 +115,7 @@ def render():
     c3.metric("持仓市值", _money(acc["持仓市值"]))
     c4.metric("持仓盈亏", _pnl(acc["持仓盈亏"]))
     c5.metric("今日盈亏", _pnl(acc["今日盈亏"]))
-    st.caption("初始资金 100,000 元 · 佣金万2.5(最低5元)双边 · 印花税0.05%仅卖出 · T+1 · 100股整手")
+    st.caption(f"初始资金 {broker.INIT_CASH:,.0f} 元 · 佣金万2.5(最低5元)双边 · 印花税0.05%仅卖出 · T+1 · 100股整手")
 
     tab_pos, tab_buy, tab_sell, tab_cancel, tab_query, tab_calendar = st.tabs(
         ["💼 持仓", "🛒 买入", "💰 卖出", "❌ 撤单", "🔍 查询", "📅 收益日历"])
@@ -335,7 +335,9 @@ def _render_calendar_tab():
     c4.metric("日胜率", f"{win / n * 100:.1f}%")
     c5.metric("最大单日涨幅", f"{eq['ret_pct'].max():+.2f}%")
     c6.metric("最大单日跌幅", f"{eq['ret_pct'].min():+.2f}%")
-    st.caption("收益率按时间加权计算，手动入金/出金不影响收益率；盈亏金额 = 当前总资产 − 累计净入金")
+    st.caption("累计盈亏 = 当前总资产 − 累计净入金（含已实现+未实现盈亏）；"
+               "持仓盈亏 = (当前价−成本价)×持仓股数（仅未实现盈亏）；"
+               "两者差异 = 已实现盈亏（已卖出股票的盈亏）")
 
     # 总资产曲线
     line_color = UP if total_ret >= 0 else DOWN

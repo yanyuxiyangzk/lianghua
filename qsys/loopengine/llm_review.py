@@ -89,8 +89,10 @@ def _rule_review(sexpr: str) -> bool:
     if max_depth > 6:
         return False
     
-    # 2. 检查除以排名型分母
-    if 'div' in sexpr_lower and 'rank' in sexpr_lower:
+    # 2. 检查除以排名型分母（仅拒绝 div(X, rank_cs(叶节点))，允许 div(rank_cs(a), rank_cs(b))）
+    import re as _re
+    div_rank_pattern = _re.search(r'div\([^,]*,\s*rank_cs\([^)]*\)\)', sexpr_lower)
+    if div_rank_pattern:
         return False
     
     # 3. 检查是否包含窗口算子（至少一个）

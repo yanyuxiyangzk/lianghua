@@ -144,6 +144,8 @@ OPS = {
     # 新增算子：EMA、Z-score 标准化、资金流加速度
     "ema": (1, True, "keep"),
     "zscore": (1, True, "rank"),
+    # P2: 非线性算子（log1p: 对称对数变换，处理重尾分布）
+    "log1p": (1, False, "keep"),
 }
 
 
@@ -181,7 +183,9 @@ class Node:
             return "rank"
         if kind == "keep":
             return self.children[0].dim()
-        return "val"  # same → 调用方需自行校验子维一致
+        if kind == "same":
+            return self.children[0].dim()  # 返回实际子维度（review已校验子维一致）
+        return "val"
 
 
 # ---------------------------------------------------------------- S 表达式解析
@@ -289,10 +293,13 @@ def evaluate_tree(tree, frames):
         if op == "ts_max":
             return args[0].rolling(w).max()
         if op == "ts_rank":
-            return args[0].rolling(w).apply(lambda x: x.rank(pct=True).iloc[-1] if len(x) == w else float("nan"))
+            from scipy.stats import rankdata as _rankdata
+            return args[0].rolling(w).apply(lambda x: float(_rankdata(x)[-1] / len(x)) if len(x) == w else float("nan"), raw=True)
         if op == "decay_linear":
-            weights = list(range(1, w + 1))
-            return args[0].rolling(w).apply(lambda x: float((x * weights).sum() / sum(weights)) if len(x) == w else float("nan"))
+            _w = w
+            _wsum = sum(range(1, _w + 1))
+            _weights = list(range(1, _w + 1))
+            return args[0].rolling(_w).apply(lambda x: float(sum(x[i] * _weights[i] for i in range(len(x))) / _wsum) if len(x) == _w else float("nan"), raw=True)
         if op == "std":
             return args[0].rolling(w).std()
         if op == "skew":
@@ -309,6 +316,8 @@ def evaluate_tree(tree, frames):
             m = args[0].rolling(w).mean()
             s = args[0].rolling(w).std()
             return (args[0] - m) / (s + 1e-12)
+        if op == "log1p":
+            return args[0].abs().log1p() * args[0].map(lambda x: (x > 0) - (x < 0))
         raise ValueError(f"未知算子 {op}")
 
     return ev(tree)

@@ -10,7 +10,10 @@ MAX_DEPTH = 6
 
 # ---------------------------------------------------------------- 随机生成
 def random_tree(rng: random.Random, depth: int, field_weights: dict | None = None):
-    if depth <= 1 or (depth >= 3 and rng.random() < 0.3):
+    # Ramped half-and-half: 深度1总是叶，深度2-6按均匀概率决定是否继续展开
+    if depth <= 1:
+        return Leaf(_pick_field(rng, field_weights))
+    if depth >= 2 and rng.random() < 0.35:
         return Leaf(_pick_field(rng, field_weights))
     op = rng.choice(list(OPS.keys()))
     arity, windowed, kind = OPS[op]
@@ -96,6 +99,8 @@ def mutate(tree, rng, field_weights):
     while new_sub.dim() != node.dim() and tries < 6:
         new_sub = random_tree(rng, min(node.depth() + 1, MAX_DEPTH - len(path)), field_weights)
         tries += 1
+    if new_sub.dim() != node.dim():
+        return _clone(node)  # 维度匹配失败，保留原节点
     return _set(tree, path, new_sub)
 
 

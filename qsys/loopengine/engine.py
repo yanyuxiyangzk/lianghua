@@ -392,7 +392,7 @@ class LoopEngine:
             r = completion(model=os.environ.get("CHAT_MODEL") or "deepseek/deepseek-chat",
                            messages=[{"role": "system", "content": system_prompt},
                                      {"role": "user", "content": user_prompt}],
-                           max_tokens=800, temperature=1.1)  # 生成端要多样性（审查端则钉 0）
+                            max_tokens=800, temperature=0.9)  # 生成端要多样性但避免语法无效输出
             # 缓存命中监控
             try:
                 usage = getattr(r, "usage", None) or {}
@@ -422,7 +422,8 @@ class LoopEngine:
             return None
 
     def _family_fewshots(self, fam: str, factor_type: str, limit: int = 3) -> list[str]:
-        """捞同族已入库且过统计闸门的真实因子 sexpr 作 few-shot（把闸门口味前置到生成端）。"""
+        """捞同族已入库且过统计闸门的真实因子 sexpr 作 few-shot（把闸门口味前置到生成端）。
+        为打破 LLM 反馈循环，随机替换 30% 为 IC>0.015 的未过闸"潜力因子"。"""
         try:
             with library._lconn() as c:
                 rows = c.execute(
@@ -436,7 +437,26 @@ class LoopEngine:
                     sx = code.split("\n", 1)[0][len("# sexpr: "):].strip()
                     if sx:
                         out.append(sx)
-            return out
+            # 30% 替换为未过闸但 IC > 0.015 的潜力因子
+            if out:
+                import random as _rng
+                with library._lconn() as c:
+                    potential = c.execute(
+                        "SELECT fs.name, fr.code FROM factor_scorecards fs"
+                        " JOIN factor_registry fr ON fr.name = fs.name"
+                        " WHERE fr.engine='loopengine' AND fr.family=?"
+                        " AND fr.gate_status NOT IN (1, 3)"
+                        " AND fs.pool_name='沪深300'"
+                        " AND ABS(fs.ic_mean) > 0.015"
+                        " AND fr.code LIKE '# sexpr:%'"
+                        " ORDER BY ABS(fs.ic_mean) DESC LIMIT 10",
+                        (fam,)).fetchall()
+                for name, code in potential:
+                    if code and code.startswith("# sexpr:"):
+                        sx = code.split("\n", 1)[0][len("# sexpr: "):].strip()
+                        if sx and sx not in out and _rng.random() < 0.3:
+                            out.append(sx)
+            return out[:limit]
         except Exception:
             return []
 
@@ -472,7 +492,8 @@ class LoopEngine:
     def run_round(self, batch: int = 30, factor_type: str = "量价") -> dict:
         """单轮挖掘：factor_type 指定因子类型（量价/资金流/板块轮动/龙虎榜/盘口异动/指数）。"""
         s = self.state
-        rng = random.Random(s["iteration"] * 7919 + 13)
+        import time as _time
+        rng = random.Random(s["iteration"] * 7919 + 13 + int(_time.time_ns() % 10000))
         s["iteration"] += 1
 
         stats = {"tested": 0, "rejected_review": 0, "llm_rejected": 0, "dup": 0, "frozen": 0,

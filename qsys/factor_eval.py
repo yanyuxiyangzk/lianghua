@@ -666,11 +666,12 @@ def _oos_stats(ic_full: pd.Series, first_seen: str | None, train_end: str | None
         prior_strength = 20
         shrinkage_factor = n_oos / (n_oos + prior_strength)  # n=10 → 0.33, n=20 → 0.5, n=30 → 0.6
         oos_ic_shrunk = oos_ic * shrinkage_factor
-        oos_icir_shrunk = oos_icir * shrinkage_factor
+        # ICIR = mean / std，只 shrink mean，std 保持原始值
+        oos_icir_corrected = oos_ic_shrunk / (seg.std() + 1e-12)
         confidence = n_oos / 60  # 60 天满信心
         result = {
             "IC_OOS": round(oos_ic_shrunk, 4),
-            "ICIR_OOS": round(oos_icir_shrunk, 4),
+            "ICIR_OOS": round(oos_icir_corrected, 4),
             "OOS天数": int(n_oos),
             "OOS_confidence": round(confidence, 3),
             "OOS_raw_ic": round(oos_ic, 4),  # 保留原始值供诊断

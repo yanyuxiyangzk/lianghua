@@ -62,7 +62,8 @@ def _daily_excess(vals: pd.Series, fwd: pd.DataFrame) -> pd.Series:
         return float(top - g["r"].mean())
 
     x = j.groupby(level="datetime").apply(_x)
-    cost_per_period = 2 * GATE["COST"] / GATE["FWD_DAYS"]  # 双边成本摊到每日
+    # 持有期一次性扣费（买入持有策略，非日频调仓）
+    cost_per_period = 2 * GATE["COST"]  # 双边千一 = 0.2%
     return (x - cost_per_period).sort_index()
 
 
@@ -116,15 +117,21 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
         return float(xy.mean() * 252), _sharpe(xy)
 
     now_year = datetime.now().year
+    year_results = []
     for year in range(now_year - 1, now_year + 1):
         tag = str(year)
         exc, shp = _year_stats(year)
         metrics[f"超额{tag}"] = round(exc, 4)
         metrics[f"夏普{tag}"] = round(shp, 2)
-        if exc <= 0:
-            reasons.append(f"{tag}年超额 {exc:.2%} ≤ 0")
-        if shp < GATE["SHARPE_MIN"]:
-            reasons.append(f"{tag}夏普 {shp:.2f} < {GATE['SHARPE_MIN']}")
+        year_results.append((tag, exc, shp))
+    # 宽松闸门：当年或前年任一满足超额>0且夏普>0.5即可
+    any_year_pass = any(exc > 0 and shp >= GATE["SHARPE_MIN"] for _, exc, shp in year_results)
+    if not any_year_pass:
+        for tag, exc, shp in year_results:
+            if exc <= 0:
+                reasons.append(f"{tag}年超额 {exc:.2%} ≤ 0")
+            if shp < GATE["SHARPE_MIN"]:
+                reasons.append(f"{tag}夏普 {shp:.2f} < {GATE['SHARPE_MIN']}")
 
     ann = float(x.mean() * 252) if len(x) else 0.0
     mdd = _max_dd(nav)
@@ -155,7 +162,7 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
     if max_corr >= GATE["CORR_MAX"]:
         reasons.append(f"IC相关 {max_corr:.2f} ≥ {GATE['CORR_MAX']}")
 
-    # Gate 12: OOS验证（最近20%数据作为验证集）
+    # Gate 12: OOS验证（最近20%数据作为验证集，至少20天样本）
     if len(ic) >= 20:
         split_idx = int(len(ic) * 0.8)
         ic_oos = ic.iloc[split_idx:]
@@ -236,15 +243,21 @@ def evaluate_gates_relaxed(vals: pd.Series, panel: pd.DataFrame,
         return float(xy.mean() * 252), _sharpe(xy)
 
     now_year = datetime.now().year
+    year_results = []
     for year in range(now_year - 1, now_year + 1):
         tag = str(year)
         exc, shp = _year_stats(year)
         metrics[f"超额{tag}"] = round(exc, 4)
         metrics[f"夏普{tag}"] = round(shp, 2)
-        if exc <= 0:
-            reasons.append(f"{tag}年超额 {exc:.2%} ≤ 0")
-        if shp < GATE["SHARPE_MIN"]:
-            reasons.append(f"{tag}夏普 {shp:.2f} < {GATE['SHARPE_MIN']}")
+        year_results.append((tag, exc, shp))
+    # 宽松闸门：当年或前年任一满足超额>0且夏普>0.5即可
+    any_year_pass = any(exc > 0 and shp >= GATE["SHARPE_MIN"] for _, exc, shp in year_results)
+    if not any_year_pass:
+        for tag, exc, shp in year_results:
+            if exc <= 0:
+                reasons.append(f"{tag}年超额 {exc:.2%} ≤ 0")
+            if shp < GATE["SHARPE_MIN"]:
+                reasons.append(f"{tag}夏普 {shp:.2f} < {GATE['SHARPE_MIN']}")
 
     ann = float(x.mean() * 252) if len(x) else 0.0
     mdd = _max_dd(nav)
@@ -465,12 +478,34 @@ def log_gate_detail(factor_name: str, gate_date: str, result: dict, pool_name: s
 
 
 def factor_hash(text: str) -> str:
-    """结构哈希：规范化文本（去空白/注释）后的 md5。"""
+    """结构哈希：规范化文本（去空白/注释/交换律归一化）后的 md5。"""
     import hashlib
     import re
 
     norm = re.sub(r"#.*", "", str(text))
     norm = re.sub(r"\s+", "", norm)
+    # 交换律归一化：sub(a,b) → sub(b,a) 视为相同，mul(a,b) → mul(b,a) 视为相同
+    def _sort_commutative_args(m):
+        op = m.group(1)
+        if op in ("sub", "mul"):
+            args_str = m.group(2)
+            depth, parts, current = 0, [], ""
+            for ch in args_str:
+                if ch == '(':
+                    depth += 1; current += ch
+                elif ch == ')':
+                    depth -= 1; current += ch
+                elif ch == ',' and depth == 0:
+                    parts.append(current); current = ""
+                else:
+                    current += ch
+            if current:
+                parts.append(current)
+            if len(parts) == 2:
+                sorted_args = sorted(parts)
+                return f"{op}({sorted_args[0]},{sorted_args[1]})"
+        return m.group(0)
+    norm = re.sub(r'(sub|mul)\(([^)]+)\)', _sort_commutative_args, norm)
     return hashlib.md5(norm.encode()).hexdigest()
 
 

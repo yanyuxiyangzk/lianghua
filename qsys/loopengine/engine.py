@@ -50,16 +50,16 @@ def _extract_sexpr(text: str) -> str | None:
 
 
 def _build_llm_prompt(fam: str, why: str, factor_type: str, evidence: str,
-                      fewshots: list[str], hypotheses: list[str] | None = None
+                      fewshots: list[str], hypotheses: list[str] | None = None,
+                      theories: list[dict] | None = None
                       ) -> tuple[str, str]:
     """LLM 出题 prompt（纯函数）——返回 (system, user) 元组，优化 DeepSeek 前缀缓存命中。
 
     System: 稳定内容（角色、字段表、算子、规则、输出格式），跨调用不变，可被缓存。
-    User: 变化内容（机制族、证据、few-shot、hypotheses），每次不同。
+    User: 变化内容（机制族、证据、few-shot、hypotheses、theories），每次不同。
 
-    字段带含义与量纲（防新类型量纲瞎猜）；fewshots 把闸门口味前置到生成端；
-    hypotheses 与 fewshots 分槽渲染——fewshots 是"过闸结构范例"，
-    hypotheses 是"待验证机制想法"（混排会让模型误以为假设也是已验证口味）。"""
+    theories: 已发现的理论知识图谱条目，包含 name, family, sexpr, validation 等。
+              用于指导 LLM 生成符合已验证理论模式的新因子。"""
     ops = "sub,mul,div,abs,sign,rank_cs,ma,ts_min,ts_max,ts_rank,decay_linear,std,skew,delta,roc,corr,ema,zscore"
     type_hint = f"（因子类型：{factor_type}）" if factor_type != "量价" else ""
 
@@ -85,6 +85,16 @@ def _build_llm_prompt(fam: str, why: str, factor_type: str, evidence: str,
         user_parts.append(
             "待验证机制假设（来自最新复盘蒸馏——是想法、不是已验证口味，可择优落地）：\n"
             + "\n".join(f"  - {h}" for h in hypotheses))
+    if theories:
+        theory_lines = []
+        for t in theories[:3]:  # 最多3条理论指导
+            name = t.get("name", "未知")
+            sexpr = t.get("sexpr", "")
+            family = t.get("family", "")
+            theory_lines.append(f"  - {name}（{family}）: {sexpr}")
+        user_parts.append(
+            "已发现的市场理论（来自知识图谱，可借鉴其数学核心但不要直接复制）：\n"
+            + "\n".join(theory_lines))
 
     return system, "\n\n".join(user_parts)
 
@@ -382,13 +392,24 @@ class LoopEngine:
                                 "请让新因子与该证据一致：强化其中验证有效的方向，规避失效方向。\n")
             except Exception:
                 pass
+        
+        # 知识图谱理论指导注入
+        theories: list[dict] = []
+        try:
+            from loopengine.theory_discovery import KnowledgeGraph
+            kg = KnowledgeGraph()
+            theories = kg.get_theories()[:5]  # 最多5条理论
+        except Exception:
+            pass
+        
         try:
             from litellm import completion
 
             system_prompt, user_prompt = _build_llm_prompt(
                 fam, why, factor_type, evidence,
                 self._family_fewshots(fam, factor_type),
-                hypotheses=hypotheses)
+                hypotheses=hypotheses,
+                theories=theories)
             r = completion(model=os.environ.get("CHAT_MODEL") or "deepseek/deepseek-chat",
                            messages=[{"role": "system", "content": system_prompt},
                                      {"role": "user", "content": user_prompt}],

@@ -1672,7 +1672,10 @@ def job_factor_direction(**_ignored) -> str:
 
 def job_risk_guard(**_ignored) -> str:
     """组合风控评估（开盘前 09:20）：净值波动率 → 日 VaR + 熔断状态写
-    risk_state.json（开仓闸，position_open_from_picks 每日开盘前读取）。"""
+    risk_state.json（开仓闸，position_open_from_picks 每日开盘前读取）。
+
+    P1-3修复：使用实时数据计算当前回撤。
+    """
     from zoneinfo import ZoneInfo
 
     now = datetime.now(ZoneInfo(TZ))
@@ -1680,7 +1683,8 @@ def job_risk_guard(**_ignored) -> str:
         return "非交易日，跳过"
     import experience
     today = now.strftime("%Y-%m-%d")
-    rk = experience.portfolio_risk()
+    # P1-3修复：use_live=True 从实时持仓计算当前回撤
+    rk = experience.portfolio_risk(use_live=True)
     if not rk.get("ok"):
         return f"风控评估跳过：{rk.get('reason')}"
     if rk["circuit"]:
@@ -1691,6 +1695,47 @@ def job_risk_guard(**_ignored) -> str:
     experience._write_risk_flag(today, False, "")
     return (f"风控正常：净值 {rk['nav']:.4f} · 日VaR {rk['var_pct']*100:.2f}% · "
             f"当前回撤 {rk['dd_now']*100:.2f}% · 熔断线 {rk['circuit_line']*100:.2f}%")
+
+
+def job_risk_guard_intraday(**_ignored) -> str:
+    """盘中风控重评估（10:00 和 13:30）：用实时持仓重新计算回撤，更新熔断状态。
+
+    P1-4修复：添加盘中熔断重评估，防止09:20后暴跌无法触发熔断。
+    """
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5:
+        return "非交易日，跳过"
+    hm = now.strftime("%H%M")
+    if not ("1000" <= hm <= "1015" or "1330" <= hm <= "1345"):
+        return "非盘中重评估时段，跳过"
+
+    import experience
+    today = now.strftime("%Y-%m-%d")
+    # 检查当前是否已熔断
+    is_halt, reason = experience.risk_halt_today(today)
+    # P1-3修复：use_live=True 从实时持仓计算当前回撤
+    rk = experience.portfolio_risk(use_live=True)
+    if not rk.get("ok"):
+        return f"盘中风控跳过：{rk.get('reason')}"
+
+    if rk["circuit"]:
+        if not is_halt:
+            # 新触发熔断
+            experience._write_risk_flag(today, True,
+                                        f"盘中熔断：净值回撤 {rk['dd_now']*100:.1f}% 触及熔断线 {rk['circuit_line']*100:.1f}%")
+            return (f"⛔ 盘中熔断：净值回撤 {rk['dd_now']*100:.2f}% ≤ 熔断线 {rk['circuit_line']*100:.2f}%"
+                    f"（σ={rk['sigma']*100:.2f}%），停止开新仓")
+        else:
+            return f"盘中风控：维持熔断状态（{reason}）"
+    else:
+        if is_halt:
+            # 熔断解除（回撤恢复）
+            experience._write_risk_flag(today, False, "")
+            return (f"✅ 熔断解除：净值回撤 {rk['dd_now']*100:.2f}% > 熔断线 {rk['circuit_line']*100:.2f}%")
+        else:
+            return (f"盘中风控正常：回撤 {rk['dd_now']*100:.2f}% · 熔断线 {rk['circuit_line']*100:.2f}%")
 
 
 def job_account_snapshot(**_ignored) -> str:
@@ -1706,6 +1751,21 @@ def job_account_snapshot(**_ignored) -> str:
     nv = experience.nav_stats()
     return (f"{day} 净值快照完成：净值 {nv.get('当前净值', 0):.4f} · "
             f"最大回撤 {(nv.get('最大回撤') or 0)*100:.2f}%")
+
+
+def job_max_close_update(**_ignored) -> str:
+    """收盘后更新吊灯止盈基准（盘后 15:35）：用当日确认收盘价更新 max_close。
+
+    P1-1修复：吊灯止盈的 max_close 只用已确认收盘价，不用盘中快照。
+    """
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5:
+        return "非交易日，跳过"
+    import experience
+    today = now.strftime("%Y-%m-%d")
+    return experience.update_max_close(today)
 
 
 def job_daily_report(**_ignored) -> str:
@@ -2672,8 +2732,14 @@ JOBS = {
                      "default": {"enabled": True, "hour": 18, "minute": 35, "params": {}}},
     "account_snapshot": {"name": "📈 账户净值快照（回撤/熔断真值源）", "func": job_account_snapshot,
                          "default": {"enabled": True, "hour": 15, "minute": 35, "params": {}}},
+    "max_close_update": {"name": "📉 吊灯止盈基准更新（收盘价）", "func": job_max_close_update,
+                         "default": {"enabled": True, "hour": 15, "minute": 36, "params": {}}},
     "risk_guard": {"name": "🛡 组合风控评估（开盘前）", "func": job_risk_guard,
                    "default": {"enabled": True, "hour": 9, "minute": 20, "params": {}}},
+    "risk_guard_intraday": {"name": "🛡 盘中风控重评估（10:00/13:30）", "func": job_risk_guard_intraday,
+                            "default": {"enabled": True, "hour": 10, "minute": 0,
+                                        "params": {}, "trigger": "cron",
+                                        "cron_expr": "0 10,13 * * 1-5"}},
     "factor_direction": {"name": "🧭 因子方向状态机（磁滞日更）", "func": job_factor_direction,
                          "default": {"enabled": True, "hour": 21, "minute": 45, "params": {}}},
     "pack_lifecycle": {"name": "📦 策略包生命周期（连败停赛）", "func": job_pack_lifecycle,

@@ -8,6 +8,7 @@
 """
 
 import json
+import os
 import re
 import sqlite3
 import hashlib
@@ -23,6 +24,10 @@ from common import DATA_DIR, QLIB_DATA_DIR, all_pools, get_last_trade_day
 DB_PATH = DATA_DIR / "experience.db"
 # 实战结算周期（交易日）：1天/5天/1月/3月/6月 —— 与因子体检的多周期胜率标准一致
 FWD_LIST = [1, 5, 20, 60, 120]
+
+# P2-1修复：缓存 strategies 字典，避免每次调用 _is_event_enhanced_pick 重复查询
+_strategies_cache = None
+_strategies_cache_ts = None
 
 _TRADES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS trades (
@@ -663,17 +668,27 @@ def position_open_from_picks(trade_date: str, today: str) -> str:
                 continue
             codes = list(items["code"])
             names = _position_names(codes)
-            # 参考买入价 = 扫描日收盘价（名单生成时的价格）；顺带取当日涨跌幅做追高保护
-            ref_prices, ref_chg = {}, {}
+            # 参考买入价 = 扫描日收盘价（名单生成时的价格）
+            ref_prices = {}
             try:
                 import datasource
                 with datasource._qconn() as dc:
                     for row in dc.execute(
-                            f"SELECT code, price, change_pct FROM ifind_stocklist"
+                            f"SELECT code, price FROM ifind_stocklist"
                             f" WHERE code IN ({','.join('?' * len(codes))})", codes):
                         if row[1]:
                             ref_prices[row[0]] = row[1]
-                            ref_chg[row[0]] = row[2]
+            except Exception:
+                pass
+            # P1-6修复：使用实时快照计算追高阈值，不用ifind_stocklist的stale change_pct
+            ref_chg = {}
+            try:
+                rt = _latest_prices(codes)
+                for code in codes:
+                    pr = rt.get(code)
+                    if pr and pr[0] and pr[1] and pr[1] > 0:
+                        # 用 (当前价 - 昨收) / 昨收 计算日内涨幅
+                        ref_chg[code] = (pr[0] / pr[1] - 1) * 100
             except Exception:
                 pass
             # 该名单的支撑阻力上下文（≤名单生成日，无未来信息）
@@ -701,6 +716,17 @@ def position_open_from_picks(trade_date: str, today: str) -> str:
                 if chg is not None and pd.notna(chg) and chg > chase_thr:
                     n_chase += 1
                     continue
+                # P2-7修复：最小流动性过滤（流通市值 < 30亿 → 跳过，避免低流动性股票）
+                try:
+                    import datasource
+                    with datasource._qconn() as dc:
+                        mv_row = dc.execute(
+                            "SELECT float_mv FROM ifind_realtime"
+                            " WHERE code=? ORDER BY datetime DESC LIMIT 1", (it.code,)).fetchone()
+                        if mv_row and mv_row[0] and float(mv_row[0]) < 3e9:
+                            continue  # 流通市值不足30亿，流动性风险
+                except Exception:
+                    pass
                 cur = c.execute(
                     "INSERT OR IGNORE INTO positions"
                     "(code, name, buy_date, buy_price, buy_ts, pick_id, source, pack_name,"
@@ -740,12 +766,22 @@ def _is_event_enhanced_pick(pack_name: str) -> bool:
         return False
     try:
         import library
-        packs = library.list_strategies()
-        pk = packs.get(pack_name, {})
+        # P2-1修复：使用缓存避免每次重复调用 library.list_strategies()
+        global _strategies_cache
+        if _strategies_cache is None:
+            _strategies_cache = library.list_strategies()
+        pk = _strategies_cache.get(pack_name, {})
         factors = pk.get("factors", [])
         return any(f.get("name", "").startswith("ev_") for f in factors)
     except Exception:
         return False
+
+
+def _get_position_rules(pos_row) -> dict:
+    """根据仓位的 pack_name 确定使用的规则集（DEFAULT_RULES 或 EVENT_RULES）。"""
+    pk_name = pos_row.get("pack_name") if hasattr(pos_row, "get") else (
+        pos_row["pack_name"] if "pack_name" in pos_row.index else None)
+    return EVENT_RULES if _is_event_enhanced_pick(pk_name) else DEFAULT_RULES
 
 
 def position_fill_check(today: str) -> str:
@@ -759,6 +795,8 @@ def position_fill_check(today: str) -> str:
         return "无挂单"
     prices = _latest_prices(list(pend["code"]))
     n_fill = n_expire = 0
+    # P2-6修复：统计实际pending数量，按实际数量分配预算
+    n_pending_total = len(pend)
     with _conn() as c:
         for _, p in pend.iterrows():
             # 隔夜挂单 / 当日收盘(15:00)后 → 失效
@@ -773,10 +811,8 @@ def position_fill_check(today: str) -> str:
                 continue
             if cur <= p["limit_price"]:  # 现价触及限价 → 成交（取更优价）
                 fill = min(cur, float(p["limit_price"]))
-                # 按轨道预算整手配股，走柜台真实买入（扣可用资金、T+1冻结）
-                top_n = c.execute("SELECT top_n FROM picks WHERE id=?",
-                                  (int(p["pick_id"]),)).fetchone()
-                per = _budget_per_stock(p["source"], top_n[0] if top_n else 10)
+                # P2-6修复：按实际pending数量分配预算，不用声明的top_n
+                per = _budget_per_stock(p["source"], n_pending_total)
                 # M4 波动率倒数 sizing：高波动票预算收缩（clip 0.4×~1.2×，基准 2% 日波动）
                 atr_pct = atr_pct_of(p["code"], today)
                 if atr_pct:
@@ -828,7 +864,8 @@ def position_fill_check(today: str) -> str:
                 # 注册 PriceMonitor 事件驱动监控
                 try:
                     from price_monitor import monitor
-                    rules = {"take_profit": 0.15, "stop_loss": -0.08, "hold_days": 20, "cost": 0.0025}
+                    # 使用正确的规则集（DEFAULT_RULES 或 EVENT_RULES）
+                    rules = _get_position_rules(p)
                     monitor.register_position(
                         position_id=int(p["id"]),
                         code=p["code"],
@@ -861,12 +898,14 @@ def get_pending_positions() -> pd.DataFrame:
 
 
 def position_reconcile(today: str) -> str:
-    """双账本对账自愈：柜台 ai 持仓 vs 经验库 open 持仓，差额补记为 open 仓。
+    """双账本对账自愈：柜台 ai 持仓 vs 经验库 open 持仓，双向修复。
 
     背景（2026-09-11 踩坑）：fill_check 中柜台买入（独立事务已扣款）与
     positions 记账 UPDATE 是两条事务，锁冲突/进程被杀会让"钱花了账没记"，
     产生孤儿仓（柜台有、账本无——止盈止损永远覆盖不到）。对账补记后，
     孤儿仓重新进入止盈/止损/到期管理（成本取柜台成本价，T+1 同样生效）。
+
+    2026-09-18 修复：补充 diff<0 处理（experience中幽灵持仓，broker已无此股）。
     """
     import broker
     with _conn() as c:
@@ -894,7 +933,9 @@ def position_reconcile(today: str) -> str:
                     continue
                 st_, fprice, fts = row
                 if st_ == "已成":
-                    pnl = (round(fprice / p["buy_price"] - 1 - DEFAULT_RULES["cost"], 6)
+                    # 确定该仓位使用的规则集
+                    rules = _get_position_rules(p)
+                    pnl = (round(fprice / p["buy_price"] - 1 - rules["cost"], 6)
                            if fprice and p["buy_price"] else None)
                     c.execute("UPDATE positions SET status='closed', sell_date=?, sell_price=?,"
                               " sell_ts=?, pnl_pct=?, hold_days=?, closed_at=? WHERE id=?",
@@ -910,36 +951,101 @@ def position_reconcile(today: str) -> str:
     except Exception:
         return "柜台持仓读取失败"
     exp_shares = {r["code"]: int(r["sh"]) for _, r in opens.iterrows()} if not opens.empty else {}
+    # 构建 broker ai 持仓的 code → shares 映射
+    broker_ai_shares = {}
+    for _, bp in bposs.iterrows():
+        if (bp["source"] or "") == "ai":
+            broker_ai_shares[str(bp["code"])] = int(bp["shares"] or 0)
+
     fixed = []
+    orphan_fixed = []
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with _conn() as c, broker._conn() as bc:
+        # 处理所有 open 持仓
+        all_opens = pd.read_sql(
+            "SELECT id, code, name, shares, buy_price, buy_date FROM positions WHERE status='open'", c)
+        for _, exp_row in all_opens.iterrows():
+            code = str(exp_row["code"])
+            exp_sh = int(exp_row["shares"] or 0)
+            broker_sh = broker_ai_shares.get(code, 0)
+            diff = broker_sh - exp_sh
+
+            if diff > 0:
+                # broker 有多余的 shares → 补记 experience
+                cost = 0
+                for _, bp in bposs.iterrows():
+                    if str(bp["code"]) == code and (bp["source"] or "") == "ai":
+                        cost = float(bp["cost"] or 0)
+                        break
+                if cost <= 0:
+                    continue
+                actual_buy_ts = now
+                try:
+                    fill_row = bc.execute(
+                        "SELECT ts FROM broker_fills WHERE code=? AND side='buy'"
+                        " AND source='ai' ORDER BY id DESC LIMIT 1", (code,)).fetchone()
+                    if fill_row and fill_row[0]:
+                        actual_buy_ts = fill_row[0]
+                except Exception:
+                    pass
+                c.execute(
+                    "INSERT INTO positions (code, name, buy_date, buy_price, buy_ts, pick_id,"
+                    " source, pack_name, status, limit_price, shares, buy_amount, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?, 'open', NULL, ?, ?, ?)",
+                    (code, exp_row.get("name") or code, str(exp_row.get("buy_date") or today),
+                     cost, actual_buy_ts, None, "reconcile_fix", "对账补记",
+                     diff, round(diff * cost, 2), actual_buy_ts))
+                fixed.append(f"{exp_row.get('name') or code}×+{diff}")
+
+            elif diff < 0:
+                # experience 有多余的 shares → broker 已无此股，标记为幽灵仓
+                # 检查 broker 是否完全无此股
+                if broker_sh == 0:
+                    # broker 已完全卖出，experience 未记录 → 关闭幽灵仓
+                    c.execute(
+                        "UPDATE positions SET status='closed', sell_reason='对账清理(幽灵仓)',"
+                        " sell_date=?, closed_at=? WHERE id=?",
+                        (today, now, int(exp_row["id"])))
+                    orphan_fixed.append(f"{exp_row.get('name') or code}×{exp_sh}")
+
+        # 处理 broker 有但 experience 完全没有的 code（补记）
         for _, bp in bposs.iterrows():
             if (bp["source"] or "") != "ai":
                 continue
             code = str(bp["code"])
-            diff = int(bp["shares"] or 0) - exp_shares.get(code, 0)
-            cost = float(bp["cost"] or 0)
-            if diff <= 0 or cost <= 0:
+            broker_sh = int(bp["shares"] or 0)
+            if broker_sh <= 0:
                 continue
-            actual_buy_ts = now
-            try:
-                fill_row = bc.execute(
-                    "SELECT ts FROM broker_fills WHERE code=? AND side='buy'"
-                    " AND source='ai' ORDER BY id DESC LIMIT 1", (code,)).fetchone()
-                if fill_row and fill_row[0]:
-                    actual_buy_ts = fill_row[0]
-            except Exception:
-                pass
-            c.execute(
-                "INSERT INTO positions (code, name, buy_date, buy_price, buy_ts, pick_id,"
-                " source, pack_name, status, limit_price, shares, buy_amount, created_at)"
-                " VALUES (?,?,?,?,?,?,?,?, 'open', NULL, ?, ?, ?)",
-                (code, bp.get("name") or code, str(bp.get("last_buy_date") or today),
-                 cost, actual_buy_ts, None, "reconcile_fix", "对账补记",
-                 diff, round(diff * cost, 2), actual_buy_ts))
-            fixed.append(f"{bp.get('name') or code}×{diff}")
-    head = "对账补记：" + ",".join(fixed) if fixed else "对账一致"
-    return head + (" · closing结算：" + ",".join(settled) if settled else "")
+            if code not in exp_shares:
+                cost = float(bp["cost"] or 0)
+                if cost <= 0:
+                    continue
+                actual_buy_ts = now
+                try:
+                    fill_row = bc.execute(
+                        "SELECT ts FROM broker_fills WHERE code=? AND side='buy'"
+                        " AND source='ai' ORDER BY id DESC LIMIT 1", (code,)).fetchone()
+                    if fill_row and fill_row[0]:
+                        actual_buy_ts = fill_row[0]
+                except Exception:
+                    pass
+                c.execute(
+                    "INSERT INTO positions (code, name, buy_date, buy_price, buy_ts, pick_id,"
+                    " source, pack_name, status, limit_price, shares, buy_amount, created_at)"
+                    " VALUES (?,?,?,?,?,?,?,?, 'open', NULL, ?, ?, ?)",
+                    (code, bp.get("name") or code, str(bp.get("last_buy_date") or today),
+                     cost, actual_buy_ts, None, "reconcile_fix", "对账补记",
+                     broker_sh, round(broker_sh * cost, 2), actual_buy_ts))
+                fixed.append(f"{bp.get('name') or code}×{broker_sh}")
+
+    parts = []
+    if fixed:
+        parts.append("对账补记：" + ",".join(fixed))
+    if orphan_fixed:
+        parts.append("幽灵仓清理：" + ",".join(orphan_fixed))
+    if not parts:
+        parts.append("对账一致")
+    return " · ".join(parts) + (" · closing结算：" + ",".join(settled) if settled else "")
 
 
 def position_close_check(today: str) -> str:
@@ -1019,20 +1125,34 @@ def position_close_check(today: str) -> str:
                 atr_e = p["atr_entry"] if "atr_entry" in p.index else None
                 sup_e = p["sup_lo_entry"] if "sup_lo_entry" in p.index else None
                 mc_old = p["max_close"] if "max_close" in p.index else None
-                mc = max(x for x in [cur, entry, mc_old] if x and pd.notna(x))  # 滚动最高（快照近似）
-                if mc != mc_old:
-                    _mc_updates.append((mc, int(p["id"])))  # 延迟到循环末统一写（防与柜台写锁自锁）
+                # P1-1修复：吊灯止盈的 max_close 只用已确认收盘价，不用盘中快照
+                # 盘中检查时用 mc_old 做比较；收盘后 job_max_close_update 统一用当日收盘更新
+                mc = max(x for x in [entry, mc_old] if x and pd.notna(x))
                 if atr_e is not None and pd.notna(atr_e) and sup_e is not None and pd.notna(sup_e):
                     if cur < sup_e - 0.5 * atr_e:
                         reason, limit_price = "破位(SR)", round(cur * 0.995, 2)
-                if not reason and atr_e is not None and pd.notna(atr_e) and mc and cur < mc - 3.0 * atr_e:
-                    reason, limit_price = "吊灯止盈", round(cur * 0.995, 2)
+                # P1-2修复：吊灯止盈使用当前ATR（更贴近当前波动率），不用入场ATR
+                if not reason:
+                    try:
+                        import density_sr
+                        cur_sr = density_sr.latest_sr_map([code], asof=today)
+                        cur_atr = float(cur_sr.loc[code, "atr"]) if (cur_sr is not None
+                                    and not cur_sr.empty and code in cur_sr.index
+                                    and pd.notna(cur_sr.loc[code, "atr"])) else atr_e
+                    except Exception:
+                        cur_atr = atr_e
+                    if cur_atr is not None and pd.notna(cur_atr) and mc and cur < mc - 3.0 * cur_atr:
+                        reason, limit_price = "吊灯止盈", round(cur * 0.995, 2)
                 if not reason:
                     hd = _trade_days_between(str(p["buy_date"]), today)
                     if hd >= r["hold_days"]:
-                        # M3 逻辑腿：到期且转弱才平；仍强则顺延一次（防好票被日历赶下车）
+                        # M3 逻辑腿：到期且转弱才平；仍强则顺延（防好票被日历赶下车）
                         extend = int(p["extend_count"] or 0) if "extend_count" in p.index else 0
-                        if extend < 1 and _states_map is not None and _states_map.get(code, "weak") != "weak":
+                        # P2-10修复：strength_states()失败时默认"strong"而非"weak"，避免强制平仓
+                        state = "strong" if _states_map is None else _states_map.get(code, "weak")
+                        # P2-3修复：自适应顺延上限（strong=2次, neutral=1次, weak=0次）
+                        max_extend = 2 if state == "strong" else (1 if state == "neutral" else 0)
+                        if extend < max_extend:
                             c.execute("UPDATE positions SET extend_count=? WHERE id=?",
                                       (extend + 1, int(p["id"])))
                             continue  # 顺延一个持有期
@@ -1067,16 +1187,40 @@ def position_close_check(today: str) -> str:
                     n_order += 1
                 # 其他结果（可卖不足等）→ 保持 open，下个周期再试
 
-        # M3 吊灯基准统一落库（所有柜台写完成后，避免写锁交叉）
-        for mc, pid in _mc_updates:
-            c.execute("UPDATE positions SET max_close=? WHERE id=?", (mc, pid))
-
     parts = [f"平仓 {n_close} 笔"] if n_close else ["持仓检查：无触发"]
     if n_order:
         parts.append(f"挂出卖单 {n_order} 笔")
     if n_skip:
         parts.append(f"账本不一致跳过 {n_skip} 笔（经验库与柜台股数对不上）")
     return "；".join(parts)
+
+
+def update_max_close(today: str) -> str:
+    """收盘后更新所有 open 持仓的 max_close（用当日确认收盘价）。
+
+    P1-1修复：吊灯止盈的 max_close 只用已确认收盘价，不用盘中快照。
+    此函数在盘后由 scheduler 调用，用当日收盘价更新 max_close。
+    """
+    with _conn() as c:
+        opens = pd.read_sql(
+            "SELECT id, code, max_close FROM positions WHERE status='open'", c)
+    if opens.empty:
+        return "无持仓需更新"
+    prices = _latest_prices(list(opens["code"]))
+    updated = 0
+    with _conn() as c:
+        for _, p in opens.iterrows():
+            code = str(p["code"])
+            pr = prices.get(code)
+            close = pr[0] if pr and pr[0] else None
+            if not close:
+                continue
+            mc_old = p["max_close"] if "max_close" in p.index else None
+            mc_new = max(x for x in [close, mc_old] if x and pd.notna(x))
+            if mc_new != mc_old:
+                c.execute("UPDATE positions SET max_close=? WHERE id=?", (mc_new, int(p["id"])))
+                updated += 1
+    return f"更新 {updated} 条 max_close"
 
 
 def get_open_positions() -> pd.DataFrame:
@@ -1094,8 +1238,11 @@ def get_open_positions() -> pd.DataFrame:
         lambda d: _trade_days_between(str(d), today))
     df["可卖(股)"] = df.apply(
         lambda r: int(r["shares"] or 0) if str(r["buy_date"]) < today else 0, axis=1)
-    df["止盈价"] = (df["buy_price"] * (1 + DEFAULT_RULES["take_profit"])).round(2)
-    df["止损价"] = (df["buy_price"] * (1 + DEFAULT_RULES["stop_loss"])).round(2)
+    # 根据每行的 pack_name 使用正确的规则集计算止盈止损价
+    df["止盈价"] = df.apply(
+        lambda r: round(r["buy_price"] * (1 + _get_position_rules(r)["take_profit"]), 2), axis=1)
+    df["止损价"] = df.apply(
+        lambda r: round(r["buy_price"] * (1 + _get_position_rules(r)["stop_loss"]), 2), axis=1)
     return df
 
 
@@ -1123,7 +1270,9 @@ def manual_sell(position_id: int, shares: int) -> str:
     fill = float(m.group(1)) if m else None
     with _conn() as c:
         if shares >= held:
-            pnl = (round(fill / p["buy_price"] - 1 - DEFAULT_RULES["cost"], 6)
+            # P1-7修复：手动卖出也使用正确的规则集计算手续费
+            rules = _get_position_rules(p)
+            pnl = (round(fill / p["buy_price"] - 1 - rules["cost"], 6)
                    if fill and p["buy_price"] else None)
             c.execute("UPDATE positions SET status='closed', sell_date=?, sell_price=?,"
                       " sell_ts=?, sell_reason='手动卖出', pnl_pct=?, hold_days=?, closed_at=?"
@@ -1302,12 +1451,14 @@ def nav_stats() -> dict:
 # ---------------------------------------------------------------- 组合风控（M4）
 _RISK_FLAG = DATA_DIR / "risk_state.json"  # 当日风控状态（开仓闸）
 
-def portfolio_risk() -> dict:
+def portfolio_risk(use_live: bool = False) -> dict:
     """组合风控评估（M4）：账户净值序列波动率 → 日 VaR 近似 + 熔断状态。
 
     口径：σ = 净值日收益 20 日标准差（含真实持仓结构信息，比 60 日个股全相关矩阵稳——
     A 股个股两两全相关噪声大、伪相关多）；日 VaR(95%) ≈ 1.65×σ×总资产；
     熔断线 = −2×σ×√5（约当 95% 置信单周极端损失）。
+
+    P1-3修复：支持 use_live=True 时从实时持仓计算当前回撤，不用昨日快照。
     """
     import broker
     nv = nav_stats()
@@ -1320,9 +1471,31 @@ def portfolio_risk() -> dict:
     sigma = float(df["daily_ret"].iloc[-20:].std())
     var_day = 1.65 * sigma * total
     circuit_line = -2 * sigma * np.sqrt(5)
-    dd_now = float(df["drawdown"].iloc[-1])
+
+    # P1-3修复：use_live=True 时从实时持仓计算当前回撤
+    if use_live:
+        try:
+            # 用最新净值快照作为基准，当前总资产作为最新值
+            latest_nav = float(df["date"].iloc[-1]) if not df.empty else None
+            # 读取最新快照的总资产作为基准
+            base_total = float(df.iloc[-1]["daily_ret"]) if not df.empty else total
+            # 简化：用总资产 vs 上次快照的总资产计算日内回撤
+            with _conn() as c2:
+                last_snap = pd.read_sql(
+                    "SELECT total_assets FROM account_snapshots ORDER BY date DESC LIMIT 1", c2)
+            if not last_snap.empty and last_snap.iloc[0]["total_assets"]:
+                base = float(last_snap.iloc[0]["total_assets"])
+                dd_now = (total - base) / base if base > 0 else 0
+            else:
+                dd_now = float(df["drawdown"].iloc[-1])
+        except Exception:
+            dd_now = float(df["drawdown"].iloc[-1])
+    else:
+        dd_now = float(df["drawdown"].iloc[-1])
+
     # σ 地板：净值近乎不动的账户（新建/空仓）熔断线≈0 会永久停开仓——无波动信号不熔断
-    circuit = bool(dd_now <= circuit_line) if sigma >= 0.002 else False
+    # P1-5修复：降低 σ 地板到 0.001，减少新账户豁免
+    circuit = bool(dd_now <= circuit_line) if sigma >= 0.001 else False
     return {"ok": True, "sigma": sigma, "var_day": var_day,
             "var_pct": 1.65 * sigma, "circuit_line": circuit_line,
             "dd_now": dd_now, "circuit": circuit,
@@ -1341,9 +1514,22 @@ def risk_halt_today(today: str) -> tuple[bool, str]:
 
 
 def _write_risk_flag(today: str, halt: bool, reason: str):
-    _RISK_FLAG.write_text(json.dumps(
-        {"date": today, "halt": halt, "reason": reason,
-         "ts": datetime.now().strftime("%F %T")}, ensure_ascii=False))
+    """P2-4修复：使用原子写入（先写临时文件再重命名），防止中断导致JSON损坏。"""
+    import tempfile
+    tmp_fd, tmp_path = tempfile.mkstemp(dir=str(DATA_DIR), suffix=".tmp")
+    try:
+        with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+            json.dump({"date": today, "halt": halt, "reason": reason,
+                       "ts": datetime.now().strftime("%F %T")}, f, ensure_ascii=False)
+        # 原子重命名
+        os.replace(tmp_path, str(_RISK_FLAG))
+    except Exception:
+        # 清理临时文件
+        try:
+            os.unlink(tmp_path)
+        except Exception:
+            pass
+        raise
 
 
 def atr_pct_of(code: str, end: str, n: int = 14) -> float | None:

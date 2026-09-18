@@ -1604,7 +1604,7 @@ def satellite_open_from_picks(picks_df: pd.DataFrame, available_cash: float,
     """卫星轨独立开仓：真实资金下单。
 
     picks_df: 含 code, name, score 列的 DataFrame（已按 score 降序）
-    available_cash: broker 可用资金
+    available_cash: 卫星轨可用资金（从 broker._get_satellite_cash() 获取）
     today: 交易日
     返回: 操作消息
     """
@@ -1643,7 +1643,7 @@ def satellite_open_from_picks(picks_df: pd.DataFrame, available_cash: float,
     # Phase1 规则决策：取 Top3 等权
     top = eligible[:3]
     per_stock = available_cash / len(top)
-    cash = bk._get_cash()
+    cash = available_cash  # 使用传入的卫星轨现金
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     n_order = 0
 
@@ -1670,6 +1670,8 @@ def satellite_open_from_picks(picks_df: pd.DataFrame, available_cash: float,
             if "已报" in msg or "已成" in msg:
                 cost = cur * shares + max(5.0, cur * shares * 0.00025)
                 cash -= cost
+                # 更新卫星轨现金
+                bk._set_satellite_cash(cash)
                 # 止损止盈价（EVENT_RULES）
                 tp = round(cur * 1.12, 2)
                 sl = round(cur * 0.95, 2)
@@ -1826,6 +1828,7 @@ def satellite_open_from_llm(decisions: list[dict], available_cash: float,
     """按 LLM 决策用真实资金下单。
 
     decisions: [{"code": "SH600XXX", "conviction": 0.8, "weight": 0.4, "reason": "..."}]
+    available_cash: 卫星轨可用现金（从 broker._get_satellite_cash() 获取）
     """
     import broker as bk
 
@@ -1838,7 +1841,7 @@ def satellite_open_from_llm(decisions: list[dict], available_cash: float,
     if total_weight <= 0:
         return "卫星轨 LLM：总权重为0"
 
-    cash = bk._get_cash()
+    cash = available_cash  # 使用传入的卫星轨现金
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     n_order = 0
 
@@ -1866,6 +1869,8 @@ def satellite_open_from_llm(decisions: list[dict], available_cash: float,
             if "已报" in msg or "已成" in msg:
                 cost = cur * shares + max(5.0, cur * shares * 0.00025)
                 cash -= cost
+                # 更新卫星轨现金
+                bk._set_satellite_cash(cash)
                 tp = round(cur * 1.12, 2)
                 sl = round(cur * 0.95, 2)
                 c.execute(
@@ -1930,6 +1935,7 @@ def satellite_close_check(today: str) -> str:
     prices = bk._latest_prices(list(opens["code"]))
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     n_close = 0
+    total_sell_amount = 0.0
 
     with _sat_conn() as c:
         for _, p in opens.iterrows():
@@ -1971,26 +1977,33 @@ def satellite_close_check(today: str) -> str:
                         (p["code"], p["name"], str(p["buy_date"])[:10], entry, shares,
                          today, cur, pnl, pnl_pct, hold, reason, now))
                     n_close += 1
+                    # 计算卖出金额（扣除手续费）
+                    sell_fee = max(5.0, cur * shares * 0.00025)
+                    sell_tax = cur * shares * 0.0005  # 印花税0.05%
+                    sell_amount = cur * shares - sell_fee - sell_tax
+                    total_sell_amount += sell_amount
+
+    # 卖出资金归还到卫星轨现金池
+    if total_sell_amount > 0:
+        current_sat_cash = bk._get_satellite_cash()
+        bk._set_satellite_cash(current_sat_cash + total_sell_amount)
 
     return f"卫星轨平仓：{n_close} 笔（止损/止盈/到期）" if n_close else "卫星轨：无触发"
 
 
-_SATELLITE_INIT_CASH = 20000.0  # 卫星轨初始资金
+_SATELLITE_INIT_CASH = 20000.0  # 卫星轨初始资金（用于收益率计算基准）
 
 
 def satellite_nav_update(today: str) -> str:
-    """更新卫星轨净值：持仓市值 + 卫星轨专属现金（非全账户现金）。"""
+    """更新卫星轨净值：持仓市值 + 卫星轨专属现金（从 broker 独立现金池读取）。"""
     import broker as bk
 
     with _sat_conn() as c:
         opens = pd.read_sql(
             "SELECT code, buy_shares, buy_price, buy_amount"
             " FROM satellite_positions WHERE status='open'", c)
-        outcomes = pd.read_sql(
-            "SELECT COALESCE(SUM(pnl), 0) AS total_pnl FROM satellite_outcomes", c)
 
     positions_value = 0.0
-    open_cost = 0.0
     if not opens.empty:
         prices = bk._latest_prices(list(opens["code"]))
         for _, p in opens.iterrows():
@@ -1998,13 +2011,9 @@ def satellite_nav_update(today: str) -> str:
             cur = pr[0] if pr and pr[0] else p["buy_price"]
             shares = int(p["buy_shares"])
             positions_value += cur * shares
-            # buy_amount 含手续费（和下单时一致）
-            cost_base = p["buy_amount"] if p["buy_amount"] else p["buy_price"] * shares
-            fee = max(5.0, cost_base * 0.00025)
-            open_cost += cost_base + fee
 
-    total_pnl = float(outcomes.iloc[0]["total_pnl"]) if not outcomes.empty else 0.0
-    cash = _SATELLITE_INIT_CASH + total_pnl - open_cost
+    # 从 broker 独立现金池读取卫星轨现金
+    cash = bk._get_satellite_cash()
     nav = cash + positions_value
 
     with _sat_conn() as c:

@@ -115,6 +115,28 @@ def _set_cash(v: float):
                   (str(round(v, 2)),))
 
 
+# 卫星轨独立现金池
+SATELLITE_INIT_CASH = 20000.0
+
+
+def _get_satellite_cash() -> float:
+    """获取卫星轨可用现金。"""
+    with _conn() as c:
+        r = c.execute("SELECT value FROM broker_account WHERE key='cash_satellite'").fetchone()
+    if r is None:
+        # 首次使用，初始化卫星轨现金
+        _set_satellite_cash(SATELLITE_INIT_CASH)
+        return SATELLITE_INIT_CASH
+    return float(r[0])
+
+
+def _set_satellite_cash(v: float):
+    """设置卫星轨现金。"""
+    with _conn() as c:
+        c.execute("INSERT OR REPLACE INTO broker_account (key, value) VALUES ('cash_satellite', ?)",
+                  (str(round(v, 2)),))
+
+
 def _cashflow(c, typ: str, amount: float, note: str):
     bal = float(c.execute("SELECT value FROM broker_account WHERE key='cash'").fetchone()[0])
     c.execute("INSERT INTO broker_cashflows (ts, type, amount, balance, note)"

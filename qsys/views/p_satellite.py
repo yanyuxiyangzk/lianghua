@@ -233,10 +233,10 @@ def _render_tab_risk():
     """Tab 4: 风控"""
     st.subheader("可用资金")
     try:
-        cash = bk._get_cash()
-        st.metric("可用资金", f"{cash:,.0f}元")
+        cash = bk._get_satellite_cash()
+        st.metric("卫星轨可用资金", f"{cash:,.0f}元")
     except Exception as e:
-        st.warning(f"无法读取资金账号: {e}")
+        st.warning(f"无法读取卫星轨资金: {e}")
 
     st.subheader("持仓明细")
     opens = exp.satellite_positions("open")

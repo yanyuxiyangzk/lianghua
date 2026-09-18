@@ -2594,8 +2594,8 @@ def job_satellite_scan(pool_name: str = "沪深300", top_n: int = 5, **_ignored)
             candidates.append({"code": code, "name": "", "score": float(spicks[code]),
                                "factors": {}, "change_pct": 0})
 
-    # 5. 市场上下文
-    cash = bk._get_cash()
+    # 5. 市场上下文（使用卫星轨独立现金池）
+    cash = bk._get_satellite_cash()
     hold_count = 0
     try:
         hold_count = len(experience.satellite_positions("open"))

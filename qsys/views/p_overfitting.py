@@ -717,6 +717,177 @@ def _render_tab_formula():
             st.metric("组合 p-value", "—", help="需先运行选股工作台③")
 
 
+# ---------------------------------------------------------------- Tab 5: 数学公式
+def _render_tab_math_formulas():
+    st.markdown("#### LoopEngine 因子生成算法数学公式")
+    st.caption("将因子演化引擎形式化为严格数学表达 · 适用于论文引用与算法审计")
+
+    # --- 1. 问题定义 ---
+    st.markdown("##### 1. 问题定义")
+    st.code(
+        "目标：找到 S-表达式树 f*(x)，使得\n"
+        "\n"
+        "    f* = argmax  Score(f) = argmax  IC(f) + λ₁·ICIR(f) + λ₂·WinRate(f)\n"
+        "          f∈F          f∈F\n"
+        "\n"
+        "约束：\n"
+        "    depth(f) ≤ 6\n"
+        "    type(f) 匹配\n"
+        "    无除零风险\n"
+        "    骨架(f) ∉ FSA_frozen",
+        language=None)
+    st.caption("其中 F 是所有合法 S-表达式树的集合，IC 为信息系数，ICIR 为IC比率")
+
+    st.divider()
+
+    # --- 2. 搜索空间 ---
+    st.markdown("##### 2. 搜索空间")
+    st.code(
+        "F = { f : f 由以下递归定义 }\n"
+        "    f  → op(f₁, f₂)        # 二元算子\n"
+        "        → unary_op(f₁)     # 一元算子\n"
+        "        → op(f₁, w)        # 算子+窗口参数\n"
+        "        → field(w)         # 字段+窗口\n"
+        "\n"
+        "字段集:   V = {v₁, v₂, ..., vₙ}  (n ≈ 50+)\n"
+        "算子集:   O = {o₁, o₂, ..., oₘ}  (m = 18)\n"
+        "窗口集:   W = {3, 5, 10, 15, 20, 30, 40, 60, 90, 120, 150, 200}",
+        language=None)
+    st.caption("字段涵盖量价、资金流、板块轮动、龙虎榜、盘口、指数、爆量抢筹7大类")
+
+    st.divider()
+
+    # --- 3. 核心公式 ---
+    st.markdown("##### 3. 核心公式")
+
+    # 3.1 适应度评分
+    with st.expander("3.1 适应度评分（Fitness）", expanded=False):
+        st.code(
+            "Score(f) = LiveBoost(f) × ValueScore(f) × DecayWeight(f)"
+            " × RegimeWeight(f) × ComplexityPenalty(f)\n"
+            "\n"
+            "其中:\n"
+            "  LiveBoost(family(f)) ∈ [0, 1]         # 实战加权\n"
+            "  ValueScore(f) = Σᵢ wᵢ·xᵢ               # 5维价值评分\n"
+            "  DecayWeight(f) ∈ {1.0, 0.7, 0.4, 0.2}  # 衰减惩罚\n"
+            "  RegimeWeight(f) ∈ [0.3, 1.5]           # 市场环境加权\n"
+            "  ComplexityPenalty(f) ∈ [0.5, 1.0]      # 复杂度惩罚",
+            language=None)
+        st.caption("每个因子的最终得分由5个乘性因子决定，任一为0则整体为0")
+
+    # 3.2 自适应预算
+    with st.expander("3.2 自适应预算（Adaptive Budget）", expanded=False):
+        st.code(
+            "pₛ(t+1) = pₛ(t) + Δ(t)\n"
+            "\n"
+            "其中:\n"
+            "  Δ(t) = { +0.02,  如果 s = argmax{accept_rate}\n"
+            "           -0.02,  如果 s = argmin{accept_rate}\n"
+            "            0,     其他 }\n"
+            "\n"
+            "约束: Σₛ pₛ = 1,  0.05 ≤ pₛ ≤ 0.45",
+            language=None)
+        st.caption("7种生成源的概率根据历史采纳率动态调整，最优源+2%，最差源-2%")
+
+    # 3.3 衰减检测
+    with st.expander("3.3 衰减检测（Decay Detection）", expanded=False):
+        st.code(
+            "IC_long  = mean(IC[t₀-500 : t₀-60])\n"
+            "IC_short = mean(IC[t₀-60 : t₀])\n"
+            "d        = (IC_short - IC_long) / |IC_long|\n"
+            "\n"
+            "统计检验: H₀: μ_short = μ_long  (Welch's t-test)\n"
+            "显著性:   p < 0.05\n"
+            "\n"
+            "衰减分类:\n"
+            "  w(d) = { 1.0,  if d ≥ -0.30 ∨ p ≥ 0.05\n"
+            "           0.7,  if d < -0.30 ∧ p < 0.05\n"
+            "           0.4,  if d < -0.50 ∧ p < 0.05\n"
+            "           0.2,  if d < -0.70 ∧ p < 0.05 }",
+            language=None)
+        st.caption("通过比较近期IC与历史IC判断因子是否衰减，重度衰减因子权重降至0.2")
+
+    # 3.4 市场环境
+    with st.expander("3.4 市场环境（Regime Detection）", expanded=False):
+        st.code(
+            "S_trend    = f(均线斜率, 趋势强度)\n"
+            "S_momentum = f(动量指标, 涨跌比)\n"
+            "S_vol      = f(波动率, 成交额)\n"
+            "\n"
+            "combined = 0.6 × S_trend + 0.4 × S_momentum × 10\n"
+            "\n"
+            "regime(combined, S_vol) = { bull,       if combined > 0.3\n"
+            "                           bear,       if combined < -0.3\n"
+            "                           transition, if |combined| ≤ 0.3 ∧ S_vol > μ+σ\n"
+            "                           sideways }  # 其他",
+            language=None)
+        st.caption("基于沪深300/深证成指/创业板指的4维度综合判断")
+
+    # 3.5 多目标评分
+    with st.expander("3.5 多目标评分（Multi-Objective）", expanded=False):
+        st.code(
+            "Score(f) = Σᵢ wᵢ · norm(xᵢ(f))\n"
+            "\n"
+            "其中:\n"
+            "  x₁ = IC均值 (IC)\n"
+            "  x₂ = ICIR (IC / std(IC))\n"
+            "  x₃ = IC胜率 (IC > 0 的比例)\n"
+            "  x₄ = Top组胜率\n"
+            "  x₅ = 因子相关性惩罚\n"
+            "\n"
+            "  norm(x) = (x - min) / (max - min)  # Min-Max归一化\n"
+            "  w = [0.80, 0.10, 0.10, 0, 0]       # 权重",
+            language=None)
+        st.caption("IC主导(80%)，风险/夏普只保留灾难阈值惩罚（回撤>70%、夏普<0.5才扣分）")
+
+    # 3.6 遗传操作
+    with st.expander("3.6 遗传操作（Genetic Operations）", expanded=False):
+        st.code(
+            "突变:    mutate(f) = replace_subtree(f, random_node, random_tree(depth≤6))\n"
+            "交叉:    crossover(f₁, f₂) = swap_subtree(f₁, f₂, compatible_nodes)\n"
+            "扰动:    perturb(f) = adjust_param(f, ±Δw, momentum)\n"
+            "随机:    random(f) = build_tree(random_field(), random_op(), depth≤6)",
+            language=None)
+        st.caption("7种生成源通过自适应预算动态选择，确保探索与利用的平衡")
+
+    st.divider()
+
+    # --- 4. 算法流程 ---
+    st.markdown("##### 4. 算法流程")
+    st.code(
+        "初始化: F₀ = {f₁, f₂, ..., fₙ}  (随机生成)\n"
+        "For t = 1, 2, ..., T:\n"
+        "    1. 评估: Score(f) = eval(f), ∀f ∈ F_{t-1}\n"
+        "    2. 选择: F'_t = select(F_{t-1}, p)  # 基于Score的轮盘赌\n"
+        "    3. 演化: F''_t = evolve(F'_t)       # 突变/交叉/LLM\n"
+        "    4. 过滤: F_t = gate(F''_t)          # 12道硬闸门\n"
+        "    5. 更新: p = update_budget(p, accept_rate)\n"
+        "    6. 衰减: decay = detect_decay(IC_series)\n"
+        "    7. F_t = F_t × decay                # 降权衰减因子",
+        language=None)
+    st.caption("每轮演化批量处理30个候选因子，持续迭代优化")
+
+    st.divider()
+
+    # --- 5. 强化学习框架 ---
+    st.markdown("##### 5. 强化学习框架")
+    st.code(
+        "整个 LoopEngine 可以用强化学习框架表达：\n"
+        "\n"
+        "状态:    s = (IC_series, decay_status, budget, regime)\n"
+        "动作:    a = (operation, tree)\n"
+        "奖励:    r = Score(f) - ComplexityPenalty(f)\n"
+        "策略:    π(a|s) = p(operation) × p(tree)\n"
+        "更新:    π ← π + α·(r - b)·∇π\n"
+        "\n"
+        "不可公式化的部分：\n"
+        "- LLM 引导生成：神经网络，只能优化输入输出\n"
+        "- LLM 审查：神经网络，只能优化输入输出\n"
+        "- 本质是探索策略的参数化近似",
+        language=None)
+    st.caption("除LLM部分外，整个系统可用强化学习框架表达")
+
+
 # ---------------------------------------------------------------- 主渲染
 def render():
     st.markdown("## 🛡️ 过拟合诊断")
@@ -725,8 +896,9 @@ def render():
     _render_health_dashboard()
     st.divider()
 
-    tab1, tab2, tab3, tab4 = st.tabs(
-        ["📈 IS/OOS三段验证", "🎯 回测可信度", "📐 统计显著性", "📊 选股公式"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(
+        ["📈 IS/OOS三段验证", "🎯 回测可信度", "📐 统计显著性",
+         "📊 选股公式", "🧮 数学公式"])
 
     with tab1:
         _render_tab_is_oos()
@@ -736,6 +908,8 @@ def render():
         _render_tab_significance()
     with tab4:
         _render_tab_formula()
+    with tab5:
+        _render_tab_math_formulas()
 
 
 if __name__ == "__main__":

@@ -1172,6 +1172,155 @@ dragon_tiger（龙虎榜）、order_book（盘口）、index（指数）、other
 - 当骨架变体数 > 3 或占比 > 15% 或失败数 > 30 时冻结
 - 冻结后禁止继续生成，防止结构同质化
 
+### 1.8 数学公式化（Mathematical Formalization）
+
+LoopEngine 本质上是一个**可微分的搜索优化问题**，可以用严格数学形式表达。
+
+#### 1.8.1 问题定义
+
+```
+目标：找到 S-表达式树 f*(x)，使得
+
+    f* = argmax  Score(f) = argmax  IC(f) + λ₁·ICIR(f) + λ₂·WinRate(f)
+          f∈F          f∈F
+
+约束：
+    depth(f) ≤ 6
+    type(f) 匹配
+    无除零风险
+    骨架(f) ∉ FSA_frozen
+```
+
+#### 1.8.2 搜索空间
+
+```
+F = { f : f 由以下递归定义 }
+    f  → op(f₁, f₂)        # 二元算子
+        → unary_op(f₁)     # 一元算子
+        → op(f₁, w)        # 算子+窗口参数
+        → field(w)         # 字段+窗口
+
+字段集:   V = {v₁, v₂, ..., vₙ}  (n ≈ 50+)
+算子集:   O = {o₁, o₂, ..., oₘ}  (m = 18)
+窗口集:   W = {3, 5, 10, 15, 20, 30, 40, 60, 90, 120, 150, 200}
+```
+
+#### 1.8.3 核心公式
+
+**1. 适应度评分（Fitness）**
+
+```
+Score(f) = LiveBoost(f) × ValueScore(f) × DecayWeight(f) × RegimeWeight(f) × ComplexityPenalty(f)
+
+其中:
+  LiveBoost(family(f)) ∈ [0, 1]     # 实战加权
+  ValueScore(f) = Σᵢ wᵢ·xᵢ           # 5维价值评分
+  DecayWeight(f) ∈ {1.0, 0.7, 0.4, 0.2}  # 衰减惩罚
+  RegimeWeight(f) ∈ [0.3, 1.5]      # 市场环境加权
+  ComplexityPenalty(f) ∈ [0.5, 1.0] # 复杂度惩罚
+```
+
+**2. 自适应预算（Adaptive Budget）**
+
+```
+pₛ(t+1) = pₛ(t) + Δ(t)
+
+其中:
+  Δ(t) = { +0.02,  如果 s = argmax{accept_rate}
+           -0.02,  如果 s = argmin{accept_rate}
+            0,     其他 }
+
+约束: Σₛ pₛ = 1,  0.05 ≤ pₛ ≤ 0.45
+```
+
+**3. 衰减检测（Decay Detection）**
+
+```
+IC_long  = mean(IC[t₀-500 : t₀-60])
+IC_short = mean(IC[t₀-60 : t₀])
+d        = (IC_short - IC_long) / |IC_long|
+
+统计检验: H₀: μ_short = μ_long  (Welch's t-test)
+显著性:   p < 0.05
+
+衰减分类:
+  w(d) = { 1.0,  if d ≥ -0.30 ∨ p ≥ 0.05
+           0.7,  if d < -0.30 ∧ p < 0.05
+           0.4,  if d < -0.50 ∧ p < 0.05
+           0.2,  if d < -0.70 ∧ p < 0.05 }
+```
+
+**4. 市场环境（Regime Detection）**
+
+```
+S_trend    = f(均线斜率, 趋势强度)
+S_momentum = f(动量指标, 涨跌比)
+S_vol      = f(波动率, 成交额)
+
+combined = 0.6 × S_trend + 0.4 × S_momentum × 10
+
+regime(combined, S_vol) = { bull,       if combined > 0.3
+                           bear,       if combined < -0.3
+                           transition, if |combined| ≤ 0.3 ∧ (S_vol > μ + σ)
+                           sideways }  # 其他
+```
+
+**5. 多目标评分（Multi-Objective）**
+
+```
+Score(f) = Σᵢ wᵢ · norm(xᵢ(f))
+
+其中:
+  x₁ = IC均值 (IC)
+  x₂ = ICIR (IC / std(IC))
+  x₃ = IC胜率 (IC > 0 的比例)
+  x₄ = Top组胜率
+  x₅ = 因子相关性惩罚
+
+  norm(x) = (x - min) / (max - min)  # Min-Max归一化
+  w = [0.80, 0.10, 0.10, 0, 0]       # 权重
+```
+
+**6. 遗传操作（Genetic Operations）**
+
+```
+突变:    mutate(f) = replace_subtree(f, random_node, random_tree(depth≤6))
+交叉:    crossover(f₁, f₂) = swap_subtree(f₁, f₂, compatible_nodes)
+扰动:    perturb(f) = adjust_param(f, ±Δw, momentum)
+随机:    random(f) = build_tree(random_field(), random_op(), depth≤6)
+```
+
+#### 1.8.4 算法流程
+
+```
+初始化: F₀ = {f₁, f₂, ..., fₙ}  (随机生成)
+For t = 1, 2, ..., T:
+    1. 评估: Score(f) = eval(f), ∀f ∈ F_{t-1}
+    2. 选择: F'_t = select(F_{t-1}, p)  # 基于Score的轮盘赌
+    3. 演化: F''_t = evolve(F'_t)       # 突变/交叉/LLM
+    4. 过滤: F_t = gate(F''_t)          # 12道硬闸门
+    5. 更新: p = update_budget(p, accept_rate)
+    6. 衰减: decay = detect_decay(IC_series)
+    7. F_t = F_t × decay                # 降权衰减因子
+```
+
+#### 1.8.5 强化学习框架
+
+整个 LoopEngine 可以用**强化学习框架**表达：
+
+```
+状态:    s = (IC_series, decay_status, budget, regime)
+动作:    a = (operation, tree)
+奖励:    r = Score(f) - ComplexityPenalty(f)
+策略:    π(a|s) = p(operation) × p(tree)
+更新:    π ← π + α·(r - b)·∇π
+```
+
+**不可公式化的部分**：
+- LLM 引导生成：神经网络，只能优化输入输出
+- LLM 审查：神经网络，只能优化输入输出
+- 本质是**探索策略的参数化近似**
+
 ---
 
 ##   策略生成算法

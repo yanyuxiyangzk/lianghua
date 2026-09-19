@@ -109,11 +109,26 @@ def render():
         r = reg[reg["name"] == fac_name]
         if r.empty:
             return None, None, None
-        code = r.iloc[0].get("code")
-        fac = {"name": fac_name, "kind": "loopengine", "code": code}
-        vals = fe.get_factor_values(fac, list(codes_tuple), end_str)
+        meta = r.iloc[0]
+        # 详情页此前把所有因子强制标成 loopengine，内置因子没有 code，
+        # 导致 factor_eval 无法路由求值，页面一律显示“因子值为空”。
+        # 按注册表中的 kind 保留 builtin/evolved/loopengine 类型；代码只
+        # 对有值的进化因子传递。
+        kind = str(meta.get("kind") or "builtin")
+        code = meta.get("code")
+        if pd.isna(code):
+            code = None
+        fac = {"name": fac_name, "kind": kind}
+        if code:
+            fac["code"] = code
+        # 详情页只需用于图表的近一年数据；此前默认 800 个交易日，
+        # 在 iFinD 数据源下首次读取 300 只股票会长时间占满内存，看起来像无限转圈。
+        lookback_days = 400
+        vals = fe.get_factor_values(fac, list(codes_tuple), end_str,
+                                    lookback_days=lookback_days)
         import datasource
-        panel = sig.get_panel_cached(list(codes_tuple), end_str, 800, source=datasource.get_loop_source())
+        panel = sig.get_panel_cached(list(codes_tuple), end_str, lookback_days,
+                                     source=datasource.get_loop_source())
         return vals, panel, code
 
     vals, panel, code = _calc_factor(selected, tuple(codes), end)

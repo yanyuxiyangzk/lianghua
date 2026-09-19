@@ -18,8 +18,11 @@ RUN pip install --no-cache-dir \
         apscheduler==3.11.0 \
         akshare==1.18.87 \
         streamlit-autorefresh==1.0.1 \
-        easy-tdx==1.20.6 \
         tables
+
+# easy-tdx 不在公开 PyPI（原先锁定的 1.20.6 无法解析），且 datasource.py
+# 仅在选择 easytdx 数据源时按需导入。基础 QSYS 镜像不安装它，避免阻塞构建；
+# 若启用该数据源，请在内部制品源提供 easy_tdx 后单独安装。
 
 # 官方 iFinDPy Linux SDK 不在 PyPI，且不是 pip 包：从 quantapi.51ifind.com
 # 下载的 tar.gz 解压后是 bin64/（iFinDPy.py + libShellExport.so 等原生库），

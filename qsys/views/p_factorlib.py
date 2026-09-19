@@ -14,7 +14,7 @@ import experience
 import factor_eval as fe
 import library
 import signals as sig
-from common import all_pools, get_evolved_factors, get_last_trade_day
+from common import all_pools, get_last_trade_day
 
 
 def _fac_of(name: str, reg_map: dict) -> dict:
@@ -174,9 +174,10 @@ def render():
     facs_all = [{"name": n, "kind": "builtin", "code": None} for n in sig.BUILTIN_FACTORS]
     facs_all += [{"name": n, "kind": "tech", "code": None} for n in sig.TECH_INDICATORS]
     facs_all += [{"name": n, "kind": "tech", "code": None} for n in sig.CATALOG_NAMES]
-    for f in get_evolved_factors(only_accepted=False):
-        facs_all.append({"name": f["name"], "kind": "evolved", "code": f["code"],
-                         "trace": f.get("trace"), "round": f.get("round"), "decision": f.get("decision")})
+    # 进化因子已由调度器/LoopEngine 注册到 factor_registry。页面加载时不要再
+    # 扫描 RD-Agent 日志：get_evolved_factors 会触发 rdagent/litellm 初始化，
+    # 某些环境会尝试联网刷新模型价格表，导致策略库页面长时间转圈。
+    # 这里保留数据库中的进化因子，详情与筛选仍使用 registry 的持久化数据。
     library.sync_factor_registry(facs_all)
     registry = library.get_factor_registry()
     reg_map = registry.set_index("name").to_dict("index") if not registry.empty else {}

@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS factor_registry (
     multi_objective_score REAL,       -- 多目标综合评分
     max_drawdown REAL, sharpe REAL, sortino REAL, calmar REAL,
     decay_status TEXT, decay_rate REAL  -- 因子衰减状态/衰减率
+    ,theory_id TEXT, hypothesis_id TEXT, generation_mode TEXT,
+    parent_factor TEXT, source_theory_sexpr TEXT
 );
 CREATE TABLE IF NOT EXISTS factor_scorecards (
     name TEXT NOT NULL, pool_name TEXT NOT NULL, eval_date TEXT NOT NULL,
@@ -43,7 +45,8 @@ CREATE TABLE IF NOT EXISTS strategies (
     factors TEXT,                 -- JSON array [{name,kind,weight,direction}]
     oos_winrate TEXT,
     horizon TEXT,                 -- 决策持有期（1日/5日/20日），调度器共振用
-    updated_at TEXT
+    updated_at TEXT, theory_id TEXT, theory_name TEXT, risk_class TEXT,
+    account_scope TEXT
 );
 CREATE TABLE IF NOT EXISTS tested_hashes (
     hash TEXT PRIMARY KEY,
@@ -130,6 +133,11 @@ _CARD_DIR = DATA_DIR / "factor_cards"
 def _lconn():
     c = _qconn()
     c.executescript(_SCHEMA)
+    # 迁移：策略包理论/账户归属字段（旧库兼容）
+    strategy_cols = {r[1] for r in c.execute("PRAGMA table_info(strategies)")}
+    for col in ("theory_id", "theory_name", "risk_class", "account_scope"):
+        if col not in strategy_cols:
+            c.execute(f"ALTER TABLE strategies ADD COLUMN {col} TEXT")
     # 迁移：factor_registry 加骨架/机制族/闸门列
     cols = [r[1] for r in c.execute("PRAGMA table_info(factor_registry)")]
     for col, ddl in [("skeleton", "TEXT"), ("family", "TEXT"), ("gate_status", "INTEGER"),
@@ -141,6 +149,11 @@ def _lconn():
     for col, ddl in [("multi_objective_score", "REAL"), ("max_drawdown", "REAL"),
                      ("sharpe", "REAL"), ("sortino", "REAL"), ("calmar", "REAL"),
                      ("decay_status", "TEXT"), ("decay_rate", "REAL")]:
+        if col not in cols:
+            c.execute(f"ALTER TABLE factor_registry ADD COLUMN {col} {ddl}")
+    for col, ddl in [("theory_id", "TEXT"), ("hypothesis_id", "TEXT"),
+                     ("generation_mode", "TEXT"), ("parent_factor", "TEXT"),
+                     ("source_theory_sexpr", "TEXT")]:
         if col not in cols:
             c.execute(f"ALTER TABLE factor_registry ADD COLUMN {col} {ddl}")
     # 迁移：factor_scorecards 加多周期胜率 JSON（1/5/20/60/120 日）
@@ -344,15 +357,20 @@ def sync_factor_registry(factors: list[dict]):
             ft = f.get("factor_type", "量价")
             c.execute(
                 "INSERT INTO factor_registry (name, kind, code, trace, round, decision, first_seen,"
-                " skeleton, family, engine, factor_type)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?)"
+                " skeleton, family, engine, factor_type, theory_id, hypothesis_id, generation_mode, parent_factor, source_theory_sexpr)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(name) DO UPDATE SET code=excluded.code, trace=excluded.trace,"
                 "   round=excluded.round, decision=excluded.decision,"
                 "   skeleton=excluded.skeleton, family=excluded.family,"
-                "   factor_type=excluded.factor_type",
+                "   factor_type=excluded.factor_type, theory_id=COALESCE(excluded.theory_id,factor_registry.theory_id),"
+                "   hypothesis_id=COALESCE(excluded.hypothesis_id,factor_registry.hypothesis_id),"
+                "   generation_mode=COALESCE(excluded.generation_mode,factor_registry.generation_mode),"
+                "   parent_factor=COALESCE(excluded.parent_factor,factor_registry.parent_factor),"
+                "   source_theory_sexpr=COALESCE(excluded.source_theory_sexpr,factor_registry.source_theory_sexpr)",
                 (f["name"], f["kind"], f.get("code"), f.get("trace"),
                  f.get("round"), int(f["decision"]) if f.get("decision") is not None else None, now,
-                 sk, fam, f.get("engine", "rdagent"), ft))
+                 sk, fam, f.get("engine", "rdagent"), ft, f.get("theory_id"), f.get("hypothesis_id"),
+                 f.get("generation_mode"), f.get("parent_factor"), f.get("source_theory_sexpr")))
 
 
 def get_factor_registry() -> pd.DataFrame:
@@ -491,15 +509,20 @@ def list_scorecard_pools() -> list[str]:
 # ---------------------------------------------------------------- 策略包
 def save_strategy(name: str, pack: dict, status: str | None = None):
     with _lconn() as c:
+        cols = {r[1] for r in c.execute("PRAGMA table_info(strategies)")}
+        for col in ("theory_id", "theory_name", "risk_class", "account_scope"):
+            if col not in cols:
+                c.execute(f"ALTER TABLE strategies ADD COLUMN {col} TEXT")
         c.execute(
             "INSERT OR REPLACE INTO strategies (name, pool_name, top_n, method, filters, factors,"
-            " oos_winrate, horizon, is_winrate, updated_at)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?)",
+            " oos_winrate, horizon, is_winrate, updated_at, theory_id, theory_name, risk_class, account_scope)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (name, pack.get("pool_name"), pack.get("top_n"), pack.get("method"),
              json.dumps(pack.get("filters", []), ensure_ascii=False),
              json.dumps(pack.get("factors", []), ensure_ascii=False),
              pack.get("oos_winrate"), pack.get("horizon"), pack.get("is_winrate"),
-             pack.get("updated") or datetime.now().strftime("%Y-%m-%d %H:%M")))
+             pack.get("updated") or datetime.now().strftime("%Y-%m-%d %H:%M"),
+             pack.get("theory_id"), pack.get("theory_name"), pack.get("risk_class"), pack.get("account_scope")))
         if status is not None:
             c.execute("UPDATE strategies SET status=? WHERE name=?", (status, name))
 
@@ -508,13 +531,14 @@ def list_strategies() -> dict:
     """返回与 packs.json 相同的结构 {name: pack_dict}，便于各处平滑切换。"""
     with _lconn() as c:
         rows = c.execute("SELECT name, pool_name, top_n, method, filters, factors, oos_winrate,"
-                         " horizon, is_winrate, updated_at, status FROM strategies").fetchall()
+            " horizon, is_winrate, updated_at, status, theory_id, theory_name, risk_class, account_scope FROM strategies").fetchall()
     out = {}
-    for (name, pool, top_n, method, filters, factors, oos, horizon, is_wr, updated, status) in rows:
+    for (name, pool, top_n, method, filters, factors, oos, horizon, is_wr, updated, status, theory_id, theory_name, risk_class, account_scope) in rows:
         out[name] = {"pool_name": pool, "top_n": top_n, "method": method,
                      "filters": json.loads(filters or "[]"), "factors": json.loads(factors or "[]"),
                      "oos_winrate": oos, "horizon": horizon, "is_winrate": is_wr, "updated": updated,
-                     "status": status or "active"}
+                     "status": status or "active", "theory_id": theory_id, "theory_name": theory_name,
+                     "risk_class": risk_class, "account_scope": account_scope}
     return out
 
 

@@ -705,6 +705,10 @@ class LoopEngine:
                     "name": name, "kind": "loopengine",
                     "code": emit,
                     "engine": "loopengine", "factor_type": factor_type,
+                    "generation_mode": "theory_guided" if getattr(self, "_theory_context", None) else src,
+                    "theory_id": (self._theory_context or {}).get("theory_id") if getattr(self, "_theory_context", None) else None,
+                    "hypothesis_id": (self._theory_context or {}).get("hypothesis_id") if getattr(self, "_theory_context", None) else None,
+                    "source_theory_sexpr": (self._theory_context or {}).get("sexpr") if getattr(self, "_theory_context", None) else None,
                     "multi_objective_score": result.get("multi_objective_score", 0.0)}])
                 with library._lconn() as c:
                     c.execute("""UPDATE factor_registry 

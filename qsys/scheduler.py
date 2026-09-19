@@ -718,17 +718,20 @@ def _satellite_pack_name(packs: dict) -> str | None:
     """卫星轨策略包：优先名字含'卫星'的包；其次含 ev_ 事件因子最多的包；最后名字含涨停/事件的包。"""
     # 优先：名字含"卫星"的包（新策略包命名规范）
     for n in packs:
-        if "卫星" in n:
+        if packs[n].get("status", "active") == "active" and "卫星" in n:
             return n
     # 其次：含 ev_ 事件因子最多的包
     best, best_n = None, 0
     for n, pk in packs.items():
+        if pk.get("status", "active") != "active":
+            continue
         k = sum(1 for f in pk.get("factors", []) if str(f["name"]).startswith("ev_"))
         if k > best_n:
             best, best_n = n, k
     if best:
         return best
-    return next((n for n in packs if "涨停" in n or "事件" in n), None)
+    return next((n for n, pk in packs.items()
+                 if pk.get("status", "active") == "active" and ("涨停" in n or "事件" in n)), None)
 
 
 def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "") -> str:
@@ -2322,7 +2325,7 @@ def _get_top_factors_for_pack(pool_name: str, top_n: int = 15) -> list[dict]:
             # builtin + evolved 因子都参与，按 ICIR 绝对值排序
             rows = c.execute('''
                 SELECT fs.name, fs.kind, fs.ic_mean, fs.icir, fs.ic_winrate,
-                       fs.top_winrate, fs.direction, fr.code
+                       fs.top_winrate, fs.direction, fr.code, fr.theory_id, fr.hypothesis_id
                 FROM factor_scorecards fs
                 LEFT JOIN factor_registry fr ON fs.name = fr.name
                 WHERE fs.pool_name = ? AND fs.eval_date >= date('now', '-30 days')
@@ -2335,7 +2338,7 @@ def _get_top_factors_for_pack(pool_name: str, top_n: int = 15) -> list[dict]:
                 # 回退：取所有池的因子
                 rows = c.execute('''
                     SELECT fs.name, fs.kind, fs.ic_mean, fs.icir, fs.ic_winrate,
-                           fs.top_winrate, fs.direction, fr.code
+                           fs.top_winrate, fs.direction, fr.code, fr.theory_id, fr.hypothesis_id
                     FROM factor_scorecards fs
                     LEFT JOIN factor_registry fr ON fs.name = fr.name
                     WHERE fs.eval_date >= date('now', '-30 days')
@@ -2345,7 +2348,7 @@ def _get_top_factors_for_pack(pool_name: str, top_n: int = 15) -> list[dict]:
                 ''').fetchall()
             
             factors = []
-            for name, kind, ic_mean, icir, ic_wr, top_wr, direction, code in rows:
+            for name, kind, ic_mean, icir, ic_wr, top_wr, direction, code, theory_id, hypothesis_id in rows:
                 if icir is None:
                     continue
                 # kind 映射：scorecards 用中文，策略包用英文
@@ -2358,6 +2361,8 @@ def _get_top_factors_for_pack(pool_name: str, top_n: int = 15) -> list[dict]:
                     "name": name,
                     "kind": kind_map.get(kind, "builtin"),
                     "code": code,
+                    "theory_id": theory_id,
+                    "hypothesis_id": hypothesis_id,
                     "ic": abs(float(ic_mean or 0)),
                     "icir": abs(float(icir or 0)),
                     "ic_winrate": float(ic_wr or 0.5),
@@ -2432,22 +2437,46 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
     for method in methods:
         try:
             # walk-forward 验证（内部用真实 ICIR 计算权重）
-            wf = fe.walk_forward(
-                factor_vals, panel, method, top_n, fwd_days=5, step=10, min_factors=2
-            )
+            # 构建策略包定义（使用真实 scorecard 数据赋权）
+            # 理论内贪心筛选：只有加入因子后 Walk-forward 成本后收益改善才保留。
+            ranked = sorted(factor_vals.keys(),
+                            key=lambda n: abs(float(scorecards_cache.get(n, {}).get("icir") or 0.0)),
+                            reverse=True)
+            selected = []
+            best_net = float("-inf")
+            for name in ranked[:12]:
+                trial = selected + [name]
+                if len(trial) == 1:
+                    selected.append(name)
+                    try:
+                        base_wf = fe.walk_forward({name: factor_vals[name]}, panel, method,
+                                                  top_n, fwd_days=5, step=10, min_factors=1)
+                        best_net = float(base_wf["优化组合扣费超额"].mean()) if not base_wf.empty else best_net
+                    except Exception:
+                        pass
+                    continue
+                try:
+                    trial_wf = fe.walk_forward({n: factor_vals[n] for n in trial}, panel,
+                                               method, top_n, fwd_days=5, step=10, min_factors=2)
+                    trial_net = float(trial_wf["优化组合扣费超额"].mean()) if not trial_wf.empty else float("-inf")
+                    if trial_net > best_net + 0.0001:
+                        selected.append(name)
+                        best_net = trial_net
+                except Exception:
+                    continue
+                if len(selected) >= 6:
+                    break
+            if len(selected) < 2:
+                continue
+            wf = fe.walk_forward({n: factor_vals[n] for n in selected}, panel, method,
+                                 top_n, fwd_days=5, step=10, min_factors=2)
             if wf.empty or "优化组合扣费超额" not in wf:
                 continue
-            
             net = wf["优化组合扣费超额"]
             oos_wr = float((net > 0).mean())
             avg_excess = float(net.mean())
-            
-            # 质量门槛
             if oos_wr < 0.55:
                 continue
-            
-            # 构建策略包定义（使用真实 scorecard 数据赋权）
-            selected = list(factor_vals.keys())
             # kind 映射：scorecards 中文 → 策略包英文
             kind_map = {"内置": "builtin", "技术指标": "tech", "loopengine": "evolved"}
             factor_kind = {f["name"]: kind_map.get(f.get("kind", ""), "builtin") for f in factors}
@@ -2468,7 +2497,11 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
                 "pool_name": pool_name,
                 "top_n": top_n,
                 "method": method,
-                "factors": [{"name": n, "kind": factor_kind.get(n, "builtin"), "weight": w[n][0], "direction": w[n][1]}
+                "factors": [{"name": n, "kind": factor_kind.get(n, "builtin"),
+                             "code": next((f.get("code") for f in factors if f.get("name") == n), None),
+                             "theory_id": next((f.get("theory_id") for f in factors if f.get("name") == n), None),
+                             "hypothesis_id": next((f.get("hypothesis_id") for f in factors if f.get("name") == n), None),
+                             "weight": w[n][0], "direction": w[n][1]}
                            for n in selected],
                 "weights": {n: w[n] for n in selected},
                 "filters": ["tradable"],
@@ -2477,6 +2510,23 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
                 "horizon": "5日",
                 "avg_excess": avg_excess,
             }
+            # 理论一致性：只有所有因子属于同一明确理论时才标记理论策略包；
+            # 历史/未归属因子仍可生成 legacy 包，但不冒充理论包。
+            theory_ids = {f.get("theory_id") for f in factors
+                          if f.get("name") in selected and f.get("theory_id")}
+            factor_theory_map = {f.get("name"): f.get("theory_id") for f in factors}
+            selected_theories = {factor_theory_map.get(n) for n in selected}
+            if len(selected_theories) == 1 and None not in selected_theories:
+                tid = next(iter(selected_theories))
+                pack_def["theory_id"] = tid
+                pack_def["theory_name"] = str(tid)
+                pack_def["risk_class"] = "event" if any(str(f.get("name", "")).startswith("ev_") for f in factors if f.get("name") in selected) else "stable"
+                pack_def["account_scope"] = "satellite" if pack_def["risk_class"] == "event" else "main"
+            else:
+                pack_def["theory_id"] = None
+                pack_def["theory_name"] = None
+                pack_def["risk_class"] = "unclassified"
+                pack_def["account_scope"] = "none"
             
             # 尝试计算IS胜率：用静态回测（非walk-forward）
             try:
@@ -2511,6 +2561,12 @@ def job_strategy_gen(pool_name: str = "沪深300", top_n: int = 10,
     
     for pack_def in candidates[:max_packs]:
         try:
+            # 保存前再次校验：因子代码必须存在，理论包不能混用多个理论。
+            fs = pack_def.get("factors", [])
+            if not fs or any(f.get("kind") in ("evolved", "tech") and not f.get("code") for f in fs):
+                continue
+            if pack_def.get("theory_id") is None and pack_def.get("risk_class") != "unclassified":
+                continue
             # 检查是否已存在同名包
             existing = library.list_strategies()
             if pack_def["name"] in existing:
@@ -2526,6 +2582,10 @@ def job_strategy_gen(pool_name: str = "沪深300", top_n: int = 10,
                 "oos_winrate": pack_def["oos_winrate"],
                 "is_winrate": pack_def.get("is_winrate"),
                 "horizon": pack_def.get("horizon"),
+                "theory_id": pack_def.get("theory_id"),
+                "theory_name": pack_def.get("theory_name"),
+                "risk_class": pack_def.get("risk_class"),
+                "account_scope": pack_def.get("account_scope"),
             })
             saved.append(f"{pack_def['name']}({pack_def['oos_winrate']})")
         except Exception:

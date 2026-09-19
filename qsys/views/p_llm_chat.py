@@ -312,10 +312,11 @@ def _send(question: str, code: str | None):
         hist_key = "chat_hist_general"
         hist = st.session_state.get(hist_key, [])
         msgs = [{"role": "system", "content": _SYSTEM_GENERAL}]
-        msgs += hist[-8:]
+        # 普通问答仅保留最近 2 轮，避免历史上下文累积
+        msgs += hist[-4:]
         msgs.append({"role": "user", "content": question})
         with st.spinner("DeepSeek v4-pro 思考中…"):
-            reply = llm_chat_multi(msgs)
+            reply = llm_chat_multi(msgs, max_tokens=1200, label="chat_general")
         if not reply:
             reply = "⚠️ LLM 暂不可用或思考超长，请稍后重试。"
         hist.append({"role": "user", "content": question})
@@ -334,13 +335,23 @@ def _send(question: str, code: str | None):
         st.session_state[hist_key] = _chat_load(code)  # 从库里恢复该股历史对话
         _chat_ctx_save(code, ctx)                      # 数据包留档（回答可复现）
     ctx = st.session_state[ctx_key]
+    # 个股数据包按完整区块裁剪，避免行情/公告上下文过长
+    if len(ctx) > 8000:
+        blocks = [b.strip() for b in str(ctx).split("\n\n") if b.strip()]
+        kept, used = [], 0
+        for block in blocks:
+            if used + len(block) + 2 > 8000:
+                break
+            kept.append(block)
+            used += len(block) + 2
+        ctx = "\n\n".join(kept) + "\n\n[部分数据已截断]"
     hist = st.session_state[hist_key]
 
     msgs = [{"role": "system", "content": _SYSTEM + "\n\n# 数据包\n" + ctx}]
-    msgs += hist[-8:]  # 最近 4 轮（user+assistant 各 4 条）
+    msgs += hist[-4:]  # 最近 2 轮（user+assistant 各 2 条）
     msgs.append({"role": "user", "content": question})
     with st.spinner("DeepSeek v4-pro 思考中…（推理模型，约 5-15 秒）"):
-        reply = llm_chat_multi(msgs)
+        reply = llm_chat_multi(msgs, max_tokens=1600, label="chat_stock")
     if not reply:  # None（异常）或空串（推理把配额想完了）都按失败提示
         reply = "⚠️ LLM 暂不可用或思考超长（检查 DEEPSEEK_API_KEY / 网络），请稍后重试。"
     hist.append({"role": "user", "content": question})

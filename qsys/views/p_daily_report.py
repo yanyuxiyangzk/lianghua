@@ -360,7 +360,15 @@ def page_daily_report():
             data = _collect_all_data()
         digest = _data_hash(data)
         cached = experience.get_daily_report(data["date"])
-        if cached and cached.get("data_hash") == digest and cached.get("content"):
+        # 同日短时间内优先复用报告，避免行情微小变化触发重复计费
+        recent = False
+        if cached and cached.get("generated_at"):
+            try:
+                age = (datetime.now() - datetime.fromisoformat(str(cached["generated_at"]))).total_seconds()
+                recent = 0 <= age < 1800
+            except (TypeError, ValueError):
+                pass
+        if cached and cached.get("content") and (cached.get("data_hash") == digest or recent):
             report = cached["content"]
             st.toast("已复用今日战报缓存")
         else:

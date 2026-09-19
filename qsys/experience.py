@@ -1868,8 +1868,7 @@ def satellite_open_from_picks(picks_df: pd.DataFrame, available_cash: float,
             if "已报" in msg or "已成" in msg:
                 cost = cur * shares + max(5.0, cur * shares * 0.00025)
                 cash -= cost
-                # 更新卫星轨现金
-                bk._set_satellite_cash(cash)
+                # broker 已按 source='satellite' 扣减卫星现金；此处仅更新本地配额
                 # 止损止盈价（EVENT_RULES）
                 tp = round(cur * 1.12, 2)
                 sl = round(cur * 0.95, 2)
@@ -2068,8 +2067,7 @@ def satellite_open_from_llm(decisions: list[dict], available_cash: float,
             if "已报" in msg or "已成" in msg:
                 cost = cur * shares + max(5.0, cur * shares * 0.00025)
                 cash -= cost
-                # 更新卫星轨现金
-                bk._set_satellite_cash(cash)
+                # broker 已按 source='satellite' 扣减卫星现金；此处仅更新本地配额
                 tp = round(cur * 1.12, 2)
                 sl = round(cur * 0.95, 2)
                 c.execute(
@@ -2182,10 +2180,7 @@ def satellite_close_check(today: str) -> str:
                     sell_amount = cur * shares - sell_fee - sell_tax
                     total_sell_amount += sell_amount
 
-    # 卖出资金归还到卫星轨现金池
-    if total_sell_amount > 0:
-        current_sat_cash = bk._get_satellite_cash()
-        bk._set_satellite_cash(current_sat_cash + total_sell_amount)
+    # 卖出回款已由 broker 按 source='satellite' 记入卫星现金池
 
     return f"卫星轨平仓：{n_close} 笔（止损/止盈/到期）" if n_close else "卫星轨：无触发"
 

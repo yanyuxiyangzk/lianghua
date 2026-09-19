@@ -161,6 +161,11 @@ class LoopEngine:
     def _gen_candidate(self, rng, gaps, proven, live_boost, factor_type: str = "量价",
                        regime: str | None = None, stats: dict | None = None):
         src = self.state["budget"].choose(rng)
+        # 每轮独立生成预算，避免 batch 增大导致 LLM 调用线性膨胀
+        import os
+        gen_limit = int(os.environ.get("LLM_LOOPENGINE_GENERATE_LIMIT", "5"))
+        if src == "llm" and stats is not None and stats.get("llm_gen_used", 0) >= gen_limit:
+            src = "mutate"
         self._signal_id_in_prompt = None  # 每候选重置；仅 LLM 真正产出且 prompt 含信号时挂标
         fw = self.state["field_weights"].w
         if factor_type != "量价":
@@ -169,6 +174,8 @@ class LoopEngine:
             #   等于非量价类型的随机生成名存实亡）
             fw = {**fw, **{f: 1.0 for f in TYPE_FIELDS.get(factor_type, [])}}
         if src == "llm":
+            if stats is not None:
+                stats["llm_gen_used"] = stats.get("llm_gen_used", 0) + 1
             tree = self._llm_generate(rng, gaps, proven, factor_type, stats=stats)
             if tree is None:  # LLM 失败回退随机树——随机产物不挂信号标
                 tree = genetics.random_tree(rng, 4, fw)

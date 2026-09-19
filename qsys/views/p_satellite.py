@@ -285,11 +285,89 @@ def _render_tab_risk():
         st.info("暂无记录")
 
 
+def _render_tab_account():
+    """卫星轨独立交易账户：手工买卖、撤单和委托查询。"""
+    st.subheader("卫星轨账户")
+    cash = bk._get_satellite_cash()
+    poss = bk.get_positions()
+    poss = poss[poss["source"] == "satellite"] if not poss.empty and "source" in poss else poss.iloc[0:0]
+    mv = float(poss["市值"].sum()) if not poss.empty and "市值" in poss else 0.0
+    a, b, c = st.columns(3)
+    a.metric("可用资金", f"{cash:,.2f} 元")
+    b.metric("持仓市值", f"{mv:,.2f} 元")
+    c.metric("总资产", f"{cash + mv:,.2f} 元")
+
+    st.subheader("卫星轨持仓明细")
+    if not poss.empty:
+        cols = [c for c in ["code", "name", "shares", "sellable", "cost", "最新价", "市值", "持仓盈亏"] if c in poss.columns]
+        st.dataframe(poss[cols].head(100), hide_index=True, use_container_width=True)
+    else:
+        # 兼容历史卫星账本：旧记录可能尚未同步到 broker_positions
+        legacy = exp.satellite_positions("open")
+        if legacy.empty:
+            st.info("暂无卫星轨持仓")
+        else:
+            cols = [c for c in ["code", "name", "buy_shares", "buy_price", "buy_amount", "buy_date"] if c in legacy.columns]
+            st.dataframe(legacy[cols].head(100), hide_index=True, use_container_width=True)
+
+    buy, sell, cancel = st.tabs(["🛒 买入", "💰 卖出", "❌ 撤单"])
+    with buy:
+        with st.form("satellite_buy_form"):
+            code = st.text_input("股票代码", key="sat_buy_code")
+            price = st.number_input("限价（0=市价）", min_value=0.0, step=0.01, key="sat_buy_price")
+            shares = st.number_input("数量（100股整数倍）", min_value=100, step=100, key="sat_buy_shares")
+            if st.form_submit_button("提交卫星轨买单", type="primary"):
+                msg = bk.place_order(code, "buy", price or None, int(shares), source="satellite")
+                st.info(msg)
+    with sell:
+        sat = poss.copy()
+        if sat.empty:
+            st.info("暂无卫星轨可卖持仓")
+        else:
+            with st.form("satellite_sell_form"):
+                code = st.selectbox("股票", sat["code"].tolist(), key="sat_sell_code")
+                row = sat[sat["code"] == code].iloc[0]
+                st.caption(f"持仓 {int(row['shares'])} 股，可卖 {int(row['sellable'])} 股")
+                price = st.number_input("限价（0=市价）", min_value=0.0, step=0.01, key="sat_sell_price")
+                shares = st.number_input("数量", min_value=100, max_value=max(100, int(row["sellable"])), step=100, key="sat_sell_shares")
+                if st.form_submit_button("提交卫星轨卖单", type="primary"):
+                    msg = bk.place_order(code, "sell", price or None, int(shares), source="satellite")
+                    st.info(msg)
+    with cancel:
+        orders = bk.list_orders(today_only=False)
+        orders = orders[orders["source"] == "satellite"] if not orders.empty else orders
+        pending = orders[orders["status"] == "已报"] if not orders.empty else orders
+        if pending.empty:
+            st.info("暂无卫星轨待撤委托")
+        else:
+            oid = st.selectbox("委托号", pending["id"].tolist(), key="sat_cancel_id")
+            if st.button("撤销卫星轨委托", type="primary"):
+                st.info(bk.cancel_order(int(oid)))
+    st.subheader("卫星轨委托与成交")
+    orders = bk.list_orders(today_only=False)
+    if not orders.empty:
+        st.dataframe(orders[orders["source"] == "satellite"].head(100), hide_index=True, use_container_width=True)
+    st.subheader("卫星轨成交记录")
+    fills = bk.list_fills(today_only=False)
+    fills = fills[fills["source"] == "satellite"] if not fills.empty else fills
+    if not fills.empty:
+        st.dataframe(fills.head(100), hide_index=True, use_container_width=True)
+    else:
+        st.info("暂无卫星轨成交")
+    st.subheader("卫星轨资金流水")
+    flows = bk.list_cashflows(500)
+    flows = flows[flows["source"] == "satellite"] if not flows.empty and "source" in flows else flows.iloc[0:0]
+    if not flows.empty:
+        st.dataframe(flows, hide_index=True, use_container_width=True)
+    else:
+        st.info("暂无卫星轨资金流水")
+
+
 def render():
     st.title("🎲 卫星轨 · 事件策略")
 
-    tab1, tab2, tab3, tab4 = st.tabs([
-        "📋 今日决策", "📊 战绩统计", "📝 历史决策", "⚠️ 风控"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
+        "📋 今日决策", "📊 战绩统计", "📝 历史决策", "⚠️ 风控", "💼 独立账户"])
 
     with tab1:
         _render_tab_today()
@@ -299,6 +377,8 @@ def render():
         _render_tab_history()
     with tab4:
         _render_tab_risk()
+    with tab5:
+        _render_tab_account()
 
 
 render()

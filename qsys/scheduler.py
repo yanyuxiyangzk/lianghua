@@ -1899,6 +1899,13 @@ def job_evolution_distill(**_ignored) -> str:
     content = (rep or {}).get("content") or ""
     if es.is_degenerate_report(content):
         return f"{today} 战报缺失或退化（LLM 不可用/过短），跳过蒸馏"
+    # 同一交易日只蒸馏一次；已有有效信号时不重复消耗 token
+    try:
+        latest_signal = experience.get_latest_evolution_signal()
+        if latest_signal and latest_signal.get("report_date") == today:
+            return f"{today} 已存在蒸馏信号，跳过重复调用"
+    except Exception:
+        pass
 
     def _clip(value, limit):
         raw = str(value or "").strip()

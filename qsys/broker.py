@@ -45,7 +45,8 @@ CREATE TABLE IF NOT EXISTS broker_fills (
     source TEXT DEFAULT 'manual');
 CREATE TABLE IF NOT EXISTS broker_cashflows (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts TEXT, type TEXT, amount REAL, balance REAL, note TEXT);
+    ts TEXT, type TEXT, amount REAL, balance REAL, note TEXT,
+    source TEXT DEFAULT 'manual');
 """
 
 
@@ -60,6 +61,9 @@ def _migrate(c):
     """老库迁移：broker_positions 拆 (code, source) 双源（手动/AI）+ 止盈止损价。"""
     cols = [r[1] for r in c.execute("PRAGMA table_info(broker_positions)")]
     if "source" in cols and "tp_price" in cols and "today_bought" in cols:
+        ccols = [r[1] for r in c.execute("PRAGMA table_info(broker_cashflows)")]
+        if "source" not in ccols:
+            c.execute("ALTER TABLE broker_cashflows ADD COLUMN source TEXT DEFAULT 'manual'")
         return
     c.execute("""CREATE TABLE IF NOT EXISTS broker_positions_mig (
         code TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'manual', name TEXT,
@@ -82,6 +86,9 @@ def _migrate(c):
     fcols = [r[1] for r in c.execute("PRAGMA table_info(broker_fills)")]
     if "source" not in fcols:
         c.execute("ALTER TABLE broker_fills ADD COLUMN source TEXT DEFAULT 'manual'")
+    ccols = [r[1] for r in c.execute("PRAGMA table_info(broker_cashflows)")]
+    if "source" not in ccols:
+        c.execute("ALTER TABLE broker_cashflows ADD COLUMN source TEXT DEFAULT 'manual'")
 
 
 def _today() -> str:
@@ -134,13 +141,20 @@ def _set_satellite_cash(v: float):
     """设置卫星轨现金。"""
     with _conn() as c:
         c.execute("INSERT OR REPLACE INTO broker_account (key, value) VALUES ('cash_satellite', ?)",
-                  (str(round(v, 2)),))
+            (str(round(v, 2)),))
+
+def _cash_key(source: str) -> str:
+    return "cash_satellite" if source == "satellite" else "cash"
+
+def _get_cash_for_source(source: str) -> float:
+    return _get_satellite_cash() if source == "satellite" else _get_cash()
 
 
-def _cashflow(c, typ: str, amount: float, note: str):
-    bal = float(c.execute("SELECT value FROM broker_account WHERE key='cash'").fetchone()[0])
-    c.execute("INSERT INTO broker_cashflows (ts, type, amount, balance, note)"
-              " VALUES (?,?,?,?,?)", (_now(), typ, round(amount, 2), round(bal, 2), note))
+def _cashflow(c, typ: str, amount: float, note: str, source: str = "manual"):
+    key = _cash_key(source)
+    bal = float(c.execute("SELECT value FROM broker_account WHERE key=?", (key,)).fetchone()[0])
+    c.execute("INSERT INTO broker_cashflows (ts, type, amount, balance, note, source)"
+              " VALUES (?,?,?,?,?,?)", (_now(), typ, round(amount, 2), round(bal, 2), note, source))
 
 
 def _settle_today():
@@ -232,7 +246,7 @@ def place_order(code: str, side: str, price: float | None, shares: int,
             (side == "sell" and cur >= price and not at_limit_down)))
         if side == "buy" and fill_now and cur:
             need = cur * shares + max(FEE_MIN, cur * shares * FEE_RATE)
-            if _get_cash() < need:
+            if _get_cash_for_source(source) < need:
                 return f"可用资金不足（约需 {need:,.2f} 元，含佣金）"
         cur_o = c.execute(
             "INSERT INTO broker_orders (date, ts, code, name, side, price, shares, status, source)"
@@ -259,10 +273,11 @@ def _fill(c, order_id: int, fill_price: float):
     fee = max(FEE_MIN, amount * FEE_RATE)
     tax = amount * TAX_RATE if side == "sell" else 0.0
     tag = "AI" if source == "ai" else "手动"
-    cash = float(c.execute("SELECT value FROM broker_account WHERE key='cash'").fetchone()[0])
+    cash_key = _cash_key(source)
+    cash = float(c.execute("SELECT value FROM broker_account WHERE key=?", (cash_key,)).fetchone()[0])
     if side == "buy":
         cash -= (amount + fee)
-        c.execute("UPDATE broker_account SET value=? WHERE key='cash'", (str(round(cash, 2)),))
+        c.execute("UPDATE broker_account SET value=? WHERE key=?", (str(round(cash, 2)), cash_key))
         pos = c.execute("SELECT shares, sellable, today_bought, cost FROM broker_positions"
                         " WHERE code=? AND source=?", (code, source)).fetchone()
         if pos:
@@ -282,16 +297,16 @@ def _fill(c, order_id: int, fill_price: float):
                        round(fill_price * (1 + TP_RATE), 4),
                        round(fill_price * (1 - SL_RATE), 4)))
         _cashflow(c, "买入", -(amount + fee),
-                  f"[{tag}]买入 {name or code} {shares}股@{fill_price:.2f}")
+                  f"[{tag}]买入 {name or code} {shares}股@{fill_price:.2f}", source)
     else:
         cash += (amount - fee - tax)
-        c.execute("UPDATE broker_account SET value=? WHERE key='cash'", (str(round(cash, 2)),))
+        c.execute("UPDATE broker_account SET value=? WHERE key=?", (str(round(cash, 2)), cash_key))
         c.execute("UPDATE broker_positions SET shares = shares - ?, sellable = sellable - ?,"
                   " updated_at=? WHERE code=? AND source=?", (shares, shares, _now(), code, source))
         c.execute("DELETE FROM broker_positions WHERE code=? AND source=? AND shares <= 0",
                   (code, source))
         _cashflow(c, "卖出", amount - fee - tax,
-                  f"[{tag}]卖出 {name or code} {shares}股@{fill_price:.2f}")
+                  f"[{tag}]卖出 {name or code} {shares}股@{fill_price:.2f}", source)
     c.execute("UPDATE broker_orders SET status='已成', filled_price=?, filled_ts=? WHERE id=?",
               (round(fill_price, 4), _now(), order_id))
     c.execute("INSERT INTO broker_fills (order_id, date, ts, code, name, side, price, shares,"
@@ -330,8 +345,9 @@ def fill_pending_orders() -> int:
                     shares = c.execute(
                         "SELECT shares FROM broker_orders WHERE id=?", (oid,)).fetchone()[0]
                     need = cur * shares + max(FEE_MIN, cur * shares * FEE_RATE)
-                    cash = float(c.execute(
-                        "SELECT value FROM broker_account WHERE key='cash'").fetchone()[0])
+                    order_source = c.execute(
+                        "SELECT COALESCE(source,'manual') FROM broker_orders WHERE id=?", (oid,)).fetchone()[0]
+                    cash = _get_cash_for_source(order_source)
                     if cash < need:
                         continue  # 资金不足留挂
                 _fill(c, oid, cur)

@@ -287,7 +287,12 @@ def render():
         show["类别"] = show["因子"].map(lambda n: sig.NAME2CAT.get(n, "量价"))
         reg_gate = registry.set_index("name")["gate_status"].to_dict() if "gate_status" in registry.columns else {}
         show["硬闸门"] = show["因子"].map(lambda n: {1: "✅", 0: "❌"}.get(reg_gate.get(n), "未测"))
-        disp = show[["因子", "因子类型", "类别", "来源", "IC均值", "ICIR", "IC胜率", "Top组胜率", "硬闸门", "实战胜率", "建议方向", "用于策略"]].copy()
+        # 理论关联只展示新生成且已写入关联字段的因子；历史因子保持未关联。
+        theory_map = registry.set_index("name")["theory_id"].to_dict() if "theory_id" in registry.columns else {}
+        hypothesis_map = registry.set_index("name")["hypothesis_id"].to_dict() if "hypothesis_id" in registry.columns else {}
+        show["理论"] = show["因子"].map(lambda n: theory_map.get(n) if pd.notna(theory_map.get(n)) else "未关联")
+        show["假说"] = show["因子"].map(lambda n: hypothesis_map.get(n) if pd.notna(hypothesis_map.get(n)) else "未关联")
+        disp = show[["因子", "理论", "假说", "因子类型", "类别", "来源", "IC均值", "ICIR", "IC胜率", "Top组胜率", "硬闸门", "实战胜率", "建议方向", "用于策略"]].copy()
         for c in ["IC均值", "ICIR"]:
             disp[c] = disp[c].map(lambda x: f"{x:.4f}" if pd.notna(x) else "—")
         for c in ["IC胜率", "Top组胜率", "实战胜率"]:
@@ -457,6 +462,9 @@ def render():
         live = live_map.get(name)
         rows.append({
             "策略包": name, "股票池": pk["pool_name"], "Top-N": pk["top_n"],
+            "理论": pk.get("theory_name") or pk.get("theory_id") or "未关联",
+            "风险类别": pk.get("risk_class") or "未分类",
+            "账号归属": pk.get("account_scope") or "未指定",
             "加权方法": pk.get("method"), "因子数": len(pk.get("factors", [])),
             "过滤器": "、".join(pk.get("filters", [])) or "—",
             "回测OOS胜率": pk.get("oos_winrate") or "未验证",

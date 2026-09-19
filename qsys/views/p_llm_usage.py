@@ -17,11 +17,29 @@ def _load_usage(days: int = 30) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _load_cache_stats() -> tuple[int, int, int]:
+    """返回缓存条目数、今日调用数、今日预留 token；无记录时也正常展示。"""
+    db = DATA_DIR / "experience.db"
+    try:
+        with sqlite3.connect(str(db)) as c:
+            cache_n = int(c.execute("SELECT COUNT(*) FROM llm_cache").fetchone()[0])
+            today = pd.Timestamp.now().strftime("%Y-%m-%d")
+            row = c.execute("SELECT calls, reserved_tokens FROM llm_usage WHERE day=?", (today,)).fetchone()
+            return cache_n, int(row[0]) if row else 0, int(row[1]) if row else 0
+    except Exception:
+        return 0, 0, 0
+
+
 st.title("🧾 LLM 用量与缓存")
 days = st.selectbox("统计范围", [1, 7, 30], index=1, format_func=lambda x: f"最近 {x} 天")
 df = _load_usage(days)
+cache_count, today_calls, today_reserved = _load_cache_stats()
 if df.empty:
-    st.info("暂无 LLM 用量记录")
+    st.info("暂无可计费调用明细；缓存和预算状态仍可正常查看。")
+    a, b, c = st.columns(3)
+    a.metric("缓存条目", f"{cache_count:,}")
+    b.metric("今日调用（含缓存）", f"{today_calls:,}")
+    c.metric("今日预留 Token", f"{today_reserved:,}")
 else:
     calls = len(df)
     hits = int(df["cache_hit"].fillna(0).sum())
@@ -32,6 +50,7 @@ else:
     b.metric("缓存命中率", f"{hits / calls:.1%}")
     c.metric("预留 Token", f"{reserved:,}")
     d.metric("实际 Token", f"{actual:,}")
+    st.caption(f"当前响应缓存：{cache_count:,} 条 · 今日预算记录：{today_calls:,} 次 / {today_reserved:,} Token")
 
     by_label = df.groupby("label", dropna=False).agg(
         调用次数=("id", "count"), 缓存命中=("cache_hit", "sum"),

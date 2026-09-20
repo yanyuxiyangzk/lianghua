@@ -22,11 +22,12 @@ def _get_satellite_pack_info() -> dict | None:
     """获取卫星轨策略包信息。"""
     packs = library.list_strategies()
     for name in packs:
-        if "卫星" in name:
+        if packs[name].get("status", "active") == "active" and "卫星" in name:
             return {"name": name, **packs[name]}
     # fallback: 涨停/事件
     for name in packs:
-        if "涨停" in name or "事件" in name:
+        if (packs[name].get("status", "active") == "active"
+                and ("涨停" in name or "事件" in name)):
             return {"name": name, **packs[name]}
     return None
 
@@ -57,7 +58,9 @@ def _get_todays_satellite_pick() -> pd.DataFrame:
             df = pd.read_sql(
                 "SELECT p.trade_date, pi.code, pi.score FROM picks p"
                 " JOIN pick_items pi ON pi.pick_id = p.id"
-                " WHERE p.source='satellite_scan' AND p.trade_date=(SELECT MAX(trade_date) FROM picks WHERE source='satellite_scan')"
+                " WHERE p.source IN ('satellite_scan','sched_satellite_scan')"
+                " AND p.trade_date=(SELECT MAX(trade_date) FROM picks"
+                " WHERE source IN ('satellite_scan','sched_satellite_scan'))"
                 " ORDER BY pi.rank", c)
         return df
     except Exception:

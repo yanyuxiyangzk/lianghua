@@ -2666,8 +2666,30 @@ def job_strategy_revalidate(pool_name: str = "沪深300") -> str:
 # 🎲 卫星轨 · 独立交易系统
 # ====================================================================
 
+def _satellite_trading_day(now: datetime | None = None) -> bool:
+    """按本地 Qlib 交易日历判断当天是否开市，避免周末/节假日运行。"""
+    now = now or datetime.now()
+    if now.weekday() >= 5:
+        return False
+    cal = QLIB_DATA_DIR / "calendars" / "day.txt"
+    if not cal.exists():
+        return True  # 日历缺失时仅以工作日兜底，避免任务永久停摆
+    today = now.strftime("%Y-%m-%d")
+    return today in {line.strip()[:10] for line in cal.read_text().splitlines() if line.strip()}
+
+
+def _satellite_market_open(now: datetime | None = None) -> bool:
+    """A 股连续竞价时段；集合竞价挂单由开盘后的首次检查处理。"""
+    now = now or datetime.now()
+    if not _satellite_trading_day(now):
+        return False
+    hhmm = now.hour * 100 + now.minute
+    return 930 <= hhmm <= 1130 or 1300 <= hhmm <= 1500
+
 def job_satellite_scan(pool_name: str = "沪深300", top_n: int = 5, **_ignored) -> str:
     """卫星轨独立选股：Top5 候选 → 剔除涨停/追高 → LLM 决策（规则兜底）→ 真实资金下单。"""
+    if not _satellite_trading_day():
+        return "卫星轨：非交易日，跳过选股"
     import experience
     import broker as bk
     import signals as sig
@@ -2765,6 +2787,8 @@ def job_satellite_scan(pool_name: str = "沪深300", top_n: int = 5, **_ignored)
 
 def job_satellite_fill(**_ignored) -> str:
     """卫星轨盘中撮合：pending 限价单触及即成交。"""
+    if not _satellite_market_open():
+        return "卫星轨：非交易时段，跳过撮合"
     import experience
     today = get_last_trade_day()
     return experience.satellite_fill_check(today)
@@ -2772,6 +2796,8 @@ def job_satellite_fill(**_ignored) -> str:
 
 def job_satellite_close(**_ignored) -> str:
     """卫星轨止损/止盈/到期平仓 + 净值更新。"""
+    if not _satellite_trading_day():
+        return "卫星轨：非交易日，跳过结算"
     import experience
     today = get_last_trade_day()
     close_msg = experience.satellite_close_check(today)
@@ -3068,6 +3094,10 @@ class SchedulerManager:
 
     # ---- 运行与记录 ----
     def _run(self, key: str):
+        # 高频卫星撮合只在连续竞价时段进入完整执行链路；在调度入口拦截，
+        # 避免夜间、午休和非交易日每 5 分钟写一条无意义日志。
+        if key == "satellite_fill" and not _satellite_market_open():
+            return
         cfg = self._state()[key]
         t0 = time.time()
         self._running[key] = t0

@@ -392,6 +392,12 @@ def get_factor_values(fac: dict, codes: list[str], end: str, lookback_days: int 
         df = sig.run_factor_code(fac["code"], fac["name"], codes, end, lookback_days, source=source)
         s = df.iloc[:, 0]
     s = _norm(s.dropna())
+    # 仅保存通过静态审查且实际算出的因子值，供后续相关性聚类使用。
+    try:
+        import library
+        library.store_factor_values(fac["name"], s, source=source)
+    except Exception:
+        pass
     sig._write_parquet_atomic(s.to_frame(fac["name"]), ck)
     return s
 
@@ -2240,4 +2246,3 @@ def adjust_operator_weights() -> dict:
     
     except Exception as e:
         return {}
-

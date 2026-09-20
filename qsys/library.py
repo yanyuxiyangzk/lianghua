@@ -30,7 +30,9 @@ CREATE TABLE IF NOT EXISTS factor_registry (
     max_drawdown REAL, sharpe REAL, sortino REAL, calmar REAL,
     decay_status TEXT, decay_rate REAL  -- 因子衰减状态/衰减率
     ,theory_id TEXT, hypothesis_id TEXT, generation_mode TEXT,
-    parent_factor TEXT, source_theory_sexpr TEXT
+    parent_factor TEXT, source_theory_sexpr TEXT,
+    validation_status TEXT DEFAULT 'generated', static_passed INTEGER,
+    static_reason TEXT, static_checked_at TEXT
 );
 CREATE TABLE IF NOT EXISTS factor_scorecards (
     name TEXT NOT NULL, pool_name TEXT NOT NULL, eval_date TEXT NOT NULL,
@@ -76,6 +78,23 @@ CREATE TABLE IF NOT EXISTS factor_usage (
     last_used TEXT,                   -- 最后使用时间
     last_pick_date TEXT,              -- 最后被选股日期
     updated_at TEXT
+);
+CREATE TABLE IF NOT EXISTS factor_value_daily (
+    factor_name TEXT NOT NULL, trade_date TEXT NOT NULL, instrument TEXT NOT NULL,
+    value REAL, source TEXT, run_id TEXT, created_at TEXT,
+    PRIMARY KEY (factor_name, trade_date, instrument, source)
+);
+CREATE INDEX IF NOT EXISTS idx_factor_value_date ON factor_value_daily(trade_date, factor_name);
+CREATE TABLE IF NOT EXISTS factor_correlation (
+    factor_a TEXT NOT NULL, factor_b TEXT NOT NULL,
+    value_corr REAL, common_obs INTEGER, cluster_version TEXT,
+    calculated_at TEXT, PRIMARY KEY (factor_a, factor_b, cluster_version)
+);
+CREATE TABLE IF NOT EXISTS factor_clusters (
+    cluster_version TEXT NOT NULL, cluster_id TEXT NOT NULL,
+    factor_name TEXT NOT NULL, cluster_role TEXT DEFAULT 'candidate',
+    cluster_score REAL, family TEXT, theory_id TEXT, created_at TEXT,
+    PRIMARY KEY (cluster_version, factor_name)
 );
 CREATE TABLE IF NOT EXISTS sched_exec_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -154,6 +173,12 @@ def _lconn():
     for col, ddl in [("theory_id", "TEXT"), ("hypothesis_id", "TEXT"),
                      ("generation_mode", "TEXT"), ("parent_factor", "TEXT"),
                      ("source_theory_sexpr", "TEXT")]:
+        if col not in cols:
+            c.execute(f"ALTER TABLE factor_registry ADD COLUMN {col} {ddl}")
+    # 因子验证状态机：只对新因子推进状态，旧因子保持历史数据不回填。
+    for col, ddl in [("validation_status", "TEXT DEFAULT 'generated'"),
+                     ("static_passed", "INTEGER"), ("static_reason", "TEXT"),
+                     ("static_checked_at", "TEXT")]:
         if col not in cols:
             c.execute(f"ALTER TABLE factor_registry ADD COLUMN {col} {ddl}")
     # 迁移：factor_scorecards 加多周期胜率 JSON（1/5/20/60/120 日）
@@ -352,13 +377,14 @@ def sync_factor_registry(factors: list[dict]):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with _lconn() as c:
         for f in factors:
+            static_ok, static_reason = static_review_factor(f["name"], f.get("kind", "builtin"), f.get("code"))
             sk = structure.extract_skeleton(f["name"], f.get("code"))
             fam = structure.assign_family(f["name"], sk)
             ft = f.get("factor_type", "量价")
             c.execute(
                 "INSERT INTO factor_registry (name, kind, code, trace, round, decision, first_seen,"
-                " skeleton, family, engine, factor_type, theory_id, hypothesis_id, generation_mode, parent_factor, source_theory_sexpr)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " skeleton, family, engine, factor_type, theory_id, hypothesis_id, generation_mode, parent_factor, source_theory_sexpr, validation_status)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(name) DO UPDATE SET code=excluded.code, trace=excluded.trace,"
                 "   round=excluded.round, decision=excluded.decision,"
                 "   skeleton=excluded.skeleton, family=excluded.family,"
@@ -370,7 +396,138 @@ def sync_factor_registry(factors: list[dict]):
                 (f["name"], f["kind"], f.get("code"), f.get("trace"),
                  f.get("round"), int(f["decision"]) if f.get("decision") is not None else None, now,
                  sk, fam, f.get("engine", "rdagent"), ft, f.get("theory_id"), f.get("hypothesis_id"),
-                 f.get("generation_mode"), f.get("parent_factor"), f.get("source_theory_sexpr")))
+                 f.get("generation_mode"), f.get("parent_factor"), f.get("source_theory_sexpr"),
+                 f.get("validation_status", "static_passed" if static_ok else "static_rejected")))
+
+
+def static_review_factor(name: str, kind: str, code: str | None = None) -> tuple[bool, str]:
+    """低成本因子静态审查；不执行代码，不调用 LLM。"""
+    if not name or not str(name).strip():
+        return False, "缺少因子名称"
+    if kind in ("evolved", "loopengine", "manual"):
+        if not code or not str(code).strip():
+            return False, "进化/手工因子缺少代码"
+        text = str(code)
+        banned = ("shift(-", "future", "lookahead", "未来")
+        if any(x in text.lower() for x in banned):
+            return False, "疑似未来数据或前视引用"
+        if len(text) > 20000:
+            return False, "代码长度超过 20000 字符"
+    return True, "static_ok"
+
+
+def set_factor_static_status(name: str, passed: bool, reason: str):
+    with _lconn() as c:
+        c.execute("UPDATE factor_registry SET validation_status=?, static_passed=?, static_reason=?, static_checked_at=? WHERE name=?",
+                  ("static_passed" if passed else "static_rejected", int(passed), reason,
+                   datetime.now().strftime("%Y-%m-%d %H:%M:%S"), name))
+
+
+def store_factor_values(name: str, values: pd.Series, source: str = "") -> int:
+    """保存最近 120 个交易日因子值，用于相关性与 K 线反馈。"""
+    if values is None or values.empty:
+        return 0
+
+
+def factor_correlation(threshold: float = 0.85, min_obs: int = 20) -> pd.DataFrame:
+    """基于已落库因子值计算相关因子对（Spearman/Pearson 近似）。"""
+    with _lconn() as c:
+        d = pd.read_sql("SELECT factor_name,trade_date,instrument,value FROM factor_value_daily", c)
+    if d.empty:
+        return pd.DataFrame(columns=["factor_a", "factor_b", "corr", "n"])
+    x = d.pivot_table(index=["trade_date", "instrument"], columns="factor_name", values="value")
+    corr = x.corr(min_periods=min_obs)
+    rows = []
+    names = list(corr.columns)
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            v = corr.at[a, b]
+            if pd.notna(v) and abs(float(v)) >= threshold:
+                rows.append({"factor_a": a, "factor_b": b, "corr": float(v),
+                             "n": int(x[[a, b]].dropna().shape[0])})
+    return pd.DataFrame(rows).sort_values("corr", key=lambda s: s.abs(), ascending=False) if rows else pd.DataFrame(columns=["factor_a", "factor_b", "corr", "n"])
+
+
+def cluster_factors(threshold: float = 0.85, min_obs: int = 60,
+                    version: str | None = None) -> pd.DataFrame:
+    """按因子值 Spearman 相关构建同质簇，并为每簇选代表因子。
+
+    只使用已落库且至少有 min_obs 个共同观测的因子；不删除冗余因子。
+    代表优先级：通过闸门、较高 ICIR、较低表达式复杂度（由调用方后续补充）。
+    """
+    import uuid
+    version = version or datetime.now().strftime("%Y%m%d%H%M%S") + "_" + uuid.uuid4().hex[:6]
+    with _lconn() as c:
+        d = pd.read_sql("SELECT factor_name,trade_date,instrument,value FROM factor_value_daily", c)
+        reg = pd.read_sql("SELECT name,family,theory_id,gate_status,sharpe,icir FROM factor_registry", c)
+    if d.empty:
+        return pd.DataFrame(columns=["cluster_version", "cluster_id", "factor_name", "cluster_role", "cluster_score"])
+    x = d.pivot_table(index=["trade_date", "instrument"], columns="factor_name", values="value")
+    names = list(x.columns)
+    parent = {n: n for n in names}
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]; a = parent[a]
+        return a
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb: parent[rb] = ra
+    pairs = []
+    for i, a in enumerate(names):
+        for b in names[i + 1:]:
+            ab = x[[a, b]].dropna()
+            if len(ab) < min_obs: continue
+            corr = float(ab[a].corr(ab[b], method="spearman"))
+            pairs.append((a, b, corr, len(ab)))
+            if abs(corr) >= threshold: union(a, b)
+    rows = []
+    groups = {}
+    for n in names: groups.setdefault(find(n), []).append(n)
+    reg_map = reg.set_index("name").to_dict("index") if not reg.empty else {}
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for idx, members in enumerate(groups.values(), 1):
+        cid = f"C{idx:04d}"
+        def score(n):
+            r = reg_map.get(n, {})
+            return (1 if r.get("gate_status") in (1, 2, 3) else 0,
+                    float(r.get("icir") or 0), float(r.get("sharpe") or 0))
+        rep = max(members, key=score)
+        for n in members:
+            r = reg_map.get(n, {})
+            rows.append((version, cid, n, "representative" if n == rep else "redundant" if len(members) > 1 else "candidate", score(n)[1], r.get("family"), r.get("theory_id"), now))
+    with _lconn() as c:
+        c.executemany("INSERT OR REPLACE INTO factor_clusters(cluster_version,cluster_id,factor_name,cluster_role,cluster_score,family,theory_id,created_at) VALUES(?,?,?,?,?,?,?,?)", rows)
+        c.executemany("INSERT OR REPLACE INTO factor_correlation(factor_a,factor_b,value_corr,common_obs,cluster_version,calculated_at) VALUES(?,?,?,?,?,?)", [(a,b,v,n,version,now) for a,b,v,n in pairs])
+    return pd.DataFrame(rows, columns=["cluster_version","cluster_id","factor_name","cluster_role","cluster_score","family","theory_id","created_at"])
+
+
+def latest_cluster_representatives() -> set[str]:
+    """返回最近一次聚类的代表因子；没有聚类结果时返回空集（不阻断生成）。"""
+    with _lconn() as c:
+        row = c.execute("SELECT MAX(cluster_version) FROM factor_clusters").fetchone()
+        if not row or not row[0]:
+            return set()
+        return {r[0] for r in c.execute("SELECT factor_name FROM factor_clusters WHERE cluster_version=? AND cluster_role='representative'", (row[0],)).fetchall()}
+
+
+def latest_factor_clusters() -> dict[str, str]:
+    """返回最近聚类版本的因子到簇映射。"""
+    with _lconn() as c:
+        ver = c.execute("SELECT MAX(cluster_version) FROM factor_clusters").fetchone()[0]
+        if not ver:
+            return {}
+        return {n: cid for n, cid in c.execute("SELECT factor_name,cluster_id FROM factor_clusters WHERE cluster_version=?", (ver,)).fetchall()}
+    try:
+        s = values.dropna().tail(120 * 600)
+        rows = []
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for (dt, inst), val in s.items():
+            rows.append((name, str(dt)[:10], str(inst), float(val), source, now, now))
+        with _lconn() as c:
+            c.executemany("INSERT OR REPLACE INTO factor_value_daily(factor_name,trade_date,instrument,value,source,run_id,created_at) VALUES(?,?,?,?,?,?,?)", rows)
+        return len(rows)
+    except Exception:
+        return 0
 
 
 def get_factor_registry() -> pd.DataFrame:

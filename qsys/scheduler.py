@@ -2283,6 +2283,17 @@ def job_fundflow_sync(pool_name: str = "自选股", lookback_days: int = 30, **_
     return msg
 
 
+def job_factor_cluster(**_ignored) -> str:
+    """基于已落库因子值做相关性聚类；无足够样本时安全跳过。"""
+    import library
+    result = library.cluster_factors(threshold=0.85, min_obs=60)
+    if result.empty:
+        return "因子相关性聚类：暂无足够因子值样本"
+    n_clusters = result["cluster_id"].nunique()
+    n_redundant = int((result["cluster_role"] == "redundant").sum())
+    return f"因子相关性聚类完成：{n_clusters}簇 · {len(result)}因子 · 冗余标记{n_redundant}"
+
+
 def job_lhb_sync(lookback_days: int = 30, **_ignored) -> str:
     """龙虎榜每日入库（同花顺 iFinD）：按日获取龙虎榜数据。"""
     now = datetime.now()
@@ -2387,6 +2398,7 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
                                methods: list[str] | None = None) -> list[dict]:
     """生成候选策略包：贪心选因子 + Walk-forward验证。"""
     import factor_eval as fe
+    import library
     import sqlite3 as sq
     from pathlib import Path
     
@@ -2396,6 +2408,15 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
     factors = _get_top_factors_for_pack(pool_name, top_n=12)
     if len(factors) < 3:
         return []
+    # 新策略包优先使用最新相关簇代表因子；没有聚类结果时保持兼容，不阻断生成。
+    try:
+        reps = library.latest_cluster_representatives()
+        if reps:
+            clustered = [f for f in factors if f["name"] in reps]
+            if len(clustered) >= 3:
+                factors = clustered
+    except Exception:
+        pass
     
     codes = (all_pools().get(pool_name) or all_pools().get("沪深300"))
     end = get_last_trade_day()
@@ -2434,6 +2455,9 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
         return []
     
     candidates = []
+    # 第4阶段约束：相关簇去重 + 机制族分散。只影响新策略包生成。
+    cluster_map = library.latest_factor_clusters()
+    family_map = {f["name"]: f.get("family", "其他") for f in factors}
     for method in methods:
         try:
             # walk-forward 验证（内部用真实 ICIR 计算权重）
@@ -2443,11 +2467,21 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
                             key=lambda n: abs(float(scorecards_cache.get(n, {}).get("icir") or 0.0)),
                             reverse=True)
             selected = []
+            selected_clusters = set()
+            family_counts = {}
             best_net = float("-inf")
             for name in ranked[:12]:
+                cid = cluster_map.get(name)
+                fam = family_map.get(name, "其他") or "其他"
+                if cid and cid in selected_clusters:
+                    continue
+                if family_counts.get(fam, 0) >= 2:
+                    continue
                 trial = selected + [name]
                 if len(trial) == 1:
                     selected.append(name)
+                    if cid: selected_clusters.add(cid)
+                    family_counts[fam] = family_counts.get(fam, 0) + 1
                     try:
                         base_wf = fe.walk_forward({name: factor_vals[name]}, panel, method,
                                                   top_n, fwd_days=5, step=10, min_factors=1)
@@ -2461,12 +2495,14 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
                     trial_net = float(trial_wf["优化组合扣费超额"].mean()) if not trial_wf.empty else float("-inf")
                     if trial_net > best_net + 0.0001:
                         selected.append(name)
+                        if cid: selected_clusters.add(cid)
+                        family_counts[fam] = family_counts.get(fam, 0) + 1
                         best_net = trial_net
                 except Exception:
                     continue
                 if len(selected) >= 6:
                     break
-            if len(selected) < 2:
+            if len(selected) < 3 or len(set(family_map.get(n, "其他") for n in selected)) < 3:
                 continue
             wf = fe.walk_forward({n: factor_vals[n] for n in selected}, panel, method,
                                  top_n, fwd_days=5, step=10, min_factors=2)
@@ -2475,7 +2511,8 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
             net = wf["优化组合扣费超额"]
             oos_wr = float((net > 0).mean())
             avg_excess = float(net.mean())
-            if oos_wr < 0.55:
+            positive_windows = float((net > 0).mean())
+            if oos_wr < 0.55 or positive_windows < 0.60 or avg_excess <= 0:
                 continue
             # kind 映射：scorecards 中文 → 策略包英文
             kind_map = {"内置": "builtin", "技术指标": "tech", "loopengine": "evolved"}
@@ -2846,6 +2883,9 @@ JOBS = {
                                         "cron_expr": "0 10,13 * * 1-5"}},
     "factor_direction": {"name": "🧭 因子方向状态机（磁滞日更）", "func": job_factor_direction,
                          "default": {"enabled": True, "hour": 21, "minute": 45, "params": {}}},
+    "factor_cluster": {"name": "🧩 因子相关性聚类（周更）", "func": job_factor_cluster,
+                       "default": {"enabled": True, "hour": 3, "minute": 30,
+                                   "params": {}, "day_of_week": "sun"}},
     "pack_lifecycle": {"name": "📦 策略包生命周期（连败停赛）", "func": job_pack_lifecycle,
                        "default": {"enabled": True, "hour": 21, "minute": 50, "params": {}}},
     "ifind_indexlist_sync": {"name": "📉 iFinD 指数列表同步（每日）", "func": job_ifind_indexlist_sync,
@@ -3082,7 +3122,7 @@ class SchedulerManager:
                 self.sched.add_job(lambda k=key: self._run(k), "interval", id=key,
                                    **params, replace_existing=True)
             else:
-                params = {"day_of_week": "mon-fri", "hour": cfg["hour"], "minute": cfg["minute"]}
+                params = {"day_of_week": cfg.get("day_of_week", "mon-fri"), "hour": cfg["hour"], "minute": cfg["minute"]}
                 if existing:
                     try:
                         self.sched.modify_job(key, **params)

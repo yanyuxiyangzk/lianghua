@@ -105,6 +105,7 @@ pages = {
         st.Page("views/p_verify.py", title="实战验证", icon="✅", url_path="verify"),
         st.Page("views/p_sched.py", title="定时任务", icon="⏰", url_path="sched"),
         st.Page("views/p_factor_usage.py", title="因子使用率", icon="📊", url_path="factor-usage"),
+        st.Page("views/p_factor_clusters.py", title="因子相关性聚类", icon="🧩", url_path="factor-clusters"),
         st.Page("views/p_factor_scores.py", title="5维因子评分", icon="💯", url_path="factor-scores"),
         st.Page("views/p_combo_detail.py", title="组合策略详情", icon="🧩", url_path="combo-detail"),
         st.Page("views/p_overfitting.py", title="过拟合诊断", icon="🛡️", url_path="overfitting"),

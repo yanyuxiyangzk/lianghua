@@ -12,11 +12,12 @@ import pandas as pd
 import plotly.graph_objects as go
 import plotly.express as px
 import streamlit as st
+import sqlite3
 
 import factor_eval as fe
 import library
 import signals as sig
-from common import all_pools, get_last_trade_day
+from common import DATA_DIR, all_pools, get_last_trade_day
 
 
 def render():
@@ -29,10 +30,12 @@ def render():
         return
 
     # 因子选择
-    factor_names = sorted(registry["name"].tolist())
+    factor_names = sorted(registry["name"].dropna().unique().tolist())
+    default_factor = "mom_20d" if "mom_20d" in factor_names else factor_names[0]
     c1, c2 = st.columns([2, 1])
     with c1:
-        selected = st.selectbox("选择因子", factor_names, key="fd_select")
+        selected = st.selectbox("选择因子", factor_names,
+                                index=factor_names.index(default_factor), key="fd_select")
     with c2:
         pool_name = st.selectbox("股票池", list(all_pools().keys()), key="fd_pool")
 
@@ -96,12 +99,31 @@ def render():
 
     # 回测可视化
     st.markdown("### 回测可视化")
+    request_key = (selected, pool_name)
+    if st.button("运行回测可视化", type="primary", key="fd_run"):
+        st.session_state["fd_requested"] = request_key
+    if st.session_state.get("fd_requested") != request_key:
+        st.info("选择因子和股票池后，点击“运行回测可视化”加载数据。")
+        return
+
     codes = all_pools().get(pool_name, [])
     if len(codes) < 30:
         st.warning(f"股票池 {pool_name} 不足30只")
         return
 
+    # 在线源的“今天”可能晚于本地已落库的最后交易日；若直接拿今天逐票补数，
+    # 详情页会对沪深300逐只发起网络请求并长时间转圈。使用当前源的本地数据边界。
+    import datasource
+    source = datasource.get_loop_source()
     end = get_last_trade_day()
+    if source != "qlib_local":
+        try:
+            with sqlite3.connect(str(DATA_DIR / "market.db")) as c:
+                latest = c.execute("SELECT MAX(date) FROM market_daily WHERE source=?", (source,)).fetchone()[0]
+            if latest:
+                end = min(end, str(latest)[:10])
+        except Exception:
+            pass
 
     @st.cache_data(ttl=600, show_spinner="计算因子值中…")
     def _calc_factor(fac_name: str, codes_tuple: tuple, end_str: str):
@@ -131,7 +153,11 @@ def render():
                                      source=datasource.get_loop_source())
         return vals, panel, code
 
-    vals, panel, code = _calc_factor(selected, tuple(codes), end)
+    try:
+        vals, panel, code = _calc_factor(selected, tuple(codes), end)
+    except Exception as exc:
+        st.error(f"因子回测加载失败：{exc}")
+        return
     if vals is None or vals.empty:
         st.warning("因子值计算失败或为空")
         return

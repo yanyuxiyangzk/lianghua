@@ -16,6 +16,7 @@ import streamlit as st
 import experience as exp
 import factor_eval as fe
 import library
+from common import all_pools, get_last_trade_day
 
 st.set_page_config(page_title="过拟合诊断", layout="wide")
 
@@ -384,6 +385,63 @@ def _render_tab_credibility():
         import factor_eval as _fe  # noqa: F811
     except ImportError:
         st.info("loopengine.tree 不可用，无法评估复杂度。")
+
+    # --- 因子回测 K 线反馈 ---
+    st.divider()
+    st.markdown("##### 📈 因子回测 K 线反馈")
+    st.caption("选择已回测因子和股票，查看因子值、价格走势及未来收益；因子值不直接当作买卖信号。")
+    try:
+        with library._lconn() as c:
+            factor_rows = c.execute("SELECT name, kind, code FROM factor_registry "
+                                    "WHERE name IS NOT NULL ORDER BY name").fetchall()
+        factor_map = {n: {"name": n, "kind": k or "builtin", "code": code}
+                      for n, k, code in factor_rows}
+        names = list(factor_map)
+        if names:
+            c1, c2, c3 = st.columns([2, 1, 1])
+            with c1:
+                factor_name = st.selectbox("因子", names, key="of_factor")
+            with c2:
+                pool_name = st.selectbox("股票池", list(all_pools()), key="of_pool")
+            with c3:
+                code = st.selectbox("股票", all_pools()[pool_name], key="of_code")
+            if st.button("加载因子 K 线反馈", key="of_load", type="primary"):
+                st.session_state["of_request"] = (factor_name, code)
+            if st.session_state.get("of_request") == (factor_name, code):
+                import datasource
+                import factor_eval as _fe
+                end = get_last_trade_day()
+                source = datasource.get_loop_source()
+                vals = _fe.get_factor_values(factor_map[factor_name], [code], end,
+                                               lookback_days=180, source=source)
+                panel = datasource.get_panel([code],
+                    (pd.Timestamp(end) - pd.Timedelta(days=300)).strftime("%Y-%m-%d"),
+                    end, ["$open", "$high", "$low", "$close", "$volume"], source=source)
+                if vals.empty or panel.empty:
+                    st.warning("该因子或股票暂无可用回测数据。")
+                else:
+                    v = vals.xs(code, level="instrument", drop_level=True).rename("因子值")
+                    p = panel.xs(code, level="instrument", drop_level=True).join(v, how="inner").dropna(subset=["$close", "因子值"])
+                    if p.empty:
+                        st.warning("因子值与 K 线没有重叠日期。")
+                    else:
+                        p["因子分位"] = p["因子值"].rolling(20, min_periods=5).rank(pct=True)
+                        fig = go.Figure(go.Candlestick(x=p.index, open=p["$open"], high=p["$high"],
+                                                       low=p["$low"], close=p["$close"], name="K线"))
+                        hi = p[p["因子分位"] >= .8]
+                        lo = p[p["因子分位"] <= .2]
+                        fig.add_trace(go.Scatter(x=hi.index, y=hi["$high"] * 1.01, mode="markers",
+                                                 marker=dict(color="#e54545", size=7), name="因子高分位"))
+                        fig.add_trace(go.Scatter(x=lo.index, y=lo["$low"] * .99, mode="markers",
+                                                 marker=dict(color="#2ca02c", size=7), name="因子低分位"))
+                        fig.update_layout(height=480, xaxis_rangeslider_visible=False,
+                                          yaxis_title="价格", margin=dict(l=10, r=10, t=25, b=10))
+                        st.plotly_chart(fig, use_container_width=True)
+                        st.line_chart(p[["因子值"]], height=180)
+                        st.caption(f"样本 {len(p)} 天 · 因子均值 {p['因子值'].mean():.4g} · "
+                                   f"高分位日占比 {(p['因子分位'] >= .8).mean():.1%}")
+    except Exception as exc:
+        st.error(f"因子 K 线反馈加载失败：{exc}")
 
 
 # ---------------------------------------------------------------- Tab 3: 统计显著性

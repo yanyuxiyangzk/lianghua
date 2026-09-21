@@ -29,10 +29,14 @@ _DEFAULT_MODEL = os.environ.get("CHAT_MODEL") or "deepseek/deepseek-chat"
 
 # 模型名映射：某些环境变量中的模型名不是有效的API模型名
 _MODEL_ALIAS = {
-    "deepseek/deepseek-v4.1-flash": "deepseek/deepseek-chat",
-    "deepseek-v4.1-flash": "deepseek/deepseek-chat",
-    "deepseek/deepseek-flash": "deepseek/deepseek-chat",
-    "deepseek-flash": "deepseek/deepseek-chat",
+    # 兼容旧配置/旧调用名，统一路由到当前 CHAT_MODEL。
+    "deepseek/deepseek-v4.1-flash": _DEFAULT_MODEL,
+    "deepseek-v4.1-flash": _DEFAULT_MODEL,
+    "deepseek/deepseek-flash": _DEFAULT_MODEL,
+    "deepseek-flash": _DEFAULT_MODEL,
+    "deepseek/deepseek-chat": _DEFAULT_MODEL,
+    "deepseek/deepseek-v4-pro": _DEFAULT_MODEL,
+    "deepseek-v4-pro": _DEFAULT_MODEL,
 }
 
 

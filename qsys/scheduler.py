@@ -249,7 +249,11 @@ def compute_pack_picks(pk: dict, codes: list[str], end: str, top_n: int):
     import library
 
     f_series, weights = {}, {}
-    panel = sig.get_panel_cached(codes, end)
+    # 纯技术/内置策略最长窗口通常不超过 60 日；读取 400 日 × 中证1000
+    # 会让每日选股首次运行耗时数分钟。保留足够预热窗口，同时显著缩短取数。
+    factor_kinds = {str(f.get("kind") or "") for f in pk.get("factors", [])}
+    panel_lookback = 180 if factor_kinds and factor_kinds <= {"tech", "builtin"} else 400
+    panel = sig.get_panel_cached(codes, end, lookback_days=panel_lookback)
     # 策略包：按其因子+权重+方向+过滤器
     evolved_by_name = {f["name"]: f for f in get_evolved_factors(only_accepted=False)}
     # LoopEngine 因子从注册表取代码（之前只查 evolved，loopengine/tech 因子会被静默丢弃）

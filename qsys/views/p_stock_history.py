@@ -25,6 +25,12 @@ def _load(code: str, start: str, end: str) -> pd.DataFrame:
         return pd.read_sql("SELECT date,open,high,low,close,volume,amount,fetched_at FROM market_daily WHERE source='ths_ifind' AND code=? AND date BETWEEN ? AND ? ORDER BY date", c, params=(code, start, end))
 
 
+def _record_job(code, start, end, count, status="success", error=None):
+    with sqlite3.connect(str(DATA_DIR / "market.db")) as c:
+        c.execute("INSERT OR REPLACE INTO stock_history_jobs(code,source,start_date,end_date,row_count,last_fetched_at,status,error) VALUES(?,?,?,?,?,?,?,?)",
+                  (code, "ths_ifind", start, end, count, pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"), status, error))
+
+
 def render():
     st.title("📥 单股票历史数据")
     st.caption("仅抓取同花顺 iFinD 日线并写入 market.db；默认最近一年。删除只影响该股票行情数据，不删除概率模型、因子快照或策略结果。")
@@ -33,21 +39,27 @@ def render():
     start = end - timedelta(days=365)
     st.write(f"抓取区间：{start} 至 {end}")
     dbcode = _db_code(code)
-    if not dbcode or len(dbcode) != 8:
-        st.info("请输入有效的 6 位股票代码。")
+    valid = bool(dbcode and len(dbcode) == 8 and dbcode[2:].isdigit())
+    if not valid:
+        st.info("请输入有效的 6 位股票代码后，再点击下方按钮。")
+    fetch_clicked = st.button("▶ 开始爬取最近一年数据", type="primary", disabled=not valid,
+                              help="只有点击此按钮才会调用同花顺接口；页面加载不会自动爬取。")
+    if not valid:
         return
     existing = _load(dbcode, str(start), str(end))
     a, b, c = st.columns(3)
     a.metric("本地记录", f"{len(existing):,} 条")
     b.metric("最早日期", existing.date.min() if not existing.empty else "—")
     c.metric("最新日期", existing.date.max() if not existing.empty else "—")
-    if st.button("抓取最近一年 iFinD 历史数据", type="primary"):
+    if fetch_clicked:
         with st.spinner("正在从同花顺 iFinD 抓取并写入本地库…"):
             try:
                 n = datasource._ths_fetch_daily(dbcode, str(start), str(end))
-                st.success(f"抓取完成：写入/更新 {n} 条记录。")
+                _record_job(dbcode, str(start), str(end), n)
+                st.success(f"抓取完成：写入/覆盖 {n} 条记录。重复抓取会按股票+日期覆盖更新。")
                 st.rerun()
             except Exception as exc:
+                _record_job(dbcode, str(start), str(end), 0, "failed", str(exc)[:500])
                 st.error(f"抓取失败：{exc}")
     if not existing.empty:
         st.subheader("最近历史数据")
@@ -59,6 +71,7 @@ def render():
             with sqlite3.connect(str(DATA_DIR / "market.db")) as conn:
                 cur = conn.execute("DELETE FROM market_daily WHERE source='ths_ifind' AND code=? AND date BETWEEN ? AND ?", (dbcode, str(start), str(end)))
                 deleted = cur.rowcount
+                conn.execute("UPDATE stock_history_jobs SET row_count=0,status='deleted',last_fetched_at=? WHERE code=? AND source='ths_ifind'", (pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"), dbcode))
             st.success(f"已删除 {deleted} 条行情记录；概率模型和因子数据保留。")
             st.rerun()
 

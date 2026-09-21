@@ -459,7 +459,14 @@ def cluster_factors(threshold: float = 0.85, min_obs: int = 60,
     version = version or datetime.now().strftime("%Y%m%d%H%M%S") + "_" + uuid.uuid4().hex[:6]
     with _lconn() as c:
         d = pd.read_sql("SELECT factor_name,trade_date,instrument,value FROM factor_value_daily", c)
-        reg = pd.read_sql("SELECT name,family,theory_id,gate_status,sharpe,icir FROM factor_registry", c)
+        # icir 保存在 factor_scorecards，旧版 factor_registry 没有该列；
+        # 先读取稳定字段，再用最近评分卡补充 ICIR，兼容历史数据库。
+        reg = pd.read_sql("SELECT name,family,theory_id,gate_status,sharpe FROM factor_registry", c)
+        try:
+            scores = pd.read_sql("SELECT name,icir FROM factor_scorecards WHERE eval_date=(SELECT MAX(eval_date) FROM factor_scorecards)", c)
+            reg = reg.merge(scores, on="name", how="left")
+        except Exception:
+            reg["icir"] = 0.0
     if d.empty:
         return pd.DataFrame(columns=["cluster_version", "cluster_id", "factor_name", "cluster_role", "cluster_score"])
     x = d.pivot_table(index=["trade_date", "instrument"], columns="factor_name", values="value")

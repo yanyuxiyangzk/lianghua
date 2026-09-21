@@ -21,7 +21,12 @@ def _network(cluster_id: str, clusters: pd.DataFrame, corr: pd.DataFrame):
     members = clusters[clusters["cluster_id"] == cluster_id]
     names = set(members["factor_name"])
     edges = corr[corr["factor_a"].isin(names) & corr["factor_b"].isin(names)].copy()
-    edges = edges.reindex(edges["corr"].abs().sort_values(ascending=False).index).head(300)
+    # 表字段为 value_corr；兼容早期返回的 corr 命名。
+    corr_col = "value_corr" if "value_corr" in edges.columns else "corr"
+    if corr_col not in edges.columns:
+        st.info("当前聚类没有可绘制的相关性边。")
+        return
+    edges = edges.reindex(edges[corr_col].abs().sort_values(ascending=False).index).head(300)
     nodes = list(names)
     if not nodes:
         return
@@ -30,8 +35,9 @@ def _network(cluster_id: str, clusters: pd.DataFrame, corr: pd.DataFrame):
     fig = go.Figure()
     for _, e in edges.iterrows():
         x0, y0 = pos[e.factor_a]; x1, y1 = pos[e.factor_b]
+        corr_value = float(e[corr_col])
         fig.add_trace(go.Scatter(x=[x0, x1, None], y=[y0, y1, None], mode="lines",
-                                 line=dict(width=max(1, abs(e.corr) * 4), color="#d95f02" if e.corr > 0 else "#1b9e77"),
+                                 line=dict(width=max(1, abs(corr_value) * 4), color="#d95f02" if corr_value > 0 else "#1b9e77"),
                                  hoverinfo="none", showlegend=False))
     rep = set(members.loc[members.cluster_role == "representative", "factor_name"])
     fig.add_trace(go.Scatter(x=[pos[n][0] for n in nodes], y=[pos[n][1] for n in nodes], mode="markers+text",

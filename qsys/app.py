@@ -71,6 +71,7 @@ pages = {
     "📡 iFinD数据": [
         st.Page("views/p_ifind_stocklist.py", title="行情", icon="📋", url_path="ifind-stocklist"),
         st.Page("views/p_ifind_kline.py", title="K线数据", icon="📈", url_path="ifind-kline"),
+        st.Page("views/p_stock_history.py", title="单股票历史数据", icon="📥", url_path="stock-history"),
         st.Page("views/p_ifind_lhb.py", title="龙虎榜", icon="🐉", url_path="ifind-lhb"),
         st.Page("views/p_ifind_announce.py", title="公告信息", icon="📜", url_path="ifind-announce"),
         st.Page("views/p_ifind_fundflow.py", title="资金流向", icon="💰", url_path="fundflow"),

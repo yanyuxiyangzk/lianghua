@@ -105,6 +105,7 @@ pages = {
         st.Page("views/p_datahub.py", title="数据采集中心", icon="🛰", url_path="datahub"),
         st.Page("views/p_verify.py", title="实战验证", icon="✅", url_path="verify"),
         st.Page("views/p_sched.py", title="定时任务", icon="⏰", url_path="sched"),
+        st.Page("views/p_runtime_logs.py", title="运行日志中心", icon="🧾", url_path="runtime-logs"),
         st.Page("views/p_factor_usage.py", title="因子使用率", icon="📊", url_path="factor-usage"),
         st.Page("views/p_factor_clusters.py", title="因子相关性聚类", icon="🧩", url_path="factor-clusters"),
         st.Page("views/p_factor_scores.py", title="5维因子评分", icon="💯", url_path="factor-scores"),

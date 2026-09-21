@@ -109,6 +109,27 @@ CREATE TABLE IF NOT EXISTS sched_exec_log (
     created_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_sched_job_time ON sched_exec_log(job_key, started_at);
+CREATE TABLE IF NOT EXISTS runtime_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id TEXT NOT NULL,
+    environment TEXT DEFAULT 'qsys',
+    module TEXT NOT NULL,
+    job_key TEXT,
+    level TEXT NOT NULL DEFAULT 'INFO',
+    event TEXT NOT NULL,
+    step TEXT,
+    message TEXT,
+    progress_current INTEGER,
+    progress_total INTEGER,
+    duration_ms INTEGER,
+    success INTEGER,
+    error_type TEXT,
+    metrics TEXT,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_runtime_time ON runtime_log(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_runtime_job_run ON runtime_log(job_key, run_id);
+CREATE INDEX IF NOT EXISTS idx_runtime_level ON runtime_log(level, created_at DESC);
 CREATE TABLE IF NOT EXISTS gate_detail_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     factor_name TEXT NOT NULL,
@@ -209,6 +230,40 @@ def _lconn():
     _migrate_sched_history(c)
     _migrate(c)
     return c
+
+
+def write_runtime_log(run_id: str, module: str, event: str, *, job_key: str | None = None,
+                      level: str = "INFO", step: str | None = None, message=None,
+                      progress_current: int | None = None, progress_total: int | None = None,
+                      duration_ms: int | None = None, success: bool | None = None,
+                      error_type: str | None = None, metrics: dict | None = None,
+                      environment: str = "qsys") -> None:
+    """写入结构化运行日志；敏感信息脱敏，正文限长，避免日志反向拖垮平台。"""
+    import re
+    def _redact(value):
+        if isinstance(value, dict):
+            return {k: ("***" if re.search(r"(?i)(authorization|api[_-]?key|token|secret|password)", str(k))
+                        else _redact(v)) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [_redact(v) for v in value]
+        if isinstance(value, str):
+            value = re.sub(r"sk-[A-Za-z0-9_-]{8,}", "sk-***", value)
+            return re.sub(r"(?i)(authorization|api[_-]?key|token)(\s*[:=]\s*)[^\s,;]+",
+                          r"\1\2***", value)
+        return value
+
+    text = _redact("" if message is None else str(message))
+    text = text[:4000]
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    with _lconn() as c:
+        c.execute(
+            "INSERT INTO runtime_log(run_id,environment,module,job_key,level,event,step,message,"
+            "progress_current,progress_total,duration_ms,success,error_type,metrics,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (run_id, environment, module, job_key, level, event, step, text,
+             progress_current, progress_total, duration_ms,
+             None if success is None else int(success), error_type,
+             json.dumps(_redact(metrics or {}), ensure_ascii=False, default=str)[:8000], now))
 
 
 _migrated = False

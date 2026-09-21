@@ -3153,10 +3153,17 @@ class SchedulerManager:
             return
         cfg = self._state()[key]
         t0 = time.time()
+        run_id = f"{key}-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
         self._running[key] = t0
         if self._owner:
             self._write_live()
         now_start = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            import library
+            library.write_runtime_log(run_id, JOBS[key]["name"], "START", job_key=key,
+                                      message="任务开始", metrics=cfg.get("params", {}))
+        except Exception:
+            pass
         # 推送 JOB_START 事件
         try:
             from event_bus import bus, EventType
@@ -3169,9 +3176,19 @@ class SchedulerManager:
             ok, detail = True, msg
         except Exception as e:
             ok, detail = False, f"{e}"
+            error_type = type(e).__name__
             traceback.print_exc()
         dur_ms = int((time.time() - t0) * 1000)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            import library
+            library.write_runtime_log(
+                run_id, JOBS[key]["name"], "END" if ok else "ERROR", job_key=key,
+                level="INFO" if ok else "ERROR", message=detail, duration_ms=dur_ms,
+                success=ok, error_type=None if ok else error_type,
+                metrics=cfg.get("params", {}))
+        except Exception:
+            pass
         # 推送 JOB_END 事件
         try:
             from event_bus import bus, EventType

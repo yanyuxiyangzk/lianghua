@@ -2234,7 +2234,10 @@ def job_le_factor_eval(batch: int = 500, pool_name: str = "沪深300") -> str:
 
     # P2+P3+P4: 批量计算因子值（一次构建面板，批量计算所有因子，跳过已有缓存，大批次并行）
     if len(facs) > 50:
-        card = fe.build_scorecard_parallel(facs, codes, end, train_end=train_end, max_workers=4)
+        # 调度器进程可能由 Streamlit 动态加载模块；跨进程提交模块函数会触发
+        # "not the same object as factor_eval._eval_single_factor" 的 pickle 错误。
+        # 调度体检优先保证可靠完成，使用串行 worker（内部仍复用面板/因子值缓存）。
+        card = fe.build_scorecard_parallel(facs, codes, end, train_end=train_end, max_workers=1)
     else:
         card = fe.build_scorecard_batch(facs, codes, end, train_end=train_end)
     library.save_scorecard(card, pool_name, end)

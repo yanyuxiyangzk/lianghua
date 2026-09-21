@@ -2180,10 +2180,16 @@ def job_le_factor_eval(batch: int = 500, pool_name: str = "沪深300") -> str:
         ).fetchall():
             ic_map[row[0]] = abs(row[1]) if row[1] else 0
 
-    # 经典层：tech/builtin 全量（每次重评）
+    # 经典层也做滚动重评。经典因子虽只有约百个，但每次全量构建多周期回测会
+    # 长时间占用调度线程，进而阻塞选股/持仓任务。优先选择最久未评估的因子，
+    # 单轮最多占 batch 的 20%（至少 10、最多 30 个）。
+    classic_quota = min(30, max(10, int(batch) // 5))
+    classic = classic.assign(
+        _eval_at=classic["name"].map(lambda n: evaluated.get(n, ""))) if not classic.empty else classic
+    classic_pick = classic.sort_values("_eval_at", na_position="first").head(classic_quota)
     classic_facs = [{"name": r["name"], "kind": r["kind"], "code": None,
                      "first_seen": r.get("first_seen")}
-                    for _, r in classic.iterrows()]
+                    for _, r in classic_pick.iterrows()]
 
     # 进化层：未体检队列按边际价值取剩余配额
     picked = pd.DataFrame()

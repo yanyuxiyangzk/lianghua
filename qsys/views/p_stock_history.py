@@ -25,10 +25,20 @@ def _load(code: str, start: str, end: str) -> pd.DataFrame:
         return pd.read_sql("SELECT date,open,high,low,close,volume,amount,fetched_at FROM market_daily WHERE source='ths_ifind' AND code=? AND date BETWEEN ? AND ? ORDER BY date", c, params=(code, start, end))
 
 
-def _record_job(code, start, end, count, status="success", error=None):
-    with sqlite3.connect(str(DATA_DIR / "market.db")) as c:
-        c.execute("INSERT OR REPLACE INTO stock_history_jobs(code,source,start_date,end_date,row_count,last_fetched_at,status,error) VALUES(?,?,?,?,?,?,?,?)",
-                  (code, "ths_ifind", start, end, count, pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"), status, error))
+def _record_job(code, data_type, start, end, count, status="success", error=None,
+                completeness=None):
+    """日线和分钟线分别记录，避免同一股票的任务状态互相覆盖。"""
+    stock_id = datasource.get_or_create_stock_id(code)
+    comp = completeness or {}
+    now = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    with datasource._conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO stock_history_jobs_v2"
+            "(stock_id,code,source,data_type,start_date,end_date,row_count,expected_days,"
+            "complete_days,missing_days,last_fetched_at,status,error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (stock_id, code, "ths_ifind", data_type, start, end, count,
+             int(comp.get("expected_days", 0)), int(comp.get("complete_days", 0)),
+             int(comp.get("missing_count", 0)), now, status, error))
 
 
 def render():
@@ -69,31 +79,58 @@ def render():
         else:
             with sqlite3.connect(str(DATA_DIR / "market.db")) as conn:
                 existing = pd.read_sql("SELECT datetime,open,high,low,close,volume,amount FROM ifind_minute WHERE code=? AND datetime BETWEEN ? AND ? ORDER BY datetime", conn, params=(dbcode, str(start), str(end) + " 23:59:59"))
+    time_col = "date" if data_mode == "日线历史" else "datetime"
     a, b, c = st.columns(3)
     a.metric("本地记录", f"{len(existing):,} 条")
-    b.metric("最早日期", existing.date.min() if not existing.empty else "—")
-    c.metric("最新日期", existing.date.max() if not existing.empty else "—")
+    b.metric("最早日期", str(existing[time_col].min())[:10] if not existing.empty else "—")
+    c.metric("最新日期", str(existing[time_col].max())[:10] if not existing.empty else "—")
+    completeness = None
+    if data_mode == "盘中1分钟历史" and fetched_sig == request_sig:
+        completeness = datasource.minute_completeness(dbcode, str(start), str(end))
+        m1, m2, m3 = st.columns(3)
+        m1.metric("交易日完整率", f"{completeness['completeness']:.1%}")
+        m2.metric("完整交易日", f"{completeness['complete_days']}/{completeness['expected_days']}")
+        m3.metric("缺失/不完整交易日", completeness["missing_count"])
     if fetch_clicked:
         with st.spinner("正在从同花顺 iFinD 抓取并写入本地库…"):
             try:
                 if data_mode == "日线历史":
                     n = datasource._ths_fetch_daily(dbcode, str(start), str(end))
                     msg = f"抓取完成：写入/覆盖 {n} 条日线记录。"
+                    _record_job(dbcode, "daily", str(start), str(end), n)
                 else:
                     n, days_ok, failed = datasource.fetch_minute_range_to_db(dbcode, str(start), str(end))
+                    comp = datasource.minute_completeness(dbcode, str(start), str(end))
                     msg = f"抓取完成：写入/覆盖 {n:,} 条分钟记录，成功 {days_ok} 个交易日。"
                     if failed:
                         msg += f" 未返回数据 {len(failed)} 天。"
-                _record_job(dbcode, str(start), str(end), n)
+                    _record_job(dbcode, "minute_1m", str(start), str(end), n,
+                                completeness=comp)
                 st.session_state["hist_fetched_sig"] = request_sig
                 st.success(msg + " 重复抓取会覆盖更新。")
                 st.rerun()
             except Exception as exc:
-                _record_job(dbcode, str(start), str(end), 0, "failed", str(exc)[:500])
+                _record_job(dbcode, "daily" if data_mode == "日线历史" else "minute_1m",
+                            str(start), str(end), 0, "failed", str(exc)[:500])
                 st.error(f"抓取失败：{exc}")
     if fetched_sig == request_sig and not existing.empty:
         st.subheader("最近历史数据")
         st.dataframe(existing.tail(100), hide_index=True, use_container_width=True)
+        if data_mode == "盘中1分钟历史" and completeness and completeness["missing_count"]:
+            with st.expander(f"查看缺失或不完整交易日（{completeness['missing_count']}天）"):
+                st.write("、".join(completeness["missing_days"][:200]))
+            if st.button("🔧 仅补抓缺失交易日", type="primary"):
+                with st.spinner("正在断点补抓缺失或不完整交易日…"):
+                    result = datasource.backfill_missing_minutes(dbcode, str(start), str(end))
+                    after = result["after"]
+                    _record_job(dbcode, "minute_1m", str(start), str(end),
+                                after["row_count"], completeness=after,
+                                status="success" if after["missing_count"] == 0 else "partial",
+                                error=("缺失：" + ",".join(after["missing_days"][:30]))
+                                if after["missing_count"] else None)
+                    st.success(f"补抓写入 {result['written']:,} 条，修复 {result['repaired_days']} 天；"
+                               f"当前完整率 {after['completeness']:.1%}。")
+                    st.rerun()
         st.subheader("删除该股票历史行情")
         st.warning("此操作只删除该股票当前类型的历史行情，不删除概率模型、因子快照、策略或分析结果。")
         confirm = st.checkbox("我确认删除该股票历史行情", key="hist_delete_confirm")
@@ -104,7 +141,10 @@ def render():
                 else:
                     cur = conn.execute("DELETE FROM ifind_minute WHERE code=? AND datetime BETWEEN ? AND ?", (dbcode, str(start), str(end) + " 23:59:59"))
                 deleted = cur.rowcount
-                conn.execute("UPDATE stock_history_jobs SET row_count=0,status='deleted',last_fetched_at=? WHERE code=? AND source='ths_ifind'", (pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"), dbcode))
+                dtype = "daily" if data_mode == "日线历史" else "minute_1m"
+                conn.execute("UPDATE stock_history_jobs_v2 SET row_count=0,status='deleted',"
+                             "last_fetched_at=? WHERE code=? AND data_type=?",
+                             (pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S"), dbcode, dtype))
             st.success(f"已删除 {deleted} 条行情记录；概率模型和因子数据保留。")
             st.rerun()
 

@@ -99,6 +99,17 @@ def _conn():
     CREATE TABLE IF NOT EXISTS stock_history_jobs(
         code TEXT PRIMARY KEY, source TEXT NOT NULL, start_date TEXT, end_date TEXT,
         row_count INTEGER DEFAULT 0, last_fetched_at TEXT, status TEXT, error TEXT);
+    CREATE TABLE IF NOT EXISTS stock_master(
+        stock_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        code TEXT NOT NULL UNIQUE, name TEXT, market TEXT,
+        created_at TEXT, updated_at TEXT);
+    CREATE TABLE IF NOT EXISTS stock_history_jobs_v2(
+        stock_id INTEGER NOT NULL, code TEXT NOT NULL, source TEXT NOT NULL,
+        data_type TEXT NOT NULL, start_date TEXT, end_date TEXT,
+        row_count INTEGER DEFAULT 0, expected_days INTEGER DEFAULT 0,
+        complete_days INTEGER DEFAULT 0, missing_days INTEGER DEFAULT 0,
+        last_fetched_at TEXT, status TEXT, error TEXT,
+        PRIMARY KEY(stock_id, data_type));
     -- iFinD 自动入库（⏰定时任务 ifind_*）：
     CREATE TABLE IF NOT EXISTS ifind_basic_daily(
         code TEXT NOT NULL, date TEXT NOT NULL, indicator TEXT NOT NULL,
@@ -174,7 +185,59 @@ def _conn():
     for col, typ in [("speed", "REAL"), ("pe_ttm", "REAL")]:
         if col not in rt_cols:
             c.execute(f"ALTER TABLE ifind_realtime ADD COLUMN {col} {typ}")
+    _migrate_stock_identity(c)
     return c
+
+
+def _migrate_stock_identity(c) -> None:
+    """建立稳定 stock_id，并为历史行情表补充关联键（幂等迁移）。"""
+    marker = c.execute(
+        "SELECT value FROM ifind_config WHERE key='stock_identity_schema_version'").fetchone()
+    if marker and marker[0] == "1":
+        return
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    c.execute(
+        "INSERT OR IGNORE INTO stock_master(code,name,market,created_at,updated_at) "
+        "SELECT code,name,market,?,? FROM ifind_stocklist WHERE code IS NOT NULL",
+        (now, now))
+    for table in ("market_daily", "ifind_minute"):
+        cols = [r[1] for r in c.execute(f"PRAGMA table_info({table})")]
+        if "stock_id" not in cols:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN stock_id INTEGER")
+        c.execute(
+            f"INSERT OR IGNORE INTO stock_master(code,created_at,updated_at) "
+            f"SELECT DISTINCT code,?,? FROM {table} WHERE code IS NOT NULL",
+            (now, now))
+        c.execute(
+            f"UPDATE {table} SET stock_id=(SELECT stock_id FROM stock_master s "
+            f"WHERE s.code={table}.code) WHERE stock_id IS NULL")
+        c.execute(f"CREATE INDEX IF NOT EXISTS idx_{table}_stock_id ON {table}(stock_id)")
+    # 旧表只记录过日线抓取，迁入 v2 后分钟任务可独立存在。
+    c.execute(
+        "INSERT OR IGNORE INTO stock_history_jobs_v2"
+        "(stock_id,code,source,data_type,start_date,end_date,row_count,last_fetched_at,status,error) "
+        "SELECT s.stock_id,j.code,j.source,'daily',j.start_date,j.end_date,j.row_count,"
+        "j.last_fetched_at,j.status,j.error FROM stock_history_jobs j "
+        "JOIN stock_master s ON s.code=j.code")
+    c.execute(
+        "INSERT OR REPLACE INTO ifind_config(key,value,updated_at) VALUES(?,?,?)",
+        ("stock_identity_schema_version", "1", now))
+
+
+def get_or_create_stock_id(code: str) -> int:
+    """按标准代码取得稳定股票主键；名称和市场来自股票列表。"""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with _conn() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO stock_master(code,name,market,created_at,updated_at) "
+            "SELECT code,name,market,?,? FROM ifind_stocklist WHERE code=?",
+            (now, now, code))
+        c.execute("INSERT OR IGNORE INTO stock_master(code,created_at,updated_at) VALUES(?,?,?)",
+                  (code, now, now))
+        row = c.execute("SELECT stock_id FROM stock_master WHERE code=?", (code,)).fetchone()
+    if not row:
+        raise RuntimeError(f"无法建立股票主键：{code}")
+    return int(row[0])
 
 
 def _touch_source(source: str):
@@ -422,11 +485,13 @@ def _ths_fetch_daily(code: str, start: str, end: str) -> int:
     if df.empty:
         return 0
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    stock_id = get_or_create_stock_id(code)
     with _conn() as c:
         c.executemany(
-            "INSERT OR REPLACE INTO market_daily (source, code, date, open, high, low, close, volume, amount, fetched_at)"
-            " VALUES ('ths_ifind',?,?,?,?,?,?,?,?,?)",
-            [(code, r.date, r.open, r.high, r.low, r.close, r.volume, r.amount, now)
+            "INSERT OR REPLACE INTO market_daily "
+            "(source, code, date, open, high, low, close, volume, amount, fetched_at, stock_id)"
+            " VALUES ('ths_ifind',?,?,?,?,?,?,?,?,?,?)",
+            [(code, r.date, r.open, r.high, r.low, r.close, r.volume, r.amount, now, stock_id)
              for r in df.itertuples()])
     return len(df)
 
@@ -1709,12 +1774,14 @@ def fetch_minute_to_db(code: str, day: str = "", interval: str = "1min") -> int:
     d["code"] = code  # iFinD 单股查询返回无 code 列，手动补充
     # 仅 1min 写入 SQLite（ifind_minute 表无 interval 列，多周期会互相覆盖）
     if interval == "1min":
-        vals = [(code, r.datetime, r.open, r.high, r.low, r.close, r.volume, r.amount)
+        stock_id = get_or_create_stock_id(code)
+        vals = [(code, r.datetime, r.open, r.high, r.low, r.close, r.volume, r.amount, stock_id)
                 for r in d.itertuples()]
         with _qconn() as c:
             c.executemany(
                 "INSERT OR REPLACE INTO ifind_minute"
-                "(code,datetime,open,high,low,close,volume,amount) VALUES (?,?,?,?,?,?,?,?)", vals)
+                "(code,datetime,open,high,low,close,volume,amount,stock_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?)", vals)
     return len(d)
 
 
@@ -1738,6 +1805,62 @@ def fetch_minute_range_to_db(code: str, start: str, end: str, interval: str = "1
         if pause:
             time.sleep(pause)
     return total, ok, failed
+
+
+def expected_trade_days(start: str, end: str) -> list[str]:
+    """合并本地交易日历和宽基指数日期，避免任一来源区间覆盖不完整。"""
+    with _conn() as c:
+        cal_rows = c.execute(
+            "SELECT DISTINCT date FROM ifind_calendar WHERE date BETWEEN ? AND ? ORDER BY date",
+            (start, end)).fetchall()
+        index_rows = c.execute(
+            "SELECT DISTINCT date FROM market_daily WHERE date BETWEEN ? AND ? "
+            "AND code IN ('SH000001','SH000300') ORDER BY date", (start, end)).fetchall()
+    return sorted({str(r[0])[:10] for r in cal_rows + index_rows})
+
+
+def minute_completeness(code: str, start: str, end: str,
+                        min_rows_per_day: int = 200) -> dict:
+    """检查单票分钟线覆盖率；少于200根的交易日视为不完整并允许断点补抓。"""
+    expected = expected_trade_days(start, end)
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT substr(datetime,1,10),COUNT(*) FROM ifind_minute "
+            "WHERE code=? AND datetime BETWEEN ? AND ? GROUP BY substr(datetime,1,10)",
+            (code, start, end + " 23:59:59")).fetchall()
+    counts = {str(day): int(n) for day, n in rows}
+    missing = [day for day in expected if counts.get(day, 0) < min_rows_per_day]
+    complete = [day for day in expected if counts.get(day, 0) >= min_rows_per_day]
+    total_rows = sum(counts.values())
+    return {"code": code, "start": start, "end": end, "expected_days": len(expected),
+            "complete_days": len(complete), "missing_days": missing,
+            "missing_count": len(missing), "row_count": total_rows,
+            "completeness": (len(complete) / len(expected)) if expected else 0.0,
+            "daily_counts": counts}
+
+
+def backfill_missing_minutes(code: str, start: str, end: str,
+                             min_rows_per_day: int = 200,
+                             pause: float = 0.15) -> dict:
+    """只重抓缺失或不完整交易日，返回抓取前后完整率。"""
+    before = minute_completeness(code, start, end, min_rows_per_day)
+    written = ok = 0
+    failed = []
+    for day in before["missing_days"]:
+        try:
+            n = fetch_minute_to_db(code, day, "1min")
+            written += n
+            if n >= min_rows_per_day:
+                ok += 1
+            else:
+                failed.append(day)
+        except Exception:
+            failed.append(day)
+        if pause:
+            time.sleep(pause)
+    after = minute_completeness(code, start, end, min_rows_per_day)
+    return {"written": written, "repaired_days": ok, "failed_days": failed,
+            "before": before, "after": after}
 
 
 def get_minute_from_db(code: str, day: str) -> pd.DataFrame:

@@ -105,9 +105,12 @@ def _position_rows() -> pd.DataFrame:
 
 
 def render():
+    import experience
+
     st.title("💹 资金账号（模拟柜台）")
 
     acc = broker.get_account()
+    main_rules = experience.get_risk_rules("main")
 
     # 账户总览
     c1, c2, c3, c4, c5 = st.columns(5)

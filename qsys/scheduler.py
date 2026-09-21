@@ -346,8 +346,19 @@ def compute_pack_picks(pk: dict, codes: list[str], end: str, top_n: int):
                 reso_note = f"·{h_main}+{h_pair}共振"
     except Exception:
         pass
+    # 单股票概率模型只作为二级影子校验：先记录潜在修正，不改变正式策略名单。
+    prob_note = ""
+    try:
+        import stock_probability as stock_prob
+        _, prob_diag = stock_prob.probability_overlay(sel, end, execute=False)
+        if not prob_diag.empty:
+            usable = int((prob_diag["status"] == "可用").sum())
+            covered = int((prob_diag["status"] != "无模型").sum())
+            prob_note = f"·概率影子覆盖{covered}/{len(prob_diag)}可用{usable}"
+    except Exception:
+        pass
     picks = sig.industry_cap_select(sel, cap=2).head(top_n)
-    note = f"{len(weights)} 因子·行业≤2{reso_note}" + \
+    note = f"{len(weights)} 因子·行业≤2{reso_note}{prob_note}" + \
         (f"，{len(dropped)} 个无法解析已跳过" if dropped else "")
 
     # 记录因子使用
@@ -2814,6 +2825,27 @@ def job_satellite_close(**_ignored) -> str:
     return f"{close_msg} | {nav_msg}"
 
 
+def job_probability_shadow_update(max_codes: int = 30, top_n: int = 10,
+                                  **_ignored) -> str:
+    """为当天正式候选更新单票概率模型并保存影子排序，不改变正式名单。"""
+    import stock_probability
+    day = get_last_trade_day()
+    result = stock_probability.update_models_and_record_shadow(day, max_codes, top_n)
+    return (f"概率影子更新：名单{result['picks']}组 · 模型成功{result['models_ok']} "
+            f"失败{result['models_failed']} · 影子记录{result['shadow_rows']} · "
+            f"待评估日{result.get('eval_date') or '未确定'}")
+
+
+def job_probability_shadow_eval(**_ignored) -> str:
+    """回填成熟的5日概率影子结果，比较影子排序与原策略排序。"""
+    import stock_probability
+    result = stock_probability.evaluate_shadow(get_last_trade_day())
+    lift = result.get("lift")
+    lift_text = "暂无可比较结果" if lift is None else f"影子增益 {lift:+.2%}"
+    return (f"概率影子评估：本次回填{result['evaluated']}条 · "
+            f"累计{result.get('total_evaluated', 0)}条/{result['groups']}组 · {lift_text}")
+
+
 # ---------------------------------------------------------------- 调度器
 JOBS = {
     "update_data": {"name": "📥 每日数据更新", "func": job_update_data,
@@ -2884,6 +2916,14 @@ JOBS = {
     "auto_scan": {"name": "🤖 自动选股（因子价值评分）", "func": job_auto_scan,
                   "default": {"enabled": True, "hour": 19, "minute": 30,
                               "params": {"pool_name": "沪深300", "top_n": 10}}},
+    "probability_shadow_update": {"name": "📐 单股票概率模型更新（影子）",
+                                  "func": job_probability_shadow_update,
+                                  "default": {"enabled": True, "hour": 20, "minute": 20,
+                                              "params": {"max_codes": 30, "top_n": 10}}},
+    "probability_shadow_eval": {"name": "🧪 概率模型5日影子评估",
+                                "func": job_probability_shadow_eval,
+                                "default": {"enabled": True, "hour": 18, "minute": 50,
+                                            "params": {}}},
     "outcome_backfill": {"name": "🎯 战果回填（经验库）", "func": job_outcome_backfill,
                          "default": {"enabled": True, "hour": 18, "minute": 45, "params": {}}},
     "evolution_distill": {"name": "🧬 进化信号蒸馏（战报→引擎）", "func": job_evolution_distill,

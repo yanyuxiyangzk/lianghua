@@ -52,7 +52,33 @@ def render():
         st.error(f"聚类数据读取失败：{exc}")
         return
     if clusters.empty:
-        st.info("暂无聚类结果。因子值积累达到共同观测数后，将由每周聚类任务自动生成。")
+        st.info("暂无聚类结果。先运行一次因子体检/回测积累因子值，再点击下方按钮生成聚类。")
+        with st.expander("没有快照数据？先积累一批内置因子样本"):
+            st.caption("仅计算 6 个内置因子和沪深300，使用本地行情缓存，不调用 LLM。")
+            if st.button("积累内置因子样本", key="cluster_seed"):
+                import factor_eval
+                import signals
+                from common import all_pools, get_last_trade_day
+                import datasource
+                codes = all_pools().get("沪深300", [])
+                end = get_last_trade_day()
+                ok = 0
+                with st.spinner("正在计算并落库因子快照…"):
+                    for name in signals.BUILTIN_FACTORS:
+                        try:
+                            factor_eval.get_factor_values({"name": name, "kind": "builtin"}, codes, end, lookback_days=180, source=datasource.get_loop_source())
+                            ok += 1
+                        except Exception:
+                            continue
+                st.success(f"已完成 {ok} 个内置因子快照，请再次点击生成聚类。")
+        if st.button("立即尝试生成聚类", type="primary"):
+            import library
+            result = library.cluster_factors(threshold=0.85, min_obs=60)
+            if result.empty:
+                st.warning("当前因子值快照仍不足 60 个共同观测，请先运行因子体检或因子详情回测。")
+            else:
+                st.success(f"已生成 {result.cluster_id.nunique()} 个聚类簇")
+                st.rerun()
         return
     latest = clusters[clusters.cluster_version == clusters.cluster_version.max()].copy()
     c1, c2, c3, c4 = st.columns(4)

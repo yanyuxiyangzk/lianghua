@@ -351,7 +351,15 @@ def get_factor_values(fac: dict, codes: list[str], end: str, lookback_days: int 
     if ck.exists():
         hit = sig._read_parquet_safe(ck)
         if hit is not None:
-            return hit.iloc[:, 0]
+            cached = hit.iloc[:, 0]
+            # 缓存命中也同步因子值快照；旧版本只在重新计算时落库，
+            # 导致已有大量 parquet 回测结果无法参与相关性聚类。
+            try:
+                import library
+                library.store_factor_values(fac["name"], cached, source=source)
+            except Exception:
+                pass
+            return cached
     # Density-SR 支撑阻力因子：值在 sr_scan_daily（逐日快照），不走 panel 计算
     if fac["name"] in ("sr_entry", "sr_hold", "sr_strength"):
         import density_sr

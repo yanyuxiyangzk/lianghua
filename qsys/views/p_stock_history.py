@@ -36,8 +36,20 @@ def render():
     st.caption("仅抓取同花顺 iFinD 日线并写入 market.db；默认最近一年。删除只影响该股票行情数据，不删除概率模型、因子快照或策略结果。")
     code = st.text_input("股票代码", placeholder="例如 SH600519、600519.SH 或 600519", key="hist_code")
     end = date.today()
-    start = end - timedelta(days=365)
-    st.write(f"抓取区间：{start} 至 {end}")
+    range_mode = st.selectbox("历史范围", ["最近1年", "最近3年", "最近5年", "自定义"], key="hist_range")
+    if range_mode == "自定义":
+        d1, d2 = st.columns(2)
+        with d1:
+            start = st.date_input("开始日期", end - timedelta(days=365), key="hist_start")
+        with d2:
+            end = st.date_input("结束日期", end, key="hist_end")
+        if start > end:
+            st.error("开始日期不能晚于结束日期。")
+            return
+    else:
+        years = {"最近1年": 1, "最近3年": 3, "最近5年": 5}[range_mode]
+        start = end - timedelta(days=365 * years)
+    st.write(f"抓取区间：{start} 至 {end}（仅点击按钮后触发网络请求）")
     dbcode = _db_code(code)
     valid = bool(dbcode and len(dbcode) == 8 and dbcode[2:].isdigit())
     if not valid:

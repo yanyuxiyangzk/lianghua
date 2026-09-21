@@ -49,6 +49,19 @@ _CACHE_DB = DATA_DIR / "experience.db"
 _CACHE_TTL = 86400  # 24小时
 _DAILY_CALL_LIMIT = int(os.environ.get("LLM_DAILY_CALL_LIMIT", "30"))
 _DAILY_TOKEN_LIMIT = int(os.environ.get("LLM_DAILY_TOKEN_LIMIT", "30000"))
+_last_error = ""
+
+
+def _set_last_error(message: str) -> None:
+    global _last_error
+    _last_error = str(message or "")[:500]
+
+
+def llm_failure_reason() -> str:
+    """返回最近一次 LLM 失败的用户可读原因，避免把所有故障误报为缺少 Key。"""
+    if not llm_available():
+        return "未配置全局 LLM API Key"
+    return _last_error or "LLM 接口调用失败，请检查服务状态或稍后重试"
 
 
 def _ensure_cache_table():
@@ -92,7 +105,14 @@ def _budget_reserve(max_tokens: int) -> bool:
         with sqlite3.connect(str(_CACHE_DB), timeout=10) as c:
             row = c.execute("SELECT calls, reserved_tokens FROM llm_usage WHERE day=?", (day,)).fetchone()
             calls, tokens = row if row else (0, 0)
-            if calls >= _DAILY_CALL_LIMIT or tokens + max_tokens > _DAILY_TOKEN_LIMIT:
+            if calls >= _DAILY_CALL_LIMIT:
+                _set_last_error(f"今日 LLM 调用次数已达上限（{calls}/{_DAILY_CALL_LIMIT}）")
+                log.warning("LLM daily call limit exceeded: calls=%d/%d", calls, _DAILY_CALL_LIMIT)
+                return False
+            if tokens + max_tokens > _DAILY_TOKEN_LIMIT:
+                _set_last_error(
+                    f"今日 LLM 输出预算不足（已预留 {tokens}/{_DAILY_TOKEN_LIMIT} tokens，"
+                    f"本次需要 {max_tokens}）")
                 log.warning("LLM daily budget exceeded: calls=%d/%d tokens=%d/%d",
                             calls, _DAILY_CALL_LIMIT, tokens, _DAILY_TOKEN_LIMIT)
                 return False
@@ -177,6 +197,7 @@ def llm_chat(system: str, user: str, max_tokens: int = 4096, model: str | None =
     """调用一次 chat completion，返回纯文本；无 key / 调用异常返回 None。
     use_cache: 是否使用响应缓存（默认启用，相同prompt直接返回缓存）。"""
     if not llm_available():
+        _set_last_error("未配置全局 LLM API Key")
         return None
     
     model = _resolve_model(model or _DEFAULT_MODEL)
@@ -214,7 +235,9 @@ def llm_chat(system: str, user: str, max_tokens: int = 4096, model: str | None =
             _set_cached(cache_key, response, model, label)
         
         return response
-    except Exception:
+    except Exception as exc:
+        _set_last_error(f"LLM 接口调用失败：{type(exc).__name__}: {exc}")
+        log.exception("LLM chat failed: model=%s label=%s", model, label)
         return None
 
 
@@ -226,6 +249,7 @@ def llm_chat_multi(messages: list[dict], max_tokens: int = 4000, model: str | No
     自动降思考强度（reasoning_effort=low）重试一次。
     use_cache: 是否使用响应缓存（默认启用）。"""
     if not llm_available():
+        _set_last_error("未配置全局 LLM API Key")
         return None
     
     model = _resolve_model(model or _DEFAULT_MODEL)
@@ -269,5 +293,7 @@ def llm_chat_multi(messages: list[dict], max_tokens: int = 4000, model: str | No
             _set_cached(cache_key, content, model, label)
         
         return content or None
-    except Exception:
+    except Exception as exc:
+        _set_last_error(f"LLM 接口调用失败：{type(exc).__name__}: {exc}")
+        log.exception("LLM multi-chat failed: model=%s label=%s", model, label)
         return None

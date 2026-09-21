@@ -9,7 +9,7 @@ import streamlit as st
 import broker
 import experience
 import datasource
-from llmutil import llm_chat
+from llmutil import llm_chat, llm_failure_reason
 
 
 # ---------------------------------------------------------------- 数据采集
@@ -281,7 +281,7 @@ def _generate_report(data: dict) -> str:
     result = llm_chat(SYSTEM_PROMPT, prompt, max_tokens=1600, label="daily_report")
     if result:
         return result
-    return "⚠️ LLM 服务不可用，请检查 DEEPSEEK_API_KEY 配置。"
+    return f"⚠️ 日报生成失败：{llm_failure_reason()}。"
 
 
 def _data_hash(data: dict) -> str:

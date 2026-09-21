@@ -329,7 +329,7 @@ def _render_sector_tab(df: pd.DataFrame, title: str, key_prefix: str):
                                   template="plotly_dark", paper_bgcolor="#101010", plot_bgcolor="#101010",
                                   xaxis=dict(title="净流入(元)", gridcolor="#333"),
                                   yaxis=dict(gridcolor="#333", automargin=True))
-                st.plotly_chart(fig, width="stretch")
+                st.plotly_chart(fig, width="stretch", key=f"sector_flow_in_{key}")
         with c2:
             st.markdown("**净流出 TOP15**")
             top_out = d.nsmallest(15, flow_col).sort_values(flow_col, ascending=False)
@@ -345,7 +345,7 @@ def _render_sector_tab(df: pd.DataFrame, title: str, key_prefix: str):
                                   template="plotly_dark", paper_bgcolor="#101010", plot_bgcolor="#101010",
                                   xaxis=dict(title="净流入(元)", gridcolor="#333"),
                                   yaxis=dict(gridcolor="#333", automargin=True))
-                st.plotly_chart(fig, width="stretch")
+                st.plotly_chart(fig, width="stretch", key=f"sector_flow_out_{key}")
 
 
 def render():
@@ -414,7 +414,7 @@ def render():
                               template="plotly_dark", paper_bgcolor="#101010", plot_bgcolor="#101010",
                               xaxis=dict(title="净流入(元)", gridcolor="#333"),
                               yaxis=dict(gridcolor="#333", automargin=True))
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, width="stretch", key="stock_flow_in")
         with c2:
             st.markdown("**净流出 TOP15**")
             top_out = d.nsmallest(15, flow_col).sort_values(flow_col, ascending=False)
@@ -429,7 +429,7 @@ def render():
                               template="plotly_dark", paper_bgcolor="#101010", plot_bgcolor="#101010",
                               xaxis=dict(title="净流入(元)", gridcolor="#333"),
                               yaxis=dict(gridcolor="#333", automargin=True))
-            st.plotly_chart(fig, width="stretch")
+            st.plotly_chart(fig, width="stretch", key="stock_flow_out")
 
     with t2:
         st.markdown(f"**板块资金流**（{datetime.now():%Y-%m-%d %H:%M}）")

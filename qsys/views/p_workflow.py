@@ -313,7 +313,7 @@ def _render_stage_status_bar(data):
 
     # 计算下一轮任务信息
     iteration = data.get("iteration", 0)
-    factor_types = ["量价", "资金流", "板块轮动", "指数", "盘口异动", "龙虎榜", "爆量抢筹"]
+    factor_types = ["量价", "资金流", "板块轮动", "指数", "盘口异动", "龙虎榜", "爆量抢筹", "财务", "支撑阻力", "事件记忆"]
     next_type = factor_types[iteration % len(factor_types)]
     next_iteration = iteration + 1
 
@@ -325,7 +325,7 @@ def _render_stage_status_bar(data):
         "指数": "指数相关性",
         "盘口异动": "盘口买卖盘变化",
         "龙虎榜": "龙虎榜数据",
-        "爆量抢筹": "盘口吸筹信号",
+        "爆量抢筹": "盘口吸筹信号", "财务": "财务质量/估值指标", "支撑阻力": "支撑阻力位置", "事件记忆": "历史事件记忆",
     }
     next_desc = type_desc.get(next_type, next_type)
 
@@ -333,7 +333,7 @@ def _render_stage_status_bar(data):
     type_colors = {
         "量价": "#667eea", "资金流": "#11998e", "板块轮动": "#f7971e",
         "指数": "#eb3349", "盘口异动": "#764ba2", "龙虎榜": "#e91e63",
-        "爆量抢筹": "#ff5722",
+        "爆量抢筹": "#ff5722", "财务": "#795548", "支撑阻力": "#607d8b", "事件记忆": "#9c27b0",
     }
     next_color = type_colors.get(next_type, "#999")
 
@@ -599,13 +599,13 @@ def _render_timeline(data):
 # ---------- 因子类型演化 ----------
 FACTOR_TYPE_COLORS = {
     "量价": "#667eea", "资金流": "#11998e", "板块轮动": "#f7971e",
-    "指数": "#eb3349", "盘口异动": "#764ba2", "龙虎榜": "#569cd6", "未分类": "#adb5bd"
+    "指数": "#eb3349", "盘口异动": "#764ba2", "龙虎榜": "#569cd6", "爆量抢筹": "#ff5722", "财务": "#795548", "支撑阻力": "#607d8b", "事件记忆": "#9c27b0", "未分类": "#adb5bd"
 }
-FACTOR_TYPES_ORDER = ["量价", "资金流", "板块轮动", "指数", "盘口异动", "龙虎榜"]
+FACTOR_TYPES_ORDER = ["量价", "资金流", "板块轮动", "指数", "盘口异动", "龙虎榜", "爆量抢筹", "财务", "支撑阻力", "事件记忆"]
 
 def _render_rotation(data):
     iteration = data.get("iteration", 0)
-    current_idx = iteration % 6 if iteration > 0 else -1
+    current_idx = iteration % len(FACTOR_TYPES_ORDER) if iteration > 0 else -1
     current_type = FACTOR_TYPES_ORDER[current_idx] if current_idx >= 0 else "-"
 
     dots = ""
@@ -613,7 +613,7 @@ def _render_rotation(data):
         cls = "active" if i == current_idx else ("done" if i < current_idx else "")
         short = ft[:2]
         dots += f'<div class="rot-dot {cls}">{short}</div>'
-        if i < 5:
+        if i < len(FACTOR_TYPES_ORDER) - 1:
             dots += '<span class="rot-arrow">→</span>'
     st.markdown(f"""<div class="rot-wrap">
         <span class="rot-label">当前轮转:</span>{dots}

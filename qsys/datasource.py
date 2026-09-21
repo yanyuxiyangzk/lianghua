@@ -96,6 +96,9 @@ def _conn():
         fetched_at TEXT, PRIMARY KEY(source, code, date));
     CREATE TABLE IF NOT EXISTS data_sources(
         source TEXT PRIMARY KEY, name TEXT, last_sync TEXT, rows INTEGER, note TEXT);
+    CREATE TABLE IF NOT EXISTS stock_history_jobs(
+        code TEXT PRIMARY KEY, source TEXT NOT NULL, start_date TEXT, end_date TEXT,
+        row_count INTEGER DEFAULT 0, last_fetched_at TEXT, status TEXT, error TEXT);
     -- iFinD 自动入库（⏰定时任务 ifind_*）：
     CREATE TABLE IF NOT EXISTS ifind_basic_daily(
         code TEXT NOT NULL, date TEXT NOT NULL, indicator TEXT NOT NULL,
@@ -1713,6 +1716,28 @@ def fetch_minute_to_db(code: str, day: str = "", interval: str = "1min") -> int:
                 "INSERT OR REPLACE INTO ifind_minute"
                 "(code,datetime,open,high,low,close,volume,amount) VALUES (?,?,?,?,?,?,?,?)", vals)
     return len(d)
+
+
+def fetch_minute_range_to_db(code: str, start: str, end: str, interval: str = "1min",
+                            pause: float = 0.15) -> tuple[int, int, list[str]]:
+    """按交易日逐日抓取单票分钟线，避免 THS_HF 超出单次时间窗口。
+    返回 (写入行数, 成功交易日数, 失败日期)。重复执行幂等覆盖。"""
+    import time
+    days = pd.date_range(start, end, freq="B")
+    total = ok = 0; failed = []
+    for day in days:
+        ds = day.strftime("%Y-%m-%d")
+        try:
+            n = fetch_minute_to_db(code, ds, interval)
+            if n:
+                total += n; ok += 1
+            else:
+                failed.append(ds)
+        except Exception:
+            failed.append(ds)
+        if pause:
+            time.sleep(pause)
+    return total, ok, failed
 
 
 def get_minute_from_db(code: str, day: str) -> pd.DataFrame:

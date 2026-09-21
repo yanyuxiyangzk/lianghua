@@ -997,7 +997,7 @@ def position_reconcile(today: str) -> str:
                 except Exception:
                     pass
                 c.execute(
-                    "INSERT INTO positions (code, name, buy_date, buy_price, buy_ts, pick_id,"
+                    "INSERT OR IGNORE INTO positions (code, name, buy_date, buy_price, buy_ts, pick_id,"
                     " source, pack_name, status, limit_price, shares, buy_amount, created_at)"
                     " VALUES (?,?,?,?,?,?,?,?, 'open', NULL, ?, ?, ?)",
                     (code, exp_row.get("name") or code, str(exp_row.get("buy_date") or today),
@@ -1038,7 +1038,7 @@ def position_reconcile(today: str) -> str:
                 except Exception:
                     pass
                 c.execute(
-                    "INSERT INTO positions (code, name, buy_date, buy_price, buy_ts, pick_id,"
+                    "INSERT OR IGNORE INTO positions (code, name, buy_date, buy_price, buy_ts, pick_id,"
                     " source, pack_name, status, limit_price, shares, buy_amount, created_at)"
                     " VALUES (?,?,?,?,?,?,?,?, 'open', NULL, ?, ?, ?)",
                     (code, bp.get("name") or code, str(bp.get("last_buy_date") or today),

@@ -623,10 +623,10 @@ def save_scorecard(card: pd.DataFrame, pool_name: str, eval_date: str):
         rows.append((r["因子"], pool_name, eval_date, r.get("来源"),
                      _f(r.get("IC均值")), _f(r.get("ICIR")), _f(r.get("IC胜率")),
                      _f(r.get("Top组胜率")), str(r.get("建议方向", "")),
-                     int(r.get("天数", 0) or 0),
+                     _safe_int(r.get("天数", 0)),
                      json.dumps(winrates, ensure_ascii=False), now,
                      _f(r.get("IC_OOS")), _f(r.get("ICIR_OOS")),
-                     int(r.get("OOS天数", 0) or 0)))
+                     _safe_int(r.get("OOS天数", 0))))
     with _lconn() as c:
         c.executemany(
             "INSERT OR REPLACE INTO factor_scorecards (name, pool_name, eval_date, kind,"
@@ -640,6 +640,14 @@ def _f(v):
         return float(v) if pd.notna(v) else None
     except (TypeError, ValueError):
         return None
+
+
+def _safe_int(v, default=0):
+    """将体检结果中的 NaN/空值安全转换为整数。"""
+    try:
+        return default if pd.isna(v) else int(float(v))
+    except (TypeError, ValueError):
+        return default
 
 
 def get_latest_scorecard(pool_name: str) -> pd.DataFrame:

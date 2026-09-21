@@ -605,7 +605,8 @@ FACTOR_TYPES_ORDER = ["量价", "资金流", "板块轮动", "指数", "盘口�
 
 def _render_rotation(data):
     iteration = data.get("iteration", 0)
-    current_idx = iteration % len(FACTOR_TYPES_ORDER) if iteration > 0 else -1
+    # iteration 表示已完成轮数；最近完成的类型是第 iteration-1 个，避免页面落后一轮
+    current_idx = (iteration - 1) % len(FACTOR_TYPES_ORDER) if iteration > 0 else -1
     current_type = FACTOR_TYPES_ORDER[current_idx] if current_idx >= 0 else "-"
 
     dots = ""

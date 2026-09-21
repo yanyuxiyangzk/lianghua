@@ -938,7 +938,7 @@ def job_gate_check(pool_name: str = "沪深300") -> str:
 
 def job_loopengine(batch: int = 50, **_ignored) -> str:
     """LoopEngine 演化引擎：每轮 生成→审查→验证→入库（检查点自动保存）。
-    按 iteration 轮转7种因子类型：量价/资金流/板块轮动/指数/盘口异动/龙虎榜/爆量抢筹。
+    按 iteration 轮转 DEFAULT_FACTOR_TYPES 全部因子类型（含财务/支撑阻力/事件记忆）。
     每 4 轮自动插入 1 轮事件定向挖掘（涨停/大涨/跌停轮转）。"""
     from loopengine.engine import LoopEngine, DEFAULT_FACTOR_TYPES
 
@@ -955,8 +955,8 @@ def job_loopengine(batch: int = 50, **_ignored) -> str:
 
 def job_multitype_mine(batch_per_type: int = 25, pool_name: str = "沪深300",
                        factor_types: str = "", **_ignored) -> str:
-    """多类型因子挖掘：遍历量价/资金流/板块轮动/指数/盘口异动/龙虎榜/爆量抢筹。
-    factor_types 为空时挖掘全部类型，逗号分隔指定子集。"""
+    """多类型因子挖掘：遍历 DEFAULT_FACTOR_TYPES 的全部类型。
+    factor_types 为空时挖掘全部类型，逗号分隔可指定子集。"""
     from loopengine.engine import LoopEngine, DEFAULT_FACTOR_TYPES
 
     eng = LoopEngine(pool_name)
@@ -2933,7 +2933,7 @@ JOBS = {
                    "default": {"enabled": True, "hour": 0, "minute": 0,
                                "params": {"batch": 50, "interval_sec": 300},
                                "trigger": "interval"}},
-    "multitype_mine": {"name": "🌐 多类型因子挖掘（资金流/板块/龙虎榜/盘口/指数）",
+    "multitype_mine": {"name": "🌐 多类型因子挖掘（全类型轮转）",
                        "func": job_multitype_mine,
                        "default": {"enabled": True, "hour": 1, "minute": 0,
                                    "params": {"batch_per_type": 25, "factor_types": ""}}},

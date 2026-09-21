@@ -67,6 +67,20 @@ def _get_todays_satellite_pick() -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def _render_position_summary():
+    """无论今日是否有候选，都展示独立卫星账户持仓。"""
+    opens = exp.satellite_positions("open")
+    pendings = exp.satellite_positions("pending")
+    st.subheader("当前持仓")
+    if opens.empty:
+        st.info("暂无卫星轨持仓")
+    else:
+        st.dataframe(opens[[c for c in ["code", "name", "buy_date", "buy_price", "buy_shares", "status"] if c in opens.columns]], hide_index=True, use_container_width=True)
+    if not pendings.empty:
+        st.subheader("挂单中")
+        st.dataframe(pendings[[c for c in ["code", "name", "limit_price", "buy_shares", "created_at"] if c in pendings.columns]], hide_index=True, use_container_width=True)
+
+
 def _render_tab_today():
     """Tab 1: 今日决策"""
     today = get_last_trade_day()
@@ -76,6 +90,9 @@ def _render_tab_today():
     pack = _get_satellite_pack_info()
     if pack:
         _render_pack_info(pack)
+
+    # 今日无选股或候选被剔除时，也不能提前 return 掉账户持仓。
+    _render_position_summary()
 
     # 今日选股结果
     picks = _get_todays_satellite_pick()

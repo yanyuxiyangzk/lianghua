@@ -669,8 +669,8 @@ def position_open_from_picks(trade_date: str, today: str) -> str:
         pass
     with _conn() as c:
         for r in picks.itertuples():
-            if r.source == "le_shadow":
-                continue  # LE 影子名单：只结算战果攒战绩，绝不开仓
+            if r.source in ("le_shadow", "sched_satellite_scan"):
+                continue  # 影子/顺带卫星扫描只攒战绩；专用 satellite_scan 才能进入主轨
             items = pick_items_detail(int(r.id))
             if items.empty:
                 continue
@@ -755,7 +755,10 @@ def position_open_from_picks(trade_date: str, today: str) -> str:
 
 
 # 每轨虚拟资金（等分买入）：主轨 7 万 / 卫星轨 2 万 / 双闸门事件票 1.5 万（高风险更小仓位）
-TRACK_BUDGET = {"sched_satellite_scan": 20000.0}
+TRACK_BUDGET = {
+    "satellite_scan": 20000.0,
+    "sched_satellite_scan": 20000.0,
+}
 
 # 事件增强票的追高保护阈值（放宽：追强逻辑允许更高涨幅进入）
 CHASE_THRESHOLD_DEFAULT = 5.0
@@ -789,7 +792,10 @@ def _get_position_rules(pos_row) -> dict:
     """根据仓位的 pack_name 确定使用的规则集（DEFAULT_RULES 或 EVENT_RULES）。"""
     pk_name = pos_row.get("pack_name") if hasattr(pos_row, "get") else (
         pos_row["pack_name"] if "pack_name" in pos_row.index else None)
-    return EVENT_RULES if _is_event_enhanced_pick(pk_name) else DEFAULT_RULES
+    source = pos_row.get("source") if hasattr(pos_row, "get") else (
+        pos_row["source"] if "source" in pos_row.index else None)
+    return (EVENT_RULES if source in ("satellite_scan", "sched_satellite_scan")
+            or _is_event_enhanced_pick(pk_name) else DEFAULT_RULES)
 
 
 def position_fill_check(today: str) -> str:
@@ -969,9 +975,12 @@ def position_reconcile(today: str) -> str:
     orphan_fixed = []
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with _conn() as c, broker._conn() as bc:
-        # 处理所有 open 持仓
+        # 按股票聚合后对账。旧逻辑逐行拿单笔仓位与柜台汇总比较，多个批次时会
+        # 重复补记，并触发 UNIQUE(code,buy_date,source)。
         all_opens = pd.read_sql(
-            "SELECT id, code, name, shares, buy_price, buy_date FROM positions WHERE status='open'", c)
+            "SELECT code, MAX(name) name, SUM(COALESCE(shares,0)) shares,"
+            " MIN(buy_date) buy_date FROM positions WHERE status IN ('open','closing')"
+            " GROUP BY code", c)
         for _, exp_row in all_opens.iterrows():
             code = str(exp_row["code"])
             exp_sh = int(exp_row["shares"] or 0)
@@ -996,13 +1005,26 @@ def position_reconcile(today: str) -> str:
                         actual_buy_ts = fill_row[0]
                 except Exception:
                     pass
-                c.execute(
-                    "INSERT OR IGNORE INTO positions (code, name, buy_date, buy_price, buy_ts, pick_id,"
-                    " source, pack_name, status, limit_price, shares, buy_amount, created_at)"
-                    " VALUES (?,?,?,?,?,?,?,?, 'open', NULL, ?, ?, ?)",
-                    (code, exp_row.get("name") or code, str(exp_row.get("buy_date") or today),
-                     cost, actual_buy_ts, None, "reconcile_fix", "对账补记",
-                     diff, round(diff * cost, 2), actual_buy_ts))
+                buy_date = str(actual_buy_ts)[:10] if actual_buy_ts else today
+                existing = c.execute(
+                    "SELECT id,COALESCE(shares,0) FROM positions"
+                    " WHERE code=? AND buy_date=? AND source='reconcile_fix'",
+                    (code, buy_date)).fetchone()
+                if existing:
+                    new_shares = int(existing[1] or 0) + diff
+                    c.execute(
+                        "UPDATE positions SET status='open',buy_price=?,buy_ts=?,shares=?,"
+                        " buy_amount=?,closed_at=NULL WHERE id=?",
+                        (cost, actual_buy_ts, new_shares,
+                         round(new_shares * cost, 2), int(existing[0])))
+                else:
+                    c.execute(
+                        "INSERT INTO positions (code,name,buy_date,buy_price,buy_ts,pick_id,"
+                        " source,pack_name,status,limit_price,shares,buy_amount,created_at)"
+                        " VALUES (?,?,?,?,?,?,?,?,'open',NULL,?,?,?)",
+                        (code, exp_row.get("name") or code, buy_date, cost, actual_buy_ts,
+                         None, "reconcile_fix", "对账补记", diff,
+                         round(diff * cost, 2), actual_buy_ts))
                 fixed.append(f"{exp_row.get('name') or code}×+{diff}")
 
             elif diff < 0:
@@ -1012,8 +1034,8 @@ def position_reconcile(today: str) -> str:
                     # broker 已完全卖出，experience 未记录 → 关闭幽灵仓
                     c.execute(
                         "UPDATE positions SET status='closed', sell_reason='对账清理(幽灵仓)',"
-                        " sell_date=?, closed_at=? WHERE id=?",
-                        (today, now, int(exp_row["id"])))
+                        " sell_date=?, closed_at=? WHERE code=? AND status IN ('open','closing')",
+                        (today, now, code))
                     orphan_fixed.append(f"{exp_row.get('name') or code}×{exp_sh}")
 
         # 处理 broker 有但 experience 完全没有的 code（补记）
@@ -1113,7 +1135,7 @@ def position_close_check(today: str) -> str:
                 continue
             # 每个仓位独立选规则：事件增强票用更紧的止损/止盈
             pk_name = str(p.get("pack_name") or "")
-            r = EVENT_RULES if _is_event_enhanced_pick(pk_name) else DEFAULT_RULES
+            r = _get_position_rules(p)
             entry = p["buy_price"]
             tp, sl = entry * (1 + r["take_profit"]), entry * (1 + r["stop_loss"])
             # M4 自适应止损：有入场 ATR 上下文的仓位，止损收紧到 1.5×ATR%（夹取 [-8%,-2%]）

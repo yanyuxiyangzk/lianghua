@@ -1,7 +1,4 @@
-"""🎲 卫星轨 · 事件策略
-
-独立仓位、独立结算、独立净值。Top5 候选 → 剔除涨停/追高 → 规则/LLM 决策 → 真实资金下单。
-"""
+"""🎲 卫星轨 · 事件策略候选名单（由主轨统一持仓与风控）。"""
 
 import json
 import pandas as pd
@@ -176,6 +173,34 @@ def _render_tab_today():
             st.write(f"⏳ **{p['code']}** {p.get('name','')} | "
                      f"限价 {p['limit_price']:.2f} × {int(p['buy_shares'])}股"
                      f"{llm_info}")
+
+
+def _render_observation_only():
+    """只展示最近一次自动选股名单；不读取或操作卫星交易账户。"""
+    today = get_last_trade_day()
+    st.caption(f"最近交易日 {today} · 自动选股结果仅供观察")
+    pack = _get_satellite_pack_info()
+    if pack:
+        _render_pack_info(pack)
+    picks = _get_todays_satellite_pick()
+    if picks.empty:
+        st.info("暂无卫星轨观察名单，请等待自动扫描任务完成。")
+        return
+    try:
+        prices = bk._latest_prices(picks["code"].tolist())
+    except Exception:
+        prices = {}
+    rows = []
+    for _, row in picks.iterrows():
+        pr = prices.get(row["code"]) or ()
+        cur = pr[0] if len(pr) > 0 else None
+        prev = pr[1] if len(pr) > 1 else None
+        chg = ((cur / prev - 1) * 100) if cur and prev else None
+        rows.append({"交易日": row["trade_date"], "股票代码": row["code"],
+                     "策略评分": row["score"], "最新价": cur, "涨跌幅(%)": chg})
+    st.subheader(f"候选股票（{len(rows)} 只）")
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+    st.caption("候选股票由主轨账户统一执行；卫星来源使用小预算和更严格的止盈止损规则。")
 
 
 def _render_tab_performance():
@@ -384,21 +409,9 @@ def _render_tab_account():
 
 
 def render():
-    st.title("🎲 卫星轨 · 事件策略")
-
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "📋 今日决策", "📊 战绩统计", "📝 历史决策", "⚠️ 风控", "💼 独立账户"])
-
-    with tab1:
-        _render_tab_today()
-    with tab2:
-        _render_tab_performance()
-    with tab3:
-        _render_tab_history()
-    with tab4:
-        _render_tab_risk()
-    with tab5:
-        _render_tab_account()
+    st.title("🎲 卫星轨 · 事件策略选股")
+    st.info("卫星轨只负责生成事件候选；下单、持仓与风控全部由主轨资金账户统一管理。")
+    _render_observation_only()
 
 
 render()

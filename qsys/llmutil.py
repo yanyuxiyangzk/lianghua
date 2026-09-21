@@ -44,6 +44,13 @@ def _resolve_model(model: str) -> str:
     """解析模型名，处理别名映射。"""
     return _MODEL_ALIAS.get(model, model)
 
+
+def _completion_options(model: str) -> dict:
+    """当前 Flash 模型默认会消耗输出额度进行内部推理；普通文本任务关闭推理。"""
+    if "flash" in model.lower():
+        return {"extra_body": {"thinking": {"type": "disabled"}}}
+    return {}
+
 # LLM 响应缓存
 _CACHE_DB = DATA_DIR / "experience.db"
 _CACHE_TTL = 86400  # 24小时
@@ -223,6 +230,7 @@ def llm_chat(system: str, user: str, max_tokens: int = 4096, model: str | None =
             messages=messages,
             max_tokens=max_tokens,
             temperature=0.2,
+            **_completion_options(model),
         )
         _log_cache_usage(r, label or "chat")
         response = (r.choices[0].message.content or "").strip()
@@ -274,6 +282,7 @@ def llm_chat_multi(messages: list[dict], max_tokens: int = 4000, model: str | No
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=0.3,
+                **_completion_options(model),
                 **extra)
             _log_cache_usage(r, label or "chat_multi")
             ch = r.choices[0]

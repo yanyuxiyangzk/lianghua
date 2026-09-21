@@ -1075,10 +1075,19 @@ def job_position_track(**_ignored) -> str:
         logging.getLogger("scheduler").warning(f"PriceMonitor 初始化失败: {e}")
 
     latest = experience.list_pick_dates(limit=1)
-    m0 = experience.position_reconcile(today)  # 双账本对账：先接住孤儿仓再谈开平仓
-    m1 = experience.position_open_from_picks(latest[0], today) if latest else "无名单"
-    m_fill = experience.position_fill_check(today)
-    m2 = experience.position_close_check(today)
+    # 各环节隔离：开仓/对账异常不得阻断已有主轨持仓的止盈、止损和到期管理。
+    def _safe(label, fn):
+        try:
+            return fn()
+        except Exception as exc:
+            import logging
+            logging.getLogger("scheduler").exception("持仓跟踪%s失败", label)
+            return f"{label}失败({type(exc).__name__}: {exc})"
+
+    m0 = _safe("对账", lambda: experience.position_reconcile(today))
+    m1 = _safe("开仓", lambda: experience.position_open_from_picks(latest[0], today)) if latest else "无名单"
+    m_fill = _safe("撮合", lambda: experience.position_fill_check(today))
+    m2 = _safe("平仓风控", lambda: experience.position_close_check(today))
     # 顺带撮合模拟柜台的挂单（限价单价格触及即成交）+ 手动持仓止盈/止损自动卖出
     import broker
     n_fill = broker.fill_pending_orders()
@@ -2737,16 +2746,11 @@ def _satellite_market_open(now: datetime | None = None) -> bool:
     return 930 <= hhmm <= 1130 or 1300 <= hhmm <= 1500
 
 def job_satellite_scan(pool_name: str = "沪深300", top_n: int = 5, **_ignored) -> str:
-    """卫星轨独立选股：Top5 候选 → 剔除涨停/追高 → LLM 决策（规则兜底）→ 真实资金下单。"""
+    """卫星轨选股：生成高风险候选名单，由主轨统一账户和持仓风控执行。"""
     if not _satellite_trading_day():
         return "卫星轨：非交易日，跳过选股"
     import experience
-    import broker as bk
-    import signals as sig
-    import llmutil
     end = get_last_trade_day()
-    today = end
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # 1. 取卫星包
     import library
@@ -2774,65 +2778,8 @@ def job_satellite_scan(pool_name: str = "沪深300", top_n: int = 5, **_ignored)
                          filters=pk.get("filters", []), factors=pk["factors"],
                          final_scores=spicks, pack_name=sat_name, trade_date=end)
 
-    # 4. 组装 LLM 决策数据包
-    candidates = []
-    try:
-        panel = sig.get_panel_cached(codes, end)
-        for code in spicks.index:
-            item = {"code": code, "name": "", "score": float(spicks[code])}
-            # 附加因子值
-            if panel is not None and code in panel.index:
-                row = panel.loc[code]
-                fv = {}
-                for f in pk.get("factors", []):
-                    fn = f["name"] if isinstance(f, dict) else str(f)
-                    if fn in row.index:
-                        v = row[fn]
-                        if pd.notna(v):
-                            fv[fn] = float(v)
-                item["factors"] = fv
-                # 涨跌幅
-                if "close" in row.index and "open" in row.index:
-                    try:
-                        item["change_pct"] = (float(row["close"]) / float(row["open"]) - 1) * 100
-                    except Exception:
-                        item["change_pct"] = 0
-            candidates.append(item)
-    except Exception:
-        # 组装失败，直接给 LLM 纯列表
-        for code in spicks.index:
-            candidates.append({"code": code, "name": "", "score": float(spicks[code]),
-                               "factors": {}, "change_pct": 0})
-
-    # 5. 市场上下文（使用卫星轨独立现金池）
-    cash = bk._get_satellite_cash()
-    hold_count = 0
-    try:
-        hold_count = len(experience.satellite_positions("open"))
-    except Exception:
-        pass
-    market_context = {
-        "regime": "未知",
-        "sentiment": 0.5,
-        "cash": cash,
-        "hold_count": hold_count
-    }
-
-    # 6. LLM 决策（失败回退到规则决策）
-    llm_result = experience.satellite_llm_decide(candidates, market_context)
-    decisions = llm_result.get("decisions", [])
-    is_fallback = llm_result.get("fallback", True)
-
-    if decisions and not is_fallback:
-        # LLM 决策成功 → 用 satellite_open_from_llm
-        msg = experience.satellite_open_from_llm(decisions, cash, today)
-        return (f"{end} 卫星轨扫描完成 · {sat_name} · LLM决策 · "
-                f"选中{len(decisions)}只 · {msg}")
-    else:
-        # LLM 失败或未选中 → 规则兜底 Top3
-        picks_df = pd.DataFrame({"code": spicks.index, "name": "", "score": spicks.values})
-        msg = experience.satellite_open_from_picks(picks_df, cash, today)
-        return (f"{end} 卫星轨扫描完成 · {sat_name} · 规则兜底 · {msg}")
+    return (f"{end} 卫星轨候选名单已生成 · {sat_name} · Top{len(spicks)}"
+            " · 交由主轨统一持仓管理")
 
 
 def job_satellite_fill(**_ignored) -> str:
@@ -3004,11 +2951,11 @@ JOBS = {
                        "default": {"enabled": True, "hour": 19, "minute": 10,
                                    "params": {"pool_name": "沪深300", "top_n": 5}}},
     "satellite_fill": {"name": "🎲 卫星轨盘中撮合", "func": job_satellite_fill,
-                       "default": {"enabled": True, "hour": 9, "minute": 30,
+                       "default": {"enabled": False, "hour": 9, "minute": 30,
                                    "params": {"interval_sec": 300},
                                    "trigger": "interval"}},
     "satellite_close": {"name": "🎲 卫星轨止损/结算（盘后）", "func": job_satellite_close,
-                        "default": {"enabled": True, "hour": 15, "minute": 35, "params": {}}},
+                        "default": {"enabled": False, "hour": 15, "minute": 35, "params": {}}},
 }
 
 

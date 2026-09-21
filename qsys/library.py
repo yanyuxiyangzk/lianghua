@@ -427,6 +427,17 @@ def store_factor_values(name: str, values: pd.Series, source: str = "") -> int:
     """保存最近 120 个交易日因子值，用于相关性与 K 线反馈。"""
     if values is None or values.empty:
         return 0
+    try:
+        s = values.dropna().tail(120 * 600)
+        rows = []
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for (dt, inst), val in s.items():
+            rows.append((name, str(dt)[:10], str(inst), float(val), source, now, now))
+        with _lconn() as c:
+            c.executemany("INSERT OR REPLACE INTO factor_value_daily(factor_name,trade_date,instrument,value,source,run_id,created_at) VALUES(?,?,?,?,?,?,?)", rows)
+        return len(rows)
+    except Exception:
+        return 0
 
 
 def factor_correlation(threshold: float = 0.85, min_obs: int = 20) -> pd.DataFrame:
@@ -524,17 +535,6 @@ def latest_factor_clusters() -> dict[str, str]:
         if not ver:
             return {}
         return {n: cid for n, cid in c.execute("SELECT factor_name,cluster_id FROM factor_clusters WHERE cluster_version=?", (ver,)).fetchall()}
-    try:
-        s = values.dropna().tail(120 * 600)
-        rows = []
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        for (dt, inst), val in s.items():
-            rows.append((name, str(dt)[:10], str(inst), float(val), source, now, now))
-        with _lconn() as c:
-            c.executemany("INSERT OR REPLACE INTO factor_value_daily(factor_name,trade_date,instrument,value,source,run_id,created_at) VALUES(?,?,?,?,?,?,?)", rows)
-        return len(rows)
-    except Exception:
-        return 0
 
 
 def get_factor_registry() -> pd.DataFrame:

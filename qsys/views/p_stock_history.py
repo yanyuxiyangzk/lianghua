@@ -119,18 +119,45 @@ def render():
         if data_mode == "盘中1分钟历史" and completeness and completeness["missing_count"]:
             with st.expander(f"查看缺失或不完整交易日（{completeness['missing_count']}天）"):
                 st.write("、".join(completeness["missing_days"][:200]))
-            if st.button("🔧 仅补抓缺失交易日", type="primary"):
-                with st.spinner("正在断点补抓缺失或不完整交易日…"):
-                    result = datasource.backfill_missing_minutes(dbcode, str(start), str(end))
+            progress = datasource.minute_backfill_status(dbcode, str(start), str(end))
+            if progress:
+                st.caption(f"断点补抓：累计尝试 {progress['attempted_days']} 天 · "
+                           f"已修复 {progress['repaired_days']} 天 · 队列剩余 {progress['remaining_days']} 天 · "
+                           f"最近更新 {progress['updated_at']}")
+            batch_days = st.selectbox("每批补抓交易日数", [5, 10, 20, 30], index=2,
+                                      key="minute_backfill_batch")
+            if st.button("🔧 分批补抓缺失交易日", type="primary"):
+                with st.spinner(f"正在补抓下一批最多 {batch_days} 个缺失交易日…"):
+                    result = datasource.backfill_missing_minutes(
+                        dbcode, str(start), str(end), batch_days=int(batch_days))
                     after = result["after"]
                     _record_job(dbcode, "minute_1m", str(start), str(end),
                                 after["row_count"], completeness=after,
                                 status="success" if after["missing_count"] == 0 else "partial",
                                 error=("缺失：" + ",".join(after["missing_days"][:30]))
                                 if after["missing_count"] else None)
-                    st.success(f"补抓写入 {result['written']:,} 条，修复 {result['repaired_days']} 天；"
+                    st.success(f"本批尝试 {result['attempted_days']} 天，写入 {result['written']:,} 条，"
+                               f"修复 {result['repaired_days']} 天；队列剩余 {result['remaining_days']} 天，"
                                f"当前完整率 {after['completeness']:.1%}。")
                     st.rerun()
+        if data_mode == "盘中1分钟历史":
+            st.subheader("日内特征日表")
+            if st.button("🧮 生成/更新当前范围日内特征"):
+                with st.spinner("正在将完整分钟交易日压缩为逐日特征…"):
+                    feat_result = datasource.compute_intraday_features(
+                        dbcode, str(start), str(end))
+                st.success(f"已计算 {feat_result['computed_days']} 个完整交易日，"
+                           f"跳过 {feat_result['skipped_days']} 个不完整交易日。")
+                st.rerun()
+            features = datasource.get_intraday_features(dbcode, str(start), str(end))
+            if features.empty:
+                st.caption("暂无日内特征。只有分钟数达到完整标准的交易日才会生成。")
+            else:
+                f1, f2, f3 = st.columns(3)
+                f1.metric("特征交易日", len(features))
+                f2.metric("最早特征日期", features["trade_date"].min())
+                f3.metric("最新特征日期", features["trade_date"].max())
+                st.dataframe(features.tail(100), hide_index=True, width="stretch")
         st.subheader("删除该股票历史行情")
         st.warning("此操作只删除该股票当前类型的历史行情，不删除概率模型、因子快照、策略或分析结果。")
         confirm = st.checkbox("我确认删除该股票历史行情", key="hist_delete_confirm")

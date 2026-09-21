@@ -2836,14 +2836,57 @@ def job_probability_shadow_update(max_codes: int = 30, top_n: int = 10,
             f"待评估日{result.get('eval_date') or '未确定'}")
 
 
+def job_intraday_feature_update(max_codes: int = 100, lookback_days: int = 5,
+                                **_ignored) -> str:
+    """盘后增量生成日内特征；只消费已落库分钟线，不触发历史补抓。"""
+    import experience
+
+    codes = set(load_watchlist())
+    with experience._conn() as c:
+        for row in c.execute(
+                "SELECT DISTINCT code FROM positions WHERE status IN ('open','pending')"):
+            if row[0]:
+                codes.add(row[0])
+    # 最新概率影子候选也纳入，但不因此扩大交易权限。
+    with datasource._conn() as c:
+        try:
+            rows = c.execute(
+                "SELECT DISTINCT code FROM stock_probability_shadow "
+                "ORDER BY trade_date DESC,pick_id DESC LIMIT ?", (int(max_codes),)).fetchall()
+            codes.update(row[0] for row in rows if row[0])
+        except Exception:
+            pass
+
+    codes = sorted(codes)[:max(1, int(max_codes))]
+    if not codes:
+        return "日内特征更新：没有自选股、持仓或影子候选"
+    end = get_last_trade_day()
+    start = trade_day_offset(end, -max(1, int(lookback_days)) + 1)
+    ok = failed = days = 0
+    for code in codes:
+        try:
+            result = datasource.compute_intraday_features(code, start, end)
+            days += int(result["computed_days"])
+            ok += 1
+        except Exception:
+            failed += 1
+            logging.getLogger("scheduler").exception("日内特征更新失败: %s", code)
+    return (f"日内特征更新：{ok}/{len(codes)}只成功 · 生成/刷新{days}个股票交易日"
+            + (f" · 失败{failed}只" if failed else ""))
+
+
 def job_probability_shadow_eval(**_ignored) -> str:
     """回填成熟的5日概率影子结果，比较影子排序与原策略排序。"""
     import stock_probability
-    result = stock_probability.evaluate_shadow(get_last_trade_day())
+    day = get_last_trade_day()
+    result = stock_probability.evaluate_shadow(day)
+    audit = stock_probability.governance_audit(day)
     lift = result.get("lift")
     lift_text = "暂无可比较结果" if lift is None else f"影子增益 {lift:+.2%}"
+    status = "可提交人工晋级评审" if audit["status"] == "eligible_for_manual_review" else "继续影子观察"
     return (f"概率影子评估：本次回填{result['evaluated']}条 · "
-            f"累计{result.get('total_evaluated', 0)}条/{result['groups']}组 · {lift_text}")
+            f"累计{result.get('total_evaluated', 0)}条/{result['groups']}组 · "
+            f"{lift_text} · {status}")
 
 
 # ---------------------------------------------------------------- 调度器
@@ -2920,6 +2963,10 @@ JOBS = {
                                   "func": job_probability_shadow_update,
                                   "default": {"enabled": True, "hour": 20, "minute": 20,
                                               "params": {"max_codes": 30, "top_n": 10}}},
+    "intraday_feature_update": {"name": "🧮 单股票日内特征增量更新（盘后）",
+                                "func": job_intraday_feature_update,
+                                "default": {"enabled": True, "hour": 16, "minute": 10,
+                                            "params": {"max_codes": 100, "lookback_days": 5}}},
     "probability_shadow_eval": {"name": "🧪 概率模型5日影子评估",
                                 "func": job_probability_shadow_eval,
                                 "default": {"enabled": True, "hour": 18, "minute": 50,

@@ -123,13 +123,52 @@ def test_shadow_upsert_preserves_evaluation_columns():
     print("PASS: test_shadow_upsert_preserves_evaluation_columns")
 
 
+def test_governance_requires_enough_groups():
+    original = sp._group_shadow_lifts
+    sp._group_shadow_lifts = lambda: pd.DataFrame([
+        {"trade_date": "2026-09-01", "pick_id": 1, "original_return": 0.01,
+         "shadow_return": 0.02, "lift": 0.01, "candidate_count": 10,
+         "usable_count": 10}
+    ])
+    try:
+        result = sp.governance_audit("2026-09-21", persist=False)
+        assert result["status"] == "shadow_continue"
+        assert result["automatic_activation"] is False
+        assert result["reasons"][0]["passed"] is False
+    finally:
+        sp._group_shadow_lifts = original
+    print("PASS: test_governance_requires_enough_groups")
+
+
+def test_governance_only_allows_manual_review():
+    original = sp._group_shadow_lifts
+    rows = []
+    for i in range(40):
+        lift = 0.01 + (i % 3) * 0.001
+        rows.append({"trade_date": f"2026-08-{(i % 28) + 1:02d}", "pick_id": i,
+                     "original_return": 0.005, "shadow_return": 0.005 + lift,
+                     "lift": lift, "candidate_count": 10, "usable_count": 8})
+    sp._group_shadow_lifts = lambda: pd.DataFrame(rows)
+    try:
+        result = sp.governance_audit("2026-09-21", persist=False,
+                                     cfg={"bootstrap_samples": 500})
+        assert result["status"] == "eligible_for_manual_review"
+        assert result["automatic_activation"] is False
+        assert all(x["passed"] for x in result["reasons"])
+    finally:
+        sp._group_shadow_lifts = original
+    print("PASS: test_governance_only_allows_manual_review")
+
+
 if __name__ == "__main__":
     tests = [test_beta_shrinkage_moves_to_half,
              test_path_probability_uses_no_hit_denominator,
              test_oos_validation_has_no_future_training,
              test_overlay_quality_gate_blocks_limited_model,
              test_model_selection_penalizes_tiny_current_sample,
-             test_shadow_upsert_preserves_evaluation_columns]
+             test_shadow_upsert_preserves_evaluation_columns,
+             test_governance_requires_enough_groups,
+             test_governance_only_allows_manual_review]
     failed = 0
     for test in tests:
         try:

@@ -16,6 +16,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 DATA_DIR = Path(os.environ.get("QSYS_DATA_DIR", "/data"))
@@ -110,6 +111,25 @@ def _conn():
         complete_days INTEGER DEFAULT 0, missing_days INTEGER DEFAULT 0,
         last_fetched_at TEXT, status TEXT, error TEXT,
         PRIMARY KEY(stock_id, data_type));
+    CREATE TABLE IF NOT EXISTS minute_backfill_progress(
+        stock_id INTEGER NOT NULL, code TEXT NOT NULL,
+        start_date TEXT NOT NULL, end_date TEXT NOT NULL,
+        remaining_json TEXT, attempted_days INTEGER DEFAULT 0,
+        repaired_days INTEGER DEFAULT 0, failed_json TEXT,
+        status TEXT, updated_at TEXT,
+        PRIMARY KEY(stock_id, start_date, end_date));
+    CREATE TABLE IF NOT EXISTS stock_intraday_features(
+        stock_id INTEGER NOT NULL, code TEXT NOT NULL, trade_date TEXT NOT NULL,
+        minute_count INTEGER, open_ret_30m REAL, morning_ret REAL,
+        afternoon_ret REAL, tail_ret_30m REAL, realized_vol REAL,
+        max_intraday_drawdown REAL, vwap REAL, close_vwap_gap REAL,
+        morning_volume_share REAL, tail_volume_share REAL,
+        up_minute_ratio REAL, max_up_streak INTEGER, max_down_streak INTEGER,
+        price_volume_corr REAL, high_time TEXT, low_time TEXT,
+        feature_version TEXT, computed_at TEXT,
+        PRIMARY KEY(stock_id, trade_date));
+    CREATE INDEX IF NOT EXISTS idx_intraday_features_code_date
+        ON stock_intraday_features(code, trade_date);
     -- iFinD 自动入库（⏰定时任务 ifind_*）：
     CREATE TABLE IF NOT EXISTS ifind_basic_daily(
         code TEXT NOT NULL, date TEXT NOT NULL, indicator TEXT NOT NULL,
@@ -1841,12 +1861,31 @@ def minute_completeness(code: str, start: str, end: str,
 
 def backfill_missing_minutes(code: str, start: str, end: str,
                              min_rows_per_day: int = 200,
-                             pause: float = 0.15) -> dict:
-    """只重抓缺失或不完整交易日，返回抓取前后完整率。"""
+                             pause: float = 0.15, batch_days: int | None = None) -> dict:
+    """断点补抓缺失交易日；batch_days 设置后每次只处理固定数量并持久化进度。"""
     before = minute_completeness(code, start, end, min_rows_per_day)
+    stock_id = get_or_create_stock_id(code)
+    with _conn() as c:
+        row = c.execute(
+            "SELECT remaining_json,attempted_days,repaired_days,failed_json FROM "
+            "minute_backfill_progress WHERE stock_id=? AND start_date=? AND end_date=?",
+            (stock_id, start, end)).fetchone()
+    if row:
+        saved = json.loads(row[0] or "[]")
+        # 已由其他采集任务补齐的日期从队列中移除，新发现缺口追加进去。
+        current_missing = set(before["missing_days"])
+        remaining = [d for d in saved if d in current_missing]
+        remaining += [d for d in before["missing_days"] if d not in set(remaining)]
+        attempted_total, repaired_total = int(row[1] or 0), int(row[2] or 0)
+        failed_total = json.loads(row[3] or "[]")
+    else:
+        remaining = list(before["missing_days"])
+        attempted_total = repaired_total = 0
+        failed_total = []
+    selected = remaining[:max(1, int(batch_days))] if batch_days else remaining
     written = ok = 0
     failed = []
-    for day in before["missing_days"]:
+    for day in selected:
         try:
             n = fetch_minute_to_db(code, day, "1min")
             written += n
@@ -1859,8 +1898,138 @@ def backfill_missing_minutes(code: str, start: str, end: str,
         if pause:
             time.sleep(pause)
     after = minute_completeness(code, start, end, min_rows_per_day)
+    still_missing = set(after["missing_days"])
+    remaining_after = [d for d in remaining if d in still_missing and d not in selected]
+    remaining_after += [d for d in selected if d in still_missing]
+    failed_total = sorted(set(failed_total + failed))
+    attempted_total += len(selected)
+    repaired_total += ok
+    status = "complete" if not remaining_after else "partial"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with _conn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO minute_backfill_progress"
+            "(stock_id,code,start_date,end_date,remaining_json,attempted_days,repaired_days,"
+            "failed_json,status,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (stock_id, code, start, end, json.dumps(remaining_after, ensure_ascii=False),
+             attempted_total, repaired_total, json.dumps(failed_total, ensure_ascii=False),
+             status, now))
     return {"written": written, "repaired_days": ok, "failed_days": failed,
-            "before": before, "after": after}
+            "attempted_days": len(selected), "remaining_days": len(remaining_after),
+            "status": status, "before": before, "after": after}
+
+
+def minute_backfill_status(code: str, start: str, end: str) -> dict:
+    stock_id = get_or_create_stock_id(code)
+    with _conn() as c:
+        row = c.execute(
+            "SELECT remaining_json,attempted_days,repaired_days,failed_json,status,updated_at "
+            "FROM minute_backfill_progress WHERE stock_id=? AND start_date=? AND end_date=?",
+            (stock_id, start, end)).fetchone()
+    if not row:
+        return {}
+    return {"remaining_days": len(json.loads(row[0] or "[]")),
+            "attempted_days": int(row[1] or 0), "repaired_days": int(row[2] or 0),
+            "failed_days": json.loads(row[3] or "[]"), "status": row[4],
+            "updated_at": row[5]}
+
+
+INTRADAY_FEATURE_VERSION = "intraday-v1"
+
+
+def _max_streak(flags: pd.Series, target: bool) -> int:
+    best = cur = 0
+    for value in flags.fillna(False).astype(bool):
+        if bool(value) == target:
+            cur += 1
+            best = max(best, cur)
+        else:
+            cur = 0
+    return best
+
+
+def compute_intraday_features(code: str, start: str, end: str,
+                              min_rows_per_day: int = 200) -> dict:
+    """把完整1分钟线压缩为逐股票逐日特征，幂等覆盖。"""
+    stock_id = get_or_create_stock_id(code)
+    with _conn() as c:
+        df = pd.read_sql_query(
+            "SELECT datetime,open,high,low,close,volume,amount FROM ifind_minute "
+            "WHERE code=? AND datetime BETWEEN ? AND ? ORDER BY datetime", c,
+            params=(code, start, end + " 23:59:59"))
+    if df.empty:
+        return {"computed_days": 0, "skipped_days": 0, "rows": 0}
+    df["datetime"] = pd.to_datetime(df["datetime"])
+    df["trade_date"] = df["datetime"].dt.strftime("%Y-%m-%d")
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    values, skipped = [], 0
+    for day, g in df.groupby("trade_date", sort=True):
+        g = g.sort_values("datetime").copy()
+        if len(g) < min_rows_per_day:
+            skipped += 1
+            continue
+        for col in ("open", "high", "low", "close", "volume", "amount"):
+            g[col] = pd.to_numeric(g[col], errors="coerce")
+        g = g.dropna(subset=["close"])
+        if len(g) < min_rows_per_day:
+            skipped += 1
+            continue
+        first, last = float(g["close"].iloc[0]), float(g["close"].iloc[-1])
+        close30 = float(g["close"].iloc[min(29, len(g) - 1)])
+        morning = g[g["datetime"].dt.time <= pd.Timestamp("11:30").time()]
+        afternoon = g[g["datetime"].dt.time >= pd.Timestamp("13:00").time()]
+        tail = g.tail(min(30, len(g)))
+        morning_close = float(morning["close"].iloc[-1]) if not morning.empty else close30
+        afternoon_open = float(afternoon["close"].iloc[0]) if not afternoon.empty else morning_close
+        minute_ret = g["close"].pct_change().replace([np.inf, -np.inf], np.nan)
+        # 单个交易日内的实现波动；不在这里年化，避免与后续模型的日频口径混淆。
+        realized_vol = float(np.sqrt(np.nansum(np.square(minute_ret))))
+        running_max = g["close"].cummax()
+        max_dd = float((g["close"] / running_max - 1).min())
+        volume = g["volume"].fillna(0).clip(lower=0)
+        amount = g["amount"].fillna(g["close"] * volume)
+        vol_sum = float(volume.sum())
+        vwap = float(amount.sum() / vol_sum) if vol_sum > 0 else float(g["close"].mean())
+        up_flags = minute_ret > 0
+        down_flags = minute_ret < 0
+        corr = minute_ret.corr(volume.pct_change().replace([np.inf, -np.inf], np.nan))
+        high_i, low_i = g["high"].idxmax(), g["low"].idxmin()
+        values.append((
+            stock_id, code, day, len(g), close30 / first - 1 if first else None,
+            morning_close / first - 1 if first else None,
+            last / afternoon_open - 1 if afternoon_open else None,
+            last / float(tail["close"].iloc[0]) - 1 if len(tail) > 1 else 0.0,
+            realized_vol, max_dd, vwap, last / vwap - 1 if vwap else None,
+            float(morning["volume"].fillna(0).sum() / vol_sum) if vol_sum else None,
+            float(tail["volume"].fillna(0).sum() / vol_sum) if vol_sum else None,
+            float(up_flags.mean()), _max_streak(up_flags, True),
+            _max_streak(down_flags, True), float(corr) if pd.notna(corr) else None,
+            g.loc[high_i, "datetime"].strftime("%H:%M:%S"),
+            g.loc[low_i, "datetime"].strftime("%H:%M:%S"),
+            INTRADAY_FEATURE_VERSION, now))
+    if values:
+        with _conn() as c:
+            c.executemany(
+                "INSERT OR REPLACE INTO stock_intraday_features"
+                "(stock_id,code,trade_date,minute_count,open_ret_30m,morning_ret,afternoon_ret,"
+                "tail_ret_30m,realized_vol,max_intraday_drawdown,vwap,close_vwap_gap,"
+                "morning_volume_share,tail_volume_share,up_minute_ratio,max_up_streak,"
+                "max_down_streak,price_volume_corr,high_time,low_time,feature_version,computed_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", values)
+    return {"computed_days": len(values), "skipped_days": skipped, "rows": len(df)}
+
+
+def get_intraday_features(code: str, start: str | None = None,
+                          end: str | None = None) -> pd.DataFrame:
+    where, params = ["code=?"], [code]
+    if start:
+        where.append("trade_date>=?"); params.append(start)
+    if end:
+        where.append("trade_date<=?"); params.append(end)
+    with _conn() as c:
+        return pd.read_sql_query(
+            "SELECT * FROM stock_intraday_features WHERE " + " AND ".join(where)
+            + " ORDER BY trade_date", c, params=params)
 
 
 def get_minute_from_db(code: str, day: str) -> pd.DataFrame:

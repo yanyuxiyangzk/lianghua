@@ -114,3 +114,24 @@ else:
                       help="同一批候选中，影子排序评估截面平均收益减去原排序评估截面平均收益。")
         else:
             st.caption("影子记录满5个交易日后，将自动回填真实收益并比较排序增益。")
+
+        audit = sp.governance_audit(persist=False)
+        st.markdown("##### 影子晋级治理")
+        if audit["status"] == "eligible_for_manual_review":
+            st.success("全部晋级门槛已通过，可以提交人工评审；系统仍不会自动开启正式修正。")
+        else:
+            st.info("当前继续影子观察，未达到人工晋级评审条件。")
+        metrics = audit["metrics"]
+        g1, g2, g3, g4 = st.columns(4)
+        g1.metric("成熟名单", metrics["groups"])
+        g2.metric("模型可用覆盖率", f"{metrics['usable_coverage']:.1%}")
+        g3.metric("正增益名单占比", f"{float(metrics.get('positive_group_rate') or 0):.1%}")
+        g4.metric("95%增益下限", f"{float(metrics.get('ci_low') or 0):+.2%}")
+        st.dataframe(pd.DataFrame(audit["reasons"]), hide_index=True, width="stretch")
+
+        with st.expander("查看最近影子明细"):
+            detail = sp.shadow_detail(200)
+            if detail.empty:
+                st.caption("暂无影子记录。")
+            else:
+                st.dataframe(detail, hide_index=True, width="stretch")

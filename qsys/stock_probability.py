@@ -38,7 +38,20 @@ CREATE TABLE IF NOT EXISTS stock_probability_shadow(
     UNIQUE(pick_id, code));
 CREATE INDEX IF NOT EXISTS idx_probability_shadow_eval
 ON stock_probability_shadow(eval_date, evaluated_at);
+CREATE TABLE IF NOT EXISTS stock_probability_governance(
+    audit_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    audit_date TEXT NOT NULL UNIQUE, status TEXT NOT NULL,
+    metrics_json TEXT, reasons_json TEXT, created_at TEXT);
 """
+
+GOVERNANCE_DEFAULTS = {
+    "min_groups": 30,
+    "min_usable_coverage": 0.30,
+    "min_positive_group_rate": 0.55,
+    "min_recent_positive_rate": 0.60,
+    "recent_groups": 10,
+    "bootstrap_samples": 2000,
+}
 
 
 def _ensure_schema(c) -> None:
@@ -449,3 +462,110 @@ def shadow_summary() -> dict:
     return {"total": total, "usable": usable, "evaluated": evaluated,
             "groups": groups, "original_avg": original_avg,
             "shadow_avg": shadow_avg, "lift": lift}
+
+
+def _group_shadow_lifts() -> pd.DataFrame:
+    """每个名单作为一个独立配对样本，避免股票多的名单获得更高权重。"""
+    with datasource._conn() as c:
+        _ensure_schema(c)
+        done = pd.read_sql_query(
+            "SELECT trade_date,pick_id,model_status,fwd_5d_return,original_top,shadow_top "
+            "FROM stock_probability_shadow WHERE evaluated_at IS NOT NULL", c)
+    if done.empty:
+        return pd.DataFrame()
+    rows = []
+    for (trade_date, pick_id), group in done.groupby(["trade_date", "pick_id"]):
+        original = group[group["original_top"] == 1]["fwd_5d_return"].dropna()
+        shadow = group[group["shadow_top"] == 1]["fwd_5d_return"].dropna()
+        if original.empty or shadow.empty:
+            continue
+        rows.append({
+            "trade_date": trade_date, "pick_id": int(pick_id),
+            "original_return": float(original.mean()),
+            "shadow_return": float(shadow.mean()),
+            "lift": float(shadow.mean() - original.mean()),
+            "candidate_count": int(len(group)),
+            "usable_count": int((group["model_status"] == "可用").sum()),
+        })
+    return pd.DataFrame(rows).sort_values(["trade_date", "pick_id"]) if rows else pd.DataFrame()
+
+
+def _bootstrap_mean_ci(values: np.ndarray, samples: int = 2000,
+                       seed: int = 20260921) -> tuple[float | None, float | None]:
+    if values is None or len(values) < 2:
+        return None, None
+    rng = np.random.default_rng(seed)
+    draws = rng.choice(values, size=(samples, len(values)), replace=True).mean(axis=1)
+    return float(np.quantile(draws, 0.025)), float(np.quantile(draws, 0.975))
+
+
+def governance_audit(asof: str | None = None, cfg: dict | None = None,
+                     persist: bool = True) -> dict:
+    """评估概率影子是否具备人工晋级资格；永远不改变执行开关。"""
+    cfg = {**GOVERNANCE_DEFAULTS, **(cfg or {})}
+    groups = _group_shadow_lifts()
+    audit_date = asof or datetime.now().strftime("%Y-%m-%d")
+    if groups.empty:
+        metrics = {"groups": 0, "usable_coverage": 0.0, "mean_lift": None,
+                   "positive_group_rate": None, "recent_positive_rate": None,
+                   "ci_low": None, "ci_high": None}
+    else:
+        lifts = groups["lift"].to_numpy(dtype=float)
+        total_candidates = int(groups["candidate_count"].sum())
+        usable = int(groups["usable_count"].sum())
+        recent = groups.tail(int(cfg["recent_groups"]))
+        ci_low, ci_high = _bootstrap_mean_ci(
+            lifts, int(cfg["bootstrap_samples"]))
+        metrics = {
+            "groups": int(len(groups)),
+            "usable_coverage": usable / total_candidates if total_candidates else 0.0,
+            "mean_lift": float(lifts.mean()),
+            "median_lift": float(np.median(lifts)),
+            "positive_group_rate": float((lifts > 0).mean()),
+            "recent_groups": int(len(recent)),
+            "recent_positive_rate": float((recent["lift"] > 0).mean()),
+            "ci_low": ci_low, "ci_high": ci_high,
+            "original_avg": float(groups["original_return"].mean()),
+            "shadow_avg": float(groups["shadow_return"].mean()),
+        }
+    checks = [
+        (metrics["groups"] >= cfg["min_groups"],
+         f"成熟名单至少 {cfg['min_groups']} 组（当前 {metrics['groups']}）"),
+        (metrics["usable_coverage"] >= cfg["min_usable_coverage"],
+         f"模型可用覆盖率至少 {cfg['min_usable_coverage']:.0%}（当前 {metrics['usable_coverage']:.1%}）"),
+        ((metrics["mean_lift"] or 0) > 0,
+         f"平均5日增益必须为正（当前 {(metrics['mean_lift'] or 0):+.2%}）"),
+        ((metrics["positive_group_rate"] or 0) >= cfg["min_positive_group_rate"],
+         f"正增益名单占比至少 {cfg['min_positive_group_rate']:.0%}（当前 {(metrics['positive_group_rate'] or 0):.1%}）"),
+        ((metrics["recent_positive_rate"] or 0) >= cfg["min_recent_positive_rate"]
+         and metrics.get("recent_groups", 0) >= cfg["recent_groups"],
+         f"最近 {cfg['recent_groups']} 组正增益占比至少 {cfg['min_recent_positive_rate']:.0%}"),
+        ((metrics["ci_low"] or 0) > 0,
+         f"Bootstrap 95%增益下限必须大于0（当前 {(metrics['ci_low'] or 0):+.2%}）"),
+    ]
+    reasons = [{"passed": bool(ok), "rule": text} for ok, text in checks]
+    status = "eligible_for_manual_review" if all(ok for ok, _ in checks) else "shadow_continue"
+    result = {"audit_date": audit_date, "status": status, "metrics": metrics,
+              "reasons": reasons, "config": cfg, "automatic_activation": False}
+    if persist:
+        with datasource._conn() as c:
+            _ensure_schema(c)
+            c.execute(
+                "INSERT OR REPLACE INTO stock_probability_governance"
+                "(audit_date,status,metrics_json,reasons_json,created_at) VALUES(?,?,?,?,?)",
+                (audit_date, status, json.dumps({"metrics": metrics, "config": cfg},
+                                                ensure_ascii=False),
+                 json.dumps(reasons, ensure_ascii=False),
+                 datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    return result
+
+
+def shadow_detail(limit: int = 200) -> pd.DataFrame:
+    with datasource._conn() as c:
+        _ensure_schema(c)
+        return pd.read_sql_query(
+            "SELECT trade_date,pick_id,code,original_rank,shadow_rank,model_status,"
+            "probability_edge,shadow_adjustment,eval_date,fwd_5d_return,original_top,"
+            "shadow_top,evaluated_at FROM stock_probability_shadow "
+            "ORDER BY trade_date DESC,pick_id DESC,original_rank LIMIT ?", c,
+            params=(int(limit),))

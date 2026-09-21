@@ -29,7 +29,7 @@ def render():
     today = pd.Timestamp.now().strftime("%Y-%m-%d")
     packs = library.list_strategies()
     TRACK_FILE = DATA_DIR / "today_tracks.json"
-    RULES = experience.DEFAULT_RULES  # 止盈15% / 止损-8% / 持有≤20交易日
+    RULES = experience.get_risk_rules("main")
 
 
     def _pct(x):
@@ -222,7 +222,8 @@ def render():
         st.markdown("---")
         st.markdown("### 📦 当前持仓")
         st.caption("名单次日挂**限价委托**（限价=名单参考价）→ 现价触及才成交开仓"
-                   " · 止盈+15% / 止损-8% / 满20交易日自动平仓 · T+1（成交日当天不卖）"
+                   f" · 止盈+{RULES['take_profit']:.0%} / 止损{RULES['stop_loss']:.0%} / "
+                   f"满{RULES['hold_days']}交易日进入到期评估 · T+1（成交日当天不卖）"
                    " · 当日未成交委托收盘自动失效")
         try:
             opens = experience.get_open_positions()
@@ -348,4 +349,3 @@ def render():
             st.rerun()
 
     st.caption("📚 各策略包最近实战赚没赚：左侧「📚 实战成绩」页 · 想自己调策略：专业区「🧩选股组合」")
-

@@ -342,7 +342,7 @@ def render():
                     for c in show_final.index
                 ]
                 # 交易计划：参考买入价(快照最新价,缺省用昨收) + 止盈/止损价
-                rules = _exp.DEFAULT_RULES
+                rules = _exp.get_risk_rules("main")
                 ref = [smap.get(c, {}).get("price") or smap.get(c, {}).get("prev_close")
                        for c in show_final.index]
                 show_final["参考买入价"] = [round(p, 2) if p else None for p in ref]

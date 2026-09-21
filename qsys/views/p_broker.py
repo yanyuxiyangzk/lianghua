@@ -41,15 +41,16 @@ def _hold_days(d0: str) -> int:
 def _merged_positions() -> pd.DataFrame:
     """合并展示：柜台手动持仓 + AI 自动跟踪持仓（列对齐，含类型/止盈/止损）。"""
     import experience
+    main_rules = experience.get_risk_rules("main")
     rows = []
     poss = broker.get_positions()
     for _, p in poss.iterrows():
         if p["source"] != "manual":
             continue  # AI 持仓以经验库 positions 为准（含每日批次明细），柜台 ai 行仅作资金台账
         tp = p["tp_price"] if pd.notna(p["tp_price"]) else (
-            p["cost"] * (1 + broker.TP_RATE) if pd.notna(p["cost"]) else None)
+            p["cost"] * (1 + main_rules["take_profit"]) if pd.notna(p["cost"]) else None)
         sl = p["sl_price"] if pd.notna(p["sl_price"]) else (
-            p["cost"] * (1 - broker.SL_RATE) if pd.notna(p["cost"]) else None)
+            p["cost"] * (1 + main_rules["stop_loss"]) if pd.notna(p["cost"]) else None)
         cur = p["最新价"] if pd.notna(p["最新价"]) else None
         rows.append({
             "code": p["code"], "name": p["name"], "类型": "手动买入",
@@ -141,7 +142,8 @@ def render():
                 "来源": merged["来源"],
             })
             st.dataframe(show, hide_index=True, width='stretch')
-            st.caption("止盈/止损随实盘价滚动触发自动卖出（手动 +15%/-8% · AI +15%/-8%/满20交易日）"
+            st.caption(f"止盈/止损随实盘价滚动触发自动卖出（主轨默认 +{main_rules['take_profit']:.0%}/"
+                       f"{main_rules['stop_loss']:.0%}/满{main_rules['hold_days']}交易日进入到期评估）"
                        " · 两种类型均可在「💰 卖出」页手动卖出（T+1）")
 
     # ---------------------------------------------------------------- 买入

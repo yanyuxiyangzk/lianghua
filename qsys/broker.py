@@ -23,6 +23,16 @@ TAX_RATE = 0.0005       # 印花税 0.05%（卖出）
 TP_RATE = 0.15          # 手动持仓默认止盈 +15%
 SL_RATE = 0.08          # 手动持仓默认止损 -8%
 
+
+def _main_risk_rates() -> tuple[float, float]:
+    """读取后台主轨风控参数；导入失败时回退到兼容常量。"""
+    try:
+        import experience
+        rules = experience.get_risk_rules("main")
+        return float(rules["take_profit"]), abs(float(rules["stop_loss"]))
+    except Exception:
+        return TP_RATE, SL_RATE
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS broker_account (
     key TEXT PRIMARY KEY, value TEXT);
@@ -276,6 +286,7 @@ def _fill(c, order_id: int, fill_price: float):
     cash_key = _cash_key(source)
     cash = float(c.execute("SELECT value FROM broker_account WHERE key=?", (cash_key,)).fetchone()[0])
     if side == "buy":
+        tp_rate, sl_rate = _main_risk_rates()
         cash -= (amount + fee)
         c.execute("UPDATE broker_account SET value=? WHERE key=?", (str(round(cash, 2)), cash_key))
         pos = c.execute("SELECT shares, sellable, today_bought, cost FROM broker_positions"
@@ -287,15 +298,15 @@ def _fill(c, order_id: int, fill_price: float):
                       " tp_price=?, sl_price=?, last_buy_date=?, updated_at=?"
                       " WHERE code=? AND source=?",
                       (new_shares, pos[2] + shares, round(new_cost, 4),
-                       round(new_cost * (1 + TP_RATE), 4), round(new_cost * (1 - SL_RATE), 4),
+                       round(new_cost * (1 + tp_rate), 4), round(new_cost * (1 - sl_rate), 4),
                        _today(), _now(), code, source))
         else:
             c.execute("INSERT INTO broker_positions (code, source, name, shares, sellable,"
                       " today_bought, cost, last_buy_date, updated_at, tp_price, sl_price)"
                       " VALUES (?,?,?,?,0,?,?,?,?,?,?)",
                       (code, source, name, shares, shares, round(fill_price, 4), _today(), _now(),
-                       round(fill_price * (1 + TP_RATE), 4),
-                       round(fill_price * (1 - SL_RATE), 4)))
+                       round(fill_price * (1 + tp_rate), 4),
+                       round(fill_price * (1 - sl_rate), 4)))
         _cashflow(c, "买入", -(amount + fee),
                   f"[{tag}]买入 {name or code} {shares}股@{fill_price:.2f}", source)
     else:
@@ -380,6 +391,7 @@ def check_stop_exits() -> int:
         return 0
     prices = _latest_prices(list(rows["code"]))
     n = 0
+    tp_rate, sl_rate = _main_risk_rates()
     for _, r in rows.iterrows():
         if int(r["sellable"] or 0) <= 0:
             continue  # T+1：当日买入不可卖
@@ -387,8 +399,8 @@ def check_stop_exits() -> int:
         cur = pr[0] if pr else None
         if not cur or not r["cost"]:
             continue
-        tp = r["tp_price"] if r["tp_price"] else r["cost"] * (1 + TP_RATE)
-        sl = r["sl_price"] if r["sl_price"] else r["cost"] * (1 - SL_RATE)
+        tp = r["tp_price"] if r["tp_price"] else r["cost"] * (1 + tp_rate)
+        sl = r["sl_price"] if r["sl_price"] else r["cost"] * (1 - sl_rate)
         if cur >= tp or cur <= sl:
             msg = place_order(r["code"], "sell", None, int(r["sellable"]), source="manual")
             if "已成交" in msg:
@@ -406,6 +418,18 @@ def cancel_order(order_id: int) -> str:
         c.execute("UPDATE broker_orders SET status='已撤', cancel_ts=? WHERE id=?",
                   (_now(), order_id))
     return f"委托 #{order_id} 已撤销"
+
+
+def cancel_pending_buys(source: str | None = None) -> int:
+    """撤销尚未成交的买单；卖单不受账户开仓闸影响。"""
+    with _conn() as c:
+        sql = ("UPDATE broker_orders SET status='已撤', cancel_ts=? "
+               "WHERE status='已报' AND side='buy'")
+        params: list = [_now()]
+        if source:
+            sql += " AND source=?"
+            params.append(source)
+        return int(c.execute(sql, params).rowcount)
 
 
 # ---------------------------------------------------------------- 查询

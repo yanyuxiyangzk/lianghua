@@ -231,7 +231,7 @@ if auto and auto.get("selected"):
             smap = {s["code"]: s for s in snaps}
         except Exception:
             smap = {}
-        rules = experience.DEFAULT_RULES
+        rules = experience.get_risk_rules("main")
         ref = [smap.get(c, {}).get("price") or smap.get(c, {}).get("prev_close") for c in tp.index]
 
         def _reason(c):
@@ -334,7 +334,7 @@ else:
             smap = {s["code"]: s for s in snaps}
         except Exception:
             smap, snap_ts = {}, None
-        rules = experience.DEFAULT_RULES
+        rules = experience.get_risk_rules("main")
         ref = [smap.get(c, {}).get("price") or smap.get(c, {}).get("prev_close") for c in merged]
         tbl = pd.DataFrame({
             "代码": merged,

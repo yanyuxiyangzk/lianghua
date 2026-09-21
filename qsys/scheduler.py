@@ -1316,7 +1316,7 @@ def job_realtime_kline(**_ignored) -> str:
 
 
 def job_trade_simulate() -> str:
-    """模拟交易回填：对经验库新名单按默认规则（止盈15%/止损-8%/持有20日）逐笔模拟平仓。"""
+    """模拟交易回填：对经验库新名单按后台当前主轨风控参数逐笔模拟平仓。"""
     import experience
 
     return experience.backfill_trades()
@@ -1686,6 +1686,42 @@ def job_factor_direction(**_ignored) -> str:
     return f"方向状态机：{len(dm)} 因子在册 · 今日无反转（磁滞生效）"
 
 
+def _apply_account_risk(today: str, rk: dict, prefix: str = "") -> str:
+    """落实账户级开仓闸；减仓部分仅生成影子建议。"""
+    import broker
+    import experience
+
+    cfg = experience.get_account_risk_config()
+    level, target = experience.account_risk_level(rk["dd_now"], cfg)
+    dynamic_halt = bool(rk.get("circuit"))
+    if dynamic_halt and level in ("normal", "yellow"):
+        level, target = "orange", cfg["orange_target"]
+    halt_all = level in ("orange", "red")
+    labels = {"normal": "正常", "yellow": "黄色预警", "orange": "橙色风控", "red": "红色风控"}
+    reason = f"{labels[level]}：当前回撤 {rk['dd_now']*100:.2f}%"
+    if dynamic_halt:
+        reason += f"，触及动态熔断线 {rk['circuit_line']*100:.2f}%"
+    experience._write_risk_flag(today, halt_all, reason, level=level,
+                                target_position_ratio=target)
+    plan = experience.build_risk_reduction_plan(
+        rk, today, level_override=level, target_override=target)
+    advice = experience.risk_llm_advice(plan)
+    cancelled = broker.cancel_pending_buys() if halt_all else 0
+    action = "正常运行"
+    if level == "yellow":
+        action = "禁止卫星来源开仓"
+    elif halt_all:
+        action = f"停止全部开仓，撤销买单 {cancelled} 笔"
+    shadow = ""
+    if plan.get("required_release", 0) > 0:
+        shadow = f"；影子减仓建议释放 {plan['required_release']:.2f} 元（未自动卖出）"
+    llm_note = ""
+    if advice.get("status") == "ok":
+        llm_note = f"；LLM参考：{advice.get('stance')}（置信度 {float(advice.get('confidence') or 0):.0%}）"
+    return (f"{prefix}{labels[level]}：回撤 {rk['dd_now']*100:.2f}% · "
+            f"目标仓位 {target*100:.0f}% · {action}{shadow}{llm_note}")
+
+
 def job_risk_guard(**_ignored) -> str:
     """组合风控评估（开盘前 09:20）：净值波动率 → 日 VaR + 熔断状态写
     risk_state.json（开仓闸，position_open_from_picks 每日开盘前读取）。
@@ -1703,14 +1739,7 @@ def job_risk_guard(**_ignored) -> str:
     rk = experience.portfolio_risk(use_live=True)
     if not rk.get("ok"):
         return f"风控评估跳过：{rk.get('reason')}"
-    if rk["circuit"]:
-        experience._write_risk_flag(today, True,
-                                    f"净值回撤 {rk['dd_now']*100:.1f}% 触及熔断线 {rk['circuit_line']*100:.1f}%")
-        return (f"⛔ 熔断：净值回撤 {rk['dd_now']*100:.2f}% ≤ 熔断线 {rk['circuit_line']*100:.2f}%"
-                f"（σ={rk['sigma']*100:.2f}%），今日停止开新仓")
-    experience._write_risk_flag(today, False, "")
-    return (f"风控正常：净值 {rk['nav']:.4f} · 日VaR {rk['var_pct']*100:.2f}% · "
-            f"当前回撤 {rk['dd_now']*100:.2f}% · 熔断线 {rk['circuit_line']*100:.2f}%")
+    return _apply_account_risk(today, rk)
 
 
 def job_risk_guard_intraday(**_ignored) -> str:
@@ -1729,29 +1758,12 @@ def job_risk_guard_intraday(**_ignored) -> str:
 
     import experience
     today = now.strftime("%Y-%m-%d")
-    # 检查当前是否已熔断
-    is_halt, reason = experience.risk_halt_today(today)
     # P1-3修复：use_live=True 从实时持仓计算当前回撤
     rk = experience.portfolio_risk(use_live=True)
     if not rk.get("ok"):
         return f"盘中风控跳过：{rk.get('reason')}"
 
-    if rk["circuit"]:
-        if not is_halt:
-            # 新触发熔断
-            experience._write_risk_flag(today, True,
-                                        f"盘中熔断：净值回撤 {rk['dd_now']*100:.1f}% 触及熔断线 {rk['circuit_line']*100:.1f}%")
-            return (f"⛔ 盘中熔断：净值回撤 {rk['dd_now']*100:.2f}% ≤ 熔断线 {rk['circuit_line']*100:.2f}%"
-                    f"（σ={rk['sigma']*100:.2f}%），停止开新仓")
-        else:
-            return f"盘中风控：维持熔断状态（{reason}）"
-    else:
-        if is_halt:
-            # 熔断解除（回撤恢复）
-            experience._write_risk_flag(today, False, "")
-            return (f"✅ 熔断解除：净值回撤 {rk['dd_now']*100:.2f}% > 熔断线 {rk['circuit_line']*100:.2f}%")
-        else:
-            return (f"盘中风控正常：回撤 {rk['dd_now']*100:.2f}% · 熔断线 {rk['circuit_line']*100:.2f}%")
+    return _apply_account_risk(today, rk, prefix="盘中")
 
 
 def job_account_snapshot(**_ignored) -> str:

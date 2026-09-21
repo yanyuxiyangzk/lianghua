@@ -92,8 +92,86 @@ def test_save_pick_norm_not_identity():
     print("PASS: test_save_pick_norm_not_identity")
 
 
+def test_account_risk_level_boundaries():
+    """账户回撤分级边界应稳定落在 normal/yellow/orange/red。"""
+    import experience
+    cfg = {
+        "yellow_drawdown": 0.03, "orange_drawdown": 0.05, "red_drawdown": 0.08,
+        "normal_target": 0.80, "yellow_target": 0.70,
+        "orange_target": 0.60, "red_target": 0.30,
+    }
+    assert experience.account_risk_level(-0.0299, cfg) == ("normal", 0.80)
+    assert experience.account_risk_level(-0.03, cfg) == ("yellow", 0.70)
+    assert experience.account_risk_level(-0.05, cfg) == ("orange", 0.60)
+    assert experience.account_risk_level(-0.08, cfg) == ("red", 0.30)
+    print("PASS: test_account_risk_level_boundaries")
+
+
+def test_risk_llm_normal_skips_call():
+    """正常风险等级不得调用 LLM，避免常态消耗 Token。"""
+    import experience
+    import llmutil
+    original = llmutil.llm_chat
+    llmutil.llm_chat = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("normal 等级不应调用 LLM"))
+    try:
+        result = experience.risk_llm_advice({"date": "2026-09-21", "level": "normal"})
+        assert result["status"] == "skipped"
+        assert result["advisory_only"] is True
+    finally:
+        llmutil.llm_chat = original
+    print("PASS: test_risk_llm_normal_skips_call")
+
+
+def test_risk_llm_advice_enforces_boundaries():
+    """LLM 不能放宽目标仓位，也不能推荐证据集之外的股票。"""
+    import json
+    import experience
+    import llmutil
+    original = llmutil.llm_chat
+    captured = {}
+
+    def fake_chat(system, user, **kwargs):
+        captured.update(system=system, user=user, kwargs=kwargs)
+        return json.dumps({
+            "decision": "维持规则计划",
+            "confidence": 0.9,
+            "recommended_target_position": 0.95,
+            "summary": "测试",
+            "priority_positions": [
+                {"code": "SH600000", "priority": 1, "action": "优先减仓", "reason": "当前浮亏"},
+                {"code": "SH999999", "priority": 2, "action": "优先减仓", "reason": "不存在"},
+            ],
+            "account_actions": ["保持开仓闸"],
+            "rule_disagreement": {"has_disagreement": False, "reason": ""},
+            "missing_evidence": [],
+        }, ensure_ascii=False)
+
+    llmutil.llm_chat = fake_chat
+    try:
+        plan = {
+            "date": "2026-09-21", "level": "orange", "drawdown": -0.05,
+            "current_position_ratio": 0.8, "target_position_ratio": 0.6,
+            "required_release": 20000,
+            "positions": [{"code": "SH600000", "source": "ai", "market_value": 30000,
+                           "risk_score": 25, "suggested_sell_value": 20000,
+                           "reasons": ["当前浮亏"]}],
+        }
+        result = experience.risk_llm_advice(plan, force=True)
+        assert result["recommended_target_position"] == 0.6
+        assert [x["code"] for x in result["priority_positions"]] == ["SH600000"]
+        assert "strict" not in captured["user"].lower()
+        assert captured["user"].startswith("账户风险证据 JSON")
+        assert captured["kwargs"]["label"] == "account_risk_advice_v2"
+    finally:
+        llmutil.llm_chat = original
+    print("PASS: test_risk_llm_advice_enforces_boundaries")
+
+
 if __name__ == "__main__":
-    tests = [test_default_rules_contain_atr, test_dynamic_tp_logic, test_save_pick_norm_not_identity]
+    tests = [test_default_rules_contain_atr, test_dynamic_tp_logic,
+             test_save_pick_norm_not_identity, test_account_risk_level_boundaries,
+             test_risk_llm_normal_skips_call, test_risk_llm_advice_enforces_boundaries]
     passed = failed = 0
     for t in tests:
         try:

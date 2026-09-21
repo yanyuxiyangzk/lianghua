@@ -158,7 +158,7 @@ def render():
         pass
 
     # 止盈/止损参考价：已入场的按实际买入价，未入场的按最新快照价
-    _rules = experience.DEFAULT_RULES
+    _rules = experience.get_risk_rules("main")
     _entry = items["entry_price"] if "entry_price" in items.columns else pd.Series([None] * len(items))
     _last = items["最新价"] if "最新价" in items.columns else pd.Series([None] * len(items))
     _ref = [(b if pd.notna(b) else l) for b, l in zip(_entry, _last)]
@@ -182,7 +182,7 @@ def render():
         done = items["pnl_pct"].dropna()
         win = (done > 0).mean()
         st.markdown(f"**个股模拟交易成绩**：{len(done)} 笔已平仓 · 胜率 {win:.0%} · 平均盈亏 {done.mean():+.2%}"
-                    f"（规则：止盈15% / 止损-8% / 持有≤20日，含双边成本）")
+                    f"（规则：止盈{_rules['take_profit']:.0%} / 止损{_rules['stop_loss']:.0%} / "
+                    f"持有≤{_rules['hold_days']}日，含双边成本）")
 
     st.caption("更多聚合视图：📚经验库（策略包/因子实战榜）· 📈模拟交易（逐笔流水）")
-

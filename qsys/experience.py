@@ -112,6 +112,7 @@ CREATE TABLE IF NOT EXISTS evolution_signals (
 
 
 def _conn():
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(DB_PATH, timeout=30)
     c.execute("PRAGMA busy_timeout=30000")  # 写冲突时等待30秒，避免 database is locked
     c.execute("PRAGMA journal_mode=WAL")    # 读写不互斥（此前默认 DELETE，锁升级死锁频发）
@@ -141,7 +142,12 @@ def _conn():
     # max_close 滚动跟踪入场以来最高收盘（吊灯止盈基准）；extend_count 到期顺延计数
     for col, ddl in [("sup_lo_entry", "REAL"), ("atr_entry", "REAL"),
                      ("regime_entry", "TEXT"), ("max_close", "REAL"),
-                     ("extend_count", "INTEGER DEFAULT 0")]:
+                     ("extend_count", "INTEGER DEFAULT 0"),
+                     ("last_extend_date", "TEXT"), ("next_review_date", "TEXT"),
+                     ("risk_take_profit", "REAL"), ("risk_stop_loss", "REAL"),
+                     ("risk_hold_days", "INTEGER"), ("risk_rule_version", "TEXT"),
+                     ("sell_attempts", "INTEGER DEFAULT 0"),
+                     ("last_sell_attempt", "TEXT")]:
         if col not in pcols:
             c.execute(f"ALTER TABLE positions ADD COLUMN {col} {ddl}")
     # 迁移：picks 增加 data_source（生产库为历史手工添加，全新建库走不到——
@@ -404,6 +410,110 @@ DEFAULT_RULES = {"take_profit": 0.15, "stop_loss": -0.08, "hold_days": 20, "cost
 # 事件增强票规则：止损更紧（-5% vs -8%）、止盈更保守（+12% vs +15%）
 EVENT_RULES = {"take_profit": 0.12, "stop_loss": -0.05, "hold_days": 15, "cost": 0.0025,
                "atr_period": 14, "atr_tp_multiplier": 2.0, "use_atr_tp": True}
+RISK_RULES_FILE = DATA_DIR / "risk_rules.json"
+ACCOUNT_RISK_DEFAULTS = {
+    "yellow_drawdown": 0.03, "orange_drawdown": 0.05, "red_drawdown": 0.08,
+    "normal_target": 0.80, "yellow_target": 0.70,
+    "orange_target": 0.60, "red_target": 0.30,
+}
+RISK_PLAN_FILE = DATA_DIR / "risk_reduction_plan.json"
+RISK_LLM_ADVICE_FILE = DATA_DIR / "risk_llm_advice.json"
+RISK_LLM_PROMPT_VERSION = "risk-shadow-v2"
+RISK_LLM_SYSTEM_PROMPT = """你是量化账户的只读影子风控决策器。你的职责是审查规则引擎生成的账户风险计划，并提供结构化的第二意见。
+
+优先级与权限边界：
+1. 硬规则、风险等级、止损约束和账户目标仓位始终拥有最高优先级。
+2. 你只能建议“维持规则计划”“建议收紧”“转人工复核”，不得建议放宽规则计划。
+3. recommended_target_position 必须小于或等于输入的 target_position_ratio，且范围为 0 到 1。
+4. 你不能下单、撤单、恢复被禁止的开仓、改变风险状态或承诺收益。
+5. 只能引用输入证据；数据不足时写入 missing_evidence 并选择“转人工复核”，禁止猜测。
+
+审查顺序：
+A. 比较当前仓位、目标仓位和需释放金额。
+B. 检查卫星来源、浮亏、持有期及规则风险分，按风险优先级排序。
+C. 判断规则计划是否遗漏显著风险；若需更保守，只能降低建议目标仓位。
+D. 每项持仓建议必须对应输入 positions 中的 code，并给出可由输入验证的 reason。
+
+严格输出一个 JSON 对象，不要 Markdown、代码围栏或额外文字：
+{"decision":"维持规则计划|建议收紧|转人工复核","confidence":0.0,
+"recommended_target_position":0.0,"summary":"不超过80字",
+"priority_positions":[{"code":"输入中的代码","priority":1,"action":"优先减仓|继续观察|人工复核","reason":"输入证据"}],
+"account_actions":["最多3项，只能是建议"],
+"rule_disagreement":{"has_disagreement":false,"reason":"无分歧时为空字符串"},
+"missing_evidence":["最多3项"]}
+
+限制：priority_positions 最多5项，priority 从1开始且不得重复；confidence 范围0到1。"""
+
+
+def get_risk_rules(track: str = "main") -> dict:
+    """动态读取持仓风控参数；文件异常时安全回退到代码默认值。"""
+    base = DEFAULT_RULES if track == "main" else EVENT_RULES
+    try:
+        saved = json.loads(RISK_RULES_FILE.read_text()) if RISK_RULES_FILE.exists() else {}
+    except Exception:
+        saved = {}
+    cfg = saved.get(track, {}) if isinstance(saved, dict) else {}
+    out = {**base}
+    try:
+        tp = float(cfg.get("take_profit", out["take_profit"]))
+        sl = float(cfg.get("stop_loss", out["stop_loss"]))
+        days = int(cfg.get("hold_days", out["hold_days"]))
+        if 0.01 <= tp <= 1.0:
+            out["take_profit"] = tp
+        if -0.5 <= sl <= -0.005:
+            out["stop_loss"] = sl
+        if 1 <= days <= 250:
+            out["hold_days"] = days
+    except (TypeError, ValueError):
+        pass
+    return out
+
+
+def save_risk_rules(main: dict, event: dict) -> None:
+    """保存主轨/卫星来源风控参数，并同步当前页面进程中的兼容常量。"""
+    old = {}
+    try:
+        old = json.loads(RISK_RULES_FILE.read_text()) if RISK_RULES_FILE.exists() else {}
+    except Exception:
+        pass
+    payload = {"main": main, "event": event, "account": old.get("account", {}),
+               "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+    RISK_RULES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = RISK_RULES_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    tmp.replace(RISK_RULES_FILE)
+    DEFAULT_RULES.update(get_risk_rules("main"))
+    EVENT_RULES.update(get_risk_rules("event"))
+
+
+def get_account_risk_config() -> dict:
+    try:
+        saved = json.loads(RISK_RULES_FILE.read_text()) if RISK_RULES_FILE.exists() else {}
+        cfg = saved.get("account", {}) if isinstance(saved, dict) else {}
+    except Exception:
+        cfg = {}
+    out = {**ACCOUNT_RISK_DEFAULTS}
+    for key in out:
+        try:
+            value = float(cfg.get(key, out[key]))
+            if 0.005 <= value <= 0.95:
+                out[key] = value
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def save_account_risk_config(cfg: dict) -> None:
+    try:
+        saved = json.loads(RISK_RULES_FILE.read_text()) if RISK_RULES_FILE.exists() else {}
+    except Exception:
+        saved = {}
+    saved["account"] = cfg
+    saved["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    RISK_RULES_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = RISK_RULES_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(saved, ensure_ascii=False, indent=2))
+    tmp.replace(RISK_RULES_FILE)
 # 规则：信号日次日开盘价买入；盘中先触止损按止损价、先触止盈按止盈价（同日双触按保守止损）；
 # 到期未触发则第 N 日收盘卖出。成本按往返 0.25% 计。
 
@@ -414,7 +524,7 @@ def trade_plan(ref_price: float | None, signal_date: str, rules: dict | None = N
     买入时间 = 信号日次一交易日开盘；最迟平仓 = 买入后第 hold_days 个交易日收盘。
     日历超出 qlib 数据末端时按 weekday 顺延近似（遇节假日再顺延，仅作参考）。
     """
-    rules = rules or DEFAULT_RULES
+    rules = rules or get_risk_rules("main")
     cal = _calendar()
     if signal_date in cal and cal.index(signal_date) + 1 < len(cal):
         nxt = cal[cal.index(signal_date) + 1]
@@ -443,7 +553,7 @@ def simulate_trade(code: str, signal_date: str, rules: dict | None = None,
     """对单只标的从 signal_date 起模拟一笔交易。返回成交明细或 None（数据不足）。
     entry_price_override 给定则以指定买入价入场（手动模拟）；entry_date_override 指定入场日。"""
     import datasource
-    r = {**DEFAULT_RULES, **(rules or {})}
+    r = {**get_risk_rules("main"), **(rules or {})}
     cal = _calendar()
     if signal_date not in cal:
         return None
@@ -602,6 +712,28 @@ def _latest_prices(codes: list[str]) -> dict:
     return {r.code: (r.price, r.open, r.prev_close) for r in df.itertuples()}
 
 
+def _latest_price_times(codes: list[str]) -> dict[str, str]:
+    """返回每只股票最新行情时间，用于阻断陈旧行情上的错误交易。"""
+    import datasource
+    if not codes:
+        return {}
+    with datasource._qconn() as c:
+        rows = c.execute(
+            f"SELECT code,MAX(datetime) FROM ifind_realtime WHERE code IN "
+            f"({','.join('?' * len(codes))}) GROUP BY code", codes).fetchall()
+    return {str(code): str(ts) for code, ts in rows if ts}
+
+
+def _quote_is_fresh(ts: str | None, max_minutes: int = 10) -> bool:
+    if not ts:
+        return False
+    try:
+        dt = pd.to_datetime(ts).to_pydatetime()
+        return -60 <= (datetime.now() - dt).total_seconds() <= max_minutes * 60
+    except Exception:
+        return False
+
+
 def _position_names(codes: list[str]) -> dict:
     import datasource
     if not codes:
@@ -674,6 +806,11 @@ def position_open_from_picks(trade_date: str, today: str) -> str:
             items = pick_items_detail(int(r.id))
             if items.empty:
                 continue
+            if r.source == "satellite_scan":
+                sat_halt, _sat_why = satellite_halt_today(today)
+                if sat_halt:
+                    n_defer += len(items)
+                    continue
             codes = list(items["code"])
             names = _position_names(codes)
             # 参考买入价 = 扫描日收盘价（名单生成时的价格）
@@ -735,16 +872,21 @@ def position_open_from_picks(trade_date: str, today: str) -> str:
                             continue  # 流通市值不足30亿，流动性风险
                 except Exception:
                     pass
+                entry_rules = (get_risk_rules("event") if r.source == "satellite_scan"
+                               or _is_event_enhanced_pick(r.pack_name)
+                               else get_risk_rules("main"))
                 cur = c.execute(
                     "INSERT OR IGNORE INTO positions"
                     "(code, name, buy_date, buy_price, buy_ts, pick_id, source, pack_name,"
-                    " status, limit_price, created_at, sup_lo_entry, atr_entry, regime_entry)"
-                    " VALUES (?,?,?,NULL,?,?,?,?, 'pending', ?, ?, ?, ?, ?)",
+                    " status, limit_price, created_at, sup_lo_entry, atr_entry, regime_entry,"
+                    " risk_take_profit,risk_stop_loss,risk_hold_days,risk_rule_version)"
+                    " VALUES (?,?,?,NULL,?,?,?,?, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (it.code, names.get(it.code, ""), today, now,
                      int(r.id), r.source, r.pack_name, float(limit), now,
                      float(sr["sup_lo"]) if sr is not None and pd.notna(sr.get("sup_lo")) else None,
                      float(sr["atr"]) if sr is not None and pd.notna(sr.get("atr")) else None,
-                     regime_now))
+                     regime_now, entry_rules["take_profit"], entry_rules["stop_loss"],
+                     entry_rules["hold_days"], now))
                 n_new += cur.rowcount
     msg = f"委托挂单：新增 {n_new} 笔限价单"
     if n_defer:
@@ -794,8 +936,20 @@ def _get_position_rules(pos_row) -> dict:
         pos_row["pack_name"] if "pack_name" in pos_row.index else None)
     source = pos_row.get("source") if hasattr(pos_row, "get") else (
         pos_row["source"] if "source" in pos_row.index else None)
-    return (EVENT_RULES if source in ("satellite_scan", "sched_satellite_scan")
-            or _is_event_enhanced_pick(pk_name) else DEFAULT_RULES)
+    track = ("event" if source in ("satellite_scan", "sched_satellite_scan")
+             or _is_event_enhanced_pick(pk_name) else "main")
+    rules = get_risk_rules(track)
+    # 新仓使用入场时保存的规则快照；老仓无快照时兼容动态配置。
+    try:
+        tp = pos_row.get("risk_take_profit")
+        sl = pos_row.get("risk_stop_loss")
+        days = pos_row.get("risk_hold_days")
+        if pd.notna(tp) and pd.notna(sl) and pd.notna(days):
+            rules = {**rules, "take_profit": float(tp), "stop_loss": float(sl),
+                     "hold_days": int(days)}
+    except Exception:
+        pass
+    return rules
 
 
 def position_fill_check(today: str) -> str:
@@ -808,7 +962,9 @@ def position_fill_check(today: str) -> str:
     if pend.empty:
         return "无挂单"
     prices = _latest_prices(list(pend["code"]))
+    quote_times = _latest_price_times(list(pend["code"]))
     n_fill = n_expire = 0
+    n_stale = n_sat_limit = 0
     # P2-6修复：统计实际pending数量，按实际数量分配预算
     n_pending_total = len(pend)
     with _conn() as c:
@@ -821,6 +977,9 @@ def position_fill_check(today: str) -> str:
                 continue
             pr = prices.get(p["code"])
             cur = pr[0] if pr else None
+            if not _quote_is_fresh(quote_times.get(str(p["code"]))):
+                n_stale += 1
+                continue
             if cur is None or not p["limit_price"]:
                 continue
             if cur <= p["limit_price"]:  # 现价触及限价 → 成交（取更优价）
@@ -849,6 +1008,22 @@ def position_fill_check(today: str) -> str:
                     _total = _bk.get_account().get("总资产", 0) or 0
                     if _total > 0:
                         per = min(per, 0.15 * _total)
+                        if p["source"] == "satellite_scan":
+                            per = min(per, 0.05 * _total)
+                            sat = pd.read_sql(
+                                "SELECT code,COALESCE(shares,0) shares,COALESCE(buy_price,0) buy_price"
+                                " FROM positions WHERE source='satellite_scan'"
+                                " AND status IN ('open','closing')", c)
+                            sat_codes = set(sat["code"]) if not sat.empty else set()
+                            sat_prices = _latest_prices(list(sat_codes)) if sat_codes else {}
+                            sat_value = (sum(float(row["shares"] or 0) * float(
+                                (sat_prices.get(row["code"]) or (row["buy_price"],))[0]
+                                or row["buy_price"] or 0) for _, row in sat.iterrows())
+                                if not sat.empty else 0.0)
+                            if ((len(sat_codes) >= 3 and p["code"] not in sat_codes)
+                                    or sat_value + per > 0.15 * _total):
+                                n_sat_limit += 1
+                                continue
                 except Exception:
                     pass
                 # M7 持仓数上限：open+pending ≥8 不再开新仓（防过散）
@@ -896,6 +1071,10 @@ def position_fill_check(today: str) -> str:
         parts.append(f"成交开仓 {n_fill} 笔")
     if n_expire:
         parts.append(f"失效撤单 {n_expire} 笔")
+    if n_stale:
+        parts.append(f"行情过期跳过 {n_stale} 笔")
+    if n_sat_limit:
+        parts.append(f"卫星仓位上限拦截 {n_sat_limit} 笔")
     return "；".join(parts) if parts else "挂单无触发"
 
 
@@ -1085,12 +1264,12 @@ def position_close_check(today: str) -> str:
     记账（不按触发价）；卖出前做双账本校验（经验库 open 股数 vs 柜台 ai 持仓
     股数，不一致则跳过该代码并计入消息，避免账本漂移后卖错数量）。
     """
-    r = DEFAULT_RULES  # 默认规则；事件增强票在循环内切换为 EVENT_RULES
     with _conn() as c:
         opens = pd.read_sql("SELECT * FROM positions WHERE status='open'", c)
     if opens.empty:
         return "无持仓"
     prices = _latest_prices(list(opens["code"]))
+    quote_times = _latest_price_times(list(opens["code"]))
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     # M3 逻辑腿要用的强弱三态（持仓股；失败则 None→到期即平，维持现状）
     _states_map = None
@@ -1110,7 +1289,7 @@ def position_close_check(today: str) -> str:
     except Exception:
         broker_shares = {}
     open_sum = opens.groupby("code")["shares"].sum()
-    n_close = n_skip = n_order = 0
+    n_close = n_skip = n_order = n_stale = n_sell_fail = 0
     _mc_updates = []  # M3 吊灯基准的滚动最高收盘，循环末统一写（防与柜台写锁自锁）
     with _conn() as c:
         for _, p in opens.iterrows():
@@ -1131,6 +1310,9 @@ def position_close_check(today: str) -> str:
             # 只有broker库存不足时才跳过
             pr = prices.get(code)
             cur = pr[0] if pr and pr[0] else None
+            if not _quote_is_fresh(quote_times.get(code)):
+                n_stale += 1
+                continue
             if not cur:
                 continue
             # 每个仓位独立选规则：事件增强票用更紧的止损/止盈
@@ -1176,19 +1358,39 @@ def position_close_check(today: str) -> str:
                 if not reason:
                     hd = _trade_days_between(str(p["buy_date"]), today)
                     if hd >= r["hold_days"]:
+                        next_review = str(p.get("next_review_date") or "")
+                        if next_review and today < next_review:
+                            continue
                         # M3 逻辑腿：到期且转弱才平；仍强则顺延（防好票被日历赶下车）
                         extend = int(p["extend_count"] or 0) if "extend_count" in p.index else 0
                         # P2-10修复：strength_states()失败时默认"strong"而非"weak"，避免强制平仓
                         state = "strong" if _states_map is None else _states_map.get(code, "weak")
                         # P2-3修复：自适应顺延上限（strong=2次, neutral=1次, weak=0次）
                         max_extend = 2 if state == "strong" else (1 if state == "neutral" else 0)
-                        if extend < max_extend:
-                            c.execute("UPDATE positions SET extend_count=? WHERE id=?",
-                                      (extend + 1, int(p["id"])))
-                            continue  # 顺延一个持有期
+                        if extend < max_extend and str(p.get("last_extend_date") or "") != today:
+                            # 强势每次顺延3个交易日，中性顺延2个；同一交易日只记一次。
+                            review_days = 3 if state == "strong" else 2
+                            cal = _calendar()
+                            if today in cal:
+                                idx = min(cal.index(today) + review_days, len(cal) - 1)
+                                review_date = cal[idx]
+                            else:
+                                d = pd.Timestamp(today)
+                                n = 0
+                                while n < review_days:
+                                    d += pd.Timedelta(days=1)
+                                    if d.weekday() < 5:
+                                        n += 1
+                                review_date = d.strftime("%Y-%m-%d")
+                            c.execute("UPDATE positions SET extend_count=?,last_extend_date=?,"
+                                      " next_review_date=? WHERE id=?",
+                                      (extend + 1, today, review_date, int(p["id"])))
+                            continue
                         reason, limit_price = "到期", round(cur * 0.995, 2)
             if reason:
                 # 委托制（实盘规则）：触发只挂单，触及才成交；当日未成交收盘自动撤，次日重估重挂
+                c.execute("UPDATE positions SET sell_attempts=COALESCE(sell_attempts,0)+1,"
+                          " last_sell_attempt=? WHERE id=?", (now, int(p["id"])))
                 msg = broker.place_order(code, "sell", limit_price, int(p["shares"] or 0),
                                          source="ai")
                 if "已成交" in msg:
@@ -1215,13 +1417,18 @@ def position_close_check(today: str) -> str:
                               " sell_order_id=? WHERE id=?",
                               (reason, int(mo.group(1)) if mo else None, int(p["id"])))
                     n_order += 1
-                # 其他结果（可卖不足等）→ 保持 open，下个周期再试
+                else:
+                    n_sell_fail += 1  # 可卖不足、行情异常等：保持 open，下周期重试并告警
 
     parts = [f"平仓 {n_close} 笔"] if n_close else ["持仓检查：无触发"]
     if n_order:
         parts.append(f"挂出卖单 {n_order} 笔")
     if n_skip:
         parts.append(f"账本不一致跳过 {n_skip} 笔（经验库与柜台股数对不上）")
+    if n_stale:
+        parts.append(f"行情超过10分钟跳过 {n_stale} 笔")
+    if n_sell_fail:
+        parts.append(f"卖出触发但下单失败 {n_sell_fail} 笔（将重试）")
     return "；".join(parts)
 
 
@@ -1264,6 +1471,7 @@ def get_open_positions() -> pd.DataFrame:
     df["最新价"] = df["code"].map(lambda x: (prices.get(x) or (None,))[0])
     df["浮动盈亏%"] = (df["最新价"] / df["buy_price"] - 1) * 100
     df["浮动盈亏额"] = (df["最新价"] - df["buy_price"]) * df["shares"].fillna(0)
+    df["市值"] = df["最新价"].fillna(df["buy_price"]) * df["shares"].fillna(0)
     df["持有交易日"] = df["buy_date"].map(
         lambda d: _trade_days_between(str(d), today))
     df["可卖(股)"] = df.apply(
@@ -1481,6 +1689,212 @@ def nav_stats() -> dict:
 # ---------------------------------------------------------------- 组合风控（M4）
 _RISK_FLAG = DATA_DIR / "risk_state.json"  # 当日风控状态（开仓闸）
 
+
+def account_risk_level(drawdown: float, cfg: dict | None = None) -> tuple[str, float]:
+    """按正数回撤幅度返回 normal/yellow/orange/red 及目标仓位。"""
+    cfg = cfg or get_account_risk_config()
+    dd = abs(min(float(drawdown or 0), 0.0))
+    if dd >= cfg["red_drawdown"]:
+        return "red", cfg["red_target"]
+    if dd >= cfg["orange_drawdown"]:
+        return "orange", cfg["orange_target"]
+    if dd >= cfg["yellow_drawdown"]:
+        return "yellow", cfg["yellow_target"]
+    return "normal", cfg["normal_target"]
+
+
+def build_risk_reduction_plan(rk: dict, today: str, level_override: str | None = None,
+                              target_override: float | None = None) -> dict:
+    """生成影子减仓计划；只计算建议，不产生任何真实卖单。"""
+    import broker
+    cfg = get_account_risk_config()
+    level, target = account_risk_level(rk.get("dd_now", 0), cfg)
+    if level_override in ("normal", "yellow", "orange", "red"):
+        level = level_override
+    if target_override is not None:
+        target = float(target_override)
+    acc = broker.get_account()
+    total = float(acc.get("总资产", 0) or 0)
+    opens = get_open_positions()
+    current_mv = float(opens["市值"].sum()) if (not opens.empty and "市值" in opens) else 0.0
+    current_ratio = current_mv / total if total > 0 else 0.0
+    release = max(0.0, current_mv - total * target)
+    rows = []
+    if release > 0 and not opens.empty:
+        for _, p in opens.iterrows():
+            source = str(p.get("source") or "")
+            pnl = float(p.get("浮动盈亏%") or 0) / 100
+            hold = int(p.get("持有交易日") or 0)
+            rules = _get_position_rules(p)
+            score = 0.0
+            reasons = []
+            if source in ("satellite_scan", "sched_satellite_scan"):
+                score += 35; reasons.append("卫星来源")
+            if pnl < 0:
+                score += min(25, abs(pnl) * 200); reasons.append("当前浮亏")
+            if hold >= int(rules["hold_days"]):
+                score += 20; reasons.append("已到持有期")
+            if str(p.get("sell_reason") or ""):
+                score += 20; reasons.append(str(p.get("sell_reason")))
+            value = float(p.get("市值") or 0)
+            rows.append({"position_id": int(p["id"]), "code": p["code"],
+                         "name": p.get("name") or "", "source": source,
+                         "market_value": round(value, 2), "risk_score": round(score, 2),
+                         "reasons": reasons})
+        rows.sort(key=lambda x: (x["risk_score"], x["market_value"]), reverse=True)
+        remain = release
+        for row in rows:
+            suggested = min(row["market_value"], remain)
+            row["suggested_sell_value"] = round(max(0.0, suggested), 2)
+            remain -= suggested
+    plan = {"date": today, "level": level, "drawdown": rk.get("dd_now"),
+            "target_position_ratio": target, "current_position_ratio": current_ratio,
+            "required_release": round(release, 2), "shadow_only": True,
+            "positions": rows, "created_at": datetime.now().strftime("%F %T")}
+    tmp = RISK_PLAN_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(plan, ensure_ascii=False, indent=2, default=str))
+    tmp.replace(RISK_PLAN_FILE)
+    return plan
+
+
+def latest_risk_plan() -> dict:
+    try:
+        return json.loads(RISK_PLAN_FILE.read_text()) if RISK_PLAN_FILE.exists() else {}
+    except Exception:
+        return {}
+
+
+def risk_llm_advice(plan: dict, force: bool = False) -> dict:
+    """生成只读 LLM 风控意见；按日期和结构化风险数据哈希缓存。
+
+    LLM 不得修改风险等级、目标仓位或触发交易；失败时保留规则引擎结果。
+    """
+    import hashlib
+    import llmutil
+
+    level = str(plan.get("level") or "normal")
+    if level == "normal":
+        advice = {"status": "skipped", "reason": "正常等级不调用 LLM，节省 Token",
+                  "date": plan.get("date"), "level": level, "advisory_only": True}
+        RISK_LLM_ADVICE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = RISK_LLM_ADVICE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(advice, ensure_ascii=False, indent=2))
+        tmp.replace(RISK_LLM_ADVICE_FILE)
+        return advice
+
+    top = []
+    for row in (plan.get("positions") or [])[:8]:
+        top.append({
+            "code": str(row.get("code") or ""),
+            "source": str(row.get("source") or ""),
+            "market_value": round(float(row.get("market_value") or 0), 2),
+            "risk_score": round(float(row.get("risk_score") or 0), 2),
+            "suggested_sell_value": round(float(row.get("suggested_sell_value") or 0), 2),
+            "reasons": [str(x)[:40] for x in (row.get("reasons") or [])[:3]],
+        })
+    evidence = {
+        "date": str(plan.get("date") or ""),
+        "level": level,
+        "drawdown": round(float(plan.get("drawdown") or 0), 6),
+        "current_position_ratio": round(float(plan.get("current_position_ratio") or 0), 4),
+        "target_position_ratio": round(float(plan.get("target_position_ratio") or 0), 4),
+        "required_release": round(float(plan.get("required_release") or 0), 2),
+        "positions": top,
+    }
+    raw_evidence = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    data_hash = hashlib.sha256(
+        f"{RISK_LLM_PROMPT_VERSION}\n{raw_evidence}".encode()).hexdigest()[:16]
+    if not force:
+        try:
+            cached = json.loads(RISK_LLM_ADVICE_FILE.read_text())
+            if cached.get("date") == evidence["date"] and cached.get("data_hash") == data_hash:
+                cached["cache_hit"] = True
+                return cached
+        except Exception:
+            pass
+
+    # 固定规则与 Schema 全部位于稳定 system 前缀；user 只承载末尾动态数据，
+    # 同时保留应用层“日期 + 数据 hash”精确缓存。
+    user = "账户风险证据 JSON：\n" + raw_evidence
+    reply = llmutil.llm_chat(
+        RISK_LLM_SYSTEM_PROMPT, user, max_tokens=650,
+        label="account_risk_advice_v2")
+    if not reply:
+        return {"status": "unavailable", "date": evidence["date"], "level": level,
+                "data_hash": data_hash, "reason": llmutil.llm_failure_reason()}
+    try:
+        import re
+        match = re.search(r"\{[\s\S]*\}", reply)
+        parsed = json.loads(match.group()) if match else {}
+        decision = str(parsed.get("decision") or "转人工复核")
+        if decision not in ("维持规则计划", "建议收紧", "转人工复核"):
+            decision = "转人工复核"
+        rule_target = float(evidence["target_position_ratio"])
+        try:
+            recommended_target = float(parsed.get("recommended_target_position"))
+        except (TypeError, ValueError):
+            recommended_target = rule_target
+            decision = "转人工复核"
+        # LLM 只可维持或收紧，绝不能突破规则引擎的目标仓位上限。
+        recommended_target = max(0.0, min(rule_target, recommended_target))
+        valid_codes = {x["code"] for x in top}
+        priority_positions = []
+        used_priorities = set()
+        for item in (parsed.get("priority_positions") or [])[:5]:
+            if not isinstance(item, dict) or str(item.get("code") or "") not in valid_codes:
+                continue
+            try:
+                priority = int(item.get("priority"))
+            except (TypeError, ValueError):
+                continue
+            action = str(item.get("action") or "人工复核")
+            if priority < 1 or priority in used_priorities or action not in ("优先减仓", "继续观察", "人工复核"):
+                continue
+            used_priorities.add(priority)
+            priority_positions.append({
+                "code": str(item["code"]), "priority": priority, "action": action,
+                "reason": str(item.get("reason") or "")[:120],
+            })
+        priority_positions.sort(key=lambda x: x["priority"])
+        disagreement = parsed.get("rule_disagreement") or {}
+        if not isinstance(disagreement, dict):
+            disagreement = {}
+        advice = {
+            "status": "ok", "date": evidence["date"], "level": level,
+            "data_hash": data_hash, "prompt_version": RISK_LLM_PROMPT_VERSION,
+            "cache_hit": False, "decision": decision,
+            # 兼容调度结果和旧页面字段。
+            "stance": {"维持规则计划": "维持", "建议收紧": "收紧",
+                       "转人工复核": "人工复核"}[decision],
+            "confidence": max(0.0, min(1.0, float(parsed.get("confidence") or 0))),
+            "recommended_target_position": recommended_target,
+            "summary": str(parsed.get("summary") or "")[:160],
+            "priority_positions": priority_positions,
+            "account_actions": [str(x)[:120] for x in (parsed.get("account_actions") or [])[:3]],
+            "rule_disagreement": {
+                "has_disagreement": bool(disagreement.get("has_disagreement", False)),
+                "reason": str(disagreement.get("reason") or "")[:160],
+            },
+            "missing_evidence": [str(x)[:120] for x in (parsed.get("missing_evidence") or [])[:3]],
+            "created_at": datetime.now().strftime("%F %T"),
+            "advisory_only": True,
+        }
+    except Exception as exc:
+        advice = {"status": "invalid", "date": evidence["date"], "level": level,
+                  "data_hash": data_hash, "reason": f"LLM 输出解析失败：{type(exc).__name__}"}
+    RISK_LLM_ADVICE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = RISK_LLM_ADVICE_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(advice, ensure_ascii=False, indent=2))
+    tmp.replace(RISK_LLM_ADVICE_FILE)
+    return advice
+
+
+def latest_risk_llm_advice() -> dict:
+    try:
+        return json.loads(RISK_LLM_ADVICE_FILE.read_text()) if RISK_LLM_ADVICE_FILE.exists() else {}
+    except Exception:
+        return {}
+
 def portfolio_risk(use_live: bool = False) -> dict:
     """组合风控评估（M4）：账户净值序列波动率 → 日 VaR 近似 + 熔断状态。
 
@@ -1502,20 +1916,17 @@ def portfolio_risk(use_live: bool = False) -> dict:
     var_day = 1.65 * sigma * total
     circuit_line = -2 * sigma * np.sqrt(5)
 
-    # P1-3修复：use_live=True 时从实时持仓计算当前回撤
+    # use_live=True：用当前总资产推算实时净值，再相对历史净值峰值计算回撤。
     if use_live:
         try:
-            # 用最新净值快照作为基准，当前总资产作为最新值
-            latest_nav = float(df["date"].iloc[-1]) if not df.empty else None
-            # 读取最新快照的总资产作为基准
-            base_total = float(df.iloc[-1]["daily_ret"]) if not df.empty else total
-            # 简化：用总资产 vs 上次快照的总资产计算日内回撤
             with _conn() as c2:
-                last_snap = pd.read_sql(
-                    "SELECT total_assets FROM account_snapshots ORDER BY date DESC LIMIT 1", c2)
-            if not last_snap.empty and last_snap.iloc[0]["total_assets"]:
-                base = float(last_snap.iloc[0]["total_assets"])
-                dd_now = (total - base) / base if base > 0 else 0
+                nav_df = pd.read_sql(
+                    "SELECT date,total_assets,nav FROM account_nav_daily ORDER BY date", c2)
+            if not nav_df.empty and float(nav_df.iloc[-1]["total_assets"] or 0) > 0:
+                last = nav_df.iloc[-1]
+                live_nav = float(last["nav"]) * total / float(last["total_assets"])
+                peak_nav = max(float(nav_df["nav"].max()), live_nav)
+                dd_now = live_nav / peak_nav - 1 if peak_nav > 0 else 0.0
             else:
                 dd_now = float(df["drawdown"].iloc[-1])
         except Exception:
@@ -1543,13 +1954,26 @@ def risk_halt_today(today: str) -> tuple[bool, str]:
     return False, ""
 
 
-def _write_risk_flag(today: str, halt: bool, reason: str):
+def satellite_halt_today(today: str) -> tuple[bool, str]:
+    """黄色及以上禁止卫星候选开仓；橙色以上由 risk_halt_today 阻断全部。"""
+    try:
+        st_ = json.loads(_RISK_FLAG.read_text())
+        if st_.get("date") == today and st_.get("level") in ("yellow", "orange", "red"):
+            return True, st_.get("reason", "账户风险预警")
+    except Exception:
+        pass
+    return False, ""
+
+
+def _write_risk_flag(today: str, halt: bool, reason: str, level: str = "normal",
+                     target_position_ratio: float | None = None):
     """P2-4修复：使用原子写入（先写临时文件再重命名），防止中断导致JSON损坏。"""
     import tempfile
     tmp_fd, tmp_path = tempfile.mkstemp(dir=str(DATA_DIR), suffix=".tmp")
     try:
         with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
-            json.dump({"date": today, "halt": halt, "reason": reason,
+            json.dump({"date": today, "halt": halt, "level": level,
+                       "target_position_ratio": target_position_ratio, "reason": reason,
                        "ts": datetime.now().strftime("%F %T")}, f, ensure_ascii=False)
         # 原子重命名
         os.replace(tmp_path, str(_RISK_FLAG))

@@ -58,7 +58,12 @@ def render():
                               help="只有点击此按钮才会调用同花顺接口；页面加载不会自动爬取。")
     if not valid:
         return
-    existing = _load(dbcode, str(start), str(end))
+    request_sig = (dbcode, str(start), str(end))
+    fetched_sig = st.session_state.get("hist_fetched_sig")
+    # 输入股票/范围后不主动查库；只有本次点击抓取成功后才查询并展示结果。
+    existing = pd.DataFrame()
+    if fetched_sig == request_sig:
+        existing = _load(dbcode, str(start), str(end))
     a, b, c = st.columns(3)
     a.metric("本地记录", f"{len(existing):,} 条")
     b.metric("最早日期", existing.date.min() if not existing.empty else "—")
@@ -68,12 +73,13 @@ def render():
             try:
                 n = datasource._ths_fetch_daily(dbcode, str(start), str(end))
                 _record_job(dbcode, str(start), str(end), n)
+                st.session_state["hist_fetched_sig"] = request_sig
                 st.success(f"抓取完成：写入/覆盖 {n} 条记录。重复抓取会按股票+日期覆盖更新。")
                 st.rerun()
             except Exception as exc:
                 _record_job(dbcode, str(start), str(end), 0, "failed", str(exc)[:500])
                 st.error(f"抓取失败：{exc}")
-    if not existing.empty:
+    if fetched_sig == request_sig and not existing.empty:
         st.subheader("最近历史数据")
         st.dataframe(existing.tail(100), hide_index=True, use_container_width=True)
         st.subheader("删除该股票历史行情")

@@ -98,7 +98,18 @@ def render():
     st.dataframe(summary, hide_index=True, use_container_width=True)
     selected = st.selectbox("选择聚类簇查看关系图", summary.cluster_id.tolist())
     _network(selected, latest, corr)
-    detail = latest[latest.cluster_id == selected].merge(reg, left_on="factor_name", right_on="name", how="left")
+    detail = latest[latest.cluster_id == selected].merge(
+        reg, left_on="factor_name", right_on="name", how="left", suffixes=("_cluster", "_registry"))
+    # 聚类表与注册表均可能有 family/theory_id，统一成页面字段。
+    for col in ["family", "theory_id", "gate_status", "validation_status"]:
+        if col not in detail.columns:
+            candidates = [f"{col}_cluster", f"{col}_registry"]
+            detail[col] = next((detail[x] for x in candidates if x in detail.columns), None)
+        elif detail[col].isna().all():
+            for alt in (f"{col}_cluster", f"{col}_registry"):
+                if alt in detail.columns:
+                    detail[col] = detail[alt]
+                    break
     st.subheader(f"{selected} 成员明细")
     st.dataframe(detail[["factor_name", "cluster_role", "cluster_score", "family", "theory_id", "gate_status", "validation_status"]], hide_index=True, use_container_width=True)
 

@@ -22,7 +22,84 @@ MATCH_SCHEMES = {
     "intraday_balanced": ("trend_state", "vol_state", "intraday_direction_state",
                           "close_vwap_state", "pressure_state"),
     "intraday_broad": ("trend_state", "intraday_direction_state", "pressure_state"),
+    # 市场 regime 维度：因子失效与个股条件分布漂移的主要外生变量。
+    # 候选总数保持克制（7个），选择仍只走滚动样本外指标。
+    "regime_balanced": ("trend_state", "vol_state", "market_trend_state"),
+    "regime_intraday": ("trend_state", "intraday_direction_state",
+                        "pressure_state", "market_trend_state"),
+    # 软匹配核：连续特征距离加权，非状态列匹配（空元组为标记，走专门分支）。
+    # 解决硬匹配"状态必须全等"的样本效率瓶颈（实证：866天历史只匹配到53个）。
+    "kernel": (),
 }
+
+KERNEL_FEATURES = ("ret_5", "ret_20", "vol_20", "volume_ratio", "atr_pct")
+
+
+def _kernel_weights(history: pd.DataFrame, current: pd.Series) -> pd.Series | None:
+    """连续特征 PIT 稳健标准化 + 高斯核权重；权重索引与 history 对齐。
+
+    标准化只用 history 的中位数/IQR（不用未来样本的分布）。带宽取 sqrt(维度)
+    的经验规则（IQR 标准化空间内平均距离≈维度数），不在样本外调参，避免带宽
+    本身成为新的过拟合源。特征不足/样本不足/当前值缺失时返回 None 表示不可用。
+    """
+    feats = [c for c in KERNEL_FEATURES
+             if c in history.columns and c in current.index]
+    if len(feats) < 3:
+        return None
+    h = history.dropna(subset=feats)
+    if len(h) < 40:
+        return None
+    cur = pd.to_numeric(current[feats], errors="coerce")
+    if cur.isna().any():
+        return None
+    med = h[feats].median()
+    iqr = (h[feats].quantile(0.75) - h[feats].quantile(0.25)).replace(0, np.nan)
+    z_h = ((h[feats] - med) / iqr).dropna(axis=1)
+    if z_h.shape[1] < 3:
+        return None
+    z_c = (cur[z_h.columns] - med[z_h.columns]) / iqr[z_h.columns]
+    dist2 = ((z_h - z_c) ** 2).sum(axis=1)
+    bw = float(np.sqrt(z_h.shape[1]))
+    w = np.exp(-0.5 * dist2 / (bw * bw))
+    return w[w > 1e-6]
+
+
+def _ess(weights: pd.Series) -> float:
+    """有效样本量：(Σw)²/Σw²，一个主导近邻时退化为1，均匀时等于样本数。"""
+    s = float(weights.sum())
+    return s * s / float((weights ** 2).sum()) if s > 0 else 0.0
+
+
+def _predict_kernel(history: pd.DataFrame, current: pd.Series) -> tuple[dict, float, str]:
+    """核加权条件频率：加权频率 × ESS 等效样本量做收缩和 Wilson 区间。"""
+    w = _kernel_weights(history, current)
+    if w is None:
+        return {}, 0.0, "连续特征高斯核软匹配(不可用)"
+    h = history.loc[w.index]
+    result = {}
+    for hz in HORIZONS:
+        ycol = f"up_{hz}"
+        mask = h[ycol].notna()
+        wy = w[mask]
+        if wy.empty:
+            result[f"up_{hz}d"] = _prob(0, 0)
+            continue
+        p_hat = float((wy * h.loc[mask, ycol].astype(float)).sum() / wy.sum())
+        ess = _ess(wy)
+        result[f"up_{hz}d"] = _prob(p_hat * ess, ess)
+    mask = h["path_5"].notna()
+    wp = w[mask]
+    if wp.empty:
+        result["up_atr_5d"] = _prob(0, 0)
+        result["down_atr_5d"] = _prob(0, 0)
+    else:
+        ess = _ess(wp)
+        path = h.loc[mask, "path_5"]
+        p_up = float((wp * (path == "up").astype(float)).sum() / wp.sum())
+        p_down = float((wp * (path == "down").astype(float)).sum() / wp.sum())
+        result["up_atr_5d"] = _prob(p_up * ess, ess)
+        result["down_atr_5d"] = _prob(p_down * ess, ess)
+    return result, _ess(w), "连续特征高斯核软匹配"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS stock_probability_models(
@@ -80,6 +157,13 @@ LLM_PROFILE_SYSTEM = """你是单股票统计概率模型的只读量化审查�
 
 def _ensure_schema(c) -> None:
     c.executescript(_SCHEMA)
+    # 影子表补列（升级兼容）：ATR 倒数基线对照——元纪律要求 overlay 必须同时跑赢
+    # "什么都不做"和"ATR 倒数一行规则"两个基线，防"治过拟合的工具自己过拟合"。
+    cols = [r[1] for r in c.execute("PRAGMA table_info(stock_probability_shadow)")]
+    for col, typ in [("baseline_adjustment", "REAL"), ("baseline_score", "REAL"),
+                     ("baseline_rank", "INTEGER"), ("baseline_top", "INTEGER DEFAULT 0")]:
+        if col not in cols:
+            c.execute(f"ALTER TABLE stock_probability_shadow ADD COLUMN {col} {typ}")
 
 
 def _load_daily(code: str) -> pd.DataFrame:
@@ -98,6 +182,37 @@ def _load_intraday(code: str) -> pd.DataFrame:
             "morning_volume_share,tail_volume_share,up_minute_ratio "
             "FROM stock_intraday_features WHERE code=? AND minute_count>=200 "
             "ORDER BY trade_date", c, params=(code,))
+
+
+MARKET_INDEX_CODE = "SH000001"
+
+
+def _load_market() -> pd.DataFrame:
+    """上证指数日线 → 市场 regime 状态（趋势/波动），按日期外连接到个股特征。
+
+    指数 20 日涨跌幅远小于个股，趋势阈值用 ±3%（个股用 ±5%）；
+    波动状态与个股同法：扩张分位数，不用未来样本定当前阈值。
+    """
+    with datasource._conn() as c:
+        df = pd.read_sql_query(
+            "SELECT date,close FROM market_daily WHERE source='ths_ifind' "
+            "AND code=? ORDER BY date", c, params=(MARKET_INDEX_CODE,))
+    if df.empty or len(df) < 90:
+        return pd.DataFrame()
+    d = df.copy()
+    d["date"] = pd.to_datetime(d["date"])
+    d["close"] = pd.to_numeric(d["close"], errors="coerce")
+    d = d.dropna(subset=["close"]).sort_values("date").reset_index(drop=True)
+    idx_ret_20 = d["close"].pct_change(20)
+    idx_vol_20 = d["close"].pct_change().rolling(20).std() * math.sqrt(252)
+    d["market_trend_state"] = pd.cut(
+        idx_ret_20, [-np.inf, -0.03, 0.03, np.inf], labels=["down", "flat", "up"])
+    q33 = idx_vol_20.expanding(60).quantile(0.33)
+    q67 = idx_vol_20.expanding(60).quantile(0.67)
+    d["market_vol_state"] = np.where(idx_vol_20 <= q33, "low",
+                                     np.where(idx_vol_20 >= q67, "high", "mid"))
+    return d[["date", "market_trend_state", "market_vol_state"]].dropna(
+        subset=["market_trend_state"])
 
 
 def intraday_quality_report(code: str, min_rows: int = 200,
@@ -126,12 +241,17 @@ def intraday_quality_report(code: str, min_rows: int = 200,
                       else "完整分钟交易日少于60天或覆盖率不足95%"}
 
 
-def _features_and_labels(df: pd.DataFrame, intraday: pd.DataFrame | None = None) -> pd.DataFrame:
+def _features_and_labels(df: pd.DataFrame, intraday: pd.DataFrame | None = None,
+                         market: pd.DataFrame | None = None) -> pd.DataFrame:
     d = df.copy()
     d["date"] = pd.to_datetime(d["date"])
     for col in ("open", "high", "low", "close", "volume", "amount"):
         d[col] = pd.to_numeric(d[col], errors="coerce")
     d = d.dropna(subset=["close", "high", "low"]).sort_values("date").reset_index(drop=True)
+    if market is not None and not market.empty:
+        market = market.copy()
+        market["date"] = pd.to_datetime(market["date"])
+        d = d.merge(market, on="date", how="left")
     ret = d["close"].pct_change()
     d["ret_5"] = d["close"].pct_change(5)
     d["ret_20"] = d["close"].pct_change(20)
@@ -177,20 +297,28 @@ def _features_and_labels(df: pd.DataFrame, intraday: pd.DataFrame | None = None)
         fwd = d["close"].shift(-h) / d["close"] - 1
         d[f"fwd_{h}"] = fwd
         d[f"up_{h}"] = (fwd > 0).astype(float).where(fwd.notna())
-    # 5日路径标签：未来窗口内先触及 +3% / -3%。
+    # 5日路径标签：未来窗口内先触及 ±1×ATR%（当日PIT值）。
+    # 固定 ±3% 对高波股（ATR 6%+）几乎必触、对低波股几乎不触，阈值必须随个股波动
+    # 自适应；clip 下限1%上限15%防停牌恢复期/极端日的退化阈值。
+    thr = d["atr_pct"].clip(lower=0.01, upper=0.15)
+    d["path_threshold"] = thr
+    closes = d["close"].to_numpy(dtype=float)
+    highs = d["high"].to_numpy(dtype=float)
+    lows = d["low"].to_numpy(dtype=float)
+    thrs = thr.to_numpy(dtype=float)
     outcomes = []
     for i in range(len(d)):
-        base = d.at[i, "close"]
-        future = d.iloc[i + 1:i + 6]
+        base, t = closes[i], thrs[i]
         hit = "no_hit"
-        for row in future.itertuples():
-            if row.low / base - 1 <= -0.03:
-                hit = "down3"; break  # 同根双触保守按下跌
-            if row.high / base - 1 >= 0.03:
-                hit = "up3"; break
+        if np.isfinite(base) and np.isfinite(t) and base > 0:
+            for j in range(i + 1, min(i + 6, len(d))):
+                if lows[j] / base - 1 <= -t:
+                    hit = "down"; break  # 同根双触保守按下跌
+                if highs[j] / base - 1 >= t:
+                    hit = "up"; break
         outcomes.append(hit)
     d["path_5"] = outcomes
-    return d.dropna(subset=["ret_5", "ret_20", "vol_20", "volume_ratio"])
+    return d.dropna(subset=["ret_5", "ret_20", "vol_20", "volume_ratio", "atr_pct"])
 
 
 def _similar(history: pd.DataFrame, current: pd.Series,
@@ -198,7 +326,10 @@ def _similar(history: pd.DataFrame, current: pd.Series,
     labels = {"strict": "四状态精确匹配", "balanced": "放宽成交量状态",
               "broad": "放宽动量和成交量状态",
               "intraday_balanced": "日线趋势+日内方向/均价/买卖压力",
-              "intraday_broad": "日线趋势+日内方向/买卖压力"}
+              "intraday_broad": "日线趋势+日内方向/买卖压力",
+              "regime_balanced": "日线趋势/波动+市场趋势",
+              "regime_intraday": "日线趋势+日内方向/买卖压力+市场趋势",
+              "kernel": "连续特征高斯核软匹配"}
     schemes = ("strict", "balanced", "broad") if scheme == "auto" else (scheme,)
     last = history.iloc[0:0]
     for name in schemes:
@@ -232,34 +363,72 @@ def _prob(success: int, n: int, prior_strength: int = 20) -> dict:
 
 def _predict_from_history(history: pd.DataFrame, current: pd.Series,
                           scheme: str = "auto") -> tuple[dict, int, str]:
+    if scheme == "kernel":
+        result, ess, method = _predict_kernel(history, current)
+        return result, int(round(ess)), method
     similar, method = _similar(history, current, scheme)
     result = {}
     for h in HORIZONS:
         valid = similar[f"up_{h}"].dropna()
         result[f"up_{h}d"] = _prob(int(valid.sum()), len(valid))
     path = similar["path_5"].dropna()
-    result["up_3pct_5d"] = _prob(int((path == "up3").sum()), len(path))
-    result["down_3pct_5d"] = _prob(int((path == "down3").sum()), len(path))
+    result["up_atr_5d"] = _prob(int((path == "up").sum()), len(path))
+    result["down_atr_5d"] = _prob(int((path == "down").sum()), len(path))
     return result, len(similar), method
 
 
+def _auc(scores: list[float], labels: list[float]) -> float | None:
+    """Mann-Whitney AUC：P(正类分 > 负类分) + 0.5×并列。"""
+    pos = [s for s, y in zip(scores, labels) if y > 0.5]
+    neg = [s for s, y in zip(scores, labels) if y < 0.5]
+    if not pos or not neg:
+        return None
+    wins = ties = 0
+    for p in pos:
+        for n_ in neg:
+            if p > n_:
+                wins += 1
+            elif p == n_:
+                ties += 1
+    return (wins + 0.5 * ties) / (len(pos) * len(neg))
+
+
 def _oos_validate(data: pd.DataFrame, scheme: str = "auto") -> dict:
-    """最后20%时间段逐点预测，训练集永远只取预测日之前。"""
-    start = max(80, int(len(data) * 0.8))
+    """多窗口 walk-forward：60%/70%/80% 三折起点逐点预测，训练集永远只取预测日之前。
+
+    单次 80/20 切分的样本外只有 ~20%×n 个点，模型选择方差大；三折聚合后样本外
+    点数约翻倍，选择更稳。返回方向指标 + 下行路径 AUC（机制A闸门用）。
+    """
+    n = len(data)
+    bounds = sorted({max(80, int(n * f)) for f in (0.6, 0.7, 0.8)})
+    bounds = [b for b in bounds if b < n - 5]
+    if not bounds:
+        return {"count": 0, "brier": None, "accuracy": None,
+                "calibration_error": None, "path_auc": None}
+    bounds.append(n - 5)
     rows = []
-    for i in range(start, len(data) - 5):
-        # 所有候选模型同时预测最长10日标签；训练末端必须至少滞后10个交易日，
-        # 否则靠近预测日的训练标签实际使用了预测日之后的价格，造成标签泄漏。
-        history_end = i - max(HORIZONS)
-        if history_end <= 0:
-            continue
-        preds, n, _ = _predict_from_history(data.iloc[:history_end], data.iloc[i], scheme)
-        p = preds["up_5d"]["shrunk"]
-        y = data.iloc[i]["up_5"]
-        if pd.notna(y) and n >= 10:
-            rows.append((p, float(y)))
+    path_scores, path_labels = [], []
+    for b0, b1 in zip(bounds, bounds[1:]):
+        for i in range(b0, b1):
+            # 所有候选模型同时预测最长10日标签；训练末端必须至少滞后10个交易日，
+            # 否则靠近预测日的训练标签实际使用了预测日之后的价格，造成标签泄漏。
+            history_end = i - max(HORIZONS)
+            if history_end <= 0:
+                continue
+            preds, m, _ = _predict_from_history(data.iloc[:history_end], data.iloc[i], scheme)
+            if not preds or m < 10:
+                continue
+            y = data.iloc[i]["up_5"]
+            if pd.notna(y):
+                rows.append((preds["up_5d"]["shrunk"], float(y)))
+            actual = data.iloc[i]["path_5"]
+            if actual in ("up", "down"):
+                path_scores.append(preds["down_atr_5d"]["shrunk"])
+                path_labels.append(1.0 if actual == "down" else 0.0)
+    result = {"count": 0, "brier": None, "accuracy": None,
+              "calibration_error": None, "path_auc": _auc(path_scores, path_labels)}
     if not rows:
-        return {"count": 0, "brier": None, "accuracy": None, "calibration_error": None}
+        return result
     arr = np.array(rows)
     brier = float(np.mean((arr[:, 0] - arr[:, 1]) ** 2))
     accuracy = float(np.mean((arr[:, 0] >= 0.5) == (arr[:, 1] > 0.5)))
@@ -267,8 +436,9 @@ def _oos_validate(data: pd.DataFrame, scheme: str = "auto") -> dict:
     cal = pd.DataFrame({"p": arr[:, 0], "y": arr[:, 1], "bin": bins}).groupby(
         "bin", observed=True).agg(p=("p", "mean"), y=("y", "mean"), n=("y", "size"))
     ece = float(((cal["p"] - cal["y"]).abs() * cal["n"]).sum() / cal["n"].sum())
-    return {"count": len(rows), "brier": brier, "accuracy": accuracy,
-            "calibration_error": ece}
+    result.update({"count": len(rows), "brier": brier, "accuracy": accuracy,
+                   "calibration_error": ece})
+    return result
 
 
 def _select_model(data: pd.DataFrame, history: pd.DataFrame,
@@ -277,16 +447,25 @@ def _select_model(data: pd.DataFrame, history: pd.DataFrame,
     candidates = []
     for scheme in MATCH_SCHEMES:
         required = MATCH_SCHEMES[scheme]
-        if any(col not in data.columns or col not in current.index
-               or pd.isna(current[col]) for col in required):
-            continue
+        if scheme == "kernel":
+            kw = _kernel_weights(history, current)
+            if kw is None:
+                continue
+            current_matches = _ess(kw)
+        else:
+            if any(col not in data.columns or col not in current.index
+                   or pd.isna(current[col]) for col in required):
+                continue
+            current_matches = len(_similar(history, current, scheme)[0])
         metrics = _oos_validate(data, scheme)
-        current_matches = len(_similar(history, current, scheme)[0])
         # Brier为主，校准误差与样本不足作惩罚；不使用方向准确率调参。
+        # 下行路径 AUC<0.5（风险排序不如随机）追加惩罚——风险否决层的基本要求。
         objective = ((metrics["brier"] if metrics["brier"] is not None else 1.0)
                      + 0.25 * (metrics["calibration_error"] if metrics["calibration_error"] is not None else 1.0)
                      + (0.1 if metrics["count"] < 30 else 0.0)
-                     + (0.2 if current_matches < 30 else 0.0))
+                     + (0.2 if current_matches < 30 else 0.0)
+                     + (0.1 if (metrics.get("path_auc") is None
+                                or metrics["path_auc"] < 0.5) else 0.0))
         # 日内模型必须有足够的共同状态样本和至少30个样本外窗口，
         # 否则即使偶然Brier很低也不能战胜稳定的日线模型。
         if scheme.startswith("intraday_") and (metrics["count"] < 30 or current_matches < 30):
@@ -296,14 +475,16 @@ def _select_model(data: pd.DataFrame, history: pd.DataFrame,
     candidates.sort(key=lambda x: (x["objective"], -x["count"]))
     best = candidates[0]
     return best["scheme"], {k: best[k] for k in
-                            ("count", "brier", "accuracy", "calibration_error")}, candidates
+                            ("count", "brier", "accuracy", "calibration_error",
+                             "path_auc")}, candidates
 
 
 def build_model(code: str) -> dict:
     raw = _load_daily(code)
     intraday = _load_intraday(code)
+    market = _load_market()
     intraday_quality = intraday_quality_report(code)
-    data = _features_and_labels(raw, intraday)
+    data = _features_and_labels(raw, intraday, market)
     if len(data) < 120:
         raise ValueError(f"有效日线仅 {len(data)} 条，至少需要120条")
     current = data.iloc[-1]
@@ -313,6 +494,9 @@ def build_model(code: str) -> dict:
         history, current, selected_scheme)
     state = {k: str(current[k]) for k in
              ("trend_state", "momentum_state", "volume_state", "vol_state")}
+    for key in ("market_trend_state", "market_vol_state"):
+        if key in current.index and pd.notna(current[key]):
+            state[key] = str(current[key])
     state.update({"ret_5": float(current["ret_5"]), "ret_20": float(current["ret_20"]),
                   "vol_20": float(current["vol_20"]),
                   "volume_ratio": float(current["volume_ratio"]),
@@ -328,9 +512,12 @@ def build_model(code: str) -> dict:
             intraday_state[key] = float(current[key])
     state.update(intraday_state)
     # 不只看样本量：样本外方向不能明显劣于随机，概率误差也要受控。
+    # 方向准确率与下行路径AUC满足其一即可——方向可以接近抛硬币（弱有效市场），
+    # 但风险否决层要求下行路径排序必须优于随机（机制A的实证洞察）。
+    direction_ok = (oos["accuracy"] is not None and oos["accuracy"] >= 0.52)
+    path_ok = (oos.get("path_auc") is not None and oos["path_auc"] >= 0.55)
     quality_ok = (oos["count"] >= 30 and oos["brier"] is not None
-                  and oos["brier"] <= 0.25 and oos["accuracy"] is not None
-                  and oos["accuracy"] >= 0.52
+                  and oos["brier"] <= 0.25 and (direction_ok or path_ok)
                   and oos["calibration_error"] is not None
                   and oos["calibration_error"] <= 0.12)
     evidence = "sufficient" if sample_count >= 50 and quality_ok else "limited"
@@ -404,7 +591,7 @@ def _llm_profile_evidence(row) -> dict:
     payload = json.loads(row[11] or "{}")
     predictions = payload.get("predictions") or {}
     compact_predictions = {}
-    for key in ("up_1d", "up_3d", "up_5d", "up_10d", "up_3pct_5d", "down_3pct_5d"):
+    for key in ("up_1d", "up_3d", "up_5d", "up_10d", "up_atr_5d", "down_atr_5d"):
         item = predictions.get(key) or {}
         compact_predictions[key] = {
             "probability": round(float(item.get("shrunk", 0.5)), 6),
@@ -413,6 +600,7 @@ def _llm_profile_evidence(row) -> dict:
             "n": int(item.get("n") or 0),
         }
     keep_state = ("trend_state", "momentum_state", "volume_state", "vol_state",
+                  "market_trend_state", "market_vol_state",
                   "ret_5", "ret_20", "vol_20", "volume_ratio", "atr_pct",
                   "intraday_direction_state", "close_vwap_state", "pressure_state",
                   "realized_vol", "max_intraday_drawdown", "close_vwap_gap",
@@ -422,7 +610,7 @@ def _llm_profile_evidence(row) -> dict:
     for item in (payload.get("model_candidates") or [])[:8]:
         candidates.append({k: item.get(k) for k in
                            ("scheme", "current_matches", "count", "brier", "accuracy",
-                            "calibration_error")})
+                            "calibration_error", "path_auc")})
     return {
         "code": row[2], "model_version": row[3], "asof_date": row[4],
         "train_start": row[5], "train_end": row[6],
@@ -544,6 +732,9 @@ def probability_overlay(scores: pd.Series, asof: str, execute: bool = False,
 
     默认 execute=False 为影子模式，只返回诊断，不改变 scores。只有模型证据充足、
     模型日期不晚于 asof 且足够新鲜时才参与；修正幅度上限为原分数横截面标准差的15%。
+    非对称设计（机制A·风险否决层）：上行概率只产生温和正修正，下行路径概率
+    （ATR自适应阈值）以双倍权重产生负修正——封过拟合因子"追高买入即遇均值回归"
+    的主要爆雷路径。诊断同时给出 ATR 倒数一行规则的基线修正值供影子对照。
     """
     if scores is None or scores.empty:
         return scores, pd.DataFrame()
@@ -552,7 +743,7 @@ def probability_overlay(scores: pd.Series, asof: str, execute: bool = False,
     with datasource._conn() as c:
         _ensure_schema(c)
         rows = c.execute(
-            f"SELECT code,asof_date,sample_count,metrics_json,prediction_json FROM "
+            f"SELECT code,asof_date,sample_count,metrics_json,prediction_json,state_json FROM "
             f"stock_probability_models WHERE code IN ({marks}) AND asof_date<=? "
             f"ORDER BY code,asof_date DESC,model_id DESC", codes + [asof]).fetchall()
     latest = {}
@@ -560,11 +751,24 @@ def probability_overlay(scores: pd.Series, asof: str, execute: bool = False,
         latest.setdefault(row[0], row)
     scale = float(scores.std()) if len(scores) > 1 and pd.notna(scores.std()) else 1.0
     adjusted = scores.copy().astype(float)
+    # ATR 倒数基线：低波动票正倾斜、高波动票负倾斜的一行规则（跨截面中位数锚定）
+    atr_map = {}
+    for code in codes:
+        row = latest.get(code)
+        if not row:
+            continue
+        try:
+            atr = float(json.loads((row[5] if len(row) > 5 else "{}") or "{}").get("atr_pct"))
+            if atr > 0:
+                atr_map[code] = atr
+        except (TypeError, ValueError):
+            continue
+    atr_median = float(np.median(list(atr_map.values()))) if atr_map else None
     diagnostics = []
     asof_ts = pd.Timestamp(asof)
     for code in codes:
         row = latest.get(code)
-        status, edge, adjustment = "无模型", 0.0, 0.0
+        status, up_edge, down_edge, adjustment = "无模型", 0.0, 0.0, 0.0
         model_date = evidence = None
         if row:
             model_date = row[1]
@@ -573,8 +777,9 @@ def probability_overlay(scores: pd.Series, asof: str, execute: bool = False,
             age = (asof_ts - pd.Timestamp(model_date)).days
             pred = payload.get("predictions", {})
             p_up = float((pred.get("up_5d") or {}).get("shrunk", 0.5))
-            p_down = float((pred.get("down_3pct_5d") or {}).get("shrunk", 0.5))
-            edge = (p_up - 0.5) - 0.5 * max(0.0, p_down - 0.5)
+            p_down = float((pred.get("down_atr_5d") or {}).get("shrunk", 0.5))
+            up_edge = max(0.0, p_up - 0.5)
+            down_edge = max(0.0, p_down - 0.5)
             if evidence != "sufficient":
                 status = "质量闸门未通过"
             elif age < 0 or age > max_age_days:
@@ -583,11 +788,18 @@ def probability_overlay(scores: pd.Series, asof: str, execute: bool = False,
                 status = "样本不足"
             else:
                 status = "可用"
+                edge = up_edge - 2.0 * down_edge
                 adjustment = float(np.clip(edge * 2, -max_adjustment, max_adjustment)) * scale
                 if execute:
                     adjusted.loc[code] += adjustment
+        baseline = 0.0
+        if atr_median and code in atr_map:
+            baseline = (float(np.clip(atr_median / atr_map[code] - 1, -1.0, 1.0))
+                        * max_adjustment * scale)
         diagnostics.append({"code": code, "model_date": model_date, "evidence": evidence,
-                            "status": status, "probability_edge": edge,
+                            "status": status, "probability_edge": up_edge - down_edge,
+                            "up_edge": up_edge, "down_edge": down_edge,
+                            "baseline_adjustment": baseline,
                             "score_adjustment": adjustment if execute else 0.0,
                             "shadow_adjustment": adjustment})
     return adjusted.sort_values(ascending=False), pd.DataFrame(diagnostics)
@@ -632,8 +844,13 @@ def update_models_and_record_shadow(trade_date: str, max_codes: int = 30,
                 models_failed += 1
         shadow_scores, diag = probability_overlay(scores, trade_date, execute=True)
         diag = diag.set_index("code") if not diag.empty else pd.DataFrame()
+        # ATR 倒数基线排序：与 overlay 影子同口径评估，作为简单规则对照组
+        baseline_adj = (diag["baseline_adjustment"] if not diag.empty
+                        else pd.Series(0.0, index=scores.index))
+        baseline_scores = (scores.astype(float) + baseline_adj).sort_values(ascending=False)
         original_rank = {c: i + 1 for i, c in enumerate(scores.index)}
         shadow_rank = {c: i + 1 for i, c in enumerate(shadow_scores.index)}
+        baseline_rank = {c: i + 1 for i, c in enumerate(baseline_scores.index)}
         # 当保存名单本身仅有 top_n 条时，比较全体没有辨识度；改用前半截评估排序增益。
         eval_top_n = min(top_n, max(1, len(scores) // 2))
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -647,14 +864,18 @@ def update_models_and_record_shadow(trade_date: str, max_codes: int = 30,
                          float(d.get("shadow_adjustment", 0) or 0) if hasattr(d, "get") else 0.0,
                          float(shadow_scores.loc[code]), shadow_rank[code], eval_date,
                          int(original_rank[code] <= eval_top_n),
-                         int(shadow_rank[code] <= eval_top_n), now))
+                         int(shadow_rank[code] <= eval_top_n),
+                         float(d.get("baseline_adjustment", 0) or 0) if hasattr(d, "get") else 0.0,
+                         float(baseline_scores.loc[code]), baseline_rank[code],
+                         int(baseline_rank[code] <= eval_top_n), now))
         with datasource._conn() as c:
             _ensure_schema(c)
             c.executemany(
                 "INSERT INTO stock_probability_shadow"
                 "(pick_id,trade_date,code,original_rank,original_score,model_date,model_status,"
                 "probability_edge,shadow_adjustment,shadow_score,shadow_rank,eval_date,"
-                "original_top,shadow_top,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "original_top,shadow_top,baseline_adjustment,baseline_score,baseline_rank,"
+                "baseline_top,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(pick_id,code) DO UPDATE SET "
                 "original_rank=excluded.original_rank,original_score=excluded.original_score,"
                 "model_date=excluded.model_date,model_status=excluded.model_status,"
@@ -662,6 +883,9 @@ def update_models_and_record_shadow(trade_date: str, max_codes: int = 30,
                 "shadow_adjustment=excluded.shadow_adjustment,shadow_score=excluded.shadow_score,"
                 "shadow_rank=excluded.shadow_rank,eval_date=excluded.eval_date,"
                 "original_top=excluded.original_top,shadow_top=excluded.shadow_top,"
+                "baseline_adjustment=excluded.baseline_adjustment,"
+                "baseline_score=excluded.baseline_score,"
+                "baseline_rank=excluded.baseline_rank,baseline_top=excluded.baseline_top,"
                 "created_at=excluded.created_at", rows)
         shadow_rows += len(rows)
     return {"models_ok": models_ok, "models_failed": models_failed,
@@ -722,16 +946,20 @@ def shadow_summary() -> dict:
             row = c.execute(
                 "SELECT AVG(CASE WHEN original_top=1 THEN fwd_5d_return END),"
                 "AVG(CASE WHEN shadow_top=1 THEN fwd_5d_return END),"
+                "AVG(CASE WHEN baseline_top=1 THEN fwd_5d_return END),"
                 "COUNT(DISTINCT trade_date || ':' || pick_id) "
                 "FROM stock_probability_shadow WHERE evaluated_at IS NOT NULL").fetchone()
-            original_avg, shadow_avg, groups = row
+            original_avg, shadow_avg, baseline_avg, groups = row
         else:
-            original_avg = shadow_avg = None; groups = 0
+            original_avg = shadow_avg = baseline_avg = None; groups = 0
     lift = (float(shadow_avg - original_avg)
             if original_avg is not None and shadow_avg is not None else None)
+    baseline_lift = (float(baseline_avg - original_avg)
+                     if original_avg is not None and baseline_avg is not None else None)
     return {"total": total, "usable": usable, "evaluated": evaluated,
             "groups": groups, "original_avg": original_avg,
-            "shadow_avg": shadow_avg, "lift": lift}
+            "shadow_avg": shadow_avg, "baseline_avg": baseline_avg,
+            "lift": lift, "baseline_lift": baseline_lift}
 
 
 def _group_shadow_lifts() -> pd.DataFrame:
@@ -739,8 +967,8 @@ def _group_shadow_lifts() -> pd.DataFrame:
     with datasource._conn() as c:
         _ensure_schema(c)
         done = pd.read_sql_query(
-            "SELECT trade_date,pick_id,model_status,fwd_5d_return,original_top,shadow_top "
-            "FROM stock_probability_shadow WHERE evaluated_at IS NOT NULL", c)
+            "SELECT trade_date,pick_id,model_status,fwd_5d_return,original_top,shadow_top,"
+            "baseline_top FROM stock_probability_shadow WHERE evaluated_at IS NOT NULL", c)
     if done.empty:
         return pd.DataFrame()
     rows = []
@@ -749,10 +977,12 @@ def _group_shadow_lifts() -> pd.DataFrame:
         shadow = group[group["shadow_top"] == 1]["fwd_5d_return"].dropna()
         if original.empty or shadow.empty:
             continue
+        baseline = group[group["baseline_top"] == 1]["fwd_5d_return"].dropna()
         rows.append({
             "trade_date": trade_date, "pick_id": int(pick_id),
             "original_return": float(original.mean()),
             "shadow_return": float(shadow.mean()),
+            "baseline_return": float(baseline.mean()) if not baseline.empty else np.nan,
             "lift": float(shadow.mean() - original.mean()),
             "candidate_count": int(len(group)),
             "usable_count": int((group["model_status"] == "可用").sum()),
@@ -778,7 +1008,9 @@ def governance_audit(asof: str | None = None, cfg: dict | None = None,
     if groups.empty:
         metrics = {"groups": 0, "usable_coverage": 0.0, "mean_lift": None,
                    "positive_group_rate": None, "recent_positive_rate": None,
-                   "ci_low": None, "ci_high": None}
+                   "ci_low": None, "ci_high": None,
+                   "baseline_lift": None, "lift_vs_baseline_groups": 0,
+                   "ci_low_vs_baseline": None}
     else:
         lifts = groups["lift"].to_numpy(dtype=float)
         total_candidates = int(groups["candidate_count"].sum())
@@ -786,6 +1018,14 @@ def governance_audit(asof: str | None = None, cfg: dict | None = None,
         recent = groups.tail(int(cfg["recent_groups"]))
         ci_low, ci_high = _bootstrap_mean_ci(
             lifts, int(cfg["bootstrap_samples"]))
+        # 基线对照：只在同时有基线数据的名单上计算 overlay 相对 ATR 规则的配对增益
+        if "baseline_return" not in groups.columns:
+            groups = groups.assign(baseline_return=np.nan)
+        paired = groups.dropna(subset=["baseline_return"])
+        vs_baseline = (paired["shadow_return"] - paired["baseline_return"]).to_numpy(dtype=float) \
+            if len(paired) else np.array([])
+        ci_low_vs, _ci_high_vs = _bootstrap_mean_ci(
+            vs_baseline, int(cfg["bootstrap_samples"])) if len(vs_baseline) >= 2 else (None, None)
         metrics = {
             "groups": int(len(groups)),
             "usable_coverage": usable / total_candidates if total_candidates else 0.0,
@@ -797,6 +1037,12 @@ def governance_audit(asof: str | None = None, cfg: dict | None = None,
             "ci_low": ci_low, "ci_high": ci_high,
             "original_avg": float(groups["original_return"].mean()),
             "shadow_avg": float(groups["shadow_return"].mean()),
+            "baseline_avg": float(paired["baseline_return"].mean()) if len(paired) else None,
+            "baseline_lift": (float(paired["baseline_return"].mean() - paired["original_return"].mean())
+                              if len(paired) else None),
+            "lift_vs_baseline_groups": int(len(vs_baseline)),
+            "mean_lift_vs_baseline": float(vs_baseline.mean()) if len(vs_baseline) else None,
+            "ci_low_vs_baseline": ci_low_vs,
         }
     checks = [
         (metrics["groups"] >= cfg["min_groups"],
@@ -812,6 +1058,12 @@ def governance_audit(asof: str | None = None, cfg: dict | None = None,
          f"最近 {cfg['recent_groups']} 组正增益占比至少 {cfg['min_recent_positive_rate']:.0%}"),
         ((metrics["ci_low"] or 0) > 0,
          f"Bootstrap 95%增益下限必须大于0（当前 {(metrics['ci_low'] or 0):+.2%}）"),
+        # 元纪律：overlay 必须同时跑赢 ATR 倒数一行规则，防止复杂模型不如简单规则
+        (metrics["lift_vs_baseline_groups"] >= cfg["min_groups"]
+         and (metrics["ci_low_vs_baseline"] or 0) > 0,
+         f"相对 ATR 基线的配对增益 95%下限必须大于0"
+         f"（对照组 {metrics['lift_vs_baseline_groups']}/{cfg['min_groups']}，"
+         f"下限 {(metrics['ci_low_vs_baseline'] or 0):+.2%}）"),
     ]
     reasons = [{"passed": bool(ok), "rule": text} for ok, text in checks]
     status = "eligible_for_manual_review" if all(ok for ok, _ in checks) else "shadow_continue"

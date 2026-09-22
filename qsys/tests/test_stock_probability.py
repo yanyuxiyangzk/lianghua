@@ -37,9 +37,9 @@ def test_path_probability_uses_no_hit_denominator():
     current = data.iloc[-1]
     history = data.iloc[:-10]
     pred, n, _ = sp._predict_from_history(history, current)
-    assert pred["up_3pct_5d"]["n"] == n
-    assert pred["down_3pct_5d"]["n"] == n
-    assert (pred["up_3pct_5d"]["raw"] + pred["down_3pct_5d"]["raw"]) <= 1.0
+    assert pred["up_atr_5d"]["n"] == n
+    assert pred["down_atr_5d"]["n"] == n
+    assert (pred["up_atr_5d"]["raw"] + pred["down_atr_5d"]["raw"]) <= 1.0
     print("PASS: test_path_probability_uses_no_hit_denominator")
 
 
@@ -50,7 +50,53 @@ def test_oos_validation_has_no_future_training():
     assert 0 <= result["accuracy"] <= 1
     assert 0 <= result["brier"] <= 1
     assert 0 <= result["calibration_error"] <= 1
+    assert "path_auc" in result
+    if result["path_auc"] is not None:
+        assert 0 <= result["path_auc"] <= 1
     print("PASS: test_oos_validation_has_no_future_training")
+
+
+def test_oos_multifold_covers_more_points_than_single_split():
+    # 多窗口 walk-forward 的样本外点数必须明显多于原单次 80/20 切分
+    data = sp._features_and_labels(_synthetic(550))
+    result = sp._oos_validate(data)
+    single_split_max = len(data) - 5 - max(80, int(len(data) * 0.8))
+    assert result["count"] > single_split_max * 1.5
+    print("PASS: test_oos_multifold_covers_more_points_than_single_split")
+
+
+def test_kernel_matching_uses_continuous_features_and_ess():
+    rng = np.random.default_rng(11)
+    n = 500
+    # 构造动量延续的合成序列：ret_5 高则未来5日大概率上涨
+    dates = pd.bdate_range("2024-01-01", periods=n)
+    ret = rng.normal(0, 0.012, n)
+    for i in range(5, n - 5):
+        if ret[i - 5:i].sum() > 0.03:
+            ret[i + 1:i + 5] += 0.004
+    close = 20 * np.cumprod(1 + ret)
+    daily = pd.DataFrame({
+        "date": dates.strftime("%Y-%m-%d"), "open": close * 0.998,
+        "high": close * 1.015, "low": close * 0.985, "close": close,
+        "volume": rng.integers(1_000_000, 4_000_000, n),
+        "amount": close * rng.integers(1_000_000, 4_000_000, n)})
+    data = sp._features_and_labels(daily)
+    history, current = data.iloc[:-10], data.iloc[-1]
+    pred, ess, method = sp._predict_from_history(history, current, "kernel")
+    assert ess > 10
+    assert "软匹配" in method
+    assert 0 < pred["up_5d"]["shrunk"] < 1
+    assert 0 < pred["down_atr_5d"]["shrunk"] < 1
+    # kernel 候选必须参与模型选择
+    _, _, candidates = sp._select_model(data, history, current)
+    kc = [c for c in candidates if c["scheme"] == "kernel"]
+    assert kc and kc[0]["current_matches"] > 10
+    # 当前特征缺失时 kernel 候选自动跳过
+    bad = current.copy()
+    bad["ret_5"] = np.nan
+    _, _, candidates2 = sp._select_model(data, history, bad)
+    assert "kernel" not in {c["scheme"] for c in candidates2}
+    print("PASS: test_kernel_matching_uses_continuous_features_and_ess")
 
 
 def test_intraday_candidates_join_without_dropping_daily_history():
@@ -73,6 +119,29 @@ def test_intraday_candidates_join_without_dropping_daily_history():
     print("PASS: test_intraday_candidates_join_without_dropping_daily_history")
 
 
+def test_market_regime_joins_and_new_schemes_participate():
+    daily = _synthetic(550)
+    market = pd.DataFrame({
+        "date": daily["date"],
+        "market_trend_state": ["up"] * 550,
+        "market_vol_state": ["mid"] * 550,
+    })
+    data = sp._features_and_labels(daily, None, market)
+    assert data["market_trend_state"].notna().all()
+    current = data.iloc[-1]
+    # 含 regime 的候选在当前状态齐全时必须参与比较
+    scheme, _, candidates = sp._select_model(data, data.iloc[:-10], current)
+    names = {c["scheme"] for c in candidates}
+    assert "regime_balanced" in names
+    matched, label = sp._similar(data.iloc[:-10], current, "regime_balanced")
+    assert (matched["market_trend_state"].astype(str) == "up").all()
+    # 无市场数据时 regime 候选自动跳过，不报错
+    plain = sp._features_and_labels(daily)
+    scheme2, _, candidates2 = sp._select_model(plain, plain.iloc[:-10], plain.iloc[-1])
+    assert "regime_balanced" not in {c["scheme"] for c in candidates2}
+    print("PASS: test_market_regime_joins_and_new_schemes_participate")
+
+
 def test_overlay_quality_gate_blocks_limited_model():
     original_conn = sp.datasource._conn
 
@@ -82,11 +151,13 @@ def test_overlay_quality_gate_blocks_limited_model():
         def executescript(self, *_): return None
         def execute(self, *_):
             class Rows:
+                def __iter__(self): return iter([])  # PRAGMA 迁移路径
                 def fetchall(self):
                     import json
                     payload = {"evidence": "limited", "predictions": {
-                        "up_5d": {"shrunk": 0.8}, "down_3pct_5d": {"shrunk": 0.2}}}
-                    return [("SZ001216", "2026-09-21", 100, "{}", json.dumps(payload))]
+                        "up_5d": {"shrunk": 0.8}, "down_atr_5d": {"shrunk": 0.2}}}
+                    return [("SZ001216", "2026-09-21", 100, "{}", json.dumps(payload),
+                             json.dumps({"atr_pct": 0.05}))]
             return Rows()
 
     sp.datasource._conn = lambda: FakeConn()
@@ -99,6 +170,41 @@ def test_overlay_quality_gate_blocks_limited_model():
     finally:
         sp.datasource._conn = original_conn
     print("PASS: test_overlay_quality_gate_blocks_limited_model")
+
+
+def test_overlay_down_path_veto_is_asymmetric():
+    original_conn = sp.datasource._conn
+
+    class FakeConn:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def executescript(self, *_): return None
+        def execute(self, *_):
+            class Rows:
+                def __iter__(self): return iter([])  # PRAGMA 迁移路径
+                def fetchall(self):
+                    import json
+                    payload = {"evidence": "sufficient", "predictions": {
+                        "up_5d": {"shrunk": 0.55}, "down_atr_5d": {"shrunk": 0.575}}}
+                    state = {"atr_pct": 0.05}
+                    return [("SZ001216", "2026-09-21", 100, "{}", json.dumps(payload),
+                             json.dumps(state))]
+            return Rows()
+
+    sp.datasource._conn = lambda: FakeConn()
+    try:
+        scores = pd.Series({"SZ001216": 1.0, "SZ000002": 1.2})
+        adjusted, diag = sp.probability_overlay(scores, "2026-09-21", execute=True)
+        d = diag.set_index("code").loc["SZ001216"]
+        # up_edge=0.05, down_edge=0.075 → edge=0.05-2×0.075=-0.10 → 负修正
+        assert d["status"] == "可用"
+        assert d["score_adjustment"] < 0
+        assert adjusted.loc["SZ001216"] < 1.0
+        # 无模型的票不受影响
+        assert adjusted.loc["SZ000002"] == 1.2
+    finally:
+        sp.datasource._conn = original_conn
+    print("PASS: test_overlay_down_path_veto_is_asymmetric")
 
 
 def test_model_selection_penalizes_tiny_current_sample():
@@ -167,6 +273,7 @@ def test_governance_only_allows_manual_review():
         lift = 0.01 + (i % 3) * 0.001
         rows.append({"trade_date": f"2026-08-{(i % 28) + 1:02d}", "pick_id": i,
                      "original_return": 0.005, "shadow_return": 0.005 + lift,
+                     "baseline_return": 0.005 + lift * 0.5,
                      "lift": lift, "candidate_count": 10, "usable_count": 8})
     sp._group_shadow_lifts = lambda: pd.DataFrame(rows)
     try:
@@ -175,6 +282,13 @@ def test_governance_only_allows_manual_review():
         assert result["status"] == "eligible_for_manual_review"
         assert result["automatic_activation"] is False
         assert all(x["passed"] for x in result["reasons"])
+        # overlay 不如 ATR 基线时，基线对照检查必须拦截晋级
+        for row in rows:
+            row["baseline_return"] = row["shadow_return"] + 0.01
+        result2 = sp.governance_audit("2026-09-21", persist=False,
+                                      cfg={"bootstrap_samples": 500})
+        assert result2["status"] == "shadow_continue"
+        assert result2["reasons"][-1]["passed"] is False
     finally:
         sp._group_shadow_lifts = original
     print("PASS: test_governance_only_allows_manual_review")
@@ -220,8 +334,12 @@ if __name__ == "__main__":
     tests = [test_beta_shrinkage_moves_to_half,
              test_path_probability_uses_no_hit_denominator,
              test_oos_validation_has_no_future_training,
+             test_oos_multifold_covers_more_points_than_single_split,
+             test_kernel_matching_uses_continuous_features_and_ess,
              test_intraday_candidates_join_without_dropping_daily_history,
+             test_market_regime_joins_and_new_schemes_participate,
              test_overlay_quality_gate_blocks_limited_model,
+             test_overlay_down_path_veto_is_asymmetric,
              test_model_selection_penalizes_tiny_current_sample,
              test_shadow_upsert_preserves_evaluation_columns,
              test_governance_requires_enough_groups,

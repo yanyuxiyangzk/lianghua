@@ -81,7 +81,7 @@ else:
         rows = []
         labels = {"up_1d": "未来1日上涨", "up_3d": "未来3日上涨",
                   "up_5d": "未来5日上涨", "up_10d": "未来10日上涨",
-                  "up_3pct_5d": "未来5日先上涨3%", "down_3pct_5d": "未来5日先下跌3%"}
+                  "up_atr_5d": "未来5日先涨1×ATR", "down_atr_5d": "未来5日先跌1×ATR"}
         for key, label in labels.items():
             p = model["predictions"].get(key, {})
             rows.append({"事件": label, "收缩后概率": p.get("shrunk"),
@@ -97,6 +97,7 @@ else:
         state = model.get("state") or {}
         state_labels = {"trend_state": "20日趋势", "momentum_state": "5日动量",
                         "volume_state": "成交量", "vol_state": "波动率",
+                        "market_trend_state": "市场趋势", "market_vol_state": "市场波动",
                         "ret_5": "5日收益", "ret_20": "20日收益",
                         "vol_20": "20日年化波动", "volume_ratio": "量比",
                         "atr_pct": "ATR占价格"}
@@ -160,8 +161,12 @@ else:
         s3.metric("已成熟记录", summary["evaluated"])
         s4.metric("已评估名单", summary["groups"])
         if summary.get("lift") is not None:
-            st.metric("概率影子5日收益增益", f"{summary['lift']:+.2%}",
+            m1, m2, _m3 = st.columns(3)
+            m1.metric("概率影子5日收益增益", f"{summary['lift']:+.2%}",
                       help="同一批候选中，影子排序评估截面平均收益减去原排序评估截面平均收益。")
+            if summary.get("baseline_lift") is not None:
+                m2.metric("ATR基线增益（对照）", f"{summary['baseline_lift']:+.2%}",
+                          help="ATR倒数一行规则的同口径增益。overlay 必须跑赢它才不是多余复杂。")
         else:
             st.caption("影子记录满5个交易日后，将自动回填真实收益并比较排序增益。")
 

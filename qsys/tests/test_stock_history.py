@@ -186,21 +186,67 @@ def test_orderbook_sync_rejects_wrong_day_and_writes_valid_rows():
         datasource.ths_call = lambda *args, **kwargs: (
             pd.DataFrame({"time": ["2026-09-21 09:30:01", "2026-09-21 09:31:01"],
                           "latest": [10.0, 10.01], "bid1": [9.99, 10.0],
-                          "ask1": [10.01, 10.02], "volume": [100, 200],
+                          "ask1": [10.01, 10.02], "bid2": [9.98, 9.99],
+                          "ask2": [10.02, 10.03], "bidSize1": [100, 200],
+                          "askSize1": [300, 400], "volume": [100, 200],
                           "amount": [1000, 2002]}), None, 0)
         result = datasource.fetch_orderbook_day_to_db("SZ001216", "2026-09-21")
         assert result["written"] == result["new_rows"] == 2
         with datasource._conn() as c:
             rows = c.execute(
-                "SELECT datetime,bid1,ask1 FROM ifind_realtime WHERE code=? ORDER BY datetime",
+                "SELECT datetime,bid1,ask1,bid2,ask2,bid_size1,ask_size1,"
+                "typeof(bid_size1) FROM ifind_realtime WHERE code=? ORDER BY datetime",
                 ("SZ001216",)).fetchall()
         assert len(rows) == 2
-        assert tuple(rows[0]) == ("2026-09-21 09:30:01", 9.99, 10.01)
+        assert tuple(rows[0]) == ("2026-09-21 09:30:01", 9.99, 10.01, 9.98, 10.02,
+                                  100.0, 300.0, "real")
     finally:
         datasource._ths_login, datasource.ths_call = original_login, original_call
         datasource.MKT_DB = old
         temp.cleanup()
     print("PASS: test_orderbook_sync_rejects_wrong_day_and_writes_valid_rows")
+
+
+def test_tencent_tick_sync_migrates_amount_and_coerces_types():
+    temp, old = _use_temp_db()
+    import akshare as ak
+    original_tick = ak.stock_zh_a_tick_tx_js
+    today = pd.Timestamp.now().strftime("%Y-%m-%d")
+    try:
+        # 预建老版 tick_data（无 amount 列），验证 _conn() 幂等补列迁移
+        with sqlite3.connect(str(datasource.MKT_DB)) as c:
+            c.execute("""CREATE TABLE tick_data(
+                id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT NOT NULL,
+                datetime TEXT NOT NULL, price REAL, volume INTEGER,
+                buyorsell INTEGER, source TEXT DEFAULT 'tdx',
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(code, datetime, price, volume))""")
+        ak.stock_zh_a_tick_tx_js = lambda symbol: pd.DataFrame({
+            "成交时间": ["09:30:00", "09:30:03"], "成交价格": [10.0, 10.01],
+            "价格变动": [0.0, 0.01], "成交量": [100, 200],
+            "成交金额": [100000, 200200], "性质": ["买盘", "卖盘"]})
+        try:
+            datasource.fetch_ticks_tx_to_db("SZ001216", "2020-01-02")
+            raise AssertionError("non-today should be rejected")
+        except RuntimeError as exc:
+            assert "只提供当日" in str(exc)
+
+        result = datasource.fetch_ticks_tx_to_db("SZ001216", today)
+        assert result["written"] == 2 and result["new_rows"] == 2
+        with datasource._conn() as c:
+            rows = c.execute(
+                "SELECT datetime,price,volume,amount,typeof(amount),buyorsell,source "
+                "FROM tick_data WHERE code=? ORDER BY datetime", ("SZ001216",)).fetchall()
+        # 纯整数的成交金额经 numpy.int64 必须强转原生 float，否则落库成 BLOB
+        assert rows[0] == (f"{today} 09:30:00", 10.0, 100, 100000.0, "real", 0, "tencent_tx")
+        assert rows[1][5] == 1  # 卖盘
+        again = datasource.fetch_ticks_tx_to_db("SZ001216", today)
+        assert again["new_rows"] == 0  # 重复执行幂等
+    finally:
+        ak.stock_zh_a_tick_tx_js = original_tick
+        datasource.MKT_DB = old
+        temp.cleanup()
+    print("PASS: test_tencent_tick_sync_migrates_amount_and_coerces_types")
 
 
 def test_background_minute_sync_is_serial_and_skips_complete_days():
@@ -266,14 +312,64 @@ def test_single_request_minute_period_writes_multiple_days():
     print("PASS: test_single_request_minute_period_writes_multiple_days")
 
 
+def test_minute_period_chunks_long_range_under_4304_cap():
+    # THS_HF 单次上限 200 万数据点（-4304）：初始按 4 年分段，超限自动对半
+    chunks = datasource._hf_splits("1990-12-19", "2026-09-22",
+                                   datasource._HF_INIT_SPAN_DAYS)
+    assert len(chunks) > 1
+    assert chunks[0][0] == "1990-12-19" and chunks[-1][1] == "2026-09-22"
+    for (a_start, a_end), (b_start, _b_end) in zip(chunks, chunks[1:]):
+        assert pd.Timestamp(a_end) + pd.Timedelta(days=1) == pd.Timestamp(b_start)
+
+    temp, old = _use_temp_db()
+    original_highfreq = datasource.ths_highfreq
+    try:
+        calls = []
+
+        def fake_highfreq(code, indicators, start, end, interval):
+            calls.append((start, end))
+            # 模拟服务端：跨度 >1000 天即超量拒绝，触发对半拆分
+            if (pd.Timestamp(end) - pd.Timestamp(start)).days > 1000:
+                return None, None, -4304
+            day = start[:10]
+            return pd.DataFrame({
+                "time": [f"{day} 09:30:00", f"{day} 09:31:00"],
+                "open": [1.0, 1.0], "high": [1.0, 1.0], "low": [1.0, 1.0],
+                "close": [1.0, 1.0], "volume": [1.0, 1.0],
+                "amount": [1.0, 1.0]}), None, 0
+
+        datasource.ths_highfreq = fake_highfreq
+        result = datasource.fetch_minute_period_to_db("SH000001", "1990-12-19", "2026-09-22")
+        ok_calls = [c for c in calls
+                    if (pd.Timestamp(c[1]) - pd.Timestamp(c[0])).days <= 1000]
+        assert any((pd.Timestamp(c[1]) - pd.Timestamp(c[0])).days > 1000 for c in calls)
+        assert result["written"] == 2 * len(ok_calls)
+        assert result["days"] == len(ok_calls)
+
+        # 其他错误码原样抛出并带分段区间，便于定位
+        datasource.ths_highfreq = lambda *args, **kwargs: (None, None, -999)
+        try:
+            datasource.fetch_minute_period_to_db("SH000001", "1990-12-19", "2026-09-22")
+            raise AssertionError("-999 should propagate")
+        except RuntimeError as exc:
+            assert "-999" in str(exc) and "分段" in str(exc)
+    finally:
+        datasource.ths_highfreq = original_highfreq
+        datasource.MKT_DB = old
+        temp.cleanup()
+    print("PASS: test_minute_period_chunks_long_range_under_4304_cap")
+
+
 if __name__ == "__main__":
     tests = [test_stock_identity_is_stable, test_expected_trade_days_uses_union,
              test_minute_completeness_marks_partial_day,
              test_backfill_runs_in_batches_and_resumes,
              test_intraday_features_are_bounded_and_idempotent,
              test_orderbook_sync_rejects_wrong_day_and_writes_valid_rows,
+             test_tencent_tick_sync_migrates_amount_and_coerces_types,
              test_background_minute_sync_is_serial_and_skips_complete_days,
-             test_single_request_minute_period_writes_multiple_days]
+             test_single_request_minute_period_writes_multiple_days,
+             test_minute_period_chunks_long_range_under_4304_cap]
     failed = 0
     for test in tests:
         try:

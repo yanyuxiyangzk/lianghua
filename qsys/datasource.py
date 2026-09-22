@@ -209,9 +209,19 @@ def _conn():
     c.execute("CREATE INDEX IF NOT EXISTS idx_realtime_code ON ifind_realtime(code)")
     # ifind_realtime 补列（升级兼容）
     rt_cols = [r[1] for r in c.execute("PRAGMA table_info(ifind_realtime)")]
-    for col, typ in [("speed", "REAL"), ("pe_ttm", "REAL")]:
+    for col, typ in [("speed", "REAL"), ("pe_ttm", "REAL"),
+                     ("bid2", "REAL"), ("bid3", "REAL"), ("bid4", "REAL"), ("bid5", "REAL"),
+                     ("ask2", "REAL"), ("ask3", "REAL"), ("ask4", "REAL"), ("ask5", "REAL"),
+                     ("bid_size1", "REAL"), ("bid_size2", "REAL"), ("bid_size3", "REAL"),
+                     ("bid_size4", "REAL"), ("bid_size5", "REAL"),
+                     ("ask_size1", "REAL"), ("ask_size2", "REAL"), ("ask_size3", "REAL"),
+                     ("ask_size4", "REAL"), ("ask_size5", "REAL")]:
         if col not in rt_cols:
             c.execute(f"ALTER TABLE ifind_realtime ADD COLUMN {col} {typ}")
+    # tick_data 补列（升级兼容：老表无 amount 列，腾讯分笔通道需要）
+    tk_cols = [r[1] for r in c.execute("PRAGMA table_info(tick_data)")]
+    if "amount" not in tk_cols:
+        c.execute("ALTER TABLE tick_data ADD COLUMN amount REAL")
     _migrate_stock_identity(c)
     return c
 
@@ -1814,21 +1824,68 @@ def fetch_minute_to_db(code: str, day: str = "", interval: str = "1min") -> int:
     return len(d)
 
 
+_HF_INIT_SPAN_DAYS = 365 * 4  # 初始分段 4 年：≈1000 交易日 × 240 条 × 6 指标 ≈ 144 万点，留余量
+
+
+def _hf_splits(start: str, end: str, days: int) -> list[tuple[str, str]]:
+    """把日期区间切成不超过 days 天的首尾相接分段。"""
+    s, e = pd.Timestamp(start), pd.Timestamp(end)
+    out = []
+    while s <= e:
+        nxt = min(s + pd.Timedelta(days=days - 1), e)
+        out.append((s.strftime("%Y-%m-%d"), nxt.strftime("%Y-%m-%d")))
+        s = nxt + pd.Timedelta(days=1)
+    return out
+
+
+def _hf_collect(ths_code: str, indicators: str, start: str, end: str,
+                interval: str) -> list:
+    """分段调用 ths_highfreq 并合并结果。
+
+    THS_HF 单次请求上限 200 万数据点（行×指标，错误码 -4304；实测 8 年窗口
+    288 万点被拒、661 天窗口 95 万点通过）。初始按 _HF_INIT_SPAN_DAYS 分段，
+    仍超限的分段自动对半拆分重试，直到单日为止。
+    """
+    frames = []
+    pending = _hf_splits(start, end, _HF_INIT_SPAN_DAYS)
+    while pending:
+        chunk_start, chunk_end = pending.pop(0)
+        df, _res, err = ths_highfreq(
+            ths_code, indicators,
+            f"{chunk_start} 09:25:00", f"{chunk_end} 15:05:00", interval)
+        if err == -4304:
+            s, e = pd.Timestamp(chunk_start), pd.Timestamp(chunk_end)
+            if (e - s).days < 2:
+                raise RuntimeError(
+                    f"同花顺分钟历史单日也返回错误码 -4304（{chunk_start}）")
+            mid = s + (e - s) / 2
+            # 左半段插到队首，保持整体时间顺序
+            pending[0:0] = [(chunk_start, mid.strftime("%Y-%m-%d")),
+                            ((mid + pd.Timedelta(days=1)).strftime("%Y-%m-%d"), chunk_end)]
+            continue
+        if err not in (0, None):
+            raise RuntimeError(
+                f"同花顺分钟历史返回错误码 {err}（分段 {chunk_start}~{chunk_end}）")
+        # 早期年份可能没有分钟数据，分段为空属正常；全部为空才报错
+        if df is not None and isinstance(df, pd.DataFrame) and not df.empty:
+            frames.append(df)
+    return frames
+
+
 def fetch_minute_period_to_db(code: str, start: str, end: str,
                               interval: str = "1min") -> dict:
-    """单次 THS_HF 请求抓取一个日期区间的分钟线并批量入库。
+    """抓取一个日期区间的分钟线并批量入库。
 
-    同花顺接口支持单股票跨交易日返回；不再逐日循环调用。返回实际日期覆盖，
+    THS_HF 单次请求上限 200 万数据点（-4304），超长区间（如上证指数 1990 年至今）
+    由 _hf_collect 自动分段+超限对半重试；不再逐日循环。返回实际日期覆盖，
     由页面展示并与日线交易日核对，避免接口截断时被误认为完整同步。
     """
     begin_ts, end_ts = f"{start} 09:25:00", f"{end} 15:05:00"
-    df, _res, err = ths_highfreq(
-        _to_ths_code(code), "open,high,low,close,volume,amount",
-        begin_ts, end_ts, interval)
-    if err not in (0, None):
-        raise RuntimeError(f"同花顺分钟历史返回错误码 {err}")
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+    frames = _hf_collect(_to_ths_code(code), "open,high,low,close,volume,amount",
+                         start, end, interval)
+    if not frames:
         raise RuntimeError("同花顺未返回该区间的分钟历史数据")
+    df = pd.concat(frames, ignore_index=True)
     d = df.copy()
     d.columns = [str(c).strip().lower() for c in d.columns]
     tcol = next((c for c in ("time", "datetime", "date") if c in d.columns), None)
@@ -1864,12 +1921,17 @@ def fetch_minute_period_to_db(code: str, start: str, end: str,
 
 
 def fetch_orderbook_day_to_db(code: str, day: str) -> dict:
-    """从同花顺 THS_SS 单次拉取指定交易日盘口快照并严格校验日期后落库。
+    """从同花顺 THS_SS 单次拉取指定交易日五档盘口快照并严格校验日期后落库。
 
+    写入 latest/open/high/low/volume/amount + bid1-5/ask1-5 + bidSize1-5/askSize1-5
+    （实测 2026-09 THS_SS 支持五档价量；changeRatio/turnoverRatio 等不支持，静默丢弃）。
     不使用 HTTP 实时行情兜底，避免把当前盘口误写成历史盘口。历史权限不支持、
     返回空或返回日期不符时均不写库。
     """
-    indicators = "latest;bid1;ask1;volume;amount"
+    indicators = ("latest;open;high;low;volume;amount;"
+                  "bid1;bid2;bid3;bid4;bid5;ask1;ask2;ask3;ask4;ask5;"
+                  "bidSize1;bidSize2;bidSize3;bidSize4;bidSize5;"
+                  "askSize1;askSize2;askSize3;askSize4;askSize5")
     start, end = f"{day} 09:25:00", f"{day} 15:05:00"
     _ths_login()
     df, _res, err = ths_call(
@@ -1898,17 +1960,39 @@ def fetch_orderbook_day_to_db(code: str, day: str) -> dict:
     def numeric(name):
         return pd.to_numeric(d[name], errors="coerce") if name in d.columns else pd.Series(np.nan, index=d.index)
 
+    def _f(v):
+        # 必须转原生 float：numpy.int64 会被 sqlite3 的 numpy __conform__ 适配成 BLOB
+        return float(v) if pd.notna(v) else None
+
     price = numeric("latest")
     if price.isna().all() and "price" in d.columns:
         price = numeric("price")
+    fields = {name: numeric(name) for name in ("open", "high", "low", "volume", "amount")}
+    for i in range(1, 6):
+        fields[f"bid{i}"] = numeric(f"bid{i}")
+        fields[f"ask{i}"] = numeric(f"ask{i}")
+        fields[f"bidsize{i}"] = numeric(f"bidsize{i}")
+        fields[f"asksize{i}"] = numeric(f"asksize{i}")
     rows = []
     for idx in d.index:
         ts = d.at[idx, "datetime"].strftime("%Y-%m-%d %H:%M:%S")
         rows.append((
-            code, ts, price.at[idx], np.nan, np.nan, np.nan, np.nan, np.nan,
-            numeric("volume").at[idx], numeric("amount").at[idx], np.nan, np.nan,
-            np.nan, np.nan, np.nan, np.nan, numeric("bid1").at[idx],
-            numeric("ask1").at[idx], np.nan, np.nan))
+            code, ts, _f(price.at[idx]), None,
+            _f(fields["open"].at[idx]), _f(fields["high"].at[idx]),
+            _f(fields["low"].at[idx]), None,
+            _f(fields["volume"].at[idx]), _f(fields["amount"].at[idx]),
+            None, None, None, None, None, None,
+            _f(fields["bid1"].at[idx]), _f(fields["ask1"].at[idx]), None, None,
+            _f(fields["bid2"].at[idx]), _f(fields["bid3"].at[idx]),
+            _f(fields["bid4"].at[idx]), _f(fields["bid5"].at[idx]),
+            _f(fields["ask2"].at[idx]), _f(fields["ask3"].at[idx]),
+            _f(fields["ask4"].at[idx]), _f(fields["ask5"].at[idx]),
+            _f(fields["bidsize1"].at[idx]), _f(fields["bidsize2"].at[idx]),
+            _f(fields["bidsize3"].at[idx]), _f(fields["bidsize4"].at[idx]),
+            _f(fields["bidsize5"].at[idx]),
+            _f(fields["asksize1"].at[idx]), _f(fields["asksize2"].at[idx]),
+            _f(fields["asksize3"].at[idx]), _f(fields["asksize4"].at[idx]),
+            _f(fields["asksize5"].at[idx])))
     before = 0
     with _conn() as c:
         before = c.execute(
@@ -1918,9 +2002,72 @@ def fetch_orderbook_day_to_db(code: str, day: str) -> dict:
             "INSERT OR REPLACE INTO ifind_realtime"
             "(code,datetime,price,prev_close,open,high,low,change_pct,volume,amount,"
             "turnover,quantity_ratio,amplitude,float_shares,float_mv,speed,bid1,ask1,"
-            "limit_up,limit_down) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            "limit_up,limit_down,bid2,bid3,bid4,bid5,ask2,ask3,ask4,ask5,"
+            "bid_size1,bid_size2,bid_size3,bid_size4,bid_size5,"
+            "ask_size1,ask_size2,ask_size3,ask_size4,ask_size5)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
         after = c.execute(
             "SELECT COUNT(*) FROM ifind_realtime WHERE code=? AND datetime BETWEEN ? AND ?",
+            (code, start, end)).fetchone()[0]
+    return {"returned": len(d), "written": len(rows), "new_rows": max(0, after - before),
+            "day": day, "start": d["datetime"].min().strftime("%H:%M:%S"),
+            "end": d["datetime"].max().strftime("%H:%M:%S")}
+
+
+def fetch_ticks_tx_to_db(code: str, day: str) -> dict:
+    """从腾讯分笔接口（akshare stock_zh_a_tick_tx_js）拉取当日分笔成交并落库 tick_data。
+
+    TDX 逐笔通道 2026-09-10 协议失配后的替代通道。腾讯分笔为交易所 3 秒级聚合
+    （与快照同频），含买/卖/中性方向；只提供当日数据，历史分笔无免费通道。
+    buyorsell 口径与 TDX 一致：0=买盘 1=卖盘 2=中性盘。
+    """
+    import akshare as ak
+    today = datetime.now().strftime("%Y-%m-%d")
+    if day != today:
+        raise RuntimeError(f"腾讯分笔只提供当日数据（请求 {day}，今天 {today}），历史分笔无免费通道")
+    symbol = code.lower()
+    if not re.match(r"^(sh|sz)\d{6}$", symbol):
+        raise RuntimeError(f"腾讯分笔不支持该代码：{code}（仅沪深 A 股）")
+    df = ak.stock_zh_a_tick_tx_js(symbol=symbol)
+    if df is None or df.empty:
+        raise RuntimeError("腾讯分笔未返回当日数据；可能非交易日或标的停牌")
+
+    d = df.copy()
+    d.columns = [str(c).strip() for c in d.columns]
+    required = {"成交时间", "成交价格", "成交量", "成交金额", "性质"}
+    if not required.issubset(set(d.columns)):
+        raise RuntimeError(f"腾讯分笔返回字段缺失：{sorted(d.columns)}")
+    d["datetime"] = pd.to_datetime(day + " " + d["成交时间"].astype(str), errors="coerce")
+    d = d[d["datetime"].notna()].copy()
+    if d.empty:
+        raise RuntimeError("腾讯分笔时间字段解析失败，未写入")
+    if sorted(d["datetime"].dt.strftime("%Y-%m-%d").unique().tolist()) != [day]:
+        raise RuntimeError("腾讯分笔返回日期与请求不符，已拒绝写库")
+
+    direction = {"买盘": 0, "卖盘": 1, "中性盘": 2}
+    price = pd.to_numeric(d["成交价格"], errors="coerce")
+    volume = pd.to_numeric(d["成交量"], errors="coerce").fillna(0).astype(int)
+    amount = pd.to_numeric(d["成交金额"], errors="coerce")
+
+    def _f(v):
+        return float(v) if pd.notna(v) else None
+
+    # 必须转原生 float/int：numpy.int64 会被 sqlite3 的 numpy __conform__ 适配成 BLOB
+    rows = [
+        (code, ts, _f(price.at[i]), int(volume.at[i]), _f(amount.at[i]),
+         direction.get(str(d.at[i, "性质"]).strip(), 2), "tencent_tx")
+        for i, ts in zip(d.index, d["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S"))
+    ]
+    start, end = f"{day} 00:00:00", f"{day} 23:59:59"
+    with _conn() as c:
+        before = c.execute(
+            "SELECT COUNT(*) FROM tick_data WHERE code=? AND datetime BETWEEN ? AND ?",
+            (code, start, end)).fetchone()[0]
+        c.executemany(
+            "INSERT OR REPLACE INTO tick_data"
+            "(code,datetime,price,volume,amount,buyorsell,source) VALUES(?,?,?,?,?,?,?)", rows)
+        after = c.execute(
+            "SELECT COUNT(*) FROM tick_data WHERE code=? AND datetime BETWEEN ? AND ?",
             (code, start, end)).fetchone()[0]
     return {"returned": len(d), "written": len(rows), "new_rows": max(0, after - before),
             "day": day, "start": d["datetime"].min().strftime("%H:%M:%S"),

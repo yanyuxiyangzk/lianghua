@@ -80,13 +80,42 @@ def _load_minute_day(code: str, trade_date: str) -> pd.DataFrame:
             params=(code, trade_date, trade_date + " 23:59:59"))
 
 
+def _orderbook_day_stats(code: str, trade_date: str) -> dict:
+    """当天盘口快照（ifind_realtime）的总量与覆盖时段。"""
+    with datasource._conn() as c:
+        row = c.execute(
+            "SELECT COUNT(*), MIN(datetime), MAX(datetime) FROM ifind_realtime "
+            "WHERE code=? AND datetime BETWEEN ? AND ?",
+            (code, trade_date, trade_date + " 23:59:59")).fetchone()
+    return {"total": int(row[0]), "first": row[1], "last": row[2]}
+
+
+def _load_orderbook_day_page(code: str, trade_date: str, page_size: int,
+                             offset: int) -> pd.DataFrame:
+    """全天盘口快照分页查询（SQL 级 LIMIT/OFFSET，不全量读入内存）。含五档价量。"""
+    with datasource._conn() as c:
+        return pd.read_sql_query(
+            """SELECT datetime,price,
+                      bid1,bid2,bid3,bid4,bid5,ask1,ask2,ask3,ask4,ask5,
+                      bid_size1,bid_size2,bid_size3,bid_size4,bid_size5,
+                      ask_size1,ask_size2,ask_size3,ask_size4,ask_size5,
+                      volume,amount,change_pct,speed
+               FROM ifind_realtime WHERE code=? AND datetime BETWEEN ? AND ?
+               ORDER BY datetime LIMIT ? OFFSET ?""",
+            c, params=(code, trade_date, trade_date + " 23:59:59", page_size, offset))
+
+
 def _load_market_depth(code: str, minute_ts: str) -> dict[str, pd.DataFrame]:
     """读取指定分钟内已有盘口快照/行情快照/逐笔成交，不跨分钟匹配。"""
     minute = pd.Timestamp(minute_ts).strftime("%Y-%m-%d %H:%M")
     start, end = minute + ":00", minute + ":59"
     with datasource._conn() as c:
         realtime = pd.read_sql_query(
-            """SELECT datetime,price,bid1,ask1,volume,amount,turnover,quantity_ratio,
+            """SELECT datetime,price,
+                      bid1,bid2,bid3,bid4,bid5,ask1,ask2,ask3,ask4,ask5,
+                      bid_size1,bid_size2,bid_size3,bid_size4,bid_size5,
+                      ask_size1,ask_size2,ask_size3,ask_size4,ask_size5,
+                      volume,amount,turnover,quantity_ratio,
                       speed,change_pct,high,low,limit_up,limit_down
                FROM ifind_realtime WHERE code=? AND datetime BETWEEN ? AND ?
                ORDER BY datetime""", c, params=(code, start, end))
@@ -255,7 +284,8 @@ def _render_market_depth(code: str, trade_date: str, minute_ts: str):
     if st.button("← 返回当天分钟列表"):
         _go("day", code, trade_date)
     st.title(f"{code} · {minute_ts} 盘口高频数据")
-    st.caption("仅展示该分钟内数据库实际保存的盘口快照与逐笔数据，不使用相邻分钟数据填充。")
+    st.caption("仅展示该分钟内数据库实际保存的盘口快照与逐笔数据，不使用相邻分钟数据填充；"
+               "全天盘口快照请返回上一层，在日详情页底部“全天盘口快照”分页浏览。")
     data = _load_market_depth(code, minute_ts)
     total = sum(len(df) for df in data.values())
     m1, m2, m3, m4 = st.columns(4)
@@ -291,7 +321,7 @@ def _render_day_detail(code: str, trade_date: str):
     if minute_day.empty:
         st.info("该交易日没有分钟历史数据。")
         return
-    sync_col, note_col = st.columns([1, 4])
+    sync_col, tick_col, note_col = st.columns([1, 1.1, 2.9])
     if sync_col.button("🔄 同步全天盘口", type="primary", use_container_width=True,
                        help="通过同花顺历史快照接口一次同步当前交易日全部可用盘口数据"):
         with st.spinner(f"正在从同花顺同步 {trade_date} 全天盘口快照…"):
@@ -303,8 +333,22 @@ def _render_day_detail(code: str, trade_date: str):
                 st.rerun()
             except Exception as exc:
                 st.error(f"盘口同步失败：{exc}")
-    note_col.caption("同步范围是当前交易日的全部分钟；严格校验返回日期和买一/卖一字段，"
-                     "不会用今天的实时盘口冒充历史盘口。")
+    is_today = str(trade_date) == date.today().isoformat()
+    if tick_col.button("🧾 同步当日分笔", disabled=not is_today,
+                       use_container_width=True,
+                       help=("腾讯分笔成交（3秒级聚合，含买/卖/中性方向）写入 tick_data"
+                             if is_today else "腾讯分笔仅支持当日数据，历史分笔无免费通道")):
+        with st.spinner(f"正在从腾讯同步 {trade_date} 分笔成交…"):
+            try:
+                result = datasource.fetch_ticks_tx_to_db(code, trade_date)
+                st.success(f"分笔同步完成：返回 {result['returned']} 条，写入/覆盖 "
+                           f"{result['written']} 条，新增 {result['new_rows']} 条；"
+                           f"覆盖 {result['start']}～{result['end']}。")
+                st.rerun()
+            except Exception as exc:
+                st.error(f"分笔同步失败：{exc}")
+    note_col.caption("盘口同步严格校验返回日期和买一/卖一字段，不会用今天的实时盘口冒充历史盘口；"
+                     "分笔成交为腾讯通道，仅当日可取。")
     if minute_day["close"].nunique(dropna=True) <= 1:
         st.warning("该交易日分钟收盘价没有变化，建议在进入模型前标记为数据异常并复核数据源。")
     page_size = 20
@@ -344,6 +388,24 @@ def _render_day_detail(code: str, trade_date: str):
                 st.session_state.pop("stock_history_minute_delete", None)
                 st.rerun()
     _pagination_bottom(len(minute_day), page_key, page, pages, page_size)
+
+    st.divider()
+    st.subheader("📖 全天盘口快照")
+    ob_stats = _orderbook_day_stats(code, trade_date)
+    if ob_stats["total"] == 0:
+        st.caption("该交易日暂无盘口快照，可点击上方“同步全天盘口”从同花顺拉取。")
+    else:
+        st.caption(
+            f"共 {ob_stats['total']:,} 条 · 覆盖 {str(ob_stats['first'])[11:]}～"
+            f"{str(ob_stats['last'])[11:]} · 快照为交易所 3 秒一笔的原生频率"
+            "（数据源上限，更细粒度需逐笔数据）；volume/amount 为当日累计口径。")
+        ob_size = st.selectbox("每页条数", [50, 100, 200, 500], index=1,
+                               key=f"ob_size_{code}_{trade_date}")
+        ob_key = f"orderbook_{code}_{trade_date}"
+        ob_page, ob_pages, ob_start = _page_slice(ob_stats["total"], ob_key, ob_size)
+        ob_df = _load_orderbook_day_page(code, trade_date, ob_size, ob_start)
+        st.dataframe(ob_df, hide_index=True, width="stretch")
+        _pagination_bottom(ob_stats["total"], ob_key, ob_page, ob_pages, ob_size)
 
 
 def _render_stock_detail(code: str):
@@ -385,10 +447,11 @@ def _render_stock_detail(code: str):
     sync_all_col, note_col = st.columns([1.4, 4.6])
     if sync_all_col.button("🔄 一次性同步全部分钟", type="primary",
                            use_container_width=True,
-                           help="单次调用同花顺THS_HF，抓取当前日线范围内全部1分钟历史"):
+                           help="调用同花顺THS_HF抓取当前日线范围内全部1分钟历史；"
+                                "超长区间自动分段（接口单次上限200万条）"):
         range_start, range_end = str(daily["date"].min()), str(daily["date"].max())
         try:
-            with st.spinner(f"正在单次抓取 {range_start} 至 {range_end} 的1分钟历史…"):
+            with st.spinner(f"正在分段抓取 {range_start} 至 {range_end} 的1分钟历史…"):
                 result = datasource.fetch_minute_period_to_db(
                     code, range_start, range_end, "1min")
                 features = datasource.compute_intraday_features(
@@ -414,7 +477,8 @@ def _render_stock_detail(code: str):
             st.session_state["stock_history_detail_flash"] = (
                 "error", f"一次性分钟同步失败：{exc}")
             st.rerun()
-    note_col.caption("只调用一次同花顺高频接口并批量入库，不再逐日循环，也不需要10秒间隔。"
+    note_col.caption("不再逐日循环，也不需要10秒间隔；接口单次上限200万数据点，"
+                     "超长区间（如指数数十年历史）自动分段、超限自动对半重试。"
                      "同步完成后会校验返回日期覆盖并重算日内特征。")
     page_size = 20
     page_key = f"daily_{code}"

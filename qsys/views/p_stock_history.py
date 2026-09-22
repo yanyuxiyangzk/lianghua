@@ -136,6 +136,29 @@ def _record_job(code, data_type, start, end, count, status="success", error=None
              int(comp.get("missing_count", 0)), now, status, error))
 
 
+@st.fragment(run_every=5)
+def _render_minute_sync_progress(code: str):
+    """同步任务运行时每5秒局部刷新，不重绘整张日线表。"""
+    task = datasource.minute_sync_task_status(code)
+    if not task:
+        return
+    api_processed = int(task.get("synced_days") or 0) + int(task.get("failed_days") or 0)
+    total = max(1, int(task.get("total_days") or 0))
+    remaining = max(0, total - api_processed)
+    st.progress(min(1.0, api_processed / total),
+                text=(f"状态：{task.get('status')} · 接口进度 {api_processed}/{total} · "
+                      f"新同步 {task.get('synced_days', 0)} · 已有数据跳过 {task.get('skipped_days', 0)} · "
+                      f"失败 {task.get('failed_days', 0)}"
+                      + (f" · 当前 {task.get('current_date')}" if task.get("current_date") else "")))
+    if task.get("status") == "running" and task.get("worker_alive"):
+        st.caption(f"进度每5秒自动刷新。按最低10秒间隔估算，剩余限速等待约 "
+                   f"{remaining * 10 // 60} 分钟；实际时间还包括同花顺接口响应。")
+    elif task.get("status") == "interrupted":
+        st.info("上次后台任务已中断，可点击“全局同步分钟”从尚未完整的日期继续。")
+    if task.get("last_error"):
+        st.warning("最近一次同步异常：" + str(task["last_error"]))
+
+
 def _delete_stock_history(code: str) -> dict:
     """删除单票原始历史与派生特征，保留概率模型、因子和策略结果。"""
     with datasource._conn() as c:
@@ -157,6 +180,41 @@ def _go(view: str, code: str = "", trade_date: str = "", minute_ts: str = ""):
     st.session_state["stock_history_day"] = trade_date
     st.session_state["stock_history_minute"] = minute_ts
     st.rerun()
+
+
+def _page_slice(total: int, key: str, page_size: int = 20) -> tuple[int, int, int]:
+    """读取当前分页状态，返回当前页、总页数和起始下标。"""
+    pages = max(1, (int(total) + page_size - 1) // page_size)
+    state_key = f"{key}_page"
+    current = max(1, min(int(st.session_state.get(state_key, 1)), pages))
+    st.session_state[state_key] = current
+    return current, pages, (current - 1) * page_size
+
+
+def _pagination_bottom(total: int, key: str, current: int,
+                       pages: int, page_size: int = 20) -> None:
+    """列表底部的上一页、页码输入跳转和下一页控件。"""
+    state_key = f"{key}_page"
+    # 输入框按当前页使用独立 key，避免组件实例化后再修改同一个 session_state key。
+    input_key = f"{key}_page_input_{current}"
+    prev_col, info_col, input_col, jump_col, next_col = st.columns([1, 2.2, 1, .8, 1])
+    if prev_col.button("← 上一页", key=f"{key}_prev", disabled=current <= 1,
+                       use_container_width=True):
+        st.session_state[state_key] = current - 1
+        st.rerun()
+    info_col.markdown(
+        f"<div style='text-align:center;padding:8px'>第 {current} / {pages} 页 · "
+        f"共 {int(total):,} 条 · 每页 {page_size} 条</div>", unsafe_allow_html=True)
+    target = input_col.number_input(
+        "页码", min_value=1, max_value=pages, value=current, step=1,
+        key=input_key, label_visibility="collapsed")
+    if jump_col.button("跳转", key=f"{key}_jump", use_container_width=True):
+        st.session_state[state_key] = int(target)
+        st.rerun()
+    if next_col.button("下一页 →", key=f"{key}_next", disabled=current >= pages,
+                       use_container_width=True):
+        st.session_state[state_key] = current + 1
+        st.rerun()
 
 
 def _render_stock_rows(inventory: pd.DataFrame):
@@ -249,12 +307,11 @@ def _render_day_detail(code: str, trade_date: str):
                      "不会用今天的实时盘口冒充历史盘口。")
     if minute_day["close"].nunique(dropna=True) <= 1:
         st.warning("该交易日分钟收盘价没有变化，建议在进入模型前标记为数据异常并复核数据源。")
-    page_size = st.selectbox("每页分钟条数", [20, 50, 100], index=1,
-                             key=f"minute_page_size_{code}_{trade_date}")
-    pages = max(1, (len(minute_day) + page_size - 1) // page_size)
-    page = st.number_input("页码", min_value=1, max_value=pages, value=1, step=1,
-                           key=f"minute_page_{code}_{trade_date}")
-    part = minute_day.iloc[(int(page) - 1) * page_size:int(page) * page_size]
+    page_size = 20
+    page_key = f"minute_{code}_{trade_date}"
+    page, pages, start_idx = _page_slice(
+        len(minute_day), page_key, page_size)
+    part = minute_day.iloc[start_idx:start_idx + page_size]
     headers = st.columns([1.25, .65, .65, .65, .65, .9, 1.0, 1.0])
     for col, label in zip(headers, ["时间", "开盘", "最高", "最低", "收盘",
                                     "成交量", "成交额", "操作"]):
@@ -286,11 +343,16 @@ def _render_day_detail(code: str, trade_date: str):
             if no.button("取消", key=f"minute_delete_no_{code}_{minute_key}"):
                 st.session_state.pop("stock_history_minute_delete", None)
                 st.rerun()
+    _pagination_bottom(len(minute_day), page_key, page, pages, page_size)
 
 
 def _render_stock_detail(code: str):
     if st.button("← 返回已抓取股票列表"):
         _go("list")
+    flash = st.session_state.pop("stock_history_detail_flash", None)
+    if flash:
+        level, message = flash
+        getattr(st, level, st.info)(message)
     inventory = _stock_inventory()
     matched = inventory[inventory["code"] == code]
     name = str(matched.iloc[0]["name"]) if not matched.empty else ""
@@ -301,35 +363,120 @@ def _render_stock_detail(code: str):
             """SELECT date,open,high,low,close,volume,amount,fetched_at
                FROM market_daily WHERE source='ths_ifind' AND code=? ORDER BY date DESC""",
             c, params=(code,))
+        minute_counts = pd.read_sql_query(
+            "SELECT substr(datetime,1,10) AS date,COUNT(*) AS minute_count "
+            "FROM ifind_minute WHERE code=? GROUP BY substr(datetime,1,10)",
+            c, params=(code,))
     if daily.empty:
         st.info("该股票暂无日线数据。请返回列表页抓取日线历史。")
         summary = _minute_daily_summary(code, "1900-01-01", "2999-12-31")
         if not summary.empty:
             st.caption(f"分钟数据仍有 {len(summary)} 个交易日。")
         return
-    p1, p2, p3 = st.columns(3)
+    count_map = (minute_counts.set_index("date")["minute_count"].to_dict()
+                 if not minute_counts.empty else {})
+    synced_days = sum(1 for day in daily["date"].astype(str) if int(count_map.get(day, 0)) >= 200)
+    p1, p2, p3, p4 = st.columns(4)
     p1.metric("日线交易日", len(daily))
     p2.metric("最早日期", daily["date"].min())
     p3.metric("最新日期", daily["date"].max())
-    page_size = st.selectbox("每页日线条数", [20, 50, 100], index=1,
-                             key=f"daily_page_size_{code}")
-    pages = max(1, (len(daily) + page_size - 1) // page_size)
-    page = st.number_input("页码", min_value=1, max_value=pages, value=1, step=1,
-                           key=f"daily_page_{code}")
-    part = daily.iloc[(int(page) - 1) * page_size:int(page) * page_size]
-    headers = st.columns([1.0, 0.75, 0.75, 0.75, 0.75, 1.0, 1.15, 0.8])
+    p4.metric("分钟已同步", f"{synced_days}/{len(daily)}")
+
+    sync_all_col, note_col = st.columns([1.4, 4.6])
+    if sync_all_col.button("🔄 一次性同步全部分钟", type="primary",
+                           use_container_width=True,
+                           help="单次调用同花顺THS_HF，抓取当前日线范围内全部1分钟历史"):
+        range_start, range_end = str(daily["date"].min()), str(daily["date"].max())
+        try:
+            with st.spinner(f"正在单次抓取 {range_start} 至 {range_end} 的1分钟历史…"):
+                result = datasource.fetch_minute_period_to_db(
+                    code, range_start, range_end, "1min")
+                features = datasource.compute_intraday_features(
+                    code, range_start, range_end, min_rows_per_day=200)
+                completeness = datasource.minute_completeness(
+                    code, range_start, range_end)
+                with datasource._conn() as c:
+                    total_rows = c.execute(
+                        "SELECT COUNT(*) FROM ifind_minute WHERE code=?",
+                        (code,)).fetchone()[0]
+                _record_job(code, "minute_1m", range_start, range_end, total_rows,
+                            "success" if not completeness["missing_count"] else "partial",
+                            completeness=completeness)
+            message = (f"一次性同步完成：单次接口返回并写入/覆盖 {result['written']:,} 条，"
+                       f"覆盖 {result['days']} 个交易日（完整 {result['complete_days']} 天），"
+                       f"重算日内特征 {features['computed_days']} 天；"
+                       f"数据范围 {result['first']} 至 {result['last']}。")
+            if completeness["missing_count"]:
+                message += f" 与日线相比仍缺少或不完整 {completeness['missing_count']} 天。"
+            st.session_state["stock_history_detail_flash"] = ("success", message)
+            st.rerun()
+        except Exception as exc:
+            st.session_state["stock_history_detail_flash"] = (
+                "error", f"一次性分钟同步失败：{exc}")
+            st.rerun()
+    note_col.caption("只调用一次同花顺高频接口并批量入库，不再逐日循环，也不需要10秒间隔。"
+                     "同步完成后会校验返回日期覆盖并重算日内特征。")
+    page_size = 20
+    page_key = f"daily_{code}"
+    page, pages, start_idx = _page_slice(len(daily), page_key, page_size)
+    part = daily.iloc[start_idx:start_idx + page_size]
+    headers = st.columns([1.0, 0.7, 0.7, 0.7, 0.7, .9, 1.05, .85, 1.45])
     for col, label in zip(headers, ["日期", "开盘", "最高", "最低", "收盘",
-                                    "成交量", "成交额", "操作"]):
+                                    "成交量", "成交额", "分钟状态", "操作"]):
         col.markdown(f"**{label}**")
     for row in part.itertuples(index=False):
-        cols = st.columns([1.0, 0.75, 0.75, 0.75, 0.75, 1.0, 1.15, 0.8])
+        cols = st.columns([1.0, 0.7, 0.7, 0.7, 0.7, .9, 1.05, .85, 1.45])
         vals = [row.date, row.open, row.high, row.low, row.close,
                 f"{float(row.volume or 0):,.0f}", f"{float(row.amount or 0):,.0f}"]
         for col, value in zip(cols[:7], vals):
             col.write(value)
-        if cols[7].button("分钟详情", key=f"day_detail_{code}_{row.date}",
-                          use_container_width=True):
-            _go("day", code, str(row.date))
+        minute_count = int(count_map.get(str(row.date), 0))
+        if minute_count >= 200:
+            cols[7].success(f"已同步 {minute_count}")
+        elif minute_count > 0:
+            cols[7].warning(f"不完整 {minute_count}")
+        else:
+            cols[7].caption("待同步")
+        with cols[8]:
+            sync_col, detail_col = st.columns(2)
+            if sync_col.button("同步分钟", key=f"day_sync_{code}_{row.date}",
+                               disabled=minute_count >= 200,
+                               use_container_width=True,
+                               help="从同花顺抓取该交易日的1分钟历史并写入本地库"):
+                try:
+                    with st.spinner(f"正在同步 {row.date} 的1分钟数据…"):
+                        written = datasource.fetch_minute_to_db(code, str(row.date), "1min")
+                        if written:
+                            datasource.compute_intraday_features(
+                                code, str(row.date), str(row.date), min_rows_per_day=200)
+                        with datasource._conn() as c:
+                            total_rows = c.execute(
+                                "SELECT COUNT(*) FROM ifind_minute WHERE code=?",
+                                (code,)).fetchone()[0]
+                        range_start, range_end = (str(daily["date"].min()),
+                                                  str(daily["date"].max()))
+                        completeness = datasource.minute_completeness(
+                            code, range_start, range_end)
+                        _record_job(code, "minute_1m", range_start, range_end, total_rows,
+                                    "success" if not completeness["missing_count"] else "partial",
+                                    completeness=completeness)
+                    if written:
+                        message = f"{row.date} 分钟数据同步完成，写入/覆盖 {written:,} 条。"
+                        level = "success"
+                    else:
+                        message = (f"{row.date} 同花顺未返回分钟数据；可能为非交易日、"
+                                   "接口权限不足或该日数据暂不可用。")
+                        level = "warning"
+                    st.session_state["stock_history_detail_flash"] = (level, message)
+                    st.rerun()
+                except Exception as exc:
+                    st.session_state["stock_history_detail_flash"] = (
+                        "error", f"{row.date} 分钟数据同步失败：{exc}")
+                    st.rerun()
+            if detail_col.button("分钟详情", key=f"day_detail_{code}_{row.date}",
+                                 use_container_width=True):
+                _go("day", code, str(row.date))
+    _pagination_bottom(len(daily), page_key, page, pages, page_size)
 
 
 def _render_fetch_form():

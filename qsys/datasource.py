@@ -12,6 +12,7 @@ import json
 import os
 import re
 import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -118,6 +119,12 @@ def _conn():
         repaired_days INTEGER DEFAULT 0, failed_json TEXT,
         status TEXT, updated_at TEXT,
         PRIMARY KEY(stock_id, start_date, end_date));
+    CREATE TABLE IF NOT EXISTS minute_sync_tasks(
+        code TEXT PRIMARY KEY, status TEXT NOT NULL,
+        total_days INTEGER DEFAULT 0, synced_days INTEGER DEFAULT 0,
+        skipped_days INTEGER DEFAULT 0, failed_days INTEGER DEFAULT 0,
+        current_date TEXT, last_error TEXT, started_at TEXT, updated_at TEXT,
+        finished_at TEXT);
     CREATE TABLE IF NOT EXISTS stock_intraday_features(
         stock_id INTEGER NOT NULL, code TEXT NOT NULL, trade_date TEXT NOT NULL,
         minute_count INTEGER, open_ret_30m REAL, morning_ret REAL,
@@ -377,6 +384,8 @@ def _ak_daily_cached(code: str, start: str, end: str) -> pd.DataFrame:
 # cooldown：登录失败（尤其 -9 会话超限）后熔断一段时间再重试——
 # 页面自动刷新会反复触发登录，不限流会把服务端锁定窗口一直续期。
 _THS = {"logged_in": False, "cooldown_until": 0.0}
+_MINUTE_SYNC_THREADS: dict[str, threading.Thread] = {}
+_MINUTE_SYNC_LOCK = threading.Lock()
 
 
 def _ths_credentials() -> tuple[str, str, str]:
@@ -1805,6 +1814,55 @@ def fetch_minute_to_db(code: str, day: str = "", interval: str = "1min") -> int:
     return len(d)
 
 
+def fetch_minute_period_to_db(code: str, start: str, end: str,
+                              interval: str = "1min") -> dict:
+    """单次 THS_HF 请求抓取一个日期区间的分钟线并批量入库。
+
+    同花顺接口支持单股票跨交易日返回；不再逐日循环调用。返回实际日期覆盖，
+    由页面展示并与日线交易日核对，避免接口截断时被误认为完整同步。
+    """
+    begin_ts, end_ts = f"{start} 09:25:00", f"{end} 15:05:00"
+    df, _res, err = ths_highfreq(
+        _to_ths_code(code), "open,high,low,close,volume,amount",
+        begin_ts, end_ts, interval)
+    if err not in (0, None):
+        raise RuntimeError(f"同花顺分钟历史返回错误码 {err}")
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        raise RuntimeError("同花顺未返回该区间的分钟历史数据")
+    d = df.copy()
+    d.columns = [str(c).strip().lower() for c in d.columns]
+    tcol = next((c for c in ("time", "datetime", "date") if c in d.columns), None)
+    if not tcol:
+        raise RuntimeError("同花顺分钟历史缺少时间字段")
+    d["datetime"] = pd.to_datetime(d[tcol], errors="coerce")
+    d = d[d["datetime"].notna()].copy()
+    d = d[(d["datetime"] >= pd.Timestamp(begin_ts)) &
+          (d["datetime"] <= pd.Timestamp(end_ts))]
+    required = ("open", "high", "low", "close", "volume")
+    missing = [col for col in required if col not in d.columns]
+    if missing:
+        raise RuntimeError("同花顺分钟历史缺少字段：" + ",".join(missing))
+    if "amount" not in d.columns:
+        d["amount"] = pd.to_numeric(d["close"], errors="coerce") * pd.to_numeric(
+            d["volume"], errors="coerce")
+    d["datetime_text"] = d["datetime"].dt.strftime("%Y-%m-%d %H:%M:%S")
+    d = d.drop_duplicates(subset=["datetime_text"], keep="last")
+    stock_id = get_or_create_stock_id(code)
+    values = [(code, r.datetime_text, r.open, r.high, r.low, r.close,
+               r.volume, r.amount, stock_id) for r in d.itertuples()]
+    with _qconn() as c:
+        c.executemany(
+            "INSERT OR REPLACE INTO ifind_minute"
+            "(code,datetime,open,high,low,close,volume,amount,stock_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?)", values)
+    daily_counts = d.groupby(d["datetime"].dt.strftime("%Y-%m-%d")).size()
+    return {"written": len(values), "days": int(len(daily_counts)),
+            "complete_days": int((daily_counts >= 200).sum()),
+            "first": d["datetime"].min().strftime("%Y-%m-%d %H:%M:%S"),
+            "last": d["datetime"].max().strftime("%Y-%m-%d %H:%M:%S"),
+            "daily_counts": {str(k): int(v) for k, v in daily_counts.items()}}
+
+
 def fetch_orderbook_day_to_db(code: str, day: str) -> dict:
     """从同花顺 THS_SS 单次拉取指定交易日盘口快照并严格校验日期后落库。
 
@@ -1889,6 +1947,137 @@ def fetch_minute_range_to_db(code: str, start: str, end: str, interval: str = "1
         if pause:
             time.sleep(pause)
     return total, ok, failed
+
+
+def minute_sync_task_status(code: str) -> dict:
+    """读取单股票全量分钟同步进度。"""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT status,total_days,synced_days,skipped_days,failed_days,current_date,"
+            "last_error,started_at,updated_at,finished_at FROM minute_sync_tasks WHERE code=?",
+            (code,)).fetchone()
+    if not row:
+        return {}
+    keys = ("status", "total_days", "synced_days", "skipped_days", "failed_days",
+            "current_date", "last_error", "started_at", "updated_at", "finished_at")
+    result = dict(zip(keys, row))
+    with _MINUTE_SYNC_LOCK:
+        thread = _MINUTE_SYNC_THREADS.get(code)
+        result["worker_alive"] = bool(thread and thread.is_alive())
+    if result["status"] == "running" and not result["worker_alive"]:
+        # Streamlit热更新或容器重启会终止内存线程；持久化状态不能永远停留在running。
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with _conn() as c:
+            c.execute(
+                "UPDATE minute_sync_tasks SET status='interrupted',last_error=?,updated_at=? "
+                "WHERE code=? AND status='running'",
+                ("后台进程已重启，任务可从未同步日期继续", now, code))
+        result["status"] = "interrupted"
+        result["last_error"] = "后台进程已重启，任务可从未同步日期继续"
+    return result
+
+
+def _run_minute_sync_task(code: str, days: list[str], pause_seconds: int) -> None:
+    with _conn() as c:
+        initial = c.execute(
+            "SELECT skipped_days FROM minute_sync_tasks WHERE code=?", (code,)).fetchone()
+    synced, skipped, failed = 0, int(initial[0] or 0) if initial else 0, 0
+    try:
+        for index, day in enumerate(days):
+            called_api = False
+            with _conn() as c:
+                count = c.execute(
+                    "SELECT COUNT(*) FROM ifind_minute WHERE code=? AND datetime BETWEEN ? AND ?",
+                    (code, day, day + " 23:59:59")).fetchone()[0]
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                c.execute(
+                    "UPDATE minute_sync_tasks SET current_date=?,updated_at=? WHERE code=?",
+                    (day, now, code))
+            if count >= 200:
+                skipped += 1
+            else:
+                called_api = True
+                try:
+                    written = fetch_minute_to_db(code, day, "1min")
+                    if written >= 200:
+                        synced += 1
+                        compute_intraday_features(code, day, day, min_rows_per_day=200)
+                    else:
+                        failed += 1
+                        with _conn() as c:
+                            c.execute("UPDATE minute_sync_tasks SET last_error=? WHERE code=?",
+                                      (f"{day} 未返回完整分钟数据（{written}条）", code))
+                except Exception as exc:
+                    failed += 1
+                    with _conn() as c:
+                        c.execute("UPDATE minute_sync_tasks SET last_error=? WHERE code=?",
+                                  (f"{day}: {type(exc).__name__}: {exc}"[:500], code))
+            with _conn() as c:
+                c.execute(
+                    "UPDATE minute_sync_tasks SET synced_days=?,skipped_days=?,failed_days=?,"
+                    "updated_at=? WHERE code=?",
+                    (synced, skipped, failed, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), code))
+            # 只在真正完成一次接口调用后限速；本地已有完整数据的日期立即跳过。
+            if called_api and index < len(days) - 1 and pause_seconds:
+                time.sleep(max(1, int(pause_seconds)))
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with _conn() as c:
+            c.execute(
+                "UPDATE minute_sync_tasks SET status='completed',current_date=NULL,"
+                "updated_at=?,finished_at=? WHERE code=?", (now, now, code))
+    except Exception as exc:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with _conn() as c:
+            c.execute(
+                "UPDATE minute_sync_tasks SET status='failed',last_error=?,updated_at=?,"
+                "finished_at=? WHERE code=?",
+                (f"{type(exc).__name__}: {exc}"[:500], now, now, code))
+    finally:
+        with _MINUTE_SYNC_LOCK:
+            _MINUTE_SYNC_THREADS.pop(code, None)
+
+
+def start_minute_sync_task(code: str, days: list[str], pause_seconds: int = 10) -> dict:
+    """启动单股票后台串行分钟同步；同一股票同时只允许一个任务。"""
+    days = [str(day)[:10] for day in days if str(day)]
+    if not days:
+        raise ValueError("没有可同步的交易日")
+    # 启动前一次性排除已完整日期，任务总量只表示真正需要调用接口的日期。
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT substr(datetime,1,10),COUNT(*) FROM ifind_minute WHERE code=? "
+            "GROUP BY substr(datetime,1,10)", (code,)).fetchall()
+    complete = {str(day) for day, count in rows if int(count or 0) >= 200}
+    requested_days = days
+    days = [day for day in days if day not in complete]
+    if not days:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with _conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO minute_sync_tasks"
+                "(code,status,total_days,synced_days,skipped_days,failed_days,current_date,"
+                "last_error,started_at,updated_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (code, "completed", 0, 0, len(requested_days), 0, None, None,
+                 now, now, now))
+        return {**minute_sync_task_status(code), "started": False, "already_complete": True}
+    with _MINUTE_SYNC_LOCK:
+        thread = _MINUTE_SYNC_THREADS.get(code)
+        if thread and thread.is_alive():
+            return {**minute_sync_task_status(code), "started": False}
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with _conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO minute_sync_tasks"
+                "(code,status,total_days,synced_days,skipped_days,failed_days,current_date,"
+                "last_error,started_at,updated_at,finished_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (code, "running", len(days), 0, len(complete.intersection(requested_days)),
+                 0, days[0], None, now, now, None))
+        thread = threading.Thread(
+            target=_run_minute_sync_task, args=(code, days, pause_seconds),
+            name=f"minute-sync-{code}", daemon=True)
+        _MINUTE_SYNC_THREADS[code] = thread
+        thread.start()
+    return {**minute_sync_task_status(code), "started": True}
 
 
 def expected_trade_days(start: str, end: str) -> list[str]:

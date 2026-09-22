@@ -2,6 +2,7 @@
 import sqlite3
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 import numpy as np
@@ -202,12 +203,77 @@ def test_orderbook_sync_rejects_wrong_day_and_writes_valid_rows():
     print("PASS: test_orderbook_sync_rejects_wrong_day_and_writes_valid_rows")
 
 
+def test_background_minute_sync_is_serial_and_skips_complete_days():
+    temp, old = _use_temp_db()
+    original_fetch = datasource.fetch_minute_to_db
+    try:
+        stock_id = datasource.get_or_create_stock_id("SZ001216")
+        with datasource._conn() as c:
+            _insert_minute_day(c, stock_id, "2026-09-18", 241)
+        calls = []
+
+        def fake_fetch(code, day, interval):
+            calls.append(day)
+            with datasource._conn() as c:
+                _insert_minute_day(c, stock_id, day, 241)
+            return 241
+
+        datasource.fetch_minute_to_db = fake_fetch
+        result = datasource.start_minute_sync_task(
+            "SZ001216", ["2026-09-18", "2026-09-21", "2026-09-22"],
+            pause_seconds=0)
+        assert result["started"] is True
+        for _ in range(100):
+            status = datasource.minute_sync_task_status("SZ001216")
+            if status.get("status") != "running":
+                break
+            time.sleep(.01)
+        assert status["status"] == "completed"
+        assert status["skipped_days"] == 1
+        assert status["synced_days"] == 2
+        assert status["failed_days"] == 0
+        assert calls == ["2026-09-21", "2026-09-22"]
+    finally:
+        datasource.fetch_minute_to_db = original_fetch
+        datasource.MKT_DB = old
+        temp.cleanup()
+    print("PASS: test_background_minute_sync_is_serial_and_skips_complete_days")
+
+
+def test_single_request_minute_period_writes_multiple_days():
+    temp, old = _use_temp_db()
+    original_highfreq = datasource.ths_highfreq
+    try:
+        frames = []
+        for day in ("2026-09-21", "2026-09-22"):
+            for i in range(241):
+                hour = 9 + (30 + i) // 60 if i < 121 else 13 + (i - 121) // 60
+                minute = (30 + i) % 60 if i < 121 else (i - 121) % 60
+                frames.append({"time": f"{day} {hour:02d}:{minute:02d}:00",
+                               "open": 10, "high": 10.1, "low": 9.9,
+                               "close": 10, "volume": 100, "amount": 1000})
+        datasource.ths_highfreq = lambda *args, **kwargs: (pd.DataFrame(frames), None, 0)
+        result = datasource.fetch_minute_period_to_db(
+            "SZ001216", "2026-09-21", "2026-09-22")
+        assert result["written"] == 482
+        assert result["days"] == result["complete_days"] == 2
+        with datasource._conn() as c:
+            assert c.execute("SELECT COUNT(*) FROM ifind_minute").fetchone()[0] == 482
+    finally:
+        datasource.ths_highfreq = original_highfreq
+        datasource.MKT_DB = old
+        temp.cleanup()
+    print("PASS: test_single_request_minute_period_writes_multiple_days")
+
+
 if __name__ == "__main__":
     tests = [test_stock_identity_is_stable, test_expected_trade_days_uses_union,
              test_minute_completeness_marks_partial_day,
              test_backfill_runs_in_batches_and_resumes,
              test_intraday_features_are_bounded_and_idempotent,
-             test_orderbook_sync_rejects_wrong_day_and_writes_valid_rows]
+             test_orderbook_sync_rejects_wrong_day_and_writes_valid_rows,
+             test_background_minute_sync_is_serial_and_skips_complete_days,
+             test_single_request_minute_period_writes_multiple_days]
     failed = 0
     for test in tests:
         try:

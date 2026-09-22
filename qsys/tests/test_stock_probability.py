@@ -199,6 +199,23 @@ def test_llm_evidence_is_compact_and_stock_bound():
     print("PASS: test_llm_evidence_is_compact_and_stock_bound")
 
 
+def test_intraday_model_candidates_require_minimum_walk_forward_and_matches():
+    data = _synthetic(550)
+    minute = pd.DataFrame({
+        "trade_date": data["date"].tail(240).to_numpy(), "minute_count": 241,
+        "morning_ret": .004, "afternoon_ret": .003, "close_vwap_gap": .006,
+        "up_minute_ratio": .58,
+    })
+    features = sp._features_and_labels(data, minute)
+    history, current = features.iloc[:-10], features.iloc[-1]
+    _, _, candidates = sp._select_model(features, history, current)
+    intraday = [x for x in candidates if x["scheme"].startswith("intraday_")]
+    assert intraday
+    assert all(x["objective"] >= 1.0 for x in intraday if
+               x["count"] < 30 or x["current_matches"] < 30)
+    print("PASS: test_intraday_model_candidates_require_minimum_walk_forward_and_matches")
+
+
 if __name__ == "__main__":
     tests = [test_beta_shrinkage_moves_to_half,
              test_path_probability_uses_no_hit_denominator,
@@ -209,7 +226,8 @@ if __name__ == "__main__":
              test_shadow_upsert_preserves_evaluation_columns,
              test_governance_requires_enough_groups,
              test_governance_only_allows_manual_review]
-    tests.append(test_llm_evidence_is_compact_and_stock_bound)
+    tests.extend([test_llm_evidence_is_compact_and_stock_bound,
+                  test_intraday_model_candidates_require_minimum_walk_forward_and_matches])
     failed = 0
     for test in tests:
         try:

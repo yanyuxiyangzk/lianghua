@@ -66,6 +66,7 @@ else:
         c.metric("样本外验证次数", model["oos_count"])
         d.metric("证据等级", "充足" if model.get("evidence") == "sufficient" else "有限")
         e.metric("完整分钟日", int(model.get("intraday_days") or 0))
+        iq = model.get("intraday_quality") or {}
         st.caption(f"训练区间：{model['train_start']} 至 {model['train_end']} · "
                    f"匹配方式：{model.get('match_method') or '-'} "
                    f"({model.get('selected_scheme') or '-'}) · 版本：{model['model_version']}")
@@ -73,6 +74,9 @@ else:
             st.success("本次样本外评估选择了日线 + 日内行为模型。")
         elif model.get("intraday_days"):
             st.info("分钟特征已参加候选模型评估，但本次样本外指标仍选择日线模型；系统不会为使用分钟数据而强行采用较差模型。")
+        if iq:
+            st.caption(f"分钟质量：{iq.get('quality', '-')} · 完整日 {iq.get('complete_days', 0)} / 总日 {iq.get('days', 0)} · "
+                       f"覆盖率 {float(iq.get('coverage') or 0):.1%} · 重复日 {iq.get('duplicate_days', 0)}")
 
         rows = []
         labels = {"up_1d": "未来1日上涨", "up_3d": "未来3日上涨",

@@ -334,6 +334,10 @@ def _render_stock_detail(code: str):
 
 def _render_fetch_form():
     st.subheader("抓取新股票或更新历史")
+    flash = st.session_state.pop("stock_history_fetch_flash", None)
+    if flash:
+        level, message = flash
+        getattr(st, level, st.info)(message)
     code = st.text_input(
         "股票代码", placeholder="例如 SH600519、600519.SH 或 600519", key="hist_code",
         help="输入代码后，只有点击开始抓取才访问同花顺接口。")
@@ -353,11 +357,18 @@ def _render_fetch_form():
         years = {"最近1年": 1, "最近3年": 3, "最近5年": 5}[range_mode]
         start = end - timedelta(days=365 * years)
     st.write(f"抓取区间：{start} 至 {end}（仅点击按钮后触发网络请求）")
+    batch_days = 10
+    if data_mode == "盘中1分钟历史":
+        batch_days = st.select_slider(
+            "每次抓取交易日数", options=[5, 10, 20], value=10,
+            help="分钟历史按交易日逐日调用同花顺。分批可避免页面长时间无响应；"
+                 "完成一批后可继续抓取，已完成日期不会重复请求。")
     dbcode = _db_code(code)
     valid = bool(dbcode and len(dbcode) == 8 and dbcode[2:].isdigit())
     if not valid:
         st.info("请输入有效的 6 位股票代码后，再点击下方按钮。")
-    fetch_clicked = st.button("▶ 开始抓取", type="primary", disabled=not valid,
+    fetch_label = "▶ 开始抓取" if data_mode == "日线历史" else "▶ 开始/继续抓取本批"
+    fetch_clicked = st.button(fetch_label, type="primary", disabled=not valid,
                               help="只有点击此按钮才会调用同花顺接口；页面加载不会自动爬取。")
     if not valid:
         return
@@ -369,14 +380,25 @@ def _render_fetch_form():
                     msg = f"抓取完成：写入/覆盖 {n} 条日线记录。"
                     _record_job(dbcode, "daily", str(start), str(end), n)
                 else:
-                    n, days_ok, failed = datasource.fetch_minute_range_to_db(dbcode, str(start), str(end))
-                    comp = datasource.minute_completeness(dbcode, str(start), str(end))
-                    msg = f"抓取完成：写入/覆盖 {n:,} 条分钟记录，成功 {days_ok} 个交易日。"
-                    if failed:
-                        msg += f" 未返回数据 {len(failed)} 天。"
-                    _record_job(dbcode, "minute_1m", str(start), str(end), n,
+                    result = datasource.backfill_missing_minutes(
+                        dbcode, str(start), str(end), batch_days=int(batch_days))
+                    comp = result["after"]
+                    with datasource._conn() as c:
+                        total_rows = c.execute(
+                            "SELECT COUNT(*) FROM ifind_minute WHERE code=? AND datetime BETWEEN ? AND ?",
+                            (dbcode, str(start), str(end) + " 23:59:59")).fetchone()[0]
+                    msg = (f"本批完成：尝试 {result['attempted_days']} 个交易日，"
+                           f"修复 {result['repaired_days']} 天，写入/覆盖 {result['written']:,} 条；"
+                           f"当前完整 {comp['complete_days']}/{comp['expected_days']} 天，"
+                           f"剩余 {result['remaining_days']} 天。")
+                    if result["failed_days"]:
+                        msg += " 本批未成功日期：" + "、".join(result["failed_days"][:10])
+                    _record_job(dbcode, "minute_1m", str(start), str(end), total_rows,
+                                "success" if result["status"] == "complete" else "partial",
                                 completeness=comp)
-                st.success(msg + " 重复抓取会覆盖更新。")
+                    if result["remaining_days"]:
+                        msg += " 请点击“开始/继续抓取本批”继续，进度已保存。"
+                st.session_state["stock_history_fetch_flash"] = ("success", msg)
                 st.rerun()
             except Exception as exc:
                 _record_job(dbcode, "daily" if data_mode == "日线历史" else "minute_1m",

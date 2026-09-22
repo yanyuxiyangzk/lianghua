@@ -100,6 +100,32 @@ def _load_intraday(code: str) -> pd.DataFrame:
             "ORDER BY trade_date", c, params=(code,))
 
 
+def intraday_quality_report(code: str, min_rows: int = 200,
+                            expected_rows: int = 241) -> dict:
+    """检查单股票分钟数据是否足以进入日内模型；不把不完整交易日混入训练。"""
+    with datasource._conn() as c:
+        raw = pd.read_sql_query(
+            "SELECT substr(datetime,1,10) AS trade_date, COUNT(*) AS rows, "
+            "COUNT(DISTINCT datetime) AS distinct_rows "
+            "FROM ifind_minute WHERE code=? GROUP BY substr(datetime,1,10) "
+            "ORDER BY trade_date", c, params=(code,))
+    if raw.empty:
+        return {"code": code, "days": 0, "complete_days": 0, "coverage": 0.0,
+                "duplicate_days": 0, "partial_days": 0, "quality": "insufficient",
+                "reason": "没有分钟数据"}
+    complete = raw[(raw["rows"] >= min_rows) &
+                   (raw["distinct_rows"] >= min_rows)]
+    duplicate_days = int((raw["rows"] != raw["distinct_rows"]).sum())
+    partial_days = int((raw["rows"] < expected_rows).sum())
+    coverage = len(complete) / len(raw)
+    quality = "ready" if len(complete) >= 60 and coverage >= 0.95 else "insufficient"
+    return {"code": code, "days": int(len(raw)), "complete_days": int(len(complete)),
+            "coverage": float(coverage), "duplicate_days": duplicate_days,
+            "partial_days": partial_days, "quality": quality,
+            "reason": "达到日内模型最低数据门槛" if quality == "ready"
+                      else "完整分钟交易日少于60天或覆盖率不足95%"}
+
+
 def _features_and_labels(df: pd.DataFrame, intraday: pd.DataFrame | None = None) -> pd.DataFrame:
     d = df.copy()
     d["date"] = pd.to_datetime(d["date"])
@@ -261,6 +287,10 @@ def _select_model(data: pd.DataFrame, history: pd.DataFrame,
                      + 0.25 * (metrics["calibration_error"] if metrics["calibration_error"] is not None else 1.0)
                      + (0.1 if metrics["count"] < 30 else 0.0)
                      + (0.2 if current_matches < 30 else 0.0))
+        # 日内模型必须有足够的共同状态样本和至少30个样本外窗口，
+        # 否则即使偶然Brier很低也不能战胜稳定的日线模型。
+        if scheme.startswith("intraday_") and (metrics["count"] < 30 or current_matches < 30):
+            objective += 1.0
         candidates.append({"scheme": scheme, "objective": objective,
                            "current_matches": current_matches, **metrics})
     candidates.sort(key=lambda x: (x["objective"], -x["count"]))
@@ -272,6 +302,7 @@ def _select_model(data: pd.DataFrame, history: pd.DataFrame,
 def build_model(code: str) -> dict:
     raw = _load_daily(code)
     intraday = _load_intraday(code)
+    intraday_quality = intraday_quality_report(code)
     data = _features_and_labels(raw, intraday)
     if len(data) < 120:
         raise ValueError(f"有效日线仅 {len(data)} 条，至少需要120条")
@@ -310,6 +341,7 @@ def build_model(code: str) -> dict:
               "sample_count": sample_count, "match_method": match_method,
               "selected_scheme": selected_scheme, "model_candidates": model_candidates,
               "intraday_days": int(len(intraday)),
+              "intraday_quality": intraday_quality,
               "uses_intraday": selected_scheme.startswith("intraday_"),
               "evidence": evidence, "state": state, "predictions": predictions,
               "oos": oos, "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
@@ -327,6 +359,7 @@ def build_model(code: str) -> dict:
                          "selected_scheme": selected_scheme,
                          "model_candidates": model_candidates,
                          "intraday_days": result["intraday_days"],
+                         "intraday_quality": result["intraday_quality"],
                          "uses_intraday": result["uses_intraday"],
                          "evidence": evidence}, ensure_ascii=False), result["created_at"]))
     return result
@@ -350,6 +383,7 @@ def load_latest(code: str) -> dict | None:
             "selected_scheme": pred.get("selected_scheme"),
             "model_candidates": pred.get("model_candidates", []),
             "intraday_days": pred.get("intraday_days", 0),
+            "intraday_quality": pred.get("intraday_quality", {}),
             "uses_intraday": bool(pred.get("uses_intraday", False)),
             "created_at": row[9]}
 

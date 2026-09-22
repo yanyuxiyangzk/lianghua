@@ -167,11 +167,47 @@ def test_intraday_features_are_bounded_and_idempotent():
     print("PASS: test_intraday_features_are_bounded_and_idempotent")
 
 
+def test_orderbook_sync_rejects_wrong_day_and_writes_valid_rows():
+    temp, old = _use_temp_db()
+    original_login, original_call = datasource._ths_login, datasource.ths_call
+    try:
+        datasource._ths_login = lambda: True
+        datasource.ths_call = lambda *args, **kwargs: (
+            pd.DataFrame({"time": ["2026-09-22 09:30:01"], "latest": [10.0],
+                          "bid1": [9.99], "ask1": [10.01], "volume": [100],
+                          "amount": [1000]}), None, 0)
+        try:
+            datasource.fetch_orderbook_day_to_db("SZ001216", "2026-09-21")
+            raise AssertionError("wrong-day response should be rejected")
+        except RuntimeError as exc:
+            assert "返回日期与请求不符" in str(exc)
+
+        datasource.ths_call = lambda *args, **kwargs: (
+            pd.DataFrame({"time": ["2026-09-21 09:30:01", "2026-09-21 09:31:01"],
+                          "latest": [10.0, 10.01], "bid1": [9.99, 10.0],
+                          "ask1": [10.01, 10.02], "volume": [100, 200],
+                          "amount": [1000, 2002]}), None, 0)
+        result = datasource.fetch_orderbook_day_to_db("SZ001216", "2026-09-21")
+        assert result["written"] == result["new_rows"] == 2
+        with datasource._conn() as c:
+            rows = c.execute(
+                "SELECT datetime,bid1,ask1 FROM ifind_realtime WHERE code=? ORDER BY datetime",
+                ("SZ001216",)).fetchall()
+        assert len(rows) == 2
+        assert tuple(rows[0]) == ("2026-09-21 09:30:01", 9.99, 10.01)
+    finally:
+        datasource._ths_login, datasource.ths_call = original_login, original_call
+        datasource.MKT_DB = old
+        temp.cleanup()
+    print("PASS: test_orderbook_sync_rejects_wrong_day_and_writes_valid_rows")
+
+
 if __name__ == "__main__":
     tests = [test_stock_identity_is_stable, test_expected_trade_days_uses_union,
              test_minute_completeness_marks_partial_day,
              test_backfill_runs_in_batches_and_resumes,
-             test_intraday_features_are_bounded_and_idempotent]
+             test_intraday_features_are_bounded_and_idempotent,
+             test_orderbook_sync_rejects_wrong_day_and_writes_valid_rows]
     failed = 0
     for test in tests:
         try:

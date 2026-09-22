@@ -1805,6 +1805,70 @@ def fetch_minute_to_db(code: str, day: str = "", interval: str = "1min") -> int:
     return len(d)
 
 
+def fetch_orderbook_day_to_db(code: str, day: str) -> dict:
+    """从同花顺 THS_SS 单次拉取指定交易日盘口快照并严格校验日期后落库。
+
+    不使用 HTTP 实时行情兜底，避免把当前盘口误写成历史盘口。历史权限不支持、
+    返回空或返回日期不符时均不写库。
+    """
+    indicators = "latest;bid1;ask1;volume;amount"
+    start, end = f"{day} 09:25:00", f"{day} 15:05:00"
+    _ths_login()
+    df, _res, err = ths_call(
+        "THS_SS", _to_ths_code(code), indicators, "dataType:Original", start, end)
+    if err not in (0, None):
+        raise RuntimeError(f"同花顺历史盘口返回错误码 {err}")
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        raise RuntimeError("同花顺未返回该交易日历史盘口；账号可能没有历史快照权限")
+
+    d = df.copy()
+    d.columns = [str(c).strip().lower() for c in d.columns]
+    tcol = next((c for c in ("time", "datetime", "date") if c in d.columns), None)
+    if not tcol:
+        raise RuntimeError("同花顺历史盘口缺少时间字段")
+    d["datetime"] = pd.to_datetime(d[tcol], errors="coerce")
+    d = d[d["datetime"].notna()].copy()
+    returned_days = sorted(d["datetime"].dt.strftime("%Y-%m-%d").unique().tolist())
+    if returned_days != [day]:
+        raise RuntimeError(
+            f"同花顺返回日期与请求不符（请求 {day}，返回 {returned_days or '空'}），已拒绝写库")
+    if "bid1" not in d.columns or "ask1" not in d.columns:
+        raise RuntimeError("同花顺历史接口未返回买一/卖一字段，不能作为盘口数据写入")
+    if d[["bid1", "ask1"]].isna().all(axis=None):
+        raise RuntimeError("同花顺历史接口的买一/卖一全部为空，不能作为盘口数据写入")
+
+    def numeric(name):
+        return pd.to_numeric(d[name], errors="coerce") if name in d.columns else pd.Series(np.nan, index=d.index)
+
+    price = numeric("latest")
+    if price.isna().all() and "price" in d.columns:
+        price = numeric("price")
+    rows = []
+    for idx in d.index:
+        ts = d.at[idx, "datetime"].strftime("%Y-%m-%d %H:%M:%S")
+        rows.append((
+            code, ts, price.at[idx], np.nan, np.nan, np.nan, np.nan, np.nan,
+            numeric("volume").at[idx], numeric("amount").at[idx], np.nan, np.nan,
+            np.nan, np.nan, np.nan, np.nan, numeric("bid1").at[idx],
+            numeric("ask1").at[idx], np.nan, np.nan))
+    before = 0
+    with _conn() as c:
+        before = c.execute(
+            "SELECT COUNT(*) FROM ifind_realtime WHERE code=? AND datetime BETWEEN ? AND ?",
+            (code, start, end)).fetchone()[0]
+        c.executemany(
+            "INSERT OR REPLACE INTO ifind_realtime"
+            "(code,datetime,price,prev_close,open,high,low,change_pct,volume,amount,"
+            "turnover,quantity_ratio,amplitude,float_shares,float_mv,speed,bid1,ask1,"
+            "limit_up,limit_down) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        after = c.execute(
+            "SELECT COUNT(*) FROM ifind_realtime WHERE code=? AND datetime BETWEEN ? AND ?",
+            (code, start, end)).fetchone()[0]
+    return {"returned": len(d), "written": len(rows), "new_rows": max(0, after - before),
+            "day": day, "start": d["datetime"].min().strftime("%H:%M:%S"),
+            "end": d["datetime"].max().strftime("%H:%M:%S")}
+
+
 def fetch_minute_range_to_db(code: str, start: str, end: str, interval: str = "1min",
                             pause: float = 0.15) -> tuple[int, int, list[str]]:
     """按交易日逐日抓取单票分钟线，避免 THS_HF 超出单次时间窗口。

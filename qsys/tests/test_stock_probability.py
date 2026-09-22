@@ -53,6 +53,26 @@ def test_oos_validation_has_no_future_training():
     print("PASS: test_oos_validation_has_no_future_training")
 
 
+def test_intraday_candidates_join_without_dropping_daily_history():
+    daily = _synthetic(550)
+    minute = pd.DataFrame({
+        "trade_date": daily["date"].tail(240).to_numpy(), "minute_count": 241,
+        "open_ret_30m": 0.002, "morning_ret": 0.004, "afternoon_ret": 0.003,
+        "tail_ret_30m": 0.001, "realized_vol": 0.015,
+        "max_intraday_drawdown": -0.01, "close_vwap_gap": 0.006,
+        "morning_volume_share": 0.55, "tail_volume_share": 0.12,
+        "up_minute_ratio": 0.58,
+    })
+    data = sp._features_and_labels(daily, minute)
+    assert len(data) > 500
+    assert data["intraday_direction_state"].notna().sum() == 240
+    current = data.iloc[-1]
+    matched, label = sp._similar(data.iloc[:-10], current, "intraday_broad")
+    assert label.startswith("日线趋势")
+    assert isinstance(matched, pd.DataFrame)
+    print("PASS: test_intraday_candidates_join_without_dropping_daily_history")
+
+
 def test_overlay_quality_gate_blocks_limited_model():
     original_conn = sp.datasource._conn
 
@@ -160,15 +180,36 @@ def test_governance_only_allows_manual_review():
     print("PASS: test_governance_only_allows_manual_review")
 
 
+def test_llm_evidence_is_compact_and_stock_bound():
+    metrics = json.dumps({"count": 40, "brier": .24, "accuracy": .55,
+                          "calibration_error": .1})
+    state = json.dumps({"trend_state": "up", "ret_5": .03, "unknown": 999})
+    pred = json.dumps({"evidence": "limited", "selected_scheme": "broad",
+                       "intraday_days": 200, "uses_intraday": False,
+                       "predictions": {"up_5d": {"shrunk": .6, "low": .5,
+                                                  "high": .7, "n": 80}},
+                       "model_candidates": []})
+    evidence = sp._llm_profile_evidence(
+        (1, 9, "SZ001216", sp.MODEL_VERSION, "2026-09-21", "2024-01-01",
+         "2026-09-07", 80, 40, metrics, state, pred, "2026-09-22 10:00:00"))
+    assert evidence["code"] == "SZ001216"
+    assert evidence["evidence"] == "limited"
+    assert evidence["predictions"]["up_5d"]["probability"] == .6
+    assert "unknown" not in evidence["state"]
+    print("PASS: test_llm_evidence_is_compact_and_stock_bound")
+
+
 if __name__ == "__main__":
     tests = [test_beta_shrinkage_moves_to_half,
              test_path_probability_uses_no_hit_denominator,
              test_oos_validation_has_no_future_training,
+             test_intraday_candidates_join_without_dropping_daily_history,
              test_overlay_quality_gate_blocks_limited_model,
              test_model_selection_penalizes_tiny_current_sample,
              test_shadow_upsert_preserves_evaluation_columns,
              test_governance_requires_enough_groups,
              test_governance_only_allows_manual_review]
+    tests.append(test_llm_evidence_is_compact_and_stock_bound)
     failed = 0
     for test in tests:
         try:

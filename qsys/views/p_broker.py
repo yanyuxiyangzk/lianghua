@@ -6,6 +6,7 @@
 """
 
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -13,6 +14,21 @@ import streamlit as st
 import broker
 
 UP, DOWN = "#e54545", "#26a69a"
+
+
+def _is_calendar_trade_day(day: str, trade_dates: set[str]) -> bool:
+    """判断开市日；交易日历未覆盖到的未来/当天工作日按工作日兜底。
+
+    日历覆盖区间内缺失代表真实休市；超过日历最新日期通常只是同步滞后，
+    不能直接判为休市。
+    """
+    target = pd.Timestamp(day)
+    if not trade_dates:
+        return target.weekday() < 5
+    first, last = min(trade_dates), max(trade_dates)
+    if first <= day <= last:
+        return day in trade_dates
+    return target.weekday() < 5
 
 
 def _money(v) -> str:
@@ -377,7 +393,7 @@ def _render_calendar_tab():
     by_day = {int(d.day): r for d, r in zip(md["date"], md.itertuples())}
     max_abs = md["ret_pct"].abs().max() or 1.0
 
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
 
     # 加载交易日历（区分"休市"与"交易日无成交"）
     trade_dates = set()
@@ -406,7 +422,7 @@ def _render_calendar_tab():
             if date_str > today_str:
                 return (f"<td class='cal-off'><div class='cal-d' style='opacity:.3'>"
                         f"{day}</div></td>")
-            if trade_dates and date_str not in trade_dates:
+            if not _is_calendar_trade_day(date_str, trade_dates):
                 return (f"<td class='cal-closed'><div class='cal-d'>{day}</div>"
                         f"<div class='cal-r' style='opacity:.35'>休市</div></td>")
             return (f"<td class='cal-closed'><div class='cal-d'>{day}</div>"

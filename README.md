@@ -1601,22 +1601,49 @@ Tick同步: 每10秒一次（job_tick_sync）
 
 **优势**：数据最全面、覆盖最广、专业级质量
 
-**配置方式**：
-```bash
-# 方式一：环境变量
-export THS_IFIND_ACCOUNT="your_account"
-export THS_IFIND_PASSWORD="your_password"
-# 或
-export THS_IFIND_REFRESH_TOKEN="your_token"
+**凭据配置位置与加载顺序**：
 
-# 方式二：settings.json
+程序按以下优先级读取同花顺 iFinD 凭据：
+
+1. 容器环境变量 `THS_IFIND_ACCOUNT`、`THS_IFIND_PASSWORD`、`THS_IFIND_REFRESH_TOKEN`；
+2. 配置文件 `qsys/data/settings.json` 中的 `ths_ifind` 节；该目录通过 Compose 挂载为容器内 `/data`，因此容器实际读取 `/data/settings.json`；
+3. 仅当上述位置没有 Refresh Token 时，回退读取 `qsys/data/market.db` 的 `ifind_config.refresh_token`。
+
+HTTP 通道换取的短期 `access_token` 及过期时间会自动缓存到
+`qsys/data/market.db` 的 `ifind_config` 表。数据库中的行情表保存的是采集结果，
+不是 SDK 账号密码的主要配置位置。
+
+当前部署使用的长期凭据位置为：
+
+```text
+宿主机：<项目目录>/qsys/data/settings.json
+容器内：/data/settings.json
+运行期 Token 数据库：<项目目录>/qsys/data/market.db
+```
+
+配置文件格式：
+
+```json
 {
   "ths_ifind": {
     "account": "your_account",
-    "password": "your_password"
+    "password": "your_password",
+    "refresh_token": "your_refresh_token"
   }
 }
 ```
+
+如果以后改为统一使用项目根目录 `.env`，变量格式如下；同时需要在
+`docker-compose.yml` 的 `lh-qsys.environment` 中引用这些变量，重建容器后才会注入：
+
+```dotenv
+THS_IFIND_ACCOUNT=your_account
+THS_IFIND_PASSWORD=your_password
+THS_IFIND_REFRESH_TOKEN=your_refresh_token
+```
+
+`.env`、`qsys/data/` 和 `qsys/data/settings.json` 已被 Git 忽略。不要把真实账号、
+密码、Refresh Token 或 Access Token写入 README、Compose 文件或其他受版本控制的文件。
 
 #### 6. 东方财富（日内资金流数据源）
 

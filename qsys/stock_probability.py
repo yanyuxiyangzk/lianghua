@@ -1,6 +1,8 @@
 """单股票经验概率模型：只使用该股票自身历史，时间顺序验证，结果持久化。"""
 import json
+import hashlib
 import math
+import re
 import sqlite3
 from datetime import datetime
 
@@ -9,12 +11,17 @@ import pandas as pd
 
 import datasource
 
-MODEL_VERSION = "single-stock-empirical-v1"
+MODEL_VERSION = "single-stock-empirical-v2"
 HORIZONS = (1, 3, 5, 10)
 MATCH_SCHEMES = {
     "strict": ("trend_state", "momentum_state", "volume_state", "vol_state"),
     "balanced": ("trend_state", "momentum_state", "vol_state"),
     "broad": ("trend_state", "vol_state"),
+    # 分钟线不直接堆入高维模型，只压缩成少量日内状态，作为独立候选模型参加
+    # 时间顺序样本外比较；数据不足时这些候选会被自动跳过。
+    "intraday_balanced": ("trend_state", "vol_state", "intraday_direction_state",
+                          "close_vwap_state", "pressure_state"),
+    "intraday_broad": ("trend_state", "intraday_direction_state", "pressure_state"),
 }
 
 _SCHEMA = """
@@ -27,6 +34,16 @@ CREATE TABLE IF NOT EXISTS stock_probability_models(
     UNIQUE(stock_id, model_version, asof_date));
 CREATE INDEX IF NOT EXISTS idx_stock_probability_code
 ON stock_probability_models(code, asof_date DESC);
+CREATE TABLE IF NOT EXISTS stock_probability_llm_profiles(
+    profile_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stock_id INTEGER NOT NULL, code TEXT NOT NULL, model_id INTEGER NOT NULL,
+    model_version TEXT NOT NULL, asof_date TEXT NOT NULL,
+    prompt_version TEXT NOT NULL, data_hash TEXT NOT NULL,
+    status TEXT NOT NULL, profile_json TEXT, raw_response TEXT,
+    created_at TEXT,
+    UNIQUE(stock_id, model_id, prompt_version, data_hash));
+CREATE INDEX IF NOT EXISTS idx_probability_llm_code
+ON stock_probability_llm_profiles(code, asof_date DESC);
 CREATE TABLE IF NOT EXISTS stock_probability_shadow(
     shadow_id INTEGER PRIMARY KEY AUTOINCREMENT,
     pick_id INTEGER NOT NULL, trade_date TEXT NOT NULL, code TEXT NOT NULL,
@@ -53,6 +70,13 @@ GOVERNANCE_DEFAULTS = {
     "bootstrap_samples": 2000,
 }
 
+LLM_PROFILE_PROMPT_VERSION = "single-stock-profile-v1"
+LLM_PROFILE_SYSTEM = """你是单股票统计概率模型的只读量化审查器。
+输入全部来自程序已经完成的时间顺序样本外验证。不得重新编造概率、收益、基本面、新闻或行情；不得把相关性描述成因果性；不得建议绕过质量闸门。
+你的作用是为这一只股票形成可保存的模型画像：解释适用状态、识别脆弱性、提出后续数据和验证建议。只输出一个JSON对象：
+{"model_character":"不超过80字","regime_fit":["最多3项"],"risk_flags":["最多4项"],"feature_guidance":[{"feature":"字段名","action":"keep|watch|drop","reason":"不超过60字"}],"validation_plan":["最多4项"],"trading_use":"shadow_only|manual_review","confidence":0到1,"summary":"不超过120字"}
+当统计证据等级不是sufficient时，trading_use必须是shadow_only。"""
+
 
 def _ensure_schema(c) -> None:
     c.executescript(_SCHEMA)
@@ -65,7 +89,18 @@ def _load_daily(code: str) -> pd.DataFrame:
             "WHERE source='ths_ifind' AND code=? ORDER BY date", c, params=(code,))
 
 
-def _features_and_labels(df: pd.DataFrame) -> pd.DataFrame:
+def _load_intraday(code: str) -> pd.DataFrame:
+    """读取已由完整分钟交易日压缩出的日内特征，不直接在建模时扫描分钟明细。"""
+    with datasource._conn() as c:
+        return pd.read_sql_query(
+            "SELECT trade_date,minute_count,open_ret_30m,morning_ret,afternoon_ret,"
+            "tail_ret_30m,realized_vol,max_intraday_drawdown,close_vwap_gap,"
+            "morning_volume_share,tail_volume_share,up_minute_ratio "
+            "FROM stock_intraday_features WHERE code=? AND minute_count>=200 "
+            "ORDER BY trade_date", c, params=(code,))
+
+
+def _features_and_labels(df: pd.DataFrame, intraday: pd.DataFrame | None = None) -> pd.DataFrame:
     d = df.copy()
     d["date"] = pd.to_datetime(d["date"])
     for col in ("open", "high", "low", "close", "volume", "amount"):
@@ -94,6 +129,24 @@ def _features_and_labels(df: pd.DataFrame) -> pd.DataFrame:
     q67 = d["vol_20"].expanding(60).quantile(0.67)
     d["vol_state"] = np.where(d["vol_20"] <= q33, "low",
                               np.where(d["vol_20"] >= q67, "high", "mid"))
+    if intraday is not None and not intraday.empty:
+        minute = intraday.copy()
+        minute["date"] = pd.to_datetime(minute.pop("trade_date"))
+        numeric_cols = [c for c in minute.columns if c != "date"]
+        for col in numeric_cols:
+            minute[col] = pd.to_numeric(minute[col], errors="coerce")
+        d = d.merge(minute, on="date", how="left")
+        has_intraday = d[["morning_ret", "afternoon_ret"]].notna().all(axis=1)
+        intraday_ret = (d["morning_ret"] + d["afternoon_ret"]).where(has_intraday)
+        d["intraday_direction_state"] = pd.cut(
+            intraday_ret, [-np.inf, -0.005, 0.005, np.inf],
+            labels=["weak", "flat", "strong"])
+        d["close_vwap_state"] = pd.cut(
+            d["close_vwap_gap"], [-np.inf, -0.005, 0.005, np.inf],
+            labels=["below", "near", "above"])
+        d["pressure_state"] = pd.cut(
+            d["up_minute_ratio"], [-np.inf, 0.45, 0.55, np.inf],
+            labels=["sell", "balanced", "buy"])
     for h in HORIZONS:
         fwd = d["close"].shift(-h) / d["close"] - 1
         d[f"fwd_{h}"] = fwd
@@ -117,12 +170,19 @@ def _features_and_labels(df: pd.DataFrame) -> pd.DataFrame:
 def _similar(history: pd.DataFrame, current: pd.Series,
              scheme: str = "auto") -> tuple[pd.DataFrame, str]:
     labels = {"strict": "四状态精确匹配", "balanced": "放宽成交量状态",
-              "broad": "放宽动量和成交量状态"}
+              "broad": "放宽动量和成交量状态",
+              "intraday_balanced": "日线趋势+日内方向/均价/买卖压力",
+              "intraday_broad": "日线趋势+日内方向/买卖压力"}
     schemes = ("strict", "balanced", "broad") if scheme == "auto" else (scheme,)
     last = history.iloc[0:0]
     for name in schemes:
+        required = MATCH_SCHEMES[name]
+        if any(col not in history.columns or col not in current.index
+               or pd.isna(current[col]) for col in required):
+            continue
         selected = history.copy()
-        for col in MATCH_SCHEMES[name]:
+        for col in required:
+            selected = selected[selected[col].notna()]
             selected = selected[selected[col].astype(str) == str(current[col])]
         last = selected
         if scheme != "auto" or len(selected) >= 30:
@@ -162,7 +222,12 @@ def _oos_validate(data: pd.DataFrame, scheme: str = "auto") -> dict:
     start = max(80, int(len(data) * 0.8))
     rows = []
     for i in range(start, len(data) - 5):
-        preds, n, _ = _predict_from_history(data.iloc[:i], data.iloc[i], scheme)
+        # 所有候选模型同时预测最长10日标签；训练末端必须至少滞后10个交易日，
+        # 否则靠近预测日的训练标签实际使用了预测日之后的价格，造成标签泄漏。
+        history_end = i - max(HORIZONS)
+        if history_end <= 0:
+            continue
+        preds, n, _ = _predict_from_history(data.iloc[:history_end], data.iloc[i], scheme)
         p = preds["up_5d"]["shrunk"]
         y = data.iloc[i]["up_5"]
         if pd.notna(y) and n >= 10:
@@ -185,6 +250,10 @@ def _select_model(data: pd.DataFrame, history: pd.DataFrame,
     """只用滚动样本外结果选择状态复杂度，避免按当前预测结果挑模型。"""
     candidates = []
     for scheme in MATCH_SCHEMES:
+        required = MATCH_SCHEMES[scheme]
+        if any(col not in data.columns or col not in current.index
+               or pd.isna(current[col]) for col in required):
+            continue
         metrics = _oos_validate(data, scheme)
         current_matches = len(_similar(history, current, scheme)[0])
         # Brier为主，校准误差与样本不足作惩罚；不使用方向准确率调参。
@@ -202,7 +271,8 @@ def _select_model(data: pd.DataFrame, history: pd.DataFrame,
 
 def build_model(code: str) -> dict:
     raw = _load_daily(code)
-    data = _features_and_labels(raw)
+    intraday = _load_intraday(code)
+    data = _features_and_labels(raw, intraday)
     if len(data) < 120:
         raise ValueError(f"有效日线仅 {len(data)} 条，至少需要120条")
     current = data.iloc[-1]
@@ -216,6 +286,16 @@ def build_model(code: str) -> dict:
                   "vol_20": float(current["vol_20"]),
                   "volume_ratio": float(current["volume_ratio"]),
                   "atr_pct": float(current["atr_pct"])})
+    intraday_state = {}
+    for key in ("intraday_direction_state", "close_vwap_state", "pressure_state"):
+        if key in current.index and pd.notna(current[key]):
+            intraday_state[key] = str(current[key])
+    for key in ("open_ret_30m", "morning_ret", "afternoon_ret", "tail_ret_30m",
+                "realized_vol", "max_intraday_drawdown", "close_vwap_gap",
+                "up_minute_ratio"):
+        if key in current.index and pd.notna(current[key]):
+            intraday_state[key] = float(current[key])
+    state.update(intraday_state)
     # 不只看样本量：样本外方向不能明显劣于随机，概率误差也要受控。
     quality_ok = (oos["count"] >= 30 and oos["brier"] is not None
                   and oos["brier"] <= 0.25 and oos["accuracy"] is not None
@@ -229,6 +309,8 @@ def build_model(code: str) -> dict:
               "train_end": history["date"].max().strftime("%Y-%m-%d"),
               "sample_count": sample_count, "match_method": match_method,
               "selected_scheme": selected_scheme, "model_candidates": model_candidates,
+              "intraday_days": int(len(intraday)),
+              "uses_intraday": selected_scheme.startswith("intraday_"),
               "evidence": evidence, "state": state, "predictions": predictions,
               "oos": oos, "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
     stock_id = datasource.get_or_create_stock_id(code)
@@ -244,6 +326,8 @@ def build_model(code: str) -> dict:
              json.dumps({"predictions": predictions, "match_method": match_method,
                          "selected_scheme": selected_scheme,
                          "model_candidates": model_candidates,
+                         "intraday_days": result["intraday_days"],
+                         "uses_intraday": result["uses_intraday"],
                          "evidence": evidence}, ensure_ascii=False), result["created_at"]))
     return result
 
@@ -265,7 +349,159 @@ def load_latest(code: str) -> dict | None:
             "match_method": pred.get("match_method"), "evidence": pred.get("evidence"),
             "selected_scheme": pred.get("selected_scheme"),
             "model_candidates": pred.get("model_candidates", []),
+            "intraday_days": pred.get("intraday_days", 0),
+            "uses_intraday": bool(pred.get("uses_intraday", False)),
             "created_at": row[9]}
+
+
+def _latest_model_row(code: str):
+    with datasource._conn() as c:
+        _ensure_schema(c)
+        return c.execute(
+            "SELECT model_id,stock_id,code,model_version,asof_date,train_start,train_end,"
+            "sample_count,oos_count,metrics_json,state_json,prediction_json,created_at "
+            "FROM stock_probability_models WHERE code=? "
+            "ORDER BY asof_date DESC,model_id DESC LIMIT 1", (code,)).fetchone()
+
+
+def _llm_profile_evidence(row) -> dict:
+    metrics = json.loads(row[9] or "{}")
+    state = json.loads(row[10] or "{}")
+    payload = json.loads(row[11] or "{}")
+    predictions = payload.get("predictions") or {}
+    compact_predictions = {}
+    for key in ("up_1d", "up_3d", "up_5d", "up_10d", "up_3pct_5d", "down_3pct_5d"):
+        item = predictions.get(key) or {}
+        compact_predictions[key] = {
+            "probability": round(float(item.get("shrunk", 0.5)), 6),
+            "ci_low": round(float(item.get("low", 0)), 6),
+            "ci_high": round(float(item.get("high", 1)), 6),
+            "n": int(item.get("n") or 0),
+        }
+    keep_state = ("trend_state", "momentum_state", "volume_state", "vol_state",
+                  "ret_5", "ret_20", "vol_20", "volume_ratio", "atr_pct",
+                  "intraday_direction_state", "close_vwap_state", "pressure_state",
+                  "realized_vol", "max_intraday_drawdown", "close_vwap_gap",
+                  "up_minute_ratio")
+    compact_state = {k: state[k] for k in keep_state if k in state}
+    candidates = []
+    for item in (payload.get("model_candidates") or [])[:8]:
+        candidates.append({k: item.get(k) for k in
+                           ("scheme", "current_matches", "count", "brier", "accuracy",
+                            "calibration_error")})
+    return {
+        "code": row[2], "model_version": row[3], "asof_date": row[4],
+        "train_start": row[5], "train_end": row[6],
+        "sample_count": int(row[7] or 0), "oos_count": int(row[8] or 0),
+        "evidence": payload.get("evidence"),
+        "selected_scheme": payload.get("selected_scheme"),
+        "intraday_days": int(payload.get("intraday_days") or 0),
+        "uses_intraday": bool(payload.get("uses_intraday", False)),
+        "oos": metrics, "state": compact_state,
+        "predictions": compact_predictions, "model_candidates": candidates,
+    }
+
+
+def build_llm_profile(code: str, force: bool = False) -> dict:
+    """为最新统计模型生成只读LLM画像，并与股票和统计模型版本永久关联。"""
+    import llmutil
+
+    row = _latest_model_row(code)
+    if not row:
+        raise ValueError("尚无统计概率模型，请先构建/更新模型")
+    evidence = _llm_profile_evidence(row)
+    evidence_json = json.dumps(evidence, ensure_ascii=False, sort_keys=True,
+                               separators=(",", ":"), default=str)
+    data_hash = hashlib.sha256(
+        f"{LLM_PROFILE_PROMPT_VERSION}\n{evidence_json}".encode()).hexdigest()[:20]
+    if not force:
+        with datasource._conn() as c:
+            _ensure_schema(c)
+            cached = c.execute(
+                "SELECT status,profile_json,created_at FROM stock_probability_llm_profiles "
+                "WHERE stock_id=? AND model_id=? AND prompt_version=? AND data_hash=?",
+                (row[1], row[0], LLM_PROFILE_PROMPT_VERSION, data_hash)).fetchone()
+        if cached:
+            profile = json.loads(cached[1] or "{}")
+            return {"status": cached[0], "code": code, "model_id": row[0],
+                    "data_hash": data_hash, "profile": profile,
+                    "created_at": cached[2], "cache_hit": True}
+    reply = llmutil.llm_chat(
+        LLM_PROFILE_SYSTEM, "单股票统计模型证据JSON：\n" + evidence_json,
+        max_tokens=700, label="stock_probability_profile_v1", use_cache=True)
+    if not reply:
+        reason = llmutil.llm_failure_reason()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        profile = {"summary": reason, "trading_use": "shadow_only", "confidence": 0.0}
+        with datasource._conn() as c:
+            _ensure_schema(c)
+            c.execute(
+                "INSERT OR REPLACE INTO stock_probability_llm_profiles"
+                "(stock_id,code,model_id,model_version,asof_date,prompt_version,data_hash,status,"
+                "profile_json,raw_response,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (row[1], code, row[0], row[3], row[4], LLM_PROFILE_PROMPT_VERSION,
+                 data_hash, "unavailable", json.dumps(profile, ensure_ascii=False), "", now))
+        return {"status": "unavailable", "code": code, "model_id": row[0],
+                "data_hash": data_hash, "reason": reason, "profile": profile,
+                "created_at": now, "cache_hit": False}
+    status, profile = "ok", {}
+    try:
+        match = re.search(r"\{[\s\S]*\}", reply)
+        profile = json.loads(match.group()) if match else {}
+        if not isinstance(profile, dict):
+            raise ValueError("LLM结果不是JSON对象")
+        profile["trading_use"] = ("manual_review" if
+            evidence.get("evidence") == "sufficient"
+            and profile.get("trading_use") == "manual_review" else "shadow_only")
+        profile["confidence"] = max(0.0, min(1.0, float(profile.get("confidence") or 0)))
+        profile["regime_fit"] = [str(x)[:100] for x in (profile.get("regime_fit") or [])[:3]]
+        profile["risk_flags"] = [str(x)[:120] for x in (profile.get("risk_flags") or [])[:4]]
+        profile["validation_plan"] = [str(x)[:120] for x in
+                                      (profile.get("validation_plan") or [])[:4]]
+        profile["model_character"] = str(profile.get("model_character") or "")[:120]
+        profile["summary"] = str(profile.get("summary") or "")[:180]
+        valid_features = set(evidence["state"])
+        guidance = []
+        for item in (profile.get("feature_guidance") or [])[:8]:
+            if not isinstance(item, dict) or str(item.get("feature")) not in valid_features:
+                continue
+            action = str(item.get("action") or "watch")
+            if action not in ("keep", "watch", "drop"):
+                action = "watch"
+            guidance.append({"feature": str(item["feature"]), "action": action,
+                             "reason": str(item.get("reason") or "")[:100]})
+        profile["feature_guidance"] = guidance
+    except Exception as exc:
+        status = "invalid"
+        profile = {"summary": f"LLM输出解析失败：{type(exc).__name__}",
+                   "trading_use": "shadow_only", "confidence": 0.0}
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with datasource._conn() as c:
+        _ensure_schema(c)
+        c.execute(
+            "INSERT OR REPLACE INTO stock_probability_llm_profiles"
+            "(stock_id,code,model_id,model_version,asof_date,prompt_version,data_hash,status,"
+            "profile_json,raw_response,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (row[1], code, row[0], row[3], row[4], LLM_PROFILE_PROMPT_VERSION, data_hash,
+             status, json.dumps(profile, ensure_ascii=False), reply[:12000], now))
+    return {"status": status, "code": code, "model_id": row[0],
+            "data_hash": data_hash, "profile": profile, "created_at": now,
+            "cache_hit": False}
+
+
+def load_latest_llm_profile(code: str) -> dict | None:
+    with datasource._conn() as c:
+        _ensure_schema(c)
+        row = c.execute(
+            "SELECT model_id,model_version,asof_date,prompt_version,data_hash,status,"
+            "profile_json,created_at FROM stock_probability_llm_profiles WHERE code=? "
+            "ORDER BY profile_id DESC LIMIT 1", (code,)).fetchone()
+    if not row:
+        return None
+    return {"code": code, "model_id": row[0], "model_version": row[1],
+            "asof_date": row[2], "prompt_version": row[3], "data_hash": row[4],
+            "status": row[5], "profile": json.loads(row[6] or "{}"),
+            "created_at": row[7]}
 
 
 def probability_overlay(scores: pd.Series, asof: str, execute: bool = False,

@@ -807,6 +807,16 @@ def position_open_from_picks(trade_date: str, today: str) -> str:
             if items.empty:
                 continue
             if r.source == "satellite_scan":
+                # 自动选股与自动执行分离：降级策略继续产候选积累样本，但不得开仓。
+                try:
+                    import library
+                    pack = library.list_strategies().get(str(r.pack_name)) or {}
+                    if pack.get("status", "active") != "active":
+                        n_defer += len(items)
+                        continue
+                except Exception:
+                    n_defer += len(items)
+                    continue
                 sat_halt, _sat_why = satellite_halt_today(today)
                 if sat_halt:
                     n_defer += len(items)

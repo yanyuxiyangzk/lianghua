@@ -53,14 +53,7 @@ def render():
 
     # ---------------------------------------------------------------- 轨道包
     def _satellite_auto():
-        best, best_n = None, 0
-        for n, pk in packs.items():
-            k = sum(1 for f in pk.get("factors", []) if str(f["name"]).startswith("ev_"))
-            if k > best_n:
-                best, best_n = n, k
-        if best:
-            return best
-        return next((n for n in packs if "涨停" in n or "事件" in n), None)
+        return scheduler._satellite_pack_name(packs)
 
 
     cfg = load_json(TRACK_FILE, {})
@@ -101,6 +94,15 @@ def render():
         return rows.iloc[0] if len(rows) else None
 
 
+    def _satellite_pick_for(pack_name):
+        """执行页只认专用 satellite_scan；顺带扫描仅是观察/战绩名单。"""
+        if picks.empty or not pack_name:
+            return None
+        rows = picks[(picks["pack_name"] == pack_name)
+                     & (picks["source"] == "satellite_scan")]
+        return rows.iloc[0] if len(rows) else None
+
+
     def _gen(pack_name, kp):
         pk = packs[pack_name]
         codes = all_pools().get(pk["pool_name"]) or []
@@ -137,6 +139,8 @@ def render():
                        + ("（先攒 ev_ 因子再组涨停包：专业区「🔬个股分析」底部定向挖）" if kp == "sat" else ""))
             return
         st.markdown(f"**{_live_badge(pack_name)}**　·　策略包「{pack_name}」")
+        if kp == "sat" and packs[pack_name].get("status", "active") != "active":
+            st.warning("该卫星策略当前回测未通过：名单继续自动生成，仅供观察，不会自动开仓。")
         if pick is None:
             if st.button(f"🚀 生成今日名单", key=f"{kp}_gen", type="primary"):
                 with st.spinner("扫描中…"):
@@ -215,7 +219,13 @@ def render():
     _render_track("🛡", "主轨 · 稳健（仓位大头，建议 7 成）", main_name, main_pick, "main", "主轨资金")
     st.markdown("---")
     _render_track("🎲", "卫星轨 · 博涨停（仓位小头，建议 ≤2 成，亏了不伤筋骨）",
-                  sat_name, _pick_for(sat_name), "sat", "卫星轨资金")
+                  sat_name, _satellite_pick_for(sat_name), "sat", "卫星轨资金")
+    if not picks.empty and sat_name:
+        observed = picks[(picks["pack_name"] == sat_name)
+                         & (picks["source"] == "sched_satellite_scan")]
+        if not observed.empty and _satellite_pick_for(sat_name) is None:
+            st.info("当前只有主扫描顺带生成的卫星观察名单，尚无专用卫星轨正式候选；"
+                    "观察名单不会进入自动持仓。")
 
     # ---------------------------------------------------------------- 持仓（限价委托 → 触及成交 → T+1 平仓）
     def _render_positions():

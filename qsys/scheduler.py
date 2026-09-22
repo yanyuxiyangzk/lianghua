@@ -729,24 +729,30 @@ def auto_select_factors(pool_name: str = "沪深300", top_n: int = 10,
     return picks, note, weights, f_series
 
 
-def _satellite_pack_name(packs: dict) -> str | None:
-    """卫星轨策略包：优先名字含'卫星'的包；其次含 ev_ 事件因子最多的包；最后名字含涨停/事件的包。"""
-    # 优先：名字含"卫星"的包（新策略包命名规范）
-    for n in packs:
-        if packs[n].get("status", "active") == "active" and "卫星" in n:
-            return n
-    # 其次：含 ev_ 事件因子最多的包
+def _satellite_pack_name(packs: dict, execution_only: bool = False) -> str | None:
+    """卫星轨策略包选择。
+
+    degraded 仍可自动选股积累前瞻样本；只有 execution_only=True 时要求回测 active。
+    """
+    allowed = ("active",) if execution_only else ("active", "degraded")
+    active = {n: p for n, p in packs.items() if p.get("status", "active") in allowed}
+
+    def newest(names):
+        return max(names, key=lambda n: str(active[n].get("updated") or "")) if names else None
+
+    scoped = [n for n, p in active.items() if p.get("account_scope") == "satellite"]
+    if scoped:
+        return newest(scoped)
+    # 未完成元数据迁移的旧包，按 ev_ 事件因子数量识别真正的事件卫星策略。
     best, best_n = None, 0
-    for n, pk in packs.items():
-        if pk.get("status", "active") != "active":
-            continue
+    for n, pk in active.items():
         k = sum(1 for f in pk.get("factors", []) if str(f["name"]).startswith("ev_"))
         if k > best_n:
             best, best_n = n, k
     if best:
         return best
-    return next((n for n, pk in packs.items()
-                 if pk.get("status", "active") == "active" and ("涨停" in n or "事件" in n)), None)
+    named = [n for n in active if "卫星" in n or "涨停" in n or "事件" in n]
+    return newest(named)
 
 
 def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "") -> str:
@@ -2678,69 +2684,71 @@ def job_strategy_gen(pool_name: str = "沪深300", top_n: int = 10,
     return f"策略包自动生成：无新包（候选{len(candidates)}个，均未达门槛）"
 
 
-def job_strategy_revalidate(pool_name: str = "沪深300") -> str:
-    """每周重验所有策略包的 OOS 表现，淘汰退化包。"""
+def revalidate_strategy(name: str) -> dict:
+    """单策略Walk-forward重验并持久化；自动选股资格由该结果控制。"""
     import factor_eval as fe
     import library
-    import sqlite3 as sq
-    from pathlib import Path
-    
+    import numpy as np
     packs = library.list_strategies()
-    if not packs:
-        return "无策略包需重验"
-    
-    codes = (all_pools().get(pool_name) or all_pools().get("沪深300"))
+    pk = packs.get(name)
+    if not pk:
+        return {"ok": False, "name": name, "error": "策略包不存在"}
+    pool_name = pk.get("pool_name") or "沪深300"
+    codes = all_pools().get(pool_name) or all_pools().get("沪深300")
     end = get_last_trade_day()
-    panel = sig.get_panel_cached(codes, end)
-    
-    results = []
-    for name, pk in packs.items():
+    panel = sig.get_panel_cached(codes, end, 800, source=datasource.get_loop_source())
+    factor_vals = {}
+    failed = []
+    for fac in pk.get("factors", []):
         try:
-            factors_list = pk.get("factors", [])
-            if not factors_list:
-                continue
-            
-            # 取因子值
-            factor_vals = {}
-            for fac in factors_list:
-                try:
-                    if fac.get("kind") == "builtin":
-                        vals = sig.compute_builtin(panel, fac["name"])
-                    elif fac.get("code") and "# sexpr:" in fac.get("code", ""):
-                        vals = sig.run_factor_code(fac["code"], fac["name"], codes, end)
-                    else:
-                        vals = sig.compute_builtin(panel, fac["name"])
-                    if not vals.dropna().empty:
-                        factor_vals[fac["name"]] = vals
-                except Exception:
-                    continue
-            
-            if len(factor_vals) < 2:
-                continue
-            
-            # walk-forward 重验
-            wf = fe.walk_forward(
-                factor_vals, panel, pk.get("method", "等权"), pk.get("top_n", 10),
-                fwd_days=5, step=10, min_factors=2
-            )
-            if wf.empty or "优化组合扣费超额" not in wf:
-                continue
-            
-            net = wf["优化组合扣费超额"]
-            new_oos = float((net > 0).mean())
-            old_oos_str = pk.get("oos_winrate", "50%")
-            old_oos = float(str(old_oos_str).rstrip("%")) / 100
-            
-            # 判断退化：OOS 下降 >5% 或跌破 50%
-            if old_oos - new_oos > 0.05 or new_oos < 0.50:
-                library.update_strategy_oos(name, new_oos, status="degraded")
-                results.append(f"{name}: 退化 {old_oos:.0%}→{new_oos:.0%}")
+            vals = fe.get_factor_values(fac, codes, end, lookback_days=800,
+                                        source=datasource.get_loop_source())
+            if not vals.dropna().empty:
+                factor_vals[fac["name"]] = vals
+        except Exception as exc:
+            failed.append(f"{fac.get('name')}:{type(exc).__name__}")
+    if len(factor_vals) < 2:
+        result = {"ok": False, "name": name, "error": "有效因子不足2个",
+                  "valid_factors": len(factor_vals), "failed_factors": failed}
+        library.update_strategy_oos(name, 0.0, status="degraded")
+        return result
+    wf = fe.walk_forward(factor_vals, panel, pk.get("method", "等权"),
+                         int(pk.get("top_n") or 10), fwd_days=5, step=10, min_factors=2)
+    if wf.empty or "优化组合扣费超额" not in wf:
+        library.update_strategy_oos(name, 0.0, status="degraded")
+        return {"ok": False, "name": name, "error": "Walk-forward无有效窗口"}
+    net = wf["优化组合扣费超额"].dropna()
+    oos = float((net > 0).mean()) if len(net) else 0.0
+    avg_net = float(net.mean()) if len(net) else 0.0
+    nav = (1 + net).cumprod()
+    max_dd = float((nav / nav.cummax() - 1).min()) if len(nav) else 0.0
+    sharpe = float(net.mean() / (net.std() + 1e-12) * np.sqrt(252 / 10)) if len(net) > 1 else 0.0
+    passed = len(net) >= 30 and oos >= 0.55 and avg_net > 0 and max_dd >= -0.25
+    status = "active" if passed else "degraded"
+    result = {"ok": True, "name": name, "eval_date": end, "pool_name": pool_name,
+              "method": pk.get("method"), "top_n": int(pk.get("top_n") or 10),
+              "fwd_days": 5, "oos_windows": len(net), "oos_winrate": oos,
+              "avg_net_excess": avg_net, "max_drawdown": max_dd, "sharpe": sharpe,
+              "valid_factors": len(factor_vals), "failed_factors": failed,
+              "status": status}
+    library.update_strategy_oos(name, oos, status=status)
+    library.save_strategy_validation(name, result)
+    return result
+
+
+def job_strategy_revalidate(pool_name: str = "沪深300") -> str:
+    """每周重验所有策略包的 OOS 表现，淘汰退化包。"""
+    import library
+    results = []
+    for name in library.list_strategies():
+        try:
+            r = revalidate_strategy(name)
+            if r.get("ok"):
+                results.append(f"{name}: {r['status']} OOS {r['oos_winrate']:.0%}")
             else:
-                library.update_strategy_oos(name, new_oos, status="active")
-                results.append(f"{name}: 正常 {new_oos:.0%}")
-        except Exception as e:
-            results.append(f"{name}: 异常 {e}")
-    
+                results.append(f"{name}: 异常 {r.get('error')}")
+        except Exception as exc:
+            results.append(f"{name}: 异常 {exc}")
     return f"策略包重验完成：{len(results)}个 → " + "; ".join(results[:10])
 
 
@@ -2749,15 +2757,21 @@ def job_strategy_revalidate(pool_name: str = "沪深300") -> str:
 # ====================================================================
 
 def _satellite_trading_day(now: datetime | None = None) -> bool:
-    """按本地 Qlib 交易日历判断当天是否开市，避免周末/节假日运行。"""
+    """判断卫星任务交易日；在线日历未覆盖到当天时按工作日兜底。"""
     now = now or datetime.now()
     if now.weekday() >= 5:
         return False
-    cal = QLIB_DATA_DIR / "calendars" / "day.txt"
-    if not cal.exists():
-        return True  # 日历缺失时仅以工作日兜底，避免任务永久停摆
     today = now.strftime("%Y-%m-%d")
-    return today in {line.strip()[:10] for line in cal.read_text().splitlines() if line.strip()}
+    try:
+        with datasource._conn() as c:
+            dates = [str(r[0])[:10] for r in c.execute(
+                "SELECT date FROM ifind_calendar WHERE exchange='SSE' ORDER BY date")]
+        if dates and dates[0] <= today <= dates[-1]:
+            return today in set(dates)
+    except Exception:
+        pass
+    # iFinD 日历尚未同步到当天时，不再使用末端更旧的 Qlib 日历误判休市。
+    return True
 
 
 def _satellite_market_open(now: datetime | None = None) -> bool:
@@ -2769,7 +2783,7 @@ def _satellite_market_open(now: datetime | None = None) -> bool:
     return 930 <= hhmm <= 1130 or 1300 <= hhmm <= 1500
 
 def job_satellite_scan(pool_name: str = "沪深300", top_n: int = 5, **_ignored) -> str:
-    """卫星轨选股：生成高风险候选名单，由主轨统一账户和持仓风控执行。"""
+    """卫星轨自动选股：未过回测门槛也产候选，但不获得自动买入资格。"""
     if not _satellite_trading_day():
         return "卫星轨：非交易日，跳过选股"
     import experience
@@ -2783,14 +2797,31 @@ def job_satellite_scan(pool_name: str = "沪深300", top_n: int = 5, **_ignored)
         return "卫星轨：无可用事件策略包"
 
     pk = packs[sat_name]
+    execution_eligible = pk.get("status", "active") == "active"
     pools = all_pools()
     codes = pools.get(pk["pool_name"]) or pools.get(pool_name) or pools.get("沪深300")
 
-    # 2. 选股（Top5）
+    # 2. 优先复用当天主扫描已算好的观察名单，避免19:10再次全池重复计算。
+    spicks = pd.Series(dtype=float)
+    reused = False
     try:
-        spicks, _sn, _sw, _sf = compute_pack_picks(pk, codes, end, int(top_n))
-    except Exception as e:
-        return f"卫星轨选股失败：{e}"
+        with experience._conn() as c:
+            row = c.execute(
+                "SELECT id FROM picks WHERE trade_date=? AND source='sched_satellite_scan' "
+                "AND pack_name=? ORDER BY id DESC LIMIT 1", (end, sat_name)).fetchone()
+        if row:
+            observed = experience.pick_items_detail(int(row[0]))
+            if not observed.empty:
+                spicks = observed.set_index("code")["score"].head(int(top_n))
+                reused = True
+    except Exception:
+        logging.getLogger("scheduler").exception("复用卫星观察名单失败")
+
+    if spicks.empty:
+        try:
+            spicks, _sn, _sw, _sf = compute_pack_picks(pk, codes, end, int(top_n))
+        except Exception as e:
+            return f"卫星轨选股失败：{e}"
 
     if spicks.empty:
         return "卫星轨：无候选票"
@@ -2801,8 +2832,11 @@ def job_satellite_scan(pool_name: str = "沪深300", top_n: int = 5, **_ignored)
                          filters=pk.get("filters", []), factors=pk["factors"],
                          final_scores=spicks, pack_name=sat_name, trade_date=end)
 
-    return (f"{end} 卫星轨候选名单已生成 · {sat_name} · Top{len(spicks)}"
-            " · 交由主轨统一持仓管理")
+    source_note = "复用19:00观察名单" if reused else "独立全池扫描"
+    execution_note = ("回测通过，可交由主轨统一持仓管理" if execution_eligible
+                      else "回测未通过，仅自动选股观察，不自动买入")
+    return (f"{end} 卫星轨候选名单已生成 · {sat_name} · Top{len(spicks)} · {source_note}"
+            f" · {execution_note}")
 
 
 def job_satellite_fill(**_ignored) -> str:

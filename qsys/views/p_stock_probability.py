@@ -27,30 +27,52 @@ valid = bool(code and len(code) == 8 and code[2:].isdigit())
 if not valid:
     st.info("请输入有效股票代码。")
 else:
-    c1, c2 = st.columns([1, 3])
-    build = c1.button("▶ 构建/更新模型", type="primary", use_container_width=True)
-    c2.caption("模型使用日线状态构建；建议至少准备1年，2年以上更稳健。")
+    c1, c2, c3 = st.columns([1, 1, 3])
+    build = c1.button("▶ 构建/更新联合模型", type="primary", use_container_width=True)
+    build_llm = c2.button("🤖 重试LLM画像", use_container_width=True)
+    c3.caption("统计程序负责概率与回测；LLM负责该股票的模型画像、脆弱性和验证建议，二者均按股票ID保存。")
     if build:
         try:
-            with st.spinner("正在构建状态、历史标签和滚动样本外验证…"):
+            with st.spinner("正在构建统计概率并生成该股票的LLM模型画像…"):
                 sp.build_model(code)
-            st.success("模型构建完成。")
+                llm_result = sp.build_llm_profile(code)
+            if llm_result.get("status") == "ok":
+                st.success("联合模型构建完成：统计概率和LLM画像均已关联保存。")
+            else:
+                st.warning("统计概率已保存；LLM画像等待重试："
+                           + str(llm_result.get("reason") or llm_result.get("status")))
             st.rerun()
         except Exception as exc:
             st.error(f"模型构建失败：{exc}")
+    if build_llm:
+        try:
+            with st.spinner("正在审查该股票的统计证据并生成独立模型画像…"):
+                result = sp.build_llm_profile(code)
+            if result.get("status") == "ok":
+                st.success("LLM模型画像已保存并关联到该股票。")
+                st.rerun()
+            else:
+                st.error(f"LLM模型画像生成失败：{result.get('reason') or result.get('status')}")
+        except Exception as exc:
+            st.error(f"LLM模型画像生成失败：{exc}")
 
     model = sp.load_latest(code)
     if not model:
         st.info("尚无模型结果。请先在“单股票历史数据”抓取日线，再点击构建模型。")
     else:
-        a, b, c, d = st.columns(4)
+        a, b, c, d, e = st.columns(5)
         a.metric("模型日期", model["asof_date"])
         b.metric("相似历史样本", model["sample_count"])
         c.metric("样本外验证次数", model["oos_count"])
         d.metric("证据等级", "充足" if model.get("evidence") == "sufficient" else "有限")
+        e.metric("完整分钟日", int(model.get("intraday_days") or 0))
         st.caption(f"训练区间：{model['train_start']} 至 {model['train_end']} · "
                    f"匹配方式：{model.get('match_method') or '-'} "
                    f"({model.get('selected_scheme') or '-'}) · 版本：{model['model_version']}")
+        if model.get("uses_intraday"):
+            st.success("本次样本外评估选择了日线 + 日内行为模型。")
+        elif model.get("intraday_days"):
+            st.info("分钟特征已参加候选模型评估，但本次样本外指标仍选择日线模型；系统不会为使用分钟数据而强行采用较差模型。")
 
         rows = []
         labels = {"up_1d": "未来1日上涨", "up_3d": "未来3日上涨",
@@ -88,10 +110,34 @@ else:
         if model.get("evidence") != "sufficient":
             st.warning("当前相似样本或样本外验证次数不足，概率只作探索参考，不应进入自动交易。")
 
+        llm_profile = sp.load_latest_llm_profile(code)
+        st.subheader("该股票的LLM模型画像")
+        if not llm_profile:
+            st.caption("尚未生成。LLM不会修改概率，只审查统计模型并保存该股票专属画像。")
+        else:
+            profile = llm_profile.get("profile") or {}
+            p1, p2, p3 = st.columns(3)
+            p1.metric("关联统计模型", f"#{llm_profile['model_id']}")
+            p2.metric("LLM置信度", f"{float(profile.get('confidence') or 0):.0%}")
+            p3.metric("使用权限", "仅影子观察" if profile.get("trading_use") == "shadow_only" else "人工评审")
+            if llm_profile.get("status") == "unavailable":
+                st.warning("LLM画像待重试：" + str(profile.get("summary") or "服务暂不可用"))
+            else:
+                st.write(profile.get("summary") or profile.get("model_character") or "暂无摘要")
+            if profile.get("risk_flags"):
+                st.markdown("**模型风险：** " + "；".join(profile["risk_flags"]))
+            if profile.get("validation_plan"):
+                st.markdown("**后续验证：** " + "；".join(profile["validation_plan"]))
+            guidance = pd.DataFrame(profile.get("feature_guidance") or [])
+            if not guidance.empty:
+                st.dataframe(guidance, hide_index=True, width="stretch")
+            st.caption(f"模型日期 {llm_profile['asof_date']} · Prompt {llm_profile['prompt_version']} · "
+                       f"数据指纹 {llm_profile['data_hash']} · 保存于 {llm_profile['created_at']}")
+
         candidates = pd.DataFrame(model.get("model_candidates") or [])
         if not candidates.empty:
             st.subheader("状态模型选择")
-            st.caption("严格、平衡、宽松三种匹配只按滚动样本外 Brier 与校准误差选择，不按当前预测结果挑选。")
+            st.caption("日线与日线+日内候选只按无标签泄漏的滚动样本外 Brier、校准误差和样本量选择，不按当前预测结果挑选。")
             st.dataframe(candidates, hide_index=True, width="stretch")
 
         st.subheader("因子 / 策略组合接口")

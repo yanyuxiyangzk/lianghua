@@ -7,6 +7,7 @@ import streamlit as st
 import experience as exp
 import broker as bk
 import library
+import scheduler
 from common import get_last_trade_day
 
 # 卫星轨常量
@@ -18,15 +19,8 @@ SL_SAMPLE_SIZE = 200  # 止损记录样本量
 def _get_satellite_pack_info() -> dict | None:
     """获取卫星轨策略包信息。"""
     packs = library.list_strategies()
-    for name in packs:
-        if packs[name].get("status", "active") == "active" and "卫星" in name:
-            return {"name": name, **packs[name]}
-    # fallback: 涨停/事件
-    for name in packs:
-        if (packs[name].get("status", "active") == "active"
-                and ("涨停" in name or "事件" in name)):
-            return {"name": name, **packs[name]}
-    return None
+    name = scheduler._satellite_pack_name(packs)
+    return {"name": name, **packs[name]} if name else None
 
 
 def _render_pack_info(pack: dict):
@@ -36,6 +30,10 @@ def _render_pack_info(pack: dict):
     oos = pack.get("oos_winrate")
     if oos:
         st.caption(f"OOS胜率: {oos}")
+    if pack.get("status") == "active":
+        st.success("回测状态：通过，可进入自动执行风控链路。")
+    else:
+        st.warning("回测状态：未通过。仍会自动选股并积累前瞻样本，但不会自动买入。")
     factors = pack.get("factors", [])
     if factors:
         rows = []
@@ -48,17 +46,17 @@ def _render_pack_info(pack: dict):
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
-def _get_todays_satellite_pick() -> pd.DataFrame:
-    """取今日卫星轨选股结果（从经验库）。"""
+def _get_todays_satellite_pick(observation: bool = False) -> pd.DataFrame:
+    """正式候选只读 satellite_scan；观察名单单独读取 sched_satellite_scan。"""
     try:
+        source = "sched_satellite_scan" if observation else "satellite_scan"
         with exp._conn() as c:
             df = pd.read_sql(
-                "SELECT p.trade_date, pi.code, pi.score FROM picks p"
+                "SELECT p.trade_date,p.source,p.pack_name,pi.code,pi.score FROM picks p"
                 " JOIN pick_items pi ON pi.pick_id = p.id"
-                " WHERE p.source IN ('satellite_scan','sched_satellite_scan')"
+                " WHERE p.source=?"
                 " AND p.trade_date=(SELECT MAX(trade_date) FROM picks"
-                " WHERE source IN ('satellite_scan','sched_satellite_scan'))"
-                " ORDER BY pi.rank", c)
+                " WHERE source=?) ORDER BY pi.rank", c, params=(source, source))
         return df
     except Exception:
         return pd.DataFrame()
@@ -81,7 +79,7 @@ def _render_position_summary():
 def _render_tab_today():
     """Tab 1: 今日决策"""
     today = get_last_trade_day()
-    st.caption(f"交易日 {today}")
+    st.caption(f"当前交易日 {today}")
 
     # 策略包信息
     pack = _get_satellite_pack_info()
@@ -92,10 +90,11 @@ def _render_tab_today():
     _render_position_summary()
 
     # 今日选股结果
-    picks = _get_todays_satellite_pick()
+    picks = _get_todays_satellite_pick(False)
     if picks.empty:
         st.info("今日卫星轨无选股结果，请等待 19:10 扫描完成")
         return
+    st.caption(f"正式候选名单日期：{picks['trade_date'].max()} · 来源：卫星轨专用扫描")
 
     # 批量获取价格（减少API调用）
     codes = picks["code"].tolist()
@@ -178,14 +177,15 @@ def _render_tab_today():
 def _render_observation_only():
     """只展示最近一次自动选股名单；不读取或操作卫星交易账户。"""
     today = get_last_trade_day()
-    st.caption(f"最近交易日 {today} · 自动选股结果仅供观察")
+    st.caption(f"当前交易日 {today} · 自动选股结果仅供观察")
     pack = _get_satellite_pack_info()
     if pack:
         _render_pack_info(pack)
-    picks = _get_todays_satellite_pick()
+    picks = _get_todays_satellite_pick(True)
     if picks.empty:
         st.info("暂无卫星轨观察名单，请等待自动扫描任务完成。")
         return
+    st.caption(f"观察名单日期：{picks['trade_date'].max()} · 来源：主扫描顺带生成")
     try:
         prices = bk._latest_prices(picks["code"].tolist())
     except Exception:
@@ -200,7 +200,7 @@ def _render_observation_only():
                      "策略评分": row["score"], "最新价": cur, "涨跌幅(%)": chg})
     st.subheader(f"候选股票（{len(rows)} 只）")
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-    st.caption("候选股票由主轨账户统一执行；卫星来源使用小预算和更严格的止盈止损规则。")
+    st.caption("这是主扫描顺带生成的观察名单，只用于积累战绩，不会进入自动持仓。")
 
 
 def _render_tab_performance():

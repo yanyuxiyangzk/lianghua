@@ -50,6 +50,13 @@ CREATE TABLE IF NOT EXISTS strategies (
     updated_at TEXT, theory_id TEXT, theory_name TEXT, risk_class TEXT,
     account_scope TEXT
 );
+CREATE TABLE IF NOT EXISTS strategy_validation (
+    strategy_name TEXT NOT NULL, eval_date TEXT NOT NULL,
+    pool_name TEXT, method TEXT, top_n INTEGER, fwd_days INTEGER,
+    oos_windows INTEGER, oos_winrate REAL, avg_net_excess REAL,
+    max_drawdown REAL, sharpe REAL, status TEXT, metrics_json TEXT,
+    created_at TEXT, PRIMARY KEY(strategy_name, eval_date)
+);
 CREATE TABLE IF NOT EXISTS tested_hashes (
     hash TEXT PRIMARY KEY,
     name TEXT, kind TEXT, engine TEXT,
@@ -759,14 +766,43 @@ def list_strategies() -> dict:
     with _lconn() as c:
         rows = c.execute("SELECT name, pool_name, top_n, method, filters, factors, oos_winrate,"
             " horizon, is_winrate, updated_at, status, theory_id, theory_name, risk_class, account_scope FROM strategies").fetchall()
+    # 旧策略包只保存了因子名称；从注册表补回代码和真实 kind，保证回测/重验可复现。
+    with _lconn() as c:
+        registry = {r[0]: {"kind": r[1], "code": r[2], "factor_type": r[3]}
+                    for r in c.execute(
+                        "SELECT name,kind,code,factor_type FROM factor_registry").fetchall()}
     out = {}
     for (name, pool, top_n, method, filters, factors, oos, horizon, is_wr, updated, status, theory_id, theory_name, risk_class, account_scope) in rows:
+        fs = json.loads(factors or "[]")
+        for fac in fs:
+            reg = registry.get(fac.get("name")) or {}
+            if reg.get("code") and not fac.get("code"):
+                fac["code"] = reg["code"]
+            if reg.get("kind") and fac.get("kind") in (None, "evolved"):
+                fac["kind"] = reg["kind"]
+            if reg.get("factor_type") and not fac.get("factor_type"):
+                fac["factor_type"] = reg["factor_type"]
         out[name] = {"pool_name": pool, "top_n": top_n, "method": method,
-                     "filters": json.loads(filters or "[]"), "factors": json.loads(factors or "[]"),
+                     "filters": json.loads(filters or "[]"), "factors": fs,
                      "oos_winrate": oos, "horizon": horizon, "is_winrate": is_wr, "updated": updated,
                      "status": status or "active", "theory_id": theory_id, "theory_name": theory_name,
                      "risk_class": risk_class, "account_scope": account_scope}
     return out
+
+
+def save_strategy_validation(name: str, result: dict) -> None:
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with _lconn() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO strategy_validation"
+            "(strategy_name,eval_date,pool_name,method,top_n,fwd_days,oos_windows,"
+            "oos_winrate,avg_net_excess,max_drawdown,sharpe,status,metrics_json,created_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (name, result["eval_date"], result.get("pool_name"), result.get("method"),
+             result.get("top_n"), result.get("fwd_days"), result.get("oos_windows"),
+             result.get("oos_winrate"), result.get("avg_net_excess"),
+             result.get("max_drawdown"), result.get("sharpe"), result.get("status"),
+             json.dumps(result, ensure_ascii=False), now))
 
 
 def update_strategy_oos(name: str, new_oos: float, status: str = "active"):

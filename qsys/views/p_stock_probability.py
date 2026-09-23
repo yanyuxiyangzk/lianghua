@@ -78,6 +78,9 @@ else:
             st.caption(f"分钟质量：{iq.get('quality', '-')} · 完整日 {iq.get('complete_days', 0)} / 总日 {iq.get('days', 0)} · "
                        f"覆盖率 {float(iq.get('coverage') or 0):.1%} · 重复日 {iq.get('duplicate_days', 0)}")
 
+        st.markdown("##### 📊 数据资产")
+        st.dataframe(sp.data_inventory(code), hide_index=True, width="stretch")
+
         rows = []
         labels = {"up_1d": "未来1日上涨", "up_3d": "未来3日上涨",
                   "up_5d": "未来5日上涨", "up_10d": "未来10日上涨",
@@ -93,6 +96,87 @@ else:
                      column_config={c: st.column_config.NumberColumn(c, format="%.1%%")
                                     for c in ["收缩后概率", "原始概率", "95%下限", "95%上限"]})
 
+        st.subheader("📈 K线与相似历史样本")
+        match = sp.get_match_detail(code)
+        if not match or match["matched"].empty:
+            st.caption("暂无相似样本明细（kernel 方案不可用或历史为空）。")
+        else:
+            st.caption(
+                f"高亮标记 = 模型按「{match['method']}」匹配到的 {match['matched_total']} 个相似历史日；"
+                "颜色为该样本后5日路径结局（红=先涨1×ATR、绿=先跌1×ATR、灰=未触及），"
+                "★ 为当前交易日。上方概率即由这些样本统计而来。")
+            import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
+            UP, DOWN, BG, GRID = "#e54545", "#26a69a", "#101010", "#2a2a2a"
+            k = match["kline"].tail(250).reset_index(drop=True)
+            detail = match["matched"].copy()
+            detail["date_str"] = pd.to_datetime(detail["date"]).dt.strftime("%Y-%m-%d")
+            in_win = detail[detail["date_str"].isin(set(k["date"]))]
+            marker_colors = {"up": UP, "down": DOWN, "no_hit": "#888888"}
+            fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                                row_heights=[0.75, 0.25], vertical_spacing=0.02)
+            fig.add_trace(go.Candlestick(
+                x=k["date"], open=k["open"], high=k["high"], low=k["low"],
+                close=k["close"], increasing_line_color=UP, increasing_fillcolor=UP,
+                decreasing_line_color=DOWN, decreasing_fillcolor=DOWN, name="K线"),
+                row=1, col=1)
+            vol_colors = [UP if c0 >= o0 else DOWN
+                          for o0, c0 in zip(k["open"], k["close"])]
+            fig.add_trace(go.Bar(x=k["date"], y=k["volume"], name="VOL",
+                                 marker_color=vol_colors), row=2, col=1)
+            if not in_win.empty:
+                lows = dict(zip(k["date"], k["low"]))
+                fig.add_trace(go.Scatter(
+                    x=in_win["date_str"],
+                    y=[float(lows.get(d, 0)) * 0.985 for d in in_win["date_str"]],
+                    mode="markers", name="相似样本",
+                    marker=dict(symbol="diamond", size=7, line=dict(width=0.5, color="#101010"),
+                                color=[marker_colors.get(str(p), "#888888")
+                                       for p in in_win["path_5"]]),
+                    hovertext=[f"{d} 后5日:{(r or 0):+.1%} 路径:{p}"
+                               for d, r, p in zip(in_win["date_str"], in_win["fwd_5"],
+                                                  in_win["path_5"])],
+                    hoverinfo="text"), row=1, col=1)
+            cur = match["current_date"]
+            cur_row = k[k["date"] == cur]
+            if not cur_row.empty:
+                fig.add_trace(go.Scatter(
+                    x=[cur], y=[float(cur_row["low"].iloc[0]) * 0.97],
+                    mode="markers", name="当前",
+                    marker=dict(symbol="star", size=13, color="#ffd54f")),
+                    row=1, col=1)
+            fig.update_layout(template="plotly_dark", paper_bgcolor=BG, plot_bgcolor=BG,
+                              height=560, showlegend=False, xaxis_rangeslider_visible=False,
+                              margin=dict(l=10, r=10, t=10, b=10))
+            fig.update_xaxes(gridcolor=GRID)
+            fig.update_yaxes(gridcolor=GRID)
+            st.plotly_chart(fig, width="stretch")
+
+            st.markdown("##### 相似样本明细")
+            disp = detail.drop(columns=["date_str"], errors="ignore").copy()
+            disp["date"] = disp["date"].astype(str).str[:10]
+            path_labels = {"up": "先涨1×ATR", "down": "先跌1×ATR", "no_hit": "未触及"}
+            disp["path_5"] = disp["path_5"].map(
+                lambda p: path_labels.get(str(p), str(p)))
+            rename = {"date": "日期", "close": "收盘", "ret_5": "5日收益",
+                      "ret_20": "20日收益", "vol_20": "年化波动", "volume_ratio": "量比",
+                      "atr_pct": "ATR占比", "trend_state": "趋势", "momentum_state": "动量",
+                      "volume_state": "量能", "vol_state": "波动状态",
+                      "market_trend_state": "市场趋势",
+                      "intraday_direction_state": "日内方向",
+                      "ob_imbalance_state": "盘口失衡", "fwd_1": "后1日",
+                      "fwd_5": "后5日", "fwd_10": "后10日", "path_5": "路径结局",
+                      "path_threshold": "路径阈值", "weight": "核权重"}
+            disp = disp.rename(columns=rename)
+            pct_cols = [c for c in ("5日收益", "20日收益", "年化波动", "ATR占比",
+                                    "后1日", "后5日", "后10日", "路径阈值")
+                        if c in disp.columns]
+            st.dataframe(disp, hide_index=True, width="stretch",
+                         column_config={c: st.column_config.NumberColumn(c, format="%.2%")
+                                        for c in pct_cols} | (
+                             {"核权重": st.column_config.NumberColumn("核权重", format="%.3f")}
+                             if "核权重" in disp.columns else {}))
+
         st.subheader("当前状态")
         state = model.get("state") or {}
         state_labels = {"trend_state": "20日趋势", "momentum_state": "5日动量",
@@ -101,7 +185,7 @@ else:
                         "ret_5": "5日收益", "ret_20": "20日收益",
                         "vol_20": "20日年化波动", "volume_ratio": "量比",
                         "atr_pct": "ATR占价格"}
-        st.dataframe(pd.DataFrame([{"指标": state_labels.get(k, k), "值": v}
+        st.dataframe(pd.DataFrame([{"指标": state_labels.get(k, k), "值": str(v)}
                                    for k, v in state.items()]), hide_index=True, width="stretch")
 
         st.subheader("样本外可信度")

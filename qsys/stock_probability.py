@@ -581,6 +581,98 @@ def build_model(code: str) -> dict:
     return result
 
 
+def data_inventory(code: str) -> pd.DataFrame:
+    """单股票数据资产盘点（页面展示用）：各数据层的记录数、覆盖区间和可用性。"""
+    with datasource._conn() as c:
+        daily = c.execute(
+            "SELECT COUNT(*), MIN(date), MAX(date) FROM market_daily "
+            "WHERE source='ths_ifind' AND code=?", (code,)).fetchone()
+        minute = c.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT substr(datetime,1,10)), "
+            "MIN(substr(datetime,1,10)), MAX(substr(datetime,1,10)) "
+            "FROM ifind_minute WHERE code=?", (code,)).fetchone()
+        intraday = c.execute(
+            "SELECT COUNT(*) FROM stock_intraday_features "
+            "WHERE code=? AND minute_count>=200", (code,)).fetchone()
+        ob = c.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT substr(datetime,1,10)), "
+            "MAX(substr(datetime,1,10)) FROM ifind_realtime WHERE code=?", (code,)).fetchone()
+        ob_full = c.execute(
+            "SELECT COUNT(*) FROM (SELECT substr(datetime,1,10) d FROM ifind_realtime "
+            "WHERE code=? GROUP BY d HAVING COUNT(*)>=1000)", (code,)).fetchone()
+        ob_feat = c.execute(
+            "SELECT COUNT(*), MAX(trade_date) FROM stock_orderbook_features "
+            "WHERE code=?", (code,)).fetchone()
+        ticks = c.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT substr(datetime,1,10)) "
+            "FROM tick_data WHERE code=?", (code,)).fetchone()
+    rows = [
+        {"数据层": "日线（前复权）", "记录数": daily[0], "天数": daily[0],
+         "覆盖": f"{daily[1] or '—'} ～ {daily[2] or '—'}",
+         "状态": "✅" if daily[0] >= 120 else "❌ 不足120天"},
+        {"数据层": "1分钟线", "记录数": minute[0], "天数": minute[1],
+         "覆盖": f"{minute[2] or '—'} ～ {minute[3] or '—'}",
+         "状态": "✅" if minute[1] >= 60 else "❌ 不足60天"},
+        {"数据层": "日内特征（分钟压缩）", "记录数": intraday[0], "天数": intraday[0],
+         "覆盖": "—", "状态": "✅" if intraday[0] >= 60 else "❌"},
+        {"数据层": "盘口快照（五档）", "记录数": ob[0], "天数": ob[1],
+         "覆盖": f"最新 {ob[2] or '—'}",
+         "状态": f"✅ 完整日 {ob_full[0]} 天" if ob_full[0] else "⏳ 积累中"},
+        {"数据层": "盘口特征（快照压缩）", "记录数": ob_feat[0], "天数": ob_feat[0],
+         "覆盖": f"最新 {ob_feat[1] or '—'}",
+         "状态": "✅" if ob_feat[0] else "⏳ 待积累"},
+        {"数据层": "分笔成交（腾讯）", "记录数": ticks[0], "天数": ticks[1],
+         "覆盖": "仅当日", "状态": "✅" if ticks[0] else "⏳ 待同步"},
+    ]
+    return pd.DataFrame(rows)
+
+
+def get_match_detail(code: str) -> dict | None:
+    """按最新已存模型的方案重放相似匹配，返回样本明细与K线数据（页面展示用，只读）。
+
+    使用已存模型的 selected_scheme 而不是重新选择，保证页面看到的高亮样本
+    就是上面概率表实际由之统计出来的样本集。kernel 方案展示权重最高的25%近邻。
+    """
+    model = load_latest(code)
+    if not model:
+        return None
+    raw = _load_daily(code)
+    if raw.empty:
+        return None
+    data = _features_and_labels(raw, _load_intraday(code), _load_market(),
+                                _load_orderbook(code))
+    if data.empty:
+        return None
+    scheme = model.get("selected_scheme") or "broad"
+    current = data.iloc[-1]
+    history = data.iloc[:-10]  # 与 build_model 相同的成熟窗口
+    weight_map = None
+    if scheme == "kernel":
+        w = _kernel_weights(history, current)
+        if w is None:
+            return None
+        cutoff = w.quantile(0.75)
+        weight_map = w[w >= cutoff]
+        matched = history.loc[weight_map.index]
+        method = "连续特征高斯核软匹配(展示权重最高25%近邻)"
+    else:
+        matched, method = _similar(history, current, scheme)
+    cols = ["date", "close", "ret_5", "ret_20", "vol_20", "volume_ratio", "atr_pct",
+            "trend_state", "momentum_state", "volume_state", "vol_state",
+            "market_trend_state", "intraday_direction_state", "ob_imbalance_state",
+            "fwd_1", "fwd_5", "fwd_10", "path_5", "path_threshold"]
+    have = [c for c in cols if c in matched.columns]
+    detail = matched[have].copy()
+    if weight_map is not None:
+        detail["weight"] = weight_map
+    detail = detail.sort_values("date", ascending=False).reset_index(drop=True)
+    return {"scheme": scheme, "method": method, "matched": detail,
+            "matched_total": int(len(matched)),
+            "kline": raw.sort_values("date").reset_index(drop=True),
+            "asof_date": model.get("asof_date"),
+            "current_date": str(data.iloc[-1]["date"].strftime("%Y-%m-%d"))}
+
+
 def load_latest(code: str) -> dict | None:
     with datasource._conn() as c:
         _ensure_schema(c)

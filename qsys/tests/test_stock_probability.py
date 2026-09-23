@@ -230,6 +230,41 @@ def test_overlay_down_path_veto_is_asymmetric():
     print("PASS: test_overlay_down_path_veto_is_asymmetric")
 
 
+def test_match_detail_replays_stored_model_scheme():
+    old_db = sp.datasource.MKT_DB
+    temp = tempfile.TemporaryDirectory()
+    sp.datasource.MKT_DB = Path(temp.name) / "market.db"
+    try:
+        daily = _synthetic(550)
+        with sp.datasource._conn() as c:
+            for r in daily.itertuples():
+                c.execute(
+                    "INSERT OR REPLACE INTO market_daily"
+                    "(source,code,date,open,high,low,close,volume,amount) "
+                    "VALUES('ths_ifind','SZ001216',?,?,?,?,?,?,?)",
+                    (r.date, r.open, r.high, r.low, r.close, r.volume, r.amount))
+        model = sp.build_model("SZ001216")
+        detail = sp.get_match_detail("SZ001216")
+        assert detail is not None
+        assert detail["scheme"] == model["selected_scheme"]
+        assert not detail["matched"].empty
+        for col in ("date", "close", "fwd_5", "path_5"):
+            assert col in detail["matched"].columns
+        assert len(detail["kline"]) == 550
+        # 样本明细条数与模型口径一致（kernel 展示 top25% 近邻，其余为全量匹配）
+        if detail["scheme"] != "kernel":
+            assert detail["matched_total"] == model["sample_count"]
+        else:
+            assert "weight" in detail["matched"].columns
+        inv = sp.data_inventory("SZ001216")
+        daily_row = inv[inv["数据层"] == "日线（前复权）"].iloc[0]
+        assert daily_row["记录数"] == 550
+    finally:
+        sp.datasource.MKT_DB = old_db
+        temp.cleanup()
+    print("PASS: test_match_detail_replays_stored_model_scheme")
+
+
 def test_model_selection_penalizes_tiny_current_sample():
     data = sp._features_and_labels(_synthetic(550))
     history, current = data.iloc[:-10], data.iloc[-1]
@@ -364,6 +399,7 @@ if __name__ == "__main__":
              test_market_regime_joins_and_new_schemes_participate,
              test_overlay_quality_gate_blocks_limited_model,
              test_overlay_down_path_veto_is_asymmetric,
+             test_match_detail_replays_stored_model_scheme,
              test_model_selection_penalizes_tiny_current_sample,
              test_shadow_upsert_preserves_evaluation_columns,
              test_governance_requires_enough_groups,

@@ -179,6 +179,24 @@ def test_consistency_fwd_days():
     print(f"PASS: test_consistency_fwd_days (MAIN_FWD={fe.MAIN_FWD}, GATE={GATE['FWD_DAYS']})")
 
 
+def test_search_budget_noise_floor():
+    """全局搜索预算：t 统计量必须超过 √(2·ln N) 噪声地板；地板随 N 单调收紧。"""
+    import gates
+    # N=40000 → t*≈4.60；典型有效因子（IC=0.02, σ=0.1, T=600 → t≈4.9）通过
+    r = gates.search_budget_check(ic_mean=0.02, ic_std=0.1, n_days=600, n_trials=40000)
+    assert r["passed"] and abs(r["t_star"] - 4.60) < 0.05
+    # 弱信号（t≈1.2）在 N=4 万时被拒
+    r2 = gates.search_budget_check(ic_mean=0.005, ic_std=0.1, n_days=600, n_trials=40000)
+    assert not r2["passed"]
+    # 地板随 N 单调升高：同样的信号，搜索量×1000 后被拒
+    r3 = gates.search_budget_check(0.02, 0.1, 600, n_trials=40_000_000)
+    assert not r3["passed"] and r3["t_star"] > r["t_star"]
+    # 账本结构（无表环境降级为零而不是报错）
+    tc = gates.global_trial_count()
+    assert set(tc) == {"factor_trials", "strategy_trials", "total"}
+    print("PASS: test_search_budget_noise_floor")
+
+
 def test_factor_ic_matured_and_decay_state():
     """live IC：正相关因子 IC>0，随机因子 ≈0；衰减状态按近期均值漂移判定。"""
     import sqlite3
@@ -253,6 +271,7 @@ if __name__ == "__main__":
         test_backtest_credibility_empty,
         test_consistency_fwd_days,
         test_factor_ic_matured_and_decay_state,
+        test_search_budget_noise_floor,
     ]
     passed = 0
     failed = 0

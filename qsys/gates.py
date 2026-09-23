@@ -216,7 +216,64 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
     # Gate 14: 因子复杂度检测（表达式越复杂过拟合风险越高）
     # 此闸门由调用方在因子代码可用时单独调用 check_complexity_gate
 
+    # Gate 15（顾问模式）：全局搜索预算——因子 IC 的 t 统计量 vs 全库试验数 N 的
+    # 噪声地板。只记账不拦截，待机制B影子读数校准后再决定是否硬闸。
+    if len(ic) >= 20:
+        sb = search_budget_check(float(ic.mean()), float(ic.std()), len(ic))
+        metrics["搜索预算t值"] = round(sb["t_stat"], 2)
+        metrics["搜索预算地板"] = round(sb["t_star"], 2)
+        metrics["搜索预算通过"] = sb["passed"]
+
     return {"pass": len(reasons) == 0, "reasons": reasons, "metrics": metrics}
+
+
+# ---------------------------------------------------------------- 全局搜索预算（P2）
+# 跨引擎试验总数决定"运气冠军"的噪声地板：N 次试验下期望最大噪声 t 值 ≈ √(2·ln N)。
+# 因子 IC 的 t 统计量必须超过地板才有统计意义。当前为顾问模式（只记账不拦截），
+# 待机制B 影子读数校准后再决定是否硬闸。
+_TRIAL_COUNT_CACHE = {"at": 0.0, "value": {"factor_trials": 0, "strategy_trials": 0, "total": 0}}
+
+
+def global_trial_count() -> dict:
+    """跨引擎累计试验数：factor_registry 是全量因子试验账本（含未过闸的），
+    strategies 是策略包试验数。1 小时缓存——evaluate_gates 在挖掘循环里高频调用。"""
+    import time as _time
+    if _time.time() - _TRIAL_COUNT_CACHE["at"] < 3600:
+        return _TRIAL_COUNT_CACHE["value"]
+    import datasource
+    try:
+        with datasource._conn() as c:
+            factors = c.execute("SELECT COUNT(*) FROM factor_registry").fetchone()[0]
+            try:
+                strategies = c.execute("SELECT COUNT(*) FROM strategies").fetchone()[0]
+            except Exception:
+                strategies = 0
+        _TRIAL_COUNT_CACHE["value"] = {
+            "factor_trials": int(factors), "strategy_trials": int(strategies),
+            "total": int(factors) + int(strategies)}
+        _TRIAL_COUNT_CACHE["at"] = _time.time()
+    except Exception:
+        pass
+    return _TRIAL_COUNT_CACHE["value"]
+
+
+def search_budget_check(ic_mean: float, ic_std: float, n_days: int,
+                        n_trials: int | None = None) -> dict:
+    """全局搜索预算检验：因子 IC 的 t 统计量必须超过全库试验数对应的噪声地板。
+
+    t = |IC|/σ_IC·√T（与 ic_pvalue 同口径）；地板 t* = √(2·ln N)。
+    校准参考（2026-09-23）：N≈39770 → t*≈4.60；现有 IC_MIN=0.02 在典型 IC 波动
+    0.1、T=600 下对应 t≈4.9，恰好位于当前试验规模的噪声地板之上——门槛将随 N
+    自动收紧，越挖越严格。
+    """
+    import math
+    if n_trials is None:
+        n_trials = global_trial_count()["total"]
+    n = max(int(n_trials), 2)
+    t_star = math.sqrt(2 * math.log(n))
+    t_stat = abs(ic_mean) / (ic_std + 1e-12) * math.sqrt(max(int(n_days), 2))
+    return {"t_stat": t_stat, "t_star": t_star, "n_trials": n,
+            "passed": bool(t_stat > t_star)}
 
 
 # 放宽版闸门：给 ev_ 因子做收益口径验证用

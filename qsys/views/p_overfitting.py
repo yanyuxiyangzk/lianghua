@@ -184,6 +184,20 @@ def _render_health_dashboard():
         else:
             st.metric("平均IC p值", "—", help="需先运行因子体检")
 
+    # 全局搜索预算（P2 顾问模式）：跨引擎试验数与噪声地板
+    import gates
+    trials = gates.global_trial_count()
+    if trials["total"] > 0:
+        import math
+        t_star = math.sqrt(2 * math.log(max(trials["total"], 2)))
+        c5, c6, _c7, _c8 = st.columns(4)
+        c5.metric("全局试验数 N", f"{trials['total']:,}",
+                  help=f"因子试验 {trials['factor_trials']:,} + 策略包 {trials['strategy_trials']:,}"
+                       "（跨 loopengine/RD-Agent/策略生成的累计账本）")
+        c6.metric("噪声地板 t*", f"{t_star:.2f}",
+                  help="N 次试验下期望最大噪声 t 值 √(2·ln N)；因子 IC 的 t 统计量必须"
+                       "超过它才算真信号。试验越多地板越高——越挖越严格。")
+
 
 # ---------------------------------------------------------------- Tab 1: IS/OOS三段验证
 def _render_tab_is_oos():

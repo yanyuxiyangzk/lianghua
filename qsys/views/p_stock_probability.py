@@ -21,7 +21,13 @@ st.set_page_config(page_title="单股票概率模型", layout="wide")
 st.title("📐 单股票概率模型")
 st.caption("仅使用该股票自身历史数据；模型结果独立落库，删除原始行情后仍可查看。概率是历史条件频率，不是收益保证。")
 
-raw_code = st.text_input("股票代码", placeholder="例如 SZ001216、001216.SZ 或 001216")
+# 跨页跳转预选（如"单股票历史数据"列表的概率按钮）：在控件创建前落位 widget key
+_pending_code = st.session_state.pop("prob_preselect", None)
+if _pending_code:
+    st.session_state["prob_code"] = _pending_code
+
+raw_code = st.text_input("股票代码", placeholder="例如 SZ001216、001216.SZ 或 001216",
+                         key="prob_code")
 code = _db_code(raw_code)
 valid = bool(code and len(code) == 8 and code[2:].isdigit())
 if not valid:

@@ -247,12 +247,12 @@ def _pagination_bottom(total: int, key: str, current: int,
 
 
 def _render_stock_rows(inventory: pd.DataFrame):
-    headers = st.columns([1.7, 0.8, 1.45, 0.9, 1.0, 1.45, 1.0])
+    headers = st.columns([1.7, 0.8, 1.45, 0.9, 1.0, 1.45, 1.35])
     for col, label in zip(headers, ["股票", "日线天数", "日线范围", "分钟交易日",
                                     "分钟记录", "分钟范围", "操作"]):
         col.markdown(f"**{label}**")
     for row in inventory.itertuples(index=False):
-        cols = st.columns([1.7, 0.8, 1.45, 0.9, 1.0, 1.45, 1.0])
+        cols = st.columns([1.7, 0.8, 1.45, 0.9, 1.0, 1.45, 1.35])
         cols[0].write(f"{row.code} {row.name}".strip())
         cols[1].write(f"{int(row.daily_days):,}")
         cols[2].write(f"{row.daily_start or '—'} ～ {row.daily_end or '—'}")
@@ -260,10 +260,14 @@ def _render_stock_rows(inventory: pd.DataFrame):
         cols[4].write(f"{int(row.minute_rows):,}")
         cols[5].write(f"{row.minute_start or '—'} ～ {row.minute_end or '—'}")
         with cols[6]:
-            b1, b2 = st.columns(2)
+            b1, b2, b3 = st.columns(3)
             if b1.button("详情", key=f"stock_detail_{row.code}", use_container_width=True):
                 _go("detail", row.code)
-            if b2.button("删除", key=f"stock_delete_{row.code}", use_container_width=True):
+            if b2.button("概率", key=f"stock_prob_{row.code}", use_container_width=True,
+                         help="跳转到该股票的概率模型页"):
+                st.session_state["prob_preselect"] = row.code
+                st.switch_page("views/p_stock_probability.py")
+            if b3.button("删除", key=f"stock_delete_{row.code}", use_container_width=True):
                 st.session_state["stock_history_delete"] = row.code
                 st.rerun()
         if st.session_state.get("stock_history_delete") == row.code:

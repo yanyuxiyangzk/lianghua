@@ -2445,6 +2445,9 @@ def _get_top_factors_for_pack(pool_name: str, top_n: int = 15) -> list[dict]:
         return []
 
 
+HOLDOUT_TRADE_DAYS = 80  # 约4个月：策略包生成与晋级评估的数据隔离带（P1-2）
+
+
 def _generate_pack_candidates(pool_name: str, top_n: int = 10,
                                methods: list[str] | None = None) -> list[dict]:
     """生成候选策略包：贪心选因子 + Walk-forward验证。"""
@@ -2470,8 +2473,10 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
         pass
     
     codes = (all_pools().get(pool_name) or all_pools().get("沪深300"))
-    end = get_last_trade_day()
-    
+    # P1-2 数据隔离：生成/排序不得看见 holdout 带（最近 ~80 个交易日）的数据；
+    # shadow 包的晋级评估只在 holdout 带上进行（revalidate_strategy）。
+    end = trade_day_offset(get_last_trade_day(), -HOLDOUT_TRADE_DAYS)
+
     # 预读 scorecards 缓存（真实 ICIR/IC均值/胜率，替代硬编码）
     scorecards_cache = {}
     try:
@@ -2597,6 +2602,7 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
                 "is_winrate": None,  # IS胜率在walk-forward中无法直接获取
                 "horizon": "5日",
                 "avg_excess": avg_excess,
+                "data_end": end,  # P1-2：生成数据截止日（holdout 带左端）
             }
             # 理论一致性：只有所有因子属于同一明确理论时才标记理论策略包；
             # 历史/未归属因子仍可生成 legacy 包，但不冒充理论包。
@@ -2726,18 +2732,28 @@ def revalidate_strategy(name: str) -> dict:
     max_dd = float((nav / nav.cummax() - 1).min()) if len(nav) else 0.0
     sharpe = float(net.mean() / (net.std() + 1e-12) * np.sqrt(252 / 10)) if len(net) > 1 else 0.0
     passed = len(net) >= 30 and oos >= 0.55 and avg_net > 0 and max_dd >= -0.25
-    # 冷静期转正：shadow 包除 walk-forward 达标外，还需机制B影子证据
-    # （名单内 top/bottom 判别力>0，至少8组成熟名单）；无证据不转正。
+    # 冷静期转正：shadow 包的晋级评估只用 holdout 带内窗口——生成没见过这批数据
+    # （_generate_pack_candidates 的 end 回退 HOLDOUT_TRADE_DAYS），walk-forward
+    # 权重本身 PIT（估计窗右端回退 fwd_days）不触 holdout。另需机制B影子证据。
     shadow_ev = None
+    holdout_info = None
     if pk.get("status", "active") == "shadow":
         import factor_health
         shadow_ev = factor_health.pack_shadow_evidence(name)
-        if passed and shadow_ev["ok"]:
+        holdout_start = trade_day_offset(end, -HOLDOUT_TRADE_DAYS)
+        ho_mask = pd.to_datetime(wf["调仓日"]) >= pd.Timestamp(holdout_start)
+        holdout_net = wf.loc[ho_mask, "优化组合扣费超额"].dropna()
+        h_win = float((holdout_net > 0).mean()) if len(holdout_net) else 0.0
+        h_avg = float(holdout_net.mean()) if len(holdout_net) else 0.0
+        holdout_passed = len(holdout_net) >= 6 and h_win >= 0.5 and h_avg > 0
+        if holdout_passed and shadow_ev["ok"]:
             status = "active"
-        elif passed:
-            status = "shadow"  # 重验通过但影子证据不足，继续冷静期
+        elif holdout_passed:
+            status = "shadow"  # holdout 通过但影子证据不足，继续冷静期
         else:
             status = "degraded"
+        holdout_info = {"start": holdout_start, "windows": len(holdout_net),
+                        "winrate": h_win, "avg_net": h_avg}
     else:
         status = "active" if passed else "degraded"
     result = {"ok": True, "name": name, "eval_date": end, "pool_name": pool_name,
@@ -2748,6 +2764,8 @@ def revalidate_strategy(name: str) -> dict:
               "status": status}
     if shadow_ev is not None:
         result["shadow_evidence"] = shadow_ev
+    if holdout_info is not None:
+        result["holdout"] = holdout_info
     library.update_strategy_oos(name, oos, status=status)
     library.save_strategy_validation(name, result)
     return result

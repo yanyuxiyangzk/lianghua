@@ -56,6 +56,10 @@ _CACHE_DB = DATA_DIR / "experience.db"
 _CACHE_TTL = 86400  # 24小时
 _DAILY_CALL_LIMIT = int(os.environ.get("LLM_DAILY_CALL_LIMIT", "30"))
 _DAILY_TOKEN_LIMIT = int(os.environ.get("LLM_DAILY_TOKEN_LIMIT", "30000"))
+# 低频高价值任务的保留日额度（调用次数）：绕过全局调用上限，不与高频任务
+# （如演化评审）竞争——2026-09-22 概率画像被 loopengine_review 打满全局额度而饿死。
+# 保留轨道仍占用全局 token 预算，且全部调用照常落 llm_usage_log 可审计。
+_LABEL_RESERVED_CALLS = {"stock_probability_profile_v1": 5}
 _last_error = ""
 
 
@@ -90,28 +94,54 @@ def _ensure_cache_table():
             id INTEGER PRIMARY KEY AUTOINCREMENT, created_at REAL NOT NULL,
             day TEXT NOT NULL, label TEXT, model TEXT, cache_hit INTEGER NOT NULL DEFAULT 0,
             input_tokens INTEGER, output_tokens INTEGER, reserved_tokens INTEGER)""")
+        # 前缀缓存遥测补列（升级兼容）：DeepSeek prompt_cache_hit/miss_tokens 落表，
+        # 前缀命中率从此可审计，不再只写日志。
+        log_cols = [r[1] for r in c.execute("PRAGMA table_info(llm_usage_log)")]
+        for col in ("prompt_cache_hit_tokens", "prompt_cache_miss_tokens"):
+            if col not in log_cols:
+                c.execute(f"ALTER TABLE llm_usage_log ADD COLUMN {col} INTEGER")
 
 
 def _record_usage(label, model, cache_hit=False, input_tokens=None,
-                  output_tokens=None, reserved_tokens=0):
+                  output_tokens=None, reserved_tokens=0,
+                  cache_hit_tokens=None, cache_miss_tokens=None):
     try:
         _ensure_cache_table()
         with sqlite3.connect(str(_CACHE_DB), timeout=10) as c:
-            c.execute("INSERT INTO llm_usage_log(created_at,day,label,model,cache_hit,input_tokens,output_tokens,reserved_tokens) VALUES(?,?,?,?,?,?,?,?)",
+            c.execute("INSERT INTO llm_usage_log(created_at,day,label,model,cache_hit,input_tokens,output_tokens,reserved_tokens,prompt_cache_hit_tokens,prompt_cache_miss_tokens) VALUES(?,?,?,?,?,?,?,?,?,?)",
                       (time.time(), time.strftime("%Y-%m-%d"), label, model, int(cache_hit),
-                       input_tokens, output_tokens, reserved_tokens))
+                       input_tokens, output_tokens, reserved_tokens,
+                       cache_hit_tokens, cache_miss_tokens))
     except Exception:
         pass
 
 
-def _budget_reserve(max_tokens: int) -> bool:
-    """Reserve a daily request/output budget. Cache hits never consume budget."""
+def _budget_reserve(max_tokens: int, label: str = "") -> bool:
+    """Reserve a daily request/output budget. Cache hits never consume budget.
+    保留轨道（_LABEL_RESERVED_CALLS 内的 label）：按自身当日非缓存调用数限流，
+    绕过全局调用上限，但仍占用全局 token 预算。"""
     day = time.strftime("%Y-%m-%d")
     try:
         _ensure_cache_table()
         with sqlite3.connect(str(_CACHE_DB), timeout=10) as c:
             row = c.execute("SELECT calls, reserved_tokens FROM llm_usage WHERE day=?", (day,)).fetchone()
             calls, tokens = row if row else (0, 0)
+            quota = _LABEL_RESERVED_CALLS.get(label)
+            if quota:
+                used = c.execute(
+                    "SELECT COUNT(*) FROM llm_usage_log WHERE day=? AND label=? AND cache_hit=0",
+                    (day, label)).fetchone()[0]
+                if used >= quota:
+                    _set_last_error(f"{label} 今日保留额度已用完（{used}/{quota}）")
+                    return False
+                if tokens + max_tokens > _DAILY_TOKEN_LIMIT:
+                    _set_last_error(
+                        f"今日 LLM 输出预算不足（已预留 {tokens}/{_DAILY_TOKEN_LIMIT} tokens，"
+                        f"本次需要 {max_tokens}）")
+                    return False
+                c.execute("INSERT OR REPLACE INTO llm_usage(day,calls,reserved_tokens) VALUES(?,?,?)",
+                          (day, calls, tokens + max_tokens))
+                return True
             if calls >= _DAILY_CALL_LIMIT:
                 _set_last_error(f"今日 LLM 调用次数已达上限（{calls}/{_DAILY_CALL_LIMIT}）")
                 log.warning("LLM daily call limit exceeded: calls=%d/%d", calls, _DAILY_CALL_LIMIT)
@@ -171,8 +201,8 @@ def _set_cached(cache_key: str, response: str, model: str, label: str):
         pass
 
 
-def _log_cache_usage(r, label: str = "") -> None:
-    """从 LLM 响应中提取缓存命中信息并记录日志。"""
+def _log_cache_usage(r, label: str = "") -> tuple[int, int]:
+    """从 LLM 响应中提取前缀缓存命中 tokens，写日志并返回 (hit, miss) 供落表。"""
     try:
         usage = getattr(r, "usage", None) or {}
         hit = getattr(usage, "prompt_cache_hit_tokens", 0) or 0
@@ -187,8 +217,32 @@ def _log_cache_usage(r, label: str = "") -> None:
             rate = hit / (hit + miss)
             log.debug("LLM cache %s: hit=%d miss=%d rate=%.0f%% total=%d",
                       label, hit, miss, rate * 100, hit + miss)
+        return int(hit), int(miss)
     except Exception:
-        pass
+        return 0, 0
+
+
+def llm_cache_stats(day: str | None = None) -> dict:
+    """缓存命中审计：应用层响应缓存命中率 + DeepSeek 前缀缓存命中率（按 label 分组）。"""
+    day = day or time.strftime("%Y-%m-%d")
+    try:
+        _ensure_cache_table()
+        with sqlite3.connect(str(_CACHE_DB), timeout=10) as c:
+            rows = c.execute(
+                "SELECT label, COUNT(*), SUM(cache_hit), "
+                "SUM(COALESCE(prompt_cache_hit_tokens,0)), "
+                "SUM(COALESCE(prompt_cache_miss_tokens,0)) "
+                "FROM llm_usage_log WHERE day=? GROUP BY label", (day,)).fetchall()
+    except Exception:
+        return {"day": day, "labels": []}
+    out = []
+    for label, calls, hits, pre_hit, pre_miss in rows:
+        total_pre = (pre_hit or 0) + (pre_miss or 0)
+        out.append({"label": label, "calls": calls, "cache_hits": hits or 0,
+                    "app_hit_rate": (hits or 0) / calls if calls else None,
+                    "prefix_hit_tokens": pre_hit or 0,
+                    "prefix_hit_rate": (pre_hit or 0) / total_pre if total_pre else None})
+    return {"day": day, "labels": out}
 
 
 def llm_available() -> bool:
@@ -222,7 +276,7 @@ def llm_chat(system: str, user: str, max_tokens: int = 4096, model: str | None =
     try:
         from litellm import completion
 
-        if not _budget_reserve(max_tokens):
+        if not _budget_reserve(max_tokens, label):
             return None
 
         r = completion(
@@ -232,11 +286,13 @@ def llm_chat(system: str, user: str, max_tokens: int = 4096, model: str | None =
             temperature=0.2,
             **_completion_options(model),
         )
-        _log_cache_usage(r, label or "chat")
+        pre_hit, pre_miss = _log_cache_usage(r, label or "chat")
         response = (r.choices[0].message.content or "").strip()
         usage = getattr(r, "usage", None) or {}
         _record_usage(label, model, input_tokens=getattr(usage, "prompt_tokens", None),
-                      output_tokens=getattr(usage, "completion_tokens", None), reserved_tokens=max_tokens)
+                      output_tokens=getattr(usage, "completion_tokens", None),
+                      reserved_tokens=max_tokens,
+                      cache_hit_tokens=pre_hit, cache_miss_tokens=pre_miss)
         
         # 缓存响应
         if use_cache and response:
@@ -273,7 +329,7 @@ def llm_chat_multi(messages: list[dict], max_tokens: int = 4000, model: str | No
     try:
         from litellm import completion
 
-        if not _budget_reserve(max_tokens):
+        if not _budget_reserve(max_tokens, label):
             return None
 
         def _call(**extra):
@@ -284,18 +340,19 @@ def llm_chat_multi(messages: list[dict], max_tokens: int = 4000, model: str | No
                 temperature=0.3,
                 **_completion_options(model),
                 **extra)
-            _log_cache_usage(r, label or "chat_multi")
+            pre = _log_cache_usage(r, label or "chat_multi")
             ch = r.choices[0]
             return ((ch.message.content or "").strip(), getattr(ch, "finish_reason", None),
-                    getattr(r, "usage", None) or {})
+                    getattr(r, "usage", None) or {}, pre)
 
-        content, finish, usage = _call()
+        content, finish, usage, pre = _call()
         if not content and finish == "length":
-            content, _, usage = _call(reasoning_effort="low")
+            content, _, usage, pre = _call(reasoning_effort="low")
         # 记录实际用量；缓存命中在入口处单独记录
         _record_usage(label, model, input_tokens=getattr(usage, "prompt_tokens", None),
                       output_tokens=getattr(usage, "completion_tokens", None),
-                      reserved_tokens=max_tokens)
+                      reserved_tokens=max_tokens,
+                      cache_hit_tokens=pre[0], cache_miss_tokens=pre[1])
         
         # 缓存响应
         if use_cache and content:

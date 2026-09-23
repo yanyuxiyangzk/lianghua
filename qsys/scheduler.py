@@ -2660,7 +2660,9 @@ def job_strategy_gen(pool_name: str = "沪深300", top_n: int = 10,
             if pack_def["name"] in existing:
                 continue
             
-            # 保存到strategies表
+            # 保存到strategies表；冷静期：新包入 shadow 态——参与候选名单产出（影子评估
+            # 需要它的名单），但执行闸门（status=="active"）不放行资金。转正由
+            # revalidate 的 walk-forward 通过 + 机制B影子判别力证据共同决定。
             library.save_strategy(pack_def["name"], {
                 "pool_name": pack_def["pool_name"],
                 "top_n": pack_def["top_n"],
@@ -2674,8 +2676,8 @@ def job_strategy_gen(pool_name: str = "沪深300", top_n: int = 10,
                 "theory_name": pack_def.get("theory_name"),
                 "risk_class": pack_def.get("risk_class"),
                 "account_scope": pack_def.get("account_scope"),
-            })
-            saved.append(f"{pack_def['name']}({pack_def['oos_winrate']})")
+            }, status="shadow")
+            saved.append(f"{pack_def['name']}({pack_def['oos_winrate']},冷静期)")
         except Exception:
             continue
     
@@ -2724,13 +2726,28 @@ def revalidate_strategy(name: str) -> dict:
     max_dd = float((nav / nav.cummax() - 1).min()) if len(nav) else 0.0
     sharpe = float(net.mean() / (net.std() + 1e-12) * np.sqrt(252 / 10)) if len(net) > 1 else 0.0
     passed = len(net) >= 30 and oos >= 0.55 and avg_net > 0 and max_dd >= -0.25
-    status = "active" if passed else "degraded"
+    # 冷静期转正：shadow 包除 walk-forward 达标外，还需机制B影子证据
+    # （名单内 top/bottom 判别力>0，至少8组成熟名单）；无证据不转正。
+    shadow_ev = None
+    if pk.get("status", "active") == "shadow":
+        import factor_health
+        shadow_ev = factor_health.pack_shadow_evidence(name)
+        if passed and shadow_ev["ok"]:
+            status = "active"
+        elif passed:
+            status = "shadow"  # 重验通过但影子证据不足，继续冷静期
+        else:
+            status = "degraded"
+    else:
+        status = "active" if passed else "degraded"
     result = {"ok": True, "name": name, "eval_date": end, "pool_name": pool_name,
               "method": pk.get("method"), "top_n": int(pk.get("top_n") or 10),
               "fwd_days": 5, "oos_windows": len(net), "oos_winrate": oos,
               "avg_net_excess": avg_net, "max_drawdown": max_dd, "sharpe": sharpe,
               "valid_factors": len(factor_vals), "failed_factors": failed,
               "status": status}
+    if shadow_ev is not None:
+        result["shadow_evidence"] = shadow_ev
     library.update_strategy_oos(name, oos, status=status)
     library.save_strategy_validation(name, result)
     return result
@@ -3055,6 +3072,10 @@ JOBS = {
     "pool_scan": {"name": "🏛️ 板块/股票池扫描（Top-N）", "func": job_pool_scan,
                   "default": {"enabled": True, "hour": 19, "minute": 0,
                               "params": {"pool_name": "沪深300", "top_n": 10, "pack": ""}}},
+    # 名单多元化（机制B燃料）：异质池的名单让因子健康度的 IC 状态有区分度。
+    "pool_scan_zz500": {"name": "🏛️ 股票池扫描（中证500·名单多元化）", "func": job_pool_scan,
+                        "default": {"enabled": True, "hour": 19, "minute": 8,
+                                    "params": {"pool_name": "中证500", "top_n": 10, "pack": ""}}},
     "auto_scan": {"name": "🤖 自动选股（因子价值评分）", "func": job_auto_scan,
                   "default": {"enabled": True, "hour": 19, "minute": 30,
                               "params": {"pool_name": "沪深300", "top_n": 10}}},

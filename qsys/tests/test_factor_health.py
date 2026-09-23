@@ -199,13 +199,38 @@ def test_upsert_preserves_evaluated_columns():
     print("PASS: test_upsert_preserves_evaluated_columns")
 
 
+def test_pack_shadow_evidence_gate():
+    temp, old_mkt, old_exp = _use_temp_dbs()
+    try:
+        _seed_market()
+        _seed_picks()
+        # 逐日回放影子（PIT），再统一回填评估
+        for d in PICK_DATES:
+            fh.update_health_shadow(d)
+        fh.evaluate_health(EVAL_DATE)
+        # 好源（包A）：名单内判别力显著为正且组数达标 → 允许转正
+        ev_good = fh.pack_shadow_evidence("包A")
+        assert ev_good["ok"] and ev_good["disc"] > 0
+        assert ev_good["groups"] >= 8
+        # 坏源（包B）：判别力为负 → 拒绝转正
+        ev_bad = fh.pack_shadow_evidence("包B")
+        assert not ev_bad["ok"] and ev_bad["disc"] < 0
+        # 无证据的包：保守拒绝
+        ev_none = fh.pack_shadow_evidence("不存在的包")
+        assert not ev_none["ok"] and ev_none["groups"] == 0
+    finally:
+        _restore_dbs(temp, old_mkt, old_exp)
+    print("PASS: test_pack_shadow_evidence_gate")
+
+
 if __name__ == "__main__":
     tests = [test_pit_history_excludes_future_lists,
              test_trailing_ic_state_detects_decay,
              test_health_estimate_shrinks_and_discriminates,
              test_shadow_update_evaluate_and_governance,
              test_empty_history_shadow_is_neutral,
-             test_upsert_preserves_evaluated_columns]
+             test_upsert_preserves_evaluated_columns,
+             test_pack_shadow_evidence_gate]
     failed = 0
     for test in tests:
         try:

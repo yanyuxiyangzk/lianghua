@@ -398,6 +398,34 @@ def health_summary() -> dict:
             "original_avg": original_avg, "health_avg": health_avg, "lift": lift}
 
 
+def pack_shadow_evidence(pack_name: str, min_groups: int = 8) -> dict:
+    """冷静期转正证据：该策略包名单内的判别力（top-half 与 bottom-half 的5日收益差）。
+
+    只统计 pack_name 精确匹配的名单（多包投票合成名单不算该包自己的证据）。
+    无证据不转正——这是保守默认：没经过影子期检验的包不得获得执行资格。
+    """
+    with datasource._conn() as c:
+        _ensure_schema(c)
+        df = pd.read_sql_query(
+            "SELECT trade_date,pick_id,score_bucket,fwd_5d_return "
+            "FROM factor_health_shadow WHERE pack_name=? AND evaluated_at IS NOT NULL",
+            c, params=(pack_name,))
+    if df.empty:
+        return {"groups": 0, "disc": None, "ok": False, "reason": "无成熟影子证据"}
+    discs = []
+    for (_day, _pid), g in df.groupby(["trade_date", "pick_id"]):
+        top = g.loc[g["score_bucket"] == "top", "fwd_5d_return"]
+        bottom = g.loc[g["score_bucket"] == "bottom", "fwd_5d_return"]
+        if len(top) and len(bottom):
+            discs.append(float(top.mean() - bottom.mean()))
+    n = len(discs)
+    mean_disc = float(np.mean(discs)) if n else None
+    ok = n >= min_groups and mean_disc is not None and mean_disc > 0
+    reason = (f"{n} 组成熟名单，名单内判别力 {mean_disc:+.2%}" if n
+              else "无成熟影子证据")
+    return {"groups": n, "disc": mean_disc, "ok": ok, "reason": reason}
+
+
 def health_detail(limit: int = 200) -> pd.DataFrame:
     with datasource._conn() as c:
         _ensure_schema(c)

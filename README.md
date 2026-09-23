@@ -568,6 +568,40 @@ tp_price = entry_price * (1 + max(0.15, atr_tp))
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### 数据到资金的全链路图（2026-09 更新）
+
+```
+数据层  iFinD日线/分钟(THS_HF·分段对半抗-4304) · 五档盘口(THS_SS 3秒快照)
+        腾讯分笔(当日·含买卖方向) · 腾讯快照 · 上证指数regime
+           │
+挖掘层  理论发现引擎(每周六: 模式→假说→形式化→验证→命名→注册因子 engine='theory')
+        → 因子挖掘(loopengine 4000+轮/RD-Agent，累计 ~39,700 次因子试验)
+        → 硬闸门(gates.py 15道: IC/Sharpe/换手/回撤/FDR/HAC/复杂度/IS-OOS gap/搜索预算顾问)
+           ↓
+策略层  因子库(注册表+聚类去重+周退役扫描+逐日 live IC 轨迹 factor_ic_daily)
+        → 策略包生成(strategy_gen: 4个月holdout隔离 + shadow冷静期)
+        → 周重验(revalidate: walk-forward + 机制B影子证据 → active/degraded)
+           ↓
+选股层  pool_scan(沪深300 19:00 + 中证500 19:08) / auto_scan / satellite_scan
+        → 名单 picks（全部进入影子评估闭环）
+           ↓
+概率层  机制A 单股票条件频率·下行路径否决(有界±15%std)
+        机制B 因子健康度元模型(名单源IC衰减×regime → 名单级score压缩)
+        机制C 盘口微观结构(ob_balanced 休眠挂接，数据到位自动参赛)
+        ─ 条件频率+Beta收缩+Wilson区间 / 三折walk-forward / 证据闸门 ─
+           ↓
+执行层  positions/trades(experience) + broker模拟柜台 + 每5分钟对账自愈
+           ↓
+风控层  盘前VaR/回撤熔断(09:20) + 盘中重评估(10:00/13:30)
+        + price_monitor止盈止损 + 影子减仓建议(只建议不自动卖)
+           ↓
+治理层  两个影子配对评估(机制A/机制B) → bootstrap 95%CI>0 + 必须跑赢ATR基线
+        → 晋级只出人工评审资格，automatic_activation=False 永久锁定
+```
+
+**核心纪律**：影子先行、证据晋级、永不自动；统计诚实（Beta收缩、PIT无泄漏、
+配对评估、简单基线对照）贯穿全链路。
+
 ### 多类型因子挖掘
 
 系统支持7大类因子数据源，每类有专门的帧构建器：

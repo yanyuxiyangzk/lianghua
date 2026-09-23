@@ -3024,6 +3024,16 @@ def job_factor_ic_track(**_ignored) -> str:
             f"写入 {total_w} 条" + (f" · 失败 {total_f}" if total_f else ""))
 
 
+def job_theory_discovery(**_ignored) -> str:
+    """理论发现引擎（每周六）：模式发现→假说→形式化→验证→命名→注册因子。
+
+    发现的理论注册为 engine='theory' 的因子（gate_status=NULL），当晚
+    job_gate_check 按正式硬闸门决定生产准入——发现阶段宽松门槛只产候选。
+    """
+    from loopengine.theory_discovery import run_theory_discovery
+    return run_theory_discovery("沪深300")
+
+
 def job_orderbook_sync(**_ignored) -> str:
     """盘后五档盘口批量同步：热码（自选+持仓+最新名单+已建模股票）THS_SS 落库
     并压缩盘口日内特征（stock_orderbook_features，供概率模型微观结构状态）。"""
@@ -3169,6 +3179,10 @@ JOBS = {
                         "func": job_factor_ic_track,
                         "default": {"enabled": True, "hour": 17, "minute": 10,
                                     "params": {}}},
+    "theory_discovery": {"name": "🔭 理论发现引擎（每周六）",
+                         "func": job_theory_discovery,
+                         "default": {"enabled": True, "hour": 9, "minute": 0,
+                                     "params": {}, "day_of_week": "sat"}},
     "outcome_backfill": {"name": "🎯 战果回填（经验库）", "func": job_outcome_backfill,
                          "default": {"enabled": True, "hour": 18, "minute": 45, "params": {}}},
     "evolution_distill": {"name": "🧬 进化信号蒸馏（战报→引擎）", "func": job_evolution_distill,

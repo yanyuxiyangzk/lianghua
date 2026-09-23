@@ -350,13 +350,10 @@ S表达式格式要求（严格遵守）：
             return []
         
         try:
-            import os
             from llmutil import llm_chat
-            
-            # 模型名映射：deepseek-v4.1-flash → deepseek-chat（flash模型返回空）
-            model = os.environ.get("CHAT_MODEL") or "deepseek/deepseek-chat"
-            if "v4.1" in model or "flash" in model:
-                model = "deepseek/deepseek-chat"
+
+            # 前缀缓存纪律：system 为常量（稳定前缀），变动内容全部在 user 且以固定
+            # 引导句开头；max_tokens/temperature 固定，模型别名统一由 llmutil 路由。
             
             # 构建prompt
             pattern_text = "\n".join([
@@ -378,19 +375,40 @@ S表达式格式要求（严格遵守）：
 请为每个模式提出1-2个可检验的假说，并形式化为S表达式。"""
             
             text = llm_chat(HypothesisGenerator.SYSTEM_PROMPT, user_prompt,
-                            max_tokens=600, label="theory_hypothesis") or ""
-            
-            # 提取JSON
-            import re
-            m = re.search(r"\{.*\}", text, re.S)
-            if m:
-                data = json.loads(m.group(0))
-                return data.get("hypotheses", [])
-            
+                            max_tokens=1500, label="theory_hypothesis") or ""
+            return _extract_hypotheses(text)
+
         except Exception as e:
             log.warning(f"假说生成失败: {e}")
-        
+
         return []
+
+
+def _extract_hypotheses(text: str) -> list[dict]:
+    """从（可能被 max_tokens 截断的）LLM 输出提取假说。
+
+    先整包解析；失败则逐对象挽救——截断的 JSON 数组里完整对象仍然可用，
+    不让一次截断浪费整次 LLM 调用（假说对象无嵌套花括号，可安全逐块提取）。
+    """
+    import re
+    if not text:
+        return []
+    m = re.search(r"\{.*\}", text, re.S)
+    if m:
+        try:
+            data = json.loads(m.group(0))
+            return data.get("hypotheses", [])
+        except json.JSONDecodeError:
+            pass
+    out = []
+    for m in re.finditer(r"\{[^{}]*\"sexpr\"[^{}]*\}", text, re.S):
+        try:
+            item = json.loads(m.group(0))
+            if isinstance(item, dict) and item.get("sexpr"):
+                out.append(item)
+        except json.JSONDecodeError:
+            continue
+    return out
 
 
 # ---------------------------------------------------------------- 形式化器
@@ -794,6 +812,7 @@ class TheoryDiscoveryEngine:
         log.info("Step 4: 命名与入库")
         namer = TheoryNamer()
         discovered = []
+        registered = 0
         
         for v in validated:
             # 匹配原始模式
@@ -820,6 +839,11 @@ class TheoryDiscoveryEngine:
             }
             
             self.kg.save_theory(name_result["name"], theory_data)
+            # 闭环：注册为因子（engine='theory'），当晚 gate_check 按正式硬闸门准入
+            if register_theory_factor(name_result["name"], v["sexpr"],
+                                      name_result.get("family", "其他"),
+                                      v.get("validation", {})):
+                registered += 1
             discovered.append({
                 "name": name_result["name"],
                 "family": name_result.get("family", "其他"),
@@ -835,12 +859,34 @@ class TheoryDiscoveryEngine:
             "patterns": len(patterns),
             "hypotheses": len(hypotheses),
             "validated": len(validated),
+            "registered": registered,
             "discovered": discovered,
             "coverage": self.kg.get_family_coverage(),
         }
 
 
 # ---------------------------------------------------------------- CLI入口
+
+def register_theory_factor(name: str, sexpr: str, family: str, validation: dict) -> bool:
+    """把验证通过的理论因子注册进 factor_registry（engine='theory'），闭合
+    理论发现 → 因子生产 的环路。
+
+    gate_status 保持 NULL：当晚 job_gate_check 会按正式硬闸门评估——发现阶段的
+    宽松门槛（|IC|>0.01 等）只负责产出候选，生产准入由硬闸门决定。
+    """
+    try:
+        import library
+        code = f"# sexpr: {sexpr}\n# theory: {name}（{family}）"
+        library.sync_factor_registry([{
+            "name": f"theory_{name}", "kind": "loopengine", "code": code,
+            "engine": "theory", "generation_mode": "theory_discovery",
+            "factor_type": "量价",
+        }])
+        return True
+    except Exception as e:
+        log.warning(f"理论因子注册失败 {name}: {e}")
+        return False
+
 
 def run_theory_discovery(pool_name: str = "沪深300", **kwargs) -> str:
     """CLI入口：运行理论发现引擎。"""
@@ -854,7 +900,7 @@ def run_theory_discovery(pool_name: str = "沪深300", **kwargs) -> str:
     lines.append(f"  模式: {result['patterns']}个")
     lines.append(f"  假说: {result['hypotheses']}个")
     lines.append(f"  验证通过: {result['validated']}个")
-    lines.append(f"  入库: {len(result['discovered'])}个")
+    lines.append(f"  入库: {len(result['discovered'])}个 · 注册因子: {result.get('registered', 0)}个")
     
     for d in result["discovered"]:
         ic = d.get('ic_mean')

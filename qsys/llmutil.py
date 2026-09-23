@@ -59,7 +59,8 @@ _DAILY_TOKEN_LIMIT = int(os.environ.get("LLM_DAILY_TOKEN_LIMIT", "30000"))
 # 低频高价值任务的保留日额度（调用次数）：绕过全局调用上限，不与高频任务
 # （如演化评审）竞争——2026-09-22 概率画像被 loopengine_review 打满全局额度而饿死。
 # 保留轨道仍占用全局 token 预算，且全部调用照常落 llm_usage_log 可审计。
-_LABEL_RESERVED_CALLS = {"stock_probability_profile_v1": 5}
+_LABEL_RESERVED_CALLS = {"stock_probability_profile_v1": 5,
+                         "theory_hypothesis": 3, "theory_name": 6}
 _last_error = ""
 
 

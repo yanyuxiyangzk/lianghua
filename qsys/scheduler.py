@@ -2945,6 +2945,49 @@ def job_factor_health_eval(**_ignored) -> str:
             f"{result['groups']}组 · {lift_text} · {status}")
 
 
+def job_orderbook_sync(**_ignored) -> str:
+    """盘后五档盘口批量同步：热码（自选+持仓+最新名单+已建模股票）THS_SS 落库
+    并压缩盘口日内特征（stock_orderbook_features，供概率模型微观结构状态）。"""
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5:
+        return "非交易日，跳过"
+    day = get_last_trade_day()
+
+    import experience
+    codes = set(load_watchlist())
+    with experience._conn() as c:
+        for r in c.execute("SELECT code FROM positions WHERE status IN ('open','pending')").fetchall():
+            codes.add(r[0])
+        for r in c.execute("SELECT DISTINCT code FROM broker_positions WHERE shares>0").fetchall():
+            codes.add(r[0])
+    latest = experience.list_pick_dates(limit=1)
+    if latest:
+        for r in experience.picks_on_date(latest[0]).itertuples():
+            for it in experience.pick_items_detail(int(r.id)).itertuples():
+                codes.add(it.code)
+    # 已建概率模型的股票持续积累盘口历史（微观结构特征的样本池）
+    with datasource._conn() as c:
+        for r in c.execute("SELECT DISTINCT code FROM stock_probability_models").fetchall():
+            codes.add(r[0])
+    codes = sorted(codes)
+    if not codes:
+        return "盘口同步：无目标股票"
+
+    result = datasource.fetch_orderbook_batch_to_db(codes, day)
+    feat_days = 0
+    for code in codes:
+        try:
+            feat_days += datasource.compute_orderbook_features(code, day, day)["computed_days"]
+        except Exception:
+            continue
+    failed = len(result["failed"])
+    return (f"盘口同步 {day}：{result['synced']}/{len(codes)} 只 · "
+            f"写入 {result['written']:,} 条 · 盘口特征 {feat_days} 天"
+            + (f" · 失败 {failed} 只" if failed else ""))
+
+
 # ---------------------------------------------------------------- 调度器
 JOBS = {
     "update_data": {"name": "📥 每日数据更新", "func": job_update_data,
@@ -3035,6 +3078,10 @@ JOBS = {
                            "func": job_factor_health_eval,
                            "default": {"enabled": True, "hour": 18, "minute": 52,
                                        "params": {}}},
+    "orderbook_sync": {"name": "📖 五档盘口批量同步（盘后）",
+                       "func": job_orderbook_sync,
+                       "default": {"enabled": True, "hour": 16, "minute": 25,
+                                   "params": {}}},
     "outcome_backfill": {"name": "🎯 战果回填（经验库）", "func": job_outcome_backfill,
                          "default": {"enabled": True, "hour": 18, "minute": 45, "params": {}}},
     "evolution_distill": {"name": "🧬 进化信号蒸馏（战报→引擎）", "func": job_evolution_distill,

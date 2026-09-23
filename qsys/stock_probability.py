@@ -27,6 +27,8 @@ MATCH_SCHEMES = {
     "regime_balanced": ("trend_state", "vol_state", "market_trend_state"),
     "regime_intraday": ("trend_state", "intraday_direction_state",
                         "pressure_state", "market_trend_state"),
+    # 盘口微观结构：五档失衡状态（盘后 orderbook_sync 积累，数据不足自动跳过）。
+    "ob_balanced": ("trend_state", "vol_state", "ob_imbalance_state"),
     # 软匹配核：连续特征距离加权，非状态列匹配（空元组为标记，走专门分支）。
     # 解决硬匹配"状态必须全等"的样本效率瓶颈（实证：866天历史只匹配到53个）。
     "kernel": (),
@@ -215,6 +217,16 @@ def _load_market() -> pd.DataFrame:
         subset=["market_trend_state"])
 
 
+def _load_orderbook(code: str) -> pd.DataFrame:
+    """读取已由完整盘口日压缩出的微观结构特征（ob_snapshots≥500 才视为可靠日）。"""
+    with datasource._conn() as c:
+        return pd.read_sql_query(
+            "SELECT trade_date,ob_imbalance_close,ob_imbalance_mean,spread_median,"
+            "seal_strength_close,auction_imbalance "
+            "FROM stock_orderbook_features WHERE code=? AND ob_snapshots>=500 "
+            "ORDER BY trade_date", c, params=(code,))
+
+
 def intraday_quality_report(code: str, min_rows: int = 200,
                             expected_rows: int = 241) -> dict:
     """检查单股票分钟数据是否足以进入日内模型；不把不完整交易日混入训练。"""
@@ -242,7 +254,8 @@ def intraday_quality_report(code: str, min_rows: int = 200,
 
 
 def _features_and_labels(df: pd.DataFrame, intraday: pd.DataFrame | None = None,
-                         market: pd.DataFrame | None = None) -> pd.DataFrame:
+                         market: pd.DataFrame | None = None,
+                         orderbook: pd.DataFrame | None = None) -> pd.DataFrame:
     d = df.copy()
     d["date"] = pd.to_datetime(d["date"])
     for col in ("open", "high", "low", "close", "volume", "amount"):
@@ -293,6 +306,17 @@ def _features_and_labels(df: pd.DataFrame, intraday: pd.DataFrame | None = None,
         d["pressure_state"] = pd.cut(
             d["up_minute_ratio"], [-np.inf, 0.45, 0.55, np.inf],
             labels=["sell", "balanced", "buy"])
+    if orderbook is not None and not orderbook.empty:
+        ob = orderbook.copy()
+        ob["date"] = pd.to_datetime(ob.pop("trade_date"))
+        for col in ob.columns:
+            if col != "date":
+                ob[col] = pd.to_numeric(ob[col], errors="coerce")
+        d = d.merge(ob, on="date", how="left")
+        # 收盘五档失衡：买方堆积为正、卖方堆积为负；±10% 为经验分界
+        d["ob_imbalance_state"] = pd.cut(
+            d["ob_imbalance_close"], [-np.inf, -0.1, 0.1, np.inf],
+            labels=["sell", "balanced", "buy"])
     for h in HORIZONS:
         fwd = d["close"].shift(-h) / d["close"] - 1
         d[f"fwd_{h}"] = fwd
@@ -329,6 +353,7 @@ def _similar(history: pd.DataFrame, current: pd.Series,
               "intraday_broad": "日线趋势+日内方向/买卖压力",
               "regime_balanced": "日线趋势/波动+市场趋势",
               "regime_intraday": "日线趋势+日内方向/买卖压力+市场趋势",
+              "ob_balanced": "日线趋势/波动+收盘盘口失衡",
               "kernel": "连续特征高斯核软匹配"}
     schemes = ("strict", "balanced", "broad") if scheme == "auto" else (scheme,)
     last = history.iloc[0:0]
@@ -483,8 +508,9 @@ def build_model(code: str) -> dict:
     raw = _load_daily(code)
     intraday = _load_intraday(code)
     market = _load_market()
+    orderbook = _load_orderbook(code)
     intraday_quality = intraday_quality_report(code)
-    data = _features_and_labels(raw, intraday, market)
+    data = _features_and_labels(raw, intraday, market, orderbook)
     if len(data) < 120:
         raise ValueError(f"有效日线仅 {len(data)} 条，至少需要120条")
     current = data.iloc[-1]
@@ -494,7 +520,7 @@ def build_model(code: str) -> dict:
         history, current, selected_scheme)
     state = {k: str(current[k]) for k in
              ("trend_state", "momentum_state", "volume_state", "vol_state")}
-    for key in ("market_trend_state", "market_vol_state"):
+    for key in ("market_trend_state", "market_vol_state", "ob_imbalance_state"):
         if key in current.index and pd.notna(current[key]):
             state[key] = str(current[key])
     state.update({"ret_5": float(current["ret_5"]), "ret_20": float(current["ret_20"]),
@@ -507,7 +533,8 @@ def build_model(code: str) -> dict:
             intraday_state[key] = str(current[key])
     for key in ("open_ret_30m", "morning_ret", "afternoon_ret", "tail_ret_30m",
                 "realized_vol", "max_intraday_drawdown", "close_vwap_gap",
-                "up_minute_ratio"):
+                "up_minute_ratio", "ob_imbalance_close", "ob_imbalance_mean",
+                "spread_median", "seal_strength_close", "auction_imbalance"):
         if key in current.index and pd.notna(current[key]):
             intraday_state[key] = float(current[key])
     state.update(intraday_state)
@@ -530,6 +557,8 @@ def build_model(code: str) -> dict:
               "intraday_days": int(len(intraday)),
               "intraday_quality": intraday_quality,
               "uses_intraday": selected_scheme.startswith("intraday_"),
+              "uses_orderbook": selected_scheme.startswith("ob_"),
+              "orderbook_days": int(len(orderbook)),
               "evidence": evidence, "state": state, "predictions": predictions,
               "oos": oos, "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
     stock_id = datasource.get_or_create_stock_id(code)
@@ -600,11 +629,11 @@ def _llm_profile_evidence(row) -> dict:
             "n": int(item.get("n") or 0),
         }
     keep_state = ("trend_state", "momentum_state", "volume_state", "vol_state",
-                  "market_trend_state", "market_vol_state",
+                  "market_trend_state", "market_vol_state", "ob_imbalance_state",
                   "ret_5", "ret_20", "vol_20", "volume_ratio", "atr_pct",
                   "intraday_direction_state", "close_vwap_state", "pressure_state",
                   "realized_vol", "max_intraday_drawdown", "close_vwap_gap",
-                  "up_minute_ratio")
+                  "up_minute_ratio", "ob_imbalance_close", "spread_median")
     compact_state = {k: state[k] for k in keep_state if k in state}
     candidates = []
     for item in (payload.get("model_candidates") or [])[:8]:

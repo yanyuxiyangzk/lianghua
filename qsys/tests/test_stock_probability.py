@@ -99,6 +99,29 @@ def test_kernel_matching_uses_continuous_features_and_ess():
     print("PASS: test_kernel_matching_uses_continuous_features_and_ess")
 
 
+def test_orderbook_state_joins_and_scheme_participates():
+    daily = _synthetic(550)
+    ob = pd.DataFrame({
+        "trade_date": daily["date"].tail(300),
+        "ob_imbalance_close": 0.2, "ob_imbalance_mean": 0.1,
+        "spread_median": 0.001, "seal_strength_close": 0.01,
+        "auction_imbalance": 0.05,
+    })
+    data = sp._features_and_labels(daily, None, None, ob)
+    assert "ob_imbalance_state" in data.columns
+    assert data["ob_imbalance_state"].notna().sum() == 300
+    current = data.iloc[-1]
+    _, _, candidates = sp._select_model(data, data.iloc[:-10], current)
+    assert "ob_balanced" in {c["scheme"] for c in candidates}
+    matched, _label = sp._similar(data.iloc[:-10], current, "ob_balanced")
+    assert (matched["ob_imbalance_state"].astype(str) == "buy").all()
+    # 无盘口数据时候选自动跳过
+    plain = sp._features_and_labels(daily)
+    _, _, candidates2 = sp._select_model(plain, plain.iloc[:-10], plain.iloc[-1])
+    assert "ob_balanced" not in {c["scheme"] for c in candidates2}
+    print("PASS: test_orderbook_state_joins_and_scheme_participates")
+
+
 def test_intraday_candidates_join_without_dropping_daily_history():
     daily = _synthetic(550)
     minute = pd.DataFrame({
@@ -336,6 +359,7 @@ if __name__ == "__main__":
              test_oos_validation_has_no_future_training,
              test_oos_multifold_covers_more_points_than_single_split,
              test_kernel_matching_uses_continuous_features_and_ess,
+             test_orderbook_state_joins_and_scheme_participates,
              test_intraday_candidates_join_without_dropping_daily_history,
              test_market_regime_joins_and_new_schemes_participate,
              test_overlay_quality_gate_blocks_limited_model,

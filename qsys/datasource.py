@@ -137,6 +137,14 @@ def _conn():
         PRIMARY KEY(stock_id, trade_date));
     CREATE INDEX IF NOT EXISTS idx_intraday_features_code_date
         ON stock_intraday_features(code, trade_date);
+    -- 盘口日内特征（五档快照压缩，供概率模型微观结构状态）
+    CREATE TABLE IF NOT EXISTS stock_orderbook_features(
+        code TEXT NOT NULL, trade_date TEXT NOT NULL,
+        ob_snapshots INTEGER,
+        ob_imbalance_close REAL, ob_imbalance_mean REAL,
+        spread_median REAL, seal_strength_close REAL, auction_imbalance REAL,
+        computed_at TEXT,
+        PRIMARY KEY(code, trade_date));
     -- iFinD 自动入库（⏰定时任务 ifind_*）：
     CREATE TABLE IF NOT EXISTS ifind_basic_daily(
         code TEXT NOT NULL, date TEXT NOT NULL, indicator TEXT NOT NULL,
@@ -1920,27 +1928,27 @@ def fetch_minute_period_to_db(code: str, start: str, end: str,
             "daily_counts": {str(k): int(v) for k, v in daily_counts.items()}}
 
 
-def fetch_orderbook_day_to_db(code: str, day: str) -> dict:
-    """从同花顺 THS_SS 单次拉取指定交易日五档盘口快照并严格校验日期后落库。
+_ORDERBOOK_INDICATORS = (
+    "latest;open;high;low;volume;amount;"
+    "bid1;bid2;bid3;bid4;bid5;ask1;ask2;ask3;ask4;ask5;"
+    "bidSize1;bidSize2;bidSize3;bidSize4;bidSize5;"
+    "askSize1;askSize2;askSize3;askSize4;askSize5")
 
-    写入 latest/open/high/low/volume/amount + bid1-5/ask1-5 + bidSize1-5/askSize1-5
-    （实测 2026-09 THS_SS 支持五档价量；changeRatio/turnoverRatio 等不支持，静默丢弃）。
-    不使用 HTTP 实时行情兜底，避免把当前盘口误写成历史盘口。历史权限不支持、
-    返回空或返回日期不符时均不写库。
+_ORDERBOOK_INSERT_SQL = (
+    "INSERT OR REPLACE INTO ifind_realtime"
+    "(code,datetime,price,prev_close,open,high,low,change_pct,volume,amount,"
+    "turnover,quantity_ratio,amplitude,float_shares,float_mv,speed,bid1,ask1,"
+    "limit_up,limit_down,bid2,bid3,bid4,bid5,ask2,ask3,ask4,ask5,"
+    "bid_size1,bid_size2,bid_size3,bid_size4,bid_size5,"
+    "ask_size1,ask_size2,ask_size3,ask_size4,ask_size5)"
+    " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+
+
+def _orderbook_prepare(df: pd.DataFrame, day: str) -> pd.DataFrame:
+    """THS_SS 返回帧 → 校验并清洗（日期严格匹配 + 买一/卖一必须存在）。
+
+    任何一项不满足都抛 RuntimeError，调用方决定整批拒绝还是按股票跳过。
     """
-    indicators = ("latest;open;high;low;volume;amount;"
-                  "bid1;bid2;bid3;bid4;bid5;ask1;ask2;ask3;ask4;ask5;"
-                  "bidSize1;bidSize2;bidSize3;bidSize4;bidSize5;"
-                  "askSize1;askSize2;askSize3;askSize4;askSize5")
-    start, end = f"{day} 09:25:00", f"{day} 15:05:00"
-    _ths_login()
-    df, _res, err = ths_call(
-        "THS_SS", _to_ths_code(code), indicators, "dataType:Original", start, end)
-    if err not in (0, None):
-        raise RuntimeError(f"同花顺历史盘口返回错误码 {err}")
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        raise RuntimeError("同花顺未返回该交易日历史盘口；账号可能没有历史快照权限")
-
     d = df.copy()
     d.columns = [str(c).strip().lower() for c in d.columns]
     tcol = next((c for c in ("time", "datetime", "date") if c in d.columns), None)
@@ -1956,7 +1964,11 @@ def fetch_orderbook_day_to_db(code: str, day: str) -> dict:
         raise RuntimeError("同花顺历史接口未返回买一/卖一字段，不能作为盘口数据写入")
     if d[["bid1", "ask1"]].isna().all(axis=None):
         raise RuntimeError("同花顺历史接口的买一/卖一全部为空，不能作为盘口数据写入")
+    return d
 
+
+def _orderbook_build_rows(code: str, d: pd.DataFrame) -> list[tuple]:
+    """清洗后的盘口帧 → ifind_realtime 38 列行；数值统一强转原生 float 防 BLOB。"""
     def numeric(name):
         return pd.to_numeric(d[name], errors="coerce") if name in d.columns else pd.Series(np.nan, index=d.index)
 
@@ -1993,25 +2005,97 @@ def fetch_orderbook_day_to_db(code: str, day: str) -> dict:
             _f(fields["asksize1"].at[idx]), _f(fields["asksize2"].at[idx]),
             _f(fields["asksize3"].at[idx]), _f(fields["asksize4"].at[idx]),
             _f(fields["asksize5"].at[idx])))
-    before = 0
+    return rows
+
+
+def _orderbook_write(code: str, day: str, rows: list[tuple]) -> tuple[int, int]:
+    """写入盘口行并返回 (written, new_rows)。"""
+    start, end = f"{day} 09:25:00", f"{day} 15:05:00"
     with _conn() as c:
         before = c.execute(
             "SELECT COUNT(*) FROM ifind_realtime WHERE code=? AND datetime BETWEEN ? AND ?",
             (code, start, end)).fetchone()[0]
-        c.executemany(
-            "INSERT OR REPLACE INTO ifind_realtime"
-            "(code,datetime,price,prev_close,open,high,low,change_pct,volume,amount,"
-            "turnover,quantity_ratio,amplitude,float_shares,float_mv,speed,bid1,ask1,"
-            "limit_up,limit_down,bid2,bid3,bid4,bid5,ask2,ask3,ask4,ask5,"
-            "bid_size1,bid_size2,bid_size3,bid_size4,bid_size5,"
-            "ask_size1,ask_size2,ask_size3,ask_size4,ask_size5)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        c.executemany(_ORDERBOOK_INSERT_SQL, rows)
         after = c.execute(
             "SELECT COUNT(*) FROM ifind_realtime WHERE code=? AND datetime BETWEEN ? AND ?",
             (code, start, end)).fetchone()[0]
-    return {"returned": len(d), "written": len(rows), "new_rows": max(0, after - before),
+    return len(rows), max(0, after - before)
+
+
+def fetch_orderbook_day_to_db(code: str, day: str) -> dict:
+    """从同花顺 THS_SS 单次拉取指定交易日五档盘口快照并严格校验日期后落库。
+
+    写入 latest/open/high/low/volume/amount + bid1-5/ask1-5 + bidSize1-5/askSize1-5
+    （实测 2026-09 THS_SS 支持五档价量；changeRatio/turnoverRatio 等不支持，静默丢弃）。
+    不使用 HTTP 实时行情兜底，避免把当前盘口误写成历史盘口。历史权限不支持、
+    返回空或返回日期不符时均不写库。
+    """
+    start, end = f"{day} 09:25:00", f"{day} 15:05:00"
+    _ths_login()
+    df, _res, err = ths_call(
+        "THS_SS", _to_ths_code(code), _ORDERBOOK_INDICATORS, "dataType:Original", start, end)
+    if err not in (0, None):
+        raise RuntimeError(f"同花顺历史盘口返回错误码 {err}")
+    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+        raise RuntimeError("同花顺未返回该交易日历史盘口；账号可能没有历史快照权限")
+    d = _orderbook_prepare(df, day)
+    rows = _orderbook_build_rows(code, d)
+    written, new_rows = _orderbook_write(code, day, rows)
+    return {"returned": len(d), "written": written, "new_rows": new_rows,
             "day": day, "start": d["datetime"].min().strftime("%H:%M:%S"),
             "end": d["datetime"].max().strftime("%H:%M:%S")}
+
+
+def fetch_orderbook_batch_to_db(codes: list[str], day: str,
+                                chunk_size: int = 8) -> dict:
+    """批量盘后五档盘口同步：THS_SS 一次调用多只（默认8只/批，约100万数据点，
+    低于单次200万上限），逐只校验日期后落库；单只失败不影响其他。
+
+    返回 {synced, failed, written, details}；失败明细含原因，不抛异常。
+    """
+    start, end = f"{day} 09:25:00", f"{day} 15:05:00"
+    _ths_login()
+    synced, written = 0, 0
+    failed = {}
+    for i in range(0, len(codes), chunk_size):
+        chunk = codes[i:i + chunk_size]
+        ths_codes = [_to_ths_code(c) for c in chunk]
+        back = {t.lower(): c for t, c in zip(ths_codes, chunk)}
+        df, _res, err = ths_call(
+            "THS_SS", ",".join(ths_codes), _ORDERBOOK_INDICATORS,
+            "dataType:Original", start, end)
+        if err not in (0, None):
+            for c0 in chunk:
+                failed[c0] = f"错误码 {err}"
+            continue
+        if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+            for c0 in chunk:
+                failed[c0] = "未返回数据"
+            continue
+        d = df.copy()
+        d.columns = [str(c).strip().lower() for c in d.columns]
+        if "thscode" not in d.columns:
+            for c0 in chunk:
+                failed[c0] = "返回缺少 thscode 字段"
+            continue
+        present = set()
+        for ths_code, grp in d.groupby(d["thscode"].astype(str).str.lower()):
+            code = back.get(ths_code)
+            if not code:
+                continue
+            try:
+                prepared = _orderbook_prepare(grp.drop(columns=["thscode"]), day)
+                rows = _orderbook_build_rows(code, prepared)
+                w, _new = _orderbook_write(code, day, rows)
+                written += w
+                synced += 1
+                present.add(code)
+            except RuntimeError as exc:
+                failed[code] = str(exc)
+        for c0 in chunk:
+            if c0 not in present and c0 not in failed:
+                failed[c0] = "该批返回中无此股票"
+    return {"synced": synced, "failed": failed, "written": written, "day": day}
 
 
 def fetch_ticks_tx_to_db(code: str, day: str) -> dict:
@@ -2430,6 +2514,57 @@ def get_intraday_features(code: str, start: str | None = None,
         return pd.read_sql_query(
             "SELECT * FROM stock_intraday_features WHERE " + " AND ".join(where)
             + " ORDER BY trade_date", c, params=params)
+
+
+def compute_orderbook_features(code: str, start: str, end: str,
+                               min_snapshots: int = 500) -> dict:
+    """把当日五档盘口快照（ifind_realtime）压缩为逐股票逐日盘口特征，幂等覆盖。
+
+    盘口快照为交易所 3 秒原生频率；完整日约 4900 条，不足 min_snapshots 的
+    交易日（盘中采集的稀疏样本）不进入特征表，避免把稀疏采样当成盘口真实状态。
+    """
+    with _conn() as c:
+        df = pd.read_sql_query(
+            "SELECT datetime,price,volume,bid1,ask1,"
+            "bid_size1,bid_size2,bid_size3,bid_size4,bid_size5,"
+            "ask_size1,ask_size2,ask_size3,ask_size4,ask_size5 "
+            "FROM ifind_realtime WHERE code=? AND datetime BETWEEN ? AND ? "
+            "ORDER BY datetime", c, params=(code, start, end + " 23:59:59"))
+    if df.empty:
+        return {"computed_days": 0, "skipped_days": 0}
+    df["trade_date"] = df["datetime"].str[:10]
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    values, skipped = [], 0
+    bid_cols = [f"bid_size{i}" for i in range(1, 6)]
+    ask_cols = [f"ask_size{i}" for i in range(1, 6)]
+    for day, g in df.groupby("trade_date", sort=True):
+        if len(g) < min_snapshots:
+            skipped += 1
+            continue
+        bid_sum = g[bid_cols].sum(axis=1, min_count=1)
+        ask_sum = g[ask_cols].sum(axis=1, min_count=1)
+        denom = bid_sum + ask_sum
+        imbalance = ((bid_sum - ask_sum) / denom).where(denom > 0)
+        spread = ((g["ask1"] - g["bid1"]) / g["price"]).where(
+            g["ask1"].notna() & g["bid1"].notna() & (g["price"] > 0))
+        last_vol = g["volume"].iloc[-1]
+        values.append((
+            code, day, int(len(g)),
+            float(imbalance.iloc[-1]) if pd.notna(imbalance.iloc[-1]) else None,
+            float(imbalance.mean()) if imbalance.notna().any() else None,
+            float(spread.median()) if spread.notna().any() else None,
+            float(g["bid_size1"].iloc[-1] / last_vol)
+            if pd.notna(g["bid_size1"].iloc[-1]) and last_vol else None,
+            float(imbalance.iloc[0]) if pd.notna(imbalance.iloc[0]) else None,
+            now))
+    if values:
+        with _conn() as c:
+            c.executemany(
+                "INSERT OR REPLACE INTO stock_orderbook_features"
+                "(code,trade_date,ob_snapshots,ob_imbalance_close,ob_imbalance_mean,"
+                "spread_median,seal_strength_close,auction_imbalance,computed_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)", values)
+    return {"computed_days": len(values), "skipped_days": skipped}
 
 
 def get_minute_from_db(code: str, day: str) -> pd.DataFrame:

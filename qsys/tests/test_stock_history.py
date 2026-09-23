@@ -249,6 +249,58 @@ def test_tencent_tick_sync_migrates_amount_and_coerces_types():
     print("PASS: test_tencent_tick_sync_migrates_amount_and_coerces_types")
 
 
+def test_orderbook_batch_sync_and_features():
+    temp, old = _use_temp_db()
+    original_login, original_call = datasource._ths_login, datasource.ths_call
+    try:
+        datasource._ths_login = lambda: True
+        # 两只票各 600 条快照的批量返回（达到 500 完整日门槛）
+        frames = []
+        for ths in ("600519.SH", "000001.SZ"):
+            ts = pd.date_range("2026-09-22 09:30:00", periods=600, freq="21s")
+            frames.append(pd.DataFrame({
+                "time": ts.strftime("%Y-%m-%d %H:%M:%S"), "thscode": ths,
+                "latest": 10.0, "bid1": 9.99, "ask1": 10.01,
+                "bidSize1": 500.0, "askSize1": 300.0,
+                "volume": 10000.0, "amount": 100000.0}))
+        datasource.ths_call = lambda *a, **k: (pd.concat(frames, ignore_index=True),
+                                               None, 0)
+        result = datasource.fetch_orderbook_batch_to_db(["SH600519", "SZ000001"],
+                                                        "2026-09-22")
+        assert result["synced"] == 2 and not result["failed"]
+        assert result["written"] == 1200
+
+        # 特征压缩：失衡 = (500-300)/(500+300) = 0.25
+        feat = datasource.compute_orderbook_features("SH600519", "2026-09-22",
+                                                     "2026-09-22")
+        assert feat["computed_days"] == 1
+        with datasource._conn() as c:
+            row = c.execute(
+                "SELECT ob_snapshots,ob_imbalance_close,ob_imbalance_mean,"
+                "seal_strength_close,typeof(ob_imbalance_close) "
+                "FROM stock_orderbook_features WHERE code='SH600519'").fetchone()
+        assert row[0] == 600
+        assert abs(row[1] - 0.25) < 1e-9 and abs(row[2] - 0.25) < 1e-9
+        assert abs(row[3] - 0.05) < 1e-9  # 500 / 10000
+        assert row[4] == "real"
+
+        # 稀疏日（<500 条快照）跳过不进特征表
+        with datasource._conn() as c:
+            for i in range(100):
+                c.execute(
+                    "INSERT OR REPLACE INTO ifind_realtime(code,datetime,price,bid1,ask1) "
+                    "VALUES('SH600519',?,10.0,9.99,10.01)",
+                    (f"2026-09-21 09:{30 + i // 30:02d}:{i % 60:02d}",))
+        feat2 = datasource.compute_orderbook_features("SH600519", "2026-09-21",
+                                                      "2026-09-22")
+        assert feat2["computed_days"] == 1 and feat2["skipped_days"] == 1
+    finally:
+        datasource._ths_login, datasource.ths_call = original_login, original_call
+        datasource.MKT_DB = old
+        temp.cleanup()
+    print("PASS: test_orderbook_batch_sync_and_features")
+
+
 def test_background_minute_sync_is_serial_and_skips_complete_days():
     temp, old = _use_temp_db()
     original_fetch = datasource.fetch_minute_to_db
@@ -367,6 +419,7 @@ if __name__ == "__main__":
              test_intraday_features_are_bounded_and_idempotent,
              test_orderbook_sync_rejects_wrong_day_and_writes_valid_rows,
              test_tencent_tick_sync_migrates_amount_and_coerces_types,
+             test_orderbook_batch_sync_and_features,
              test_background_minute_sync_is_serial_and_skips_complete_days,
              test_single_request_minute_period_writes_multiple_days,
              test_minute_period_chunks_long_range_under_4304_cap]

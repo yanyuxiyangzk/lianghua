@@ -9,6 +9,7 @@ import pandas as pd
 # 确保 qsys 可导入
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import datasource
 import factor_eval as fe
 
 
@@ -197,6 +198,29 @@ def test_search_budget_noise_floor():
     print("PASS: test_search_budget_noise_floor")
 
 
+def test_budget_telemetry_record_and_load():
+    """预算遥测：落库幂等、近 N 日读取按日期倒序。"""
+    import tempfile
+    import gaterun
+
+    temp = tempfile.TemporaryDirectory()
+    old_db = datasource.MKT_DB
+    datasource.MKT_DB = Path(temp.name) / "market.db"
+    try:
+        gaterun._record_budget_telemetry("沪深300", "2026-09-22", 50, 20, 3, 4.60)
+        gaterun._record_budget_telemetry("沪深300", "2026-09-23", 60, 25, 5, 4.60)
+        gaterun._record_budget_telemetry("沪深300", "2026-09-23", 60, 25, 7, 4.60)  # 同日覆盖
+        df = gaterun.load_budget_telemetry(10)
+        assert len(df) == 2
+        assert df.iloc[0]["date"] == "2026-09-23"
+        assert df.iloc[0]["would_block"] == 7  # 幂等覆盖取最新
+        assert df.iloc[0]["t_star"] == 4.60
+    finally:
+        datasource.MKT_DB = old_db
+        temp.cleanup()
+    print("PASS: test_budget_telemetry_record_and_load")
+
+
 def test_factor_ic_matured_and_decay_state():
     """live IC：正相关因子 IC>0，随机因子 ≈0；衰减状态按近期均值漂移判定。"""
     import sqlite3
@@ -272,6 +296,7 @@ if __name__ == "__main__":
         test_consistency_fwd_days,
         test_factor_ic_matured_and_decay_state,
         test_search_budget_noise_floor,
+        test_budget_telemetry_record_and_load,
     ]
     passed = 0
     failed = 0

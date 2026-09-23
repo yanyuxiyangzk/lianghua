@@ -190,13 +190,28 @@ def _render_health_dashboard():
     if trials["total"] > 0:
         import math
         t_star = math.sqrt(2 * math.log(max(trials["total"], 2)))
-        c5, c6, _c7, _c8 = st.columns(4)
+        c5, c6, c7, _c8 = st.columns(4)
         c5.metric("全局试验数 N", f"{trials['total']:,}",
                   help=f"因子试验 {trials['factor_trials']:,} + 策略包 {trials['strategy_trials']:,}"
                        "（跨 loopengine/RD-Agent/策略生成的累计账本）")
         c6.metric("噪声地板 t*", f"{t_star:.2f}",
                   help="N 次试验下期望最大噪声 t 值 √(2·ln N)；因子 IC 的 t 统计量必须"
                        "超过它才算真信号。试验越多地板越高——越挖越严格。")
+        try:
+            import gaterun
+            tele = gaterun.load_budget_telemetry(14)
+            if not tele.empty:
+                latest = tele.iloc[0]
+                blocked = int(latest["would_block"])
+                evaluated = int(latest["evaluated"])
+                rate = blocked / evaluated if evaluated else 0.0
+                c7.metric("预算遥测拦截（今日）", f"{blocked}/{evaluated}",
+                          help=f"今日过闸评估中会被 Gate15 拦截的因子数（顾问模式，只记账"
+                               "不拦截）；拦截率 %.0f%%。硬闸 11 月校准后开启。" % (rate * 100))
+                with st.expander("近两周预算遥测趋势"):
+                    st.dataframe(tele, hide_index=True, width="stretch")
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------- Tab 1: IS/OOS三段验证

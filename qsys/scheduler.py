@@ -950,11 +950,12 @@ def job_outcome_backfill() -> str:
 
 
 def job_gate_check(pool_name: str = "沪深300") -> str:
-    """因子库硬闸门筛查（每日）：新因子过 11 项闸门 + 重算 FSA。"""
+    """因子库硬闸门筛查（每日）：新因子过 11 项闸门 + 重算 FSA + 搜索预算遥测。"""
     import gaterun
 
     res = gaterun.run_gates_for_pool(pool_name, only_pending=True)
-    return f"硬闸门：评估 {res['evaluated']} · 通过 {res['passed']} · FSA冻结 {res['frozen']}"
+    return (f"硬闸门：评估 {res['evaluated']} · 通过 {res['passed']} · "
+            f"预算遥测拦截 {res.get('would_block', 0)} · FSA冻结 {res['frozen']}")
 
 
 def job_loopengine(batch: int = 50, **_ignored) -> str:

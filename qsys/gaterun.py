@@ -12,6 +12,34 @@ import structure
 from common import all_pools, get_last_trade_day
 
 
+# ---------------------------------------------------------------- 搜索预算遥测（P2 顾问→硬闸的过渡）
+def _record_budget_telemetry(pool_name: str, date: str, evaluated: int,
+                             gate_passed: int, would_block: int, t_star: float) -> None:
+    """每日落库：过闸因子中"会被搜索预算 Gate15 拦截"的数量——硬闸校准数据。"""
+    from datetime import datetime
+    with datasource._conn() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS search_budget_telemetry(
+            date TEXT NOT NULL, pool_name TEXT NOT NULL,
+            evaluated INTEGER, gate_passed INTEGER, would_block INTEGER,
+            t_star REAL, created_at TEXT, PRIMARY KEY(date, pool_name))""")
+        c.execute("INSERT OR REPLACE INTO search_budget_telemetry VALUES(?,?,?,?,?,?,?)",
+                  (date, pool_name, int(evaluated), int(gate_passed), int(would_block),
+                   float(t_star), datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+
+
+def load_budget_telemetry(days: int = 30) -> pd.DataFrame:
+    """近 N 日预算遥测（页面趋势展示）。"""
+    with datasource._conn() as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS search_budget_telemetry(
+            date TEXT NOT NULL, pool_name TEXT NOT NULL,
+            evaluated INTEGER, gate_passed INTEGER, would_block INTEGER,
+            t_star REAL, created_at TEXT, PRIMARY KEY(date, pool_name))""")
+        return pd.read_sql_query(
+            "SELECT date,pool_name,evaluated,gate_passed,would_block,t_star "
+            "FROM search_budget_telemetry ORDER BY date DESC LIMIT ?",
+            c, params=(int(days),))
+
+
 def run_gates_for_pool(pool_name: str = "沪深300", only_pending: bool = True) -> dict:
     """对注册表因子逐个评估硬闸门。only_pending=True 时只跑未评估过的。"""
     registry = library.get_factor_registry()
@@ -27,7 +55,8 @@ def run_gates_for_pool(pool_name: str = "沪深300", only_pending: bool = True) 
 
     # 已通过因子的 IC 序列用于相关性闸门
     passed_ics = {}
-    n_eval, n_pass = 0, 0
+    n_eval, n_pass, n_would_block = 0, 0, 0
+    t_star = 0.0
     for _, row in registry.iterrows():
         name = row["name"]
         try:
@@ -35,6 +64,12 @@ def run_gates_for_pool(pool_name: str = "沪深300", only_pending: bool = True) 
             vals = fe.get_factor_values(fac, codes, end)
             result = G.evaluate_gates(vals, panel, library_ics=passed_ics)
             ic_val = result["metrics"].get("IC", 0.0)
+            # Gate 15 遥测：复用 evaluate_gates 的搜索预算顾问字段（零重算），
+            # 统计"过了硬闸但会被搜索预算拦截"的因子——硬闸校准的拦击率。
+            sb_pass = result["metrics"].get("搜索预算通过")
+            if sb_pass is False:
+                n_would_block += 1
+            t_star = float(result["metrics"].get("搜索预算地板") or t_star)
             library.record_tested(G.factor_hash(row.get("code") or name), name, row["kind"],
                                   row.get("engine", "rdagent"), end_date, result["pass"], ic_val)
             with library._lconn() as c:
@@ -54,4 +89,12 @@ def run_gates_for_pool(pool_name: str = "沪深300", only_pending: bool = True) 
             with library._lconn() as c:
                 c.execute("UPDATE factor_registry SET gate_status=0 WHERE name=?", (name,))
     fsa = library.fsa_recompute()
-    return {"evaluated": n_eval, "passed": n_pass, "frozen": int(fsa["frozen"].sum()) if not fsa.empty else 0}
+    if n_eval:
+        try:
+            _record_budget_telemetry(pool_name, end_date, n_eval, n_pass,
+                                     n_would_block, t_star)
+        except Exception:
+            pass
+    return {"evaluated": n_eval, "passed": n_pass, "would_block": n_would_block,
+            "t_star": t_star,
+            "frozen": int(fsa["frozen"].sum()) if not fsa.empty else 0}

@@ -2962,6 +2962,50 @@ def job_factor_health_eval(**_ignored) -> str:
             f"{result['groups']}组 · {lift_text} · {status}")
 
 
+def job_factor_ic_track(**_ignored) -> str:
+    """因子 live IC 轨迹（盘后）：对 active+shadow 包用到的因子，计算 5 个交易日前
+    （前向收益已成熟）的横截面 rank IC 并落库 factor_ic_daily——因子失效从此逐日可见，
+    不再等每周重验。"""
+    from zoneinfo import ZoneInfo
+
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5:
+        return "非交易日，跳过"
+    today = get_last_trade_day()
+    score_date = trade_day_offset(today, -5)
+    if not score_date:
+        return "因子IC轨迹：无法确定成熟评分日"
+
+    import library
+    packs = library.list_strategies()
+    factors = {}
+    for _name, pk in packs.items():
+        if pk.get("status") not in (None, "active", "shadow"):
+            continue
+        for fac in pk.get("factors", []):
+            if fac.get("name"):
+                factors[fac["name"]] = fac
+    if not factors:
+        return "因子IC轨迹：无在管因子"
+
+    import factor_eval as fe
+    pools = ("沪深300", "中证500")
+    total_w = total_f = 0
+    for pool_name in pools:
+        codes = all_pools().get(pool_name)
+        if not codes:
+            continue
+        try:
+            r = fe.compute_factor_ic_matured(score_date, today, pool_name,
+                                             codes, list(factors.values()))
+            total_w += r["written"]
+            total_f += r["failed"]
+        except Exception as exc:
+            logging.getLogger("scheduler").warning("因子IC轨迹 %s 失败: %s", pool_name, exc)
+    return (f"因子IC轨迹 {score_date}：{len(factors)} 因子 × {len(pools)} 池 · "
+            f"写入 {total_w} 条" + (f" · 失败 {total_f}" if total_f else ""))
+
+
 def job_orderbook_sync(**_ignored) -> str:
     """盘后五档盘口批量同步：热码（自选+持仓+最新名单+已建模股票）THS_SS 落库
     并压缩盘口日内特征（stock_orderbook_features，供概率模型微观结构状态）。"""
@@ -3103,6 +3147,10 @@ JOBS = {
                        "func": job_orderbook_sync,
                        "default": {"enabled": True, "hour": 16, "minute": 25,
                                    "params": {}}},
+    "factor_ic_track": {"name": "📉 因子 live IC 轨迹（盘后）",
+                        "func": job_factor_ic_track,
+                        "default": {"enabled": True, "hour": 17, "minute": 10,
+                                    "params": {}}},
     "outcome_backfill": {"name": "🎯 战果回填（经验库）", "func": job_outcome_backfill,
                          "default": {"enabled": True, "hour": 18, "minute": 45, "params": {}}},
     "evolution_distill": {"name": "🧬 进化信号蒸馏（战报→引擎）", "func": job_evolution_distill,

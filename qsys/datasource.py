@@ -145,6 +145,11 @@ def _conn():
         spread_median REAL, seal_strength_close REAL, auction_imbalance REAL,
         computed_at TEXT,
         PRIMARY KEY(code, trade_date));
+    -- 因子 live IC 轨迹（每日盘后：成熟日的横截面 rank IC，供因子衰减在线监测）
+    CREATE TABLE IF NOT EXISTS factor_ic_daily(
+        name TEXT NOT NULL, date TEXT NOT NULL, pool_name TEXT NOT NULL,
+        ic REAL, n INTEGER, fwd_days INTEGER, computed_at TEXT,
+        PRIMARY KEY(name, date, pool_name));
     -- iFinD 自动入库（⏰定时任务 ifind_*）：
     CREATE TABLE IF NOT EXISTS ifind_basic_daily(
         code TEXT NOT NULL, date TEXT NOT NULL, indicator TEXT NOT NULL,

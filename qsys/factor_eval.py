@@ -9,6 +9,7 @@
 
 import hashlib
 import random
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -2254,3 +2255,92 @@ def adjust_operator_weights() -> dict:
     
     except Exception as e:
         return {}
+
+
+# ---------------------------------------------------------------- 因子 live IC 轨迹（在线衰减监测）
+def compute_factor_ic_matured(score_date: str, eval_date: str, pool_name: str,
+                              codes: list[str], factors: list[dict],
+                              panel: pd.DataFrame | None = None, fwd_days: int = 5,
+                              values_map: dict | None = None) -> dict:
+    """计算因子在 score_date 的横截面 rank IC（fwd_days 前向收益已成熟）并落库。
+
+    PIT 口径：因子值取 eval_date 可见的序列在 score_date 的截面（因子本身因果），
+    前向收益 = close(eval 窗口) — 调用方负责选择 score_date 使窗口在 eval_date 前闭合
+    （调度传 score_date = 今日-5 个交易日）。幂等覆盖。
+    values_map: 测试注入用 {name: Series[(datetime, instrument)]}，为 None 时走
+    get_factor_values 真实计算。
+    """
+    import datasource
+    import signals as sig
+
+    # 日频 IC 只需 score_date 截面，250 天回看足以覆盖长窗因子预热；
+    # 面板/因子值缓存按 end 日变化每日重算，800→250 把每日成本压到原来的 ~1/3。
+    lookback = 250
+    if panel is None:
+        panel = sig.get_panel_cached(codes, eval_date, lookback, source=_eval_source())
+    close = panel["$close"].unstack("instrument")
+    fwd = close.shift(-fwd_days) / close - 1
+    score_ts = pd.Timestamp(score_date)
+    if score_ts not in fwd.index:
+        return {"written": 0, "failed": 0, "reason": f"{score_date} 不在面板区间内"}
+    fwd_row = fwd.loc[score_ts]
+    if fwd_row.notna().sum() < 30:
+        return {"written": 0, "failed": 0, "reason": f"{score_date} 前向收益未成熟"}
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows, failed = [], 0
+    for fac in factors:
+        try:
+            s = (values_map or {}).get(fac["name"]) if values_map is not None else None
+            if s is None and values_map is None:
+                s = get_factor_values(fac, codes, eval_date, lookback, source=_eval_source())
+            if s is None or s.empty:
+                failed += 1
+                continue
+            if isinstance(s.index, pd.MultiIndex):
+                v = s.xs(score_ts, level=0)
+            else:
+                v = s
+            aligned = pd.concat([v.rename("v"), fwd_row.rename("f")], axis=1).dropna()
+            if len(aligned) < 30:
+                failed += 1
+                continue
+            ic = float(aligned["v"].corr(aligned["f"], method="spearman"))
+            rows.append((fac["name"], score_date, pool_name, ic,
+                         int(len(aligned)), fwd_days, now))
+        except Exception:
+            failed += 1
+    if rows:
+        with datasource._conn() as c:
+            c.executemany(
+                "INSERT OR REPLACE INTO factor_ic_daily"
+                "(name,date,pool_name,ic,n,fwd_days,computed_at) VALUES(?,?,?,?,?,?,?)", rows)
+    return {"written": len(rows), "failed": failed, "score_date": score_date,
+            "pool_name": pool_name}
+
+
+def factor_ic_state(name: str, pool_name: str, asof: str,
+                    window: int = 20, eps: float = 0.01) -> dict:
+    """因子 live IC 衰减状态：最近5日均值 vs 之前15日均值。
+
+    rising / flat / decaying / unknown（<10 天轨迹不判定）。
+    """
+    import datasource
+    with datasource._conn() as c:
+        df = pd.read_sql_query(
+            "SELECT date,ic FROM factor_ic_daily WHERE name=? AND pool_name=? "
+            "AND date<=? ORDER BY date DESC LIMIT ?",
+            c, params=(name, pool_name, asof, int(window)))
+    if len(df) < 10:
+        return {"state": "unknown", "days": int(len(df)),
+                "recent_ic": None, "prior_ic": None}
+    recent = float(df["ic"].head(5).mean())
+    prior = float(df["ic"].tail(len(df) - 5).mean())
+    if recent - prior > eps:
+        state = "rising"
+    elif recent - prior < -eps:
+        state = "decaying"
+    else:
+        state = "flat"
+    return {"state": state, "days": int(len(df)),
+            "recent_ic": recent, "prior_ic": prior}

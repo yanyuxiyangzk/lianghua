@@ -179,6 +179,66 @@ def test_consistency_fwd_days():
     print(f"PASS: test_consistency_fwd_days (MAIN_FWD={fe.MAIN_FWD}, GATE={GATE['FWD_DAYS']})")
 
 
+def test_factor_ic_matured_and_decay_state():
+    """live IC：正相关因子 IC>0，随机因子 ≈0；衰减状态按近期均值漂移判定。"""
+    import sqlite3
+    import tempfile
+    import datasource
+
+    temp = tempfile.TemporaryDirectory()
+    old_db = datasource.MKT_DB
+    datasource.MKT_DB = Path(temp.name) / "market.db"
+    try:
+        panel, vals = _make_panel_and_vals(n_stocks=60, n_days=120, seed=1)
+        close = panel["$close"].unstack("instrument")
+        dates = close.index
+        score_ts = dates[100]           # 前向5日在 dates[110] 已闭合
+        eval_date = str(dates[110])[:10]
+        score_date = str(score_ts)[:10]
+        fwd5 = close.shift(-5) / close - 1
+
+        # 因子A：score_date 截面 = 前向收益 + 微噪声 → IC 显著为正
+        good = fwd5.loc[score_ts] + np.random.RandomState(1).normal(0, 0.001, 60)
+        good = pd.Series(good.values,
+                         index=pd.MultiIndex.from_product(
+                             [[score_ts], close.columns], names=["datetime", "instrument"]))
+        # 因子B：纯噪声 → IC≈0
+        noise = pd.Series(np.random.RandomState(2).normal(0, 1, 60),
+                          index=good.index)
+        values_map = {"因子A好": good, "因子B噪声": noise}
+        factors = [{"name": "因子A好", "kind": "builtin"},
+                   {"name": "因子B噪声", "kind": "builtin"}]
+        codes = list(close.columns)
+        r = fe.compute_factor_ic_matured(score_date, eval_date, "测试池", codes,
+                                         factors, panel=panel, values_map=values_map)
+        assert r["written"] == 2, r
+        with datasource._conn() as c:
+            rows = dict(c.execute(
+                "SELECT name, ic FROM factor_ic_daily WHERE date=?", (score_date,)).fetchall())
+        assert rows["因子A好"] > 0.9, rows
+        assert abs(rows["因子B噪声"]) < 0.3, rows
+        # 幂等：重跑覆盖不膨胀
+        fe.compute_factor_ic_matured(score_date, eval_date, "测试池", codes,
+                                     factors, panel=panel, values_map=values_map)
+        with datasource._conn() as c:
+            n = c.execute("SELECT COUNT(*) FROM factor_ic_daily").fetchone()[0]
+        assert n == 2
+
+        # 衰减状态：手写 20 天递减 IC → decaying；<10 天 → unknown
+        with datasource._conn() as c:
+            for i in range(20):
+                c.execute("INSERT OR REPLACE INTO factor_ic_daily"
+                          "(name,date,pool_name,ic,n,fwd_days) VALUES(?,?,?,?,?,5)",
+                          ("因子C衰减", f"2026-08-{i+1:02d}", "测试池", 0.05 - i * 0.004, 100))
+        st = fe.factor_ic_state("因子C衰减", "测试池", "2026-08-20")
+        assert st["state"] == "decaying" and st["days"] == 20, st
+        assert fe.factor_ic_state("因子A好", "测试池", "2026-08-20")["state"] == "unknown"
+    finally:
+        datasource.MKT_DB = old_db
+        temp.cleanup()
+    print("PASS: test_factor_ic_matured_and_decay_state")
+
+
 # ================================================================ 主函数
 if __name__ == "__main__":
     tests = [
@@ -192,6 +252,7 @@ if __name__ == "__main__":
         test_backtest_credibility_score,
         test_backtest_credibility_empty,
         test_consistency_fwd_days,
+        test_factor_ic_matured_and_decay_state,
     ]
     passed = 0
     failed = 0

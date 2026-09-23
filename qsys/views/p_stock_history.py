@@ -5,6 +5,7 @@ import pandas as pd
 import streamlit as st
 
 import datasource
+import stock_probability as sp
 from common import DATA_DIR
 
 st.set_page_config(page_title="单股票历史数据", layout="wide")
@@ -247,12 +248,12 @@ def _pagination_bottom(total: int, key: str, current: int,
 
 
 def _render_stock_rows(inventory: pd.DataFrame):
-    headers = st.columns([1.7, 0.8, 1.45, 0.9, 1.0, 1.45, 1.35])
+    headers = st.columns([1.6, 0.75, 1.4, 0.85, 0.95, 1.4, 1.9])
     for col, label in zip(headers, ["股票", "日线天数", "日线范围", "分钟交易日",
                                     "分钟记录", "分钟范围", "操作"]):
         col.markdown(f"**{label}**")
     for row in inventory.itertuples(index=False):
-        cols = st.columns([1.7, 0.8, 1.45, 0.9, 1.0, 1.45, 1.35])
+        cols = st.columns([1.6, 0.75, 1.4, 0.85, 0.95, 1.4, 1.9])
         cols[0].write(f"{row.code} {row.name}".strip())
         cols[1].write(f"{int(row.daily_days):,}")
         cols[2].write(f"{row.daily_start or '—'} ～ {row.daily_end or '—'}")
@@ -260,14 +261,34 @@ def _render_stock_rows(inventory: pd.DataFrame):
         cols[4].write(f"{int(row.minute_rows):,}")
         cols[5].write(f"{row.minute_start or '—'} ～ {row.minute_end or '—'}")
         with cols[6]:
-            b1, b2, b3 = st.columns(3)
+            b1, b2, b3, b4 = st.columns(4)
             if b1.button("详情", key=f"stock_detail_{row.code}", use_container_width=True):
                 _go("detail", row.code)
-            if b2.button("概率", key=f"stock_prob_{row.code}", use_container_width=True,
+            if b2.button("建模", key=f"stock_build_{row.code}", use_container_width=True,
+                         help="用该股票已有历史数据构建/更新概率模型（统计模型，约数秒）"):
+                bar = st.progress(0, text=f"准备构建 {row.code} 概率模型…")
+                try:
+                    bar.progress(15, text="读取日线/分钟/盘口数据并计算特征…")
+                    bar.progress(35, text="三折样本外验证，候选模型竞争中…")
+                    result = sp.build_model(row.code)
+                    bar.progress(90, text="模型已落库…")
+                    bar.progress(100, text="构建完成")
+                    st.session_state["stock_history_list_flash"] = (
+                        "success",
+                        f"✅ {row.code} 概率模型创建成功：选中「{result['match_method']}」，"
+                        f"相似样本 {result['sample_count']} 个，证据等级 "
+                        f"{'充足' if result['evidence'] == 'sufficient' else '有限'}。"
+                        f"点击右侧「概率」按钮查看 K 线、相似样本与条件概率。")
+                except Exception as exc:
+                    bar.empty()
+                    st.session_state["stock_history_list_flash"] = (
+                        "error", f"❌ {row.code} 模型创建失败：{exc}")
+                st.rerun()
+            if b3.button("概率", key=f"stock_prob_{row.code}", use_container_width=True,
                          help="跳转到该股票的概率模型页"):
                 st.session_state["prob_preselect"] = row.code
                 st.switch_page("views/p_stock_probability.py")
-            if b3.button("删除", key=f"stock_delete_{row.code}", use_container_width=True):
+            if b4.button("删除", key=f"stock_delete_{row.code}", use_container_width=True):
                 st.session_state["stock_history_delete"] = row.code
                 st.rerun()
         if st.session_state.get("stock_history_delete") == row.code:
@@ -638,6 +659,10 @@ def render():
 
     st.title("📥 单股票历史数据")
     st.caption("按需抓取同花顺 iFinD 日线或盘中1分钟历史；本地详情查询不会调用接口。")
+    flash = st.session_state.pop("stock_history_list_flash", None)
+    if flash:
+        level, message = flash
+        getattr(st, level, st.info)(message)
     inventory = _stock_inventory()
     st.subheader("已抓取股票列表")
     if inventory.empty:

@@ -190,3 +190,30 @@ else:
                 st.caption("暂无影子记录。")
             else:
                 st.dataframe(detail, hide_index=True, width="stretch")
+
+st.divider()
+st.subheader("🧬 因子健康度元模型（机制B·影子）")
+st.caption("池化全部名单历史估计 P(跑赢同批中位 | 分数位置 × 名单源IC状态 × 市场regime)，"
+           "直接捕捉因子/策略包的过拟合失效期；影子模式只记录对照排序，不改正式名单。")
+import factor_health as fh
+hs = fh.health_summary()
+h1, h2, h3, h4 = st.columns(4)
+h1.metric("影子记录", hs["total"])
+h2.metric("已成熟记录", hs["evaluated"])
+h3.metric("已评估名单", hs["groups"])
+if hs.get("lift") is not None:
+    h4.metric("健康压缩5日增益", f"{hs['lift']:+.2%}",
+              help="健康压缩排序 Top 与原排序 Top 的名单级配对平均收益差。")
+haudit = fh.health_governance(persist=False)
+if haudit["status"] == "eligible_for_manual_review":
+    st.success("健康压缩达到人工晋级评审条件；系统仍不会自动开启正式修正。")
+else:
+    st.info("健康压缩继续影子观察。")
+with st.expander("晋级门槛明细"):
+    st.dataframe(pd.DataFrame(haudit["reasons"]), hide_index=True, width="stretch")
+with st.expander("最近健康影子明细"):
+    hdetail = fh.health_detail(200)
+    if hdetail.empty:
+        st.caption("暂无健康影子记录。")
+    else:
+        st.dataframe(hdetail, hide_index=True, width="stretch")

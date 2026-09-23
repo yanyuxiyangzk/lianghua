@@ -2923,6 +2923,28 @@ def job_probability_shadow_eval(**_ignored) -> str:
             f"{lift_text} · {status}")
 
 
+def job_factor_health_update(**_ignored) -> str:
+    """因子健康度元模型影子（盘后）：当天名单的健康压缩对照排序，不改正式名单。"""
+    import factor_health
+    day = get_last_trade_day()
+    result = factor_health.update_health_shadow(day)
+    return (f"因子健康影子：名单{result['picks']}组 · 记录{result['rows']}条 · "
+            f"待评估日{result.get('eval_date') or '未确定'}")
+
+
+def job_factor_health_eval(**_ignored) -> str:
+    """回填成熟的5日因子健康影子结果，比较健康压缩排序与原排序。"""
+    import factor_health
+    day = get_last_trade_day()
+    result = factor_health.evaluate_health(day)
+    audit = factor_health.health_governance(day)
+    lift = result.get("lift")
+    lift_text = "暂无可比较结果" if lift is None else f"健康增益 {lift:+.2%}"
+    status = "可提交人工晋级评审" if audit["status"] == "eligible_for_manual_review" else "继续影子观察"
+    return (f"因子健康评估：本次回填{result['evaluated']}条 · "
+            f"{result['groups']}组 · {lift_text} · {status}")
+
+
 # ---------------------------------------------------------------- 调度器
 JOBS = {
     "update_data": {"name": "📥 每日数据更新", "func": job_update_data,
@@ -3005,6 +3027,14 @@ JOBS = {
                                 "func": job_probability_shadow_eval,
                                 "default": {"enabled": True, "hour": 18, "minute": 50,
                                             "params": {}}},
+    "factor_health_update": {"name": "🧬 因子健康度元模型影子（盘后）",
+                             "func": job_factor_health_update,
+                             "default": {"enabled": True, "hour": 20, "minute": 40,
+                                         "params": {}}},
+    "factor_health_eval": {"name": "🧪 因子健康5日影子评估",
+                           "func": job_factor_health_eval,
+                           "default": {"enabled": True, "hour": 18, "minute": 52,
+                                       "params": {}}},
     "outcome_backfill": {"name": "🎯 战果回填（经验库）", "func": job_outcome_backfill,
                          "default": {"enabled": True, "hour": 18, "minute": 45, "params": {}}},
     "evolution_distill": {"name": "🧬 进化信号蒸馏（战报→引擎）", "func": job_evolution_distill,

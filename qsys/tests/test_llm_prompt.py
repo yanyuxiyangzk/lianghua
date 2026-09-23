@@ -71,16 +71,21 @@ def test_extract_sexpr_robustness():
 
 
 def test_build_prompt_contents():
-    p = _build_llm_prompt("动量", "该族覆盖极少", "资金流", "昨日证据：XXX\n",
-                          ["rank_cs(div(main_net_pct,amount))"])
-    assert "「动量」" in p and "该族覆盖极少" in p
-    assert "昨日证据：XXX" in p
-    assert "主力净流入占比" in p, "prompt 应含字段语义"
-    assert "rank_cs(div(main_net_pct,amount))" in p, "prompt 应含 few-shot"
-    assert "因子类型：资金流" in p and "只输出一个 S 表达式" in p
+    # _build_llm_prompt 现返回 (system, user) 元组：system 为前缀缓存稳定前缀，
+    # user 为每次不同的变动内容（机制族/证据/few-shot/假设/理论）。
+    system, user = _build_llm_prompt("动量", "该族覆盖极少", "资金流", "昨日证据：XXX\n",
+                                     ["rank_cs(div(main_net_pct,amount))"])
+    both = system + "\n" + user
+    assert "「动量」" in both and "该族覆盖极少" in both
+    assert "昨日证据：XXX" in both
+    assert "主力净流入占比" in both, "prompt 应含字段语义"
+    assert "rank_cs(div(main_net_pct,amount))" in both, "prompt 应含 few-shot"
+    assert "因子类型：资金流" in both and "只输出一个 S 表达式" in both
+    # 前缀缓存纪律：system 不得混入变动内容（证据/few-shot 只许在 user）
+    assert "昨日证据" not in system and "rank_cs(" not in system
     # 无量价 hint（默认类型不注入类型提示）
-    p2 = _build_llm_prompt("反转", "why", "量价", "", [])
-    assert "因子类型" not in p2 and "few" not in p2.lower()
+    system2, user2 = _build_llm_prompt("反转", "why", "量价", "", [])
+    assert "因子类型" not in system2 and "few" not in user2.lower()
 
 
 def test_llm_review_json_extraction():

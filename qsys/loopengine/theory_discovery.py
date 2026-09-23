@@ -344,33 +344,48 @@ S表达式格式要求（严格遵守）：
 - 鼓励创新组合"""
     
     @staticmethod
-    def generate(patterns: list[dict], theories: dict = None) -> list[dict]:
-        """从模式生成假说。"""
+    def generate(patterns: list[dict], theories: dict = None,
+                 track_record: dict = None) -> list[dict]:
+        """从模式生成假说。track_record：理论战绩（有效/已证伪），注入 user 段
+        明令禁止重提已证伪方向——前缀纪律：system 常量不变，战绩只在 user。"""
         if not patterns:
             return []
-        
+
         try:
             from llmutil import llm_chat
 
             # 前缀缓存纪律：system 为常量（稳定前缀），变动内容全部在 user 且以固定
             # 引导句开头；max_tokens/temperature 固定，模型别名统一由 llmutil 路由。
-            
+
             # 构建prompt
             pattern_text = "\n".join([
                 f"- {p['type']}: {p['description']}（严重度: {p['severity']:.2f}）"
                 for p in patterns[:5]
             ])
-            
+
             theory_text = ""
             if theories:
                 theory_text = "\n已知理论参考：\n" + "\n".join([
                     f"- {name}: {t['definition']}（核心: {t['math_core']}）"
                     for name, t in list(theories.items())[:10]
                 ])
-            
+
+            record_text = ""
+            if track_record:
+                eff = track_record.get("effective") or []
+                fals = track_record.get("falsified") or []
+                if eff:
+                    record_text += "\n已验证有效的理论方向（可借鉴但不要照抄）：\n" + "\n".join(
+                        f"- {e['name']}（{e['family']}）IC={e['ic']:.3f}" for e in eff)
+                if fals:
+                    record_text += ("\n已被证伪的方向（不要重复提出，证伪的是具体模式而非"
+                                    "整个机制族）：\n" + "\n".join(
+                        f"- {f['name']}（{f['family']}）：{f['reason']}" for f in fals))
+
             user_prompt = f"""发现的市场模式：
 {pattern_text}
 {theory_text}
+{record_text}
 
 请为每个模式提出1-2个可检验的假说，并形式化为S表达式。"""
             
@@ -737,6 +752,113 @@ class KnowledgeGraph:
         return coverage
 
 
+# ---------------------------------------------------------------- 理论战绩回喂
+
+def load_theory_track_record(limit_effective: int = 8,
+                             limit_falsified: int = 20) -> dict:
+    """理论战绩：已注册理论因子的闸门结果与现状，回喂下一轮假说生成。
+
+    effective = 过闸（gate_status=1）的理论方向（供借鉴）；
+    falsified = 被拒（gate_status=0）的方向 + 最近拒绝原因（gate_detail_log），
+    下一轮 prompt 明令禁止重提——理论引擎不再每周从零开始。
+    """
+    record = {"effective": [], "falsified": []}
+    try:
+        import library
+        reg = library.get_factor_registry()
+        if reg.empty or "engine" not in reg.columns:
+            return record
+        theory = reg[reg["engine"] == "theory"]
+        if theory.empty:
+            return record
+        names = [str(n) for n in theory["name"]]
+        marks = ",".join("?" * len(names))
+        logs, ic_map = {}, {}
+        with library._lconn() as c:
+            try:
+                for name, reasons in c.execute(
+                        f"SELECT factor_name, fail_reasons FROM gate_detail_log "
+                        f"WHERE passed=0 AND factor_name IN ({marks}) "
+                        f"ORDER BY gate_date DESC", names).fetchall():
+                    logs.setdefault(name, str(reasons or ""))
+            except Exception:
+                pass
+            try:
+                for name, ic in c.execute(
+                        f"SELECT name, AVG(ic) FROM factor_ic_daily "
+                        f"WHERE name IN ({marks}) GROUP BY name", names).fetchall():
+                    ic_map[name] = ic
+            except Exception:
+                pass
+        for _, row in theory.iterrows():
+            name = str(row.get("name", ""))
+            family = str(row.get("family") or "其他")
+            gs = row.get("gate_status")
+            try:
+                gs = int(gs) if gs is not None and gs == gs else None
+            except (TypeError, ValueError):
+                gs = None
+            if gs == 1:
+                record["effective"].append({
+                    "name": name, "family": family,
+                    "ic": float(ic_map.get(name) or 0.0)})
+            elif gs == 0:
+                reason = logs.get(name, "")
+                record["falsified"].append({
+                    "name": name, "family": family,
+                    "skeleton": _skeleton_of_name_code(name, _code_of(row)),
+                    "reason": reason[:120] or "未过硬闸门"})
+        # 压缩规模：有效按 |IC| 排序截取，证伪按机制族去重后截取
+        record["effective"].sort(key=lambda e: -abs(e["ic"]))
+        seen_fam, falsified = set(), []
+        for f in record["falsified"]:
+            if f["family"] in seen_fam:
+                continue
+            seen_fam.add(f["family"])
+            falsified.append(f)
+        record["effective"] = record["effective"][:limit_effective]
+        record["falsified"] = falsified[:limit_falsified]
+    except Exception as e:
+        log.warning(f"理论战绩加载失败（按无历史处理）: {e}")
+    return record
+
+
+def _code_of(row) -> str:
+    for key in ("code", "sexpr"):
+        v = row.get(key)
+        if v:
+            return str(v)
+    return ""
+
+
+def _skeleton_of_name_code(name: str, code: str) -> str:
+    """由任意 sexpr/代码构造骨架签名（结构同构即命中，窗口参数天然归一）。"""
+    if not code:
+        return ""
+    wrapped = code if code.startswith("# sexpr: ") else f"# sexpr: {code}"
+    try:
+        import structure
+        return structure.extract_skeleton(name, wrapped)
+    except Exception:
+        return ""
+
+
+def _filter_falsified(hypotheses: list[dict], track_record: dict) -> list[dict]:
+    """丢弃与已证伪方向结构同构的假说（防止 LLM 换皮重提同一想法）。"""
+    skels = {f["skeleton"] for f in (track_record or {}).get("falsified", [])
+             if f.get("skeleton")}
+    if not skels:
+        return hypotheses
+    out = []
+    for h in hypotheses:
+        sk = _skeleton_of_name_code(str(h.get("name", "")), str(h.get("sexpr", "")))
+        if sk and sk in skels:
+            log.info(f"丢弃与已证伪方向同构的假说: {h.get('name')}")
+            continue
+        out.append(h)
+    return out
+
+
 # ---------------------------------------------------------------- 主引擎
 
 class TheoryDiscoveryEngine:
@@ -770,12 +892,15 @@ class TheoryDiscoveryEngine:
         patterns = patterns[:max_patterns]
         log.info(f"发现 {len(patterns)} 个模式")
         
-        # 3. 假说生成
+        # 3. 假说生成（回喂理论战绩：有效方向借鉴、已证伪方向禁提+同构丢弃）
         log.info("Step 2: 假说生成")
         hg = HypothesisGenerator()
-        hypotheses = hg.generate(patterns, KNOWN_THEORIES)
+        track_record = load_theory_track_record()
+        hypotheses = hg.generate(patterns, KNOWN_THEORIES, track_record)
+        hypotheses = _filter_falsified(hypotheses, track_record)
         hypotheses = hypotheses[:max_hypotheses]
-        log.info(f"生成 {len(hypotheses)} 个假说")
+        log.info(f"生成 {len(hypotheses)} 个假说"
+                 f"（战绩: 有效{len(track_record['effective'])} 证伪{len(track_record['falsified'])}）")
         
         # 4. 形式化与验证
         log.info("Step 3: 形式化与验证")

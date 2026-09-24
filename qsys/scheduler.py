@@ -140,8 +140,18 @@ def _best_pack(packs: dict) -> str:
     except Exception:
         pass
     
+    try:
+        from loopengine.regime import detect_regime
+        current_regime = str((detect_regime() or {}).get("regime", "unknown"))
+    except Exception:
+        current_regime = "unknown"
     best, best_score = "", -1.0
     for name, pk in packs.items():
+        scope = str(pk.get("regime_scope") or "all").replace(" ", "").split(",")
+        if current_regime != "unknown" and "all" not in scope and current_regime not in scope:
+            continue
+        if not pk.get("theory_family") or pk.get("theory_family") == "unclassified":
+            continue  # 没有理论属性的策略包只可影子运行
         v = str(pk.get("oos_winrate") or "")
         if not v.endswith("%"):
             continue
@@ -755,6 +765,24 @@ def _satellite_pack_name(packs: dict, execution_only: bool = False) -> str | Non
     return newest(named)
 
 
+def _selection_decision_evidence(pack: dict | None, codes: list[str], end: str) -> dict:
+    """保存分层选股的可追溯证据；数据缺失时明确记录，绝不把缺失当作通过。"""
+    try:
+        from loopengine.regime import detect_regime
+        info = detect_regime(codes=codes, end=end) or {}
+        state = info.get("regime", "unknown")
+    except Exception:
+        state = "unknown"
+    evidence = (pack or {}).get("evidence_type", "")
+    return {
+        "market_state": state,
+        "sector": {"required": True, "source": "sector_daily", "status": "advisory" if "板块" in str(evidence) else "not_required"},
+        "financial": {"required": "基本面" in str(evidence) or "财务" in str(evidence), "source": "ifind_financial", "status": "advisory"},
+        "technical": {"required": True, "source": "market_daily/ifind_realtime", "status": "applied"},
+        "risk": {"status": "checked_at_execution", "theory_family": (pack or {}).get("theory_family", "unclassified")},
+    }
+
+
 def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "") -> str:
     """板块/池任务：综合打分输出 Top-N。pack 为空时自动选用 OOS 胜率最高的策略包。
     主包扫完后顺带扫卫星包（涨停轨），今日执行页两条轨每天都有当天名单。"""
@@ -866,10 +894,17 @@ def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "")
             oos = float(str(pk["oos_winrate"]).strip("%")) / 100
         except (TypeError, ValueError):
             oos = None
+    def _meta(pk):
+        pk = pk or {}
+        fs = pk.get("factors", [])
+        return {"theory_family": pk.get("theory_family") or ",".join(sorted({f.get("theory_family") or f.get("family") for f in fs if f.get("theory_family") or f.get("family")})) or "unclassified",
+                "regime_scope": pk.get("regime_scope") or "all", "evidence_type": pk.get("evidence_type") or ",".join(sorted({f.get("evidence_type") or f.get("factor_type") for f in fs})), "risk_class": pk.get("risk_class") or "unclassified"}
+    meta = _meta(pk)
     experience.save_pick(source="sched_pool_scan", pool_name=pool_name, top_n=top_n,
                          method=(pk.get("method") if pk else "默认组合"), filters=(pk.get("filters", []) if pk else []),
-                         factors=fcfg, final_scores=picks, pack_name=(pack_name or None),
-                         oos_winrate=oos, trade_date=end)
+                         factors=fcfg, final_scores=picks, pack_name=(pack_name or None), **meta,
+                         oos_winrate=oos, trade_date=end,
+                         decision_evidence=_selection_decision_evidence(pk, list(codes), end))
 
     # 卫星包顺带扫描：给「博涨停」轨出每日名单（今日执行页卫星轨按包名读取）
     sat_msg = ""
@@ -882,7 +917,8 @@ def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "")
             experience.save_pick(source="sched_satellite_scan", pool_name=spk["pool_name"],
                                  top_n=int(spk["top_n"]), method=spk.get("method"),
                                  filters=spk.get("filters", []), factors=spk["factors"],
-                                 final_scores=spicks, pack_name=sat_name, trade_date=end)
+                                 final_scores=spicks, pack_name=sat_name, trade_date=end, **_meta(spk),
+                                 decision_evidence=_selection_decision_evidence(spk, list(scodes), end))
             sat_msg = f" · 卫星包「{sat_name}」Top{len(spicks)}"
     except Exception as e:
         sat_msg = f" · 卫星包扫描失败({e})"
@@ -938,7 +974,9 @@ def job_auto_scan(pool_name: str = "沪深300", top_n: int = 10, **_ignored) -> 
             for n, (w, d) in weights.items()]
     experience.save_pick(source="sched_auto_scan", pool_name=pool_name, top_n=top_n,
                          method="auto_select", filters=[], factors=fcfg,
-                         final_scores=picks, pack_name=None, trade_date=end)
+                         final_scores=picks, pack_name=None, trade_date=end,
+                         theory_family="unclassified", regime_scope="all", evidence_type="mixed", risk_class="unclassified",
+                         decision_evidence=_selection_decision_evidence(None, list(codes), end))
 
     return f"{end} 自动选股完成：Top{top_n} 已出（{note}）"
 
@@ -1019,7 +1057,7 @@ def job_ev_dual_gate(pool_name: str = "沪深300", **_ignored) -> str:
 
     with library._lconn() as c:
         ev_rows = c.execute(
-            "SELECT name, code FROM factor_registry WHERE gate_status=2 AND name LIKE 'ev_%'"
+            "SELECT name, code, factor_type FROM factor_registry WHERE gate_status=2 AND name LIKE 'ev_%'"
         ).fetchall()
 
     if not ev_rows:
@@ -1028,7 +1066,7 @@ def job_ev_dual_gate(pool_name: str = "沪深300", **_ignored) -> str:
     n_passed = 0
     n_failed = 0
     passed_names = []
-    for name, code in ev_rows:
+    for name, code, factor_type in ev_rows:
         if not code or not code.startswith("# sexpr:"):
             continue
         try:
@@ -1036,7 +1074,7 @@ def job_ev_dual_gate(pool_name: str = "沪深300", **_ignored) -> str:
             tree = parse(sexpr)
             vals = evaluate_tree(tree, build_field_frames(panel)).stack().rename("f")
             vals.index = vals.index.set_names(["datetime", "instrument"])
-            r = G.evaluate_gates_relaxed(vals, panel)
+            r = G.evaluate_gates_relaxed(vals, panel, factor_type=factor_type or "事件记忆")
             if r["pass"]:
                 with library._lconn() as c:
                     c.execute("UPDATE factor_registry SET gate_status=3 WHERE name=?", (name,))
@@ -1721,10 +1759,10 @@ def _apply_account_risk(today: str, rk: dict, prefix: str = "") -> str:
         reason += f"，触及动态熔断线 {rk['circuit_line']*100:.2f}%"
     experience._write_risk_flag(today, halt_all, reason, level=level,
                                 target_position_ratio=target)
+    cancelled = broker.cancel_pending_buys() if halt_all else 0
     plan = experience.build_risk_reduction_plan(
         rk, today, level_override=level, target_override=target)
     advice = experience.risk_llm_advice(plan)
-    cancelled = broker.cancel_pending_buys() if halt_all else 0
     action = "正常运行"
     if level == "yellow":
         action = "禁止卫星来源开仓"
@@ -2377,41 +2415,29 @@ def job_lhb_sync(lookback_days: int = 30, **_ignored) -> str:
 
 
 # ---------------------------------------------------------------- 策略包自动生成
-def _get_top_factors_for_pack(pool_name: str, top_n: int = 15) -> list[dict]:
+def _get_top_factors_for_pack(pool_name: str, top_n: int = 15, asof: str | None = None) -> list[dict]:
     """从因子评分表取Top因子用于策略包生成（builtin + evolved 同台竞争，按 ICIR 排序）。"""
     import sqlite3
     from pathlib import Path
     
+    asof = asof or get_last_trade_day()
     try:
         db_path = Path("/data/market.db")
         with sqlite3.connect(str(db_path), timeout=30) as c:
             # builtin + evolved 因子都参与，按 ICIR 绝对值排序
             rows = c.execute('''
                 SELECT fs.name, fs.kind, fs.ic_mean, fs.icir, fs.ic_winrate,
-                       fs.top_winrate, fs.direction, fr.code, fr.theory_id, fr.hypothesis_id
+                       fs.top_winrate, fs.direction, fr.code, fr.theory_id, fr.hypothesis_id, fr.family, fr.theory_family, fr.regime_scope, fr.evidence_type, fr.factor_type
                 FROM factor_scorecards fs
                 LEFT JOIN factor_registry fr ON fs.name = fr.name
-                WHERE fs.pool_name = ? AND fs.eval_date >= date('now', '-30 days')
+                WHERE fs.pool_name = ? AND fs.eval_date BETWEEN date(?, '-30 days') AND ? AND fr.first_seen <= ?
                   AND fs.icir IS NOT NULL
                   AND fs.kind IN ('内置', '技术指标', 'loopengine')
                 ORDER BY ABS(fs.icir) DESC
-            ''', (pool_name,)).fetchall()
-            
-            if not rows:
-                # 回退：取所有池的因子
-                rows = c.execute('''
-                    SELECT fs.name, fs.kind, fs.ic_mean, fs.icir, fs.ic_winrate,
-                           fs.top_winrate, fs.direction, fr.code, fr.theory_id, fr.hypothesis_id
-                    FROM factor_scorecards fs
-                    LEFT JOIN factor_registry fr ON fs.name = fr.name
-                    WHERE fs.eval_date >= date('now', '-30 days')
-                      AND fs.icir IS NOT NULL
-                      AND fs.kind IN ('内置', '技术指标', 'loopengine')
-                    ORDER BY ABS(fs.icir) DESC
-                ''').fetchall()
+            ''', (pool_name, asof, asof, asof + " 23:59:59")).fetchall()
             
             factors = []
-            for name, kind, ic_mean, icir, ic_wr, top_wr, direction, code, theory_id, hypothesis_id in rows:
+            for name, kind, ic_mean, icir, ic_wr, top_wr, direction, code, theory_id, hypothesis_id, family, theory_family, regime_scope, evidence_type, factor_type in rows:
                 if icir is None:
                     continue
                 # kind 映射：scorecards 用中文，策略包用英文
@@ -2425,7 +2451,8 @@ def _get_top_factors_for_pack(pool_name: str, top_n: int = 15) -> list[dict]:
                     "kind": kind_map.get(kind, "builtin"),
                     "code": code,
                     "theory_id": theory_id,
-                    "hypothesis_id": hypothesis_id,
+                    "hypothesis_id": hypothesis_id, "family": family, "theory_family": theory_family,
+                    "regime_scope": regime_scope, "evidence_type": evidence_type, "factor_type": factor_type,
                     "ic": abs(float(ic_mean or 0)),
                     "icir": abs(float(icir or 0)),
                     "ic_winrate": float(ic_wr or 0.5),
@@ -2460,19 +2487,11 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
     if methods is None:
         methods = ["ICIR加权", "等权", "胜率加权", "均值方差"]
     
-    factors = _get_top_factors_for_pack(pool_name, top_n=12)
+    end = trade_day_offset(get_last_trade_day(), -HOLDOUT_TRADE_DAYS)
+    factors = _get_top_factors_for_pack(pool_name, top_n=12, asof=end)
     if len(factors) < 3:
         return []
-    # 新策略包优先使用最新相关簇代表因子；没有聚类结果时保持兼容，不阻断生成。
-    try:
-        reps = library.latest_cluster_representatives()
-        if reps:
-            clustered = [f for f in factors if f["name"] in reps]
-            if len(clustered) >= 3:
-                factors = clustered
-    except Exception:
-        pass
-    
+    # 当前簇代表是全历史产物，不能参与回退截止日的选因子。
     codes = (all_pools().get(pool_name) or all_pools().get("沪深300"))
     # P1-2 数据隔离：生成/排序不得看见 holdout 带（最近 ~80 个交易日）的数据；
     # shadow 包的晋级评估只在 holdout 带上进行（revalidate_strategy）。
@@ -2485,8 +2504,8 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
             c.execute("PRAGMA busy_timeout=30000")
             rows = c.execute('''SELECT name, ic_mean, icir, top_winrate
                                 FROM factor_scorecards
-                                WHERE pool_name=? AND eval_date>=date('now','-30 days')''',
-                             (pool_name,)).fetchall()
+                                WHERE pool_name=? AND eval_date BETWEEN date(?,'-30 days') AND ? ORDER BY eval_date''',
+                             (pool_name, end, end)).fetchall()
             for r in rows:
                 scorecards_cache[r[0]] = {"ic_mean": r[1], "icir": r[2], "top_winrate": r[3]}
     except Exception:
@@ -2513,7 +2532,7 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
     
     candidates = []
     # 第4阶段约束：相关簇去重 + 机制族分散。只影响新策略包生成。
-    cluster_map = library.latest_factor_clusters()
+    cluster_map = {}  # 历史簇快照未建立前，不读取当前簇污染训练段
     family_map = {f["name"]: f.get("family", "其他") for f in factors}
     for method in methods:
         try:
@@ -2540,6 +2559,7 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
                     if cid: selected_clusters.add(cid)
                     family_counts[fam] = family_counts.get(fam, 0) + 1
                     try:
+                        library.record_research_trial("strategy_search")
                         base_wf = fe.walk_forward({name: factor_vals[name]}, panel, method,
                                                   top_n, fwd_days=5, step=10, min_factors=1)
                         best_net = float(base_wf["优化组合扣费超额"].mean()) if not base_wf.empty else best_net
@@ -2547,6 +2567,7 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
                         pass
                     continue
                 try:
+                    library.record_research_trial("strategy_search")
                     trial_wf = fe.walk_forward({n: factor_vals[n] for n in trial}, panel,
                                                method, top_n, fwd_days=5, step=10, min_factors=2)
                     trial_net = float(trial_wf["优化组合扣费超额"].mean()) if not trial_wf.empty else float("-inf")
@@ -2584,7 +2605,7 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
                     "Top组胜率": sc.get("top_winrate") or 0.5,
                 })
             sc = pd.DataFrame(sc_rows)
-            w = fe.compute_weights(sc, method, selected)
+            w = fe.compute_weights(sc, method, selected, use_direction_state=False)
             
             pack_def = {
                 "name": f"Auto_{pool_name}_{method}_{len(candidates)+1}",
@@ -2605,6 +2626,14 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
                 "avg_excess": avg_excess,
                 "data_end": end,  # P1-2：生成数据截止日（holdout 带左端）
             }
+            # 理论属性快照：策略必须说明因子为何可能有效，以及适用环境。
+            selected_meta = [f for f in factors if f.get("name") in selected]
+            families = {f.get("theory_family") or f.get("family") for f in selected_meta if f.get("theory_family") or f.get("family")}
+            regimes = {r for f in selected_meta for r in (f.get("regime_scope") or "all").split(",") if r}
+            evidence = {f.get("evidence_type") or f.get("factor_type") or "unclassified" for f in selected_meta}
+            pack_def["theory_family"] = ",".join(sorted(families)) if families else "unclassified"
+            pack_def["regime_scope"] = ",".join(sorted(regimes)) if regimes else "all"
+            pack_def["evidence_type"] = ",".join(sorted(evidence))
             # 理论一致性：只有所有因子属于同一明确理论时才标记理论策略包；
             # 历史/未归属因子仍可生成 legacy 包，但不冒充理论包。
             theory_ids = {f.get("theory_id") for f in factors
@@ -2635,7 +2664,11 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
             except Exception:
                 pass
             
-            candidates.append(pack_def)
+            library.record_research_trial("strategy_candidate")
+            cv = fe.time_series_cv({n: factor_vals[n] for n in selected}, panel, method, top_n,
+                                   n_folds=3, fwd_days=5, step=5)
+            if cv.get("passed"):
+                candidates.append(pack_def)
         except Exception:
             continue
     
@@ -2683,6 +2716,9 @@ def job_strategy_gen(pool_name: str = "沪深300", top_n: int = 10,
                 "theory_name": pack_def.get("theory_name"),
                 "risk_class": pack_def.get("risk_class"),
                 "account_scope": pack_def.get("account_scope"),
+                "theory_family": pack_def.get("theory_family"),
+                "regime_scope": pack_def.get("regime_scope"),
+                "evidence_type": pack_def.get("evidence_type"),
             }, status="shadow")
             saved.append(f"{pack_def['name']}({pack_def['oos_winrate']},冷静期)")
         except Exception:
@@ -2716,6 +2752,8 @@ def revalidate_strategy(name: str) -> dict:
                 factor_vals[fac["name"]] = vals
         except Exception as exc:
             failed.append(f"{fac.get('name')}:{type(exc).__name__}")
+    if pk.get("status") in ("paused", "retired", "archived"):
+        return {"ok": False, "name": name, "error": "策略停用状态保持不变"}
     if len(factor_vals) < 2:
         result = {"ok": False, "name": name, "error": "有效因子不足2个",
                   "valid_factors": len(factor_vals), "failed_factors": failed}
@@ -2730,9 +2768,22 @@ def revalidate_strategy(name: str) -> dict:
     oos = float((net > 0).mean()) if len(net) else 0.0
     avg_net = float(net.mean()) if len(net) else 0.0
     nav = (1 + net).cumprod()
-    max_dd = float((nav / nav.cummax() - 1).min()) if len(nav) else 0.0
+    max_dd = float((nav / nav.cummax().clip(lower=1) - 1).min()) if len(nav) else 0.0
     sharpe = float(net.mean() / (net.std() + 1e-12) * np.sqrt(252 / 10)) if len(net) > 1 else 0.0
-    passed = len(net) >= 30 and oos >= 0.55 and avg_net > 0 and max_dd >= -0.25
+    from validation_policy import regime_report, POLICY_VERSION
+    from execution_gate import strategy_version
+    cv = fe.time_series_cv(factor_vals, panel, pk.get("method", "等权"),
+                           int(pk.get("top_n") or 10), n_folds=3, fwd_days=5, step=5)
+    from loopengine.regime import detect_regime
+    labels = {}
+    for day in wf["调仓日"]:
+        rg = detect_regime(end=day)
+        if rg.get("confidence", 0) > 0:
+            labels[day] = rg.get("regime")
+    regimes = regime_report(wf, labels, pk.get("regime_scope"))
+    passed = (len(net) >= 30 and oos >= .55 and avg_net > 0 and max_dd >= -.25
+              and sharpe >= .5 and cv.get("passed", False) and regimes["passed"]
+              and not failed and len(factor_vals) == len(pk.get("factors", [])))
     # 冷静期转正：shadow 包的晋级评估只用 holdout 带内窗口——生成没见过这批数据
     # （_generate_pack_candidates 的 end 回退 HOLDOUT_TRADE_DAYS），walk-forward
     # 权重本身 PIT（估计窗右端回退 fwd_days）不触 holdout。另需机制B影子证据。
@@ -2747,21 +2798,26 @@ def revalidate_strategy(name: str) -> dict:
         h_win = float((holdout_net > 0).mean()) if len(holdout_net) else 0.0
         h_avg = float(holdout_net.mean()) if len(holdout_net) else 0.0
         holdout_passed = len(holdout_net) >= 6 and h_win >= 0.5 and h_avg > 0
-        if holdout_passed and shadow_ev["ok"]:
-            status = "active"
-        elif holdout_passed:
+        if passed and holdout_passed and shadow_ev["ok"]:
+            status = "shadow"  # 统计通过仍不等于版本审批
+        elif passed and holdout_passed:
             status = "shadow"  # holdout 通过但影子证据不足，继续冷静期
         else:
             status = "degraded"
         holdout_info = {"start": holdout_start, "windows": len(holdout_net),
                         "winrate": h_win, "avg_net": h_avg}
     else:
-        status = "active" if passed else "degraded"
+        status = ("active" if pk.get("status") == "active" else "shadow") if passed else "degraded"
+    if pk.get("status") in ("paused", "retired", "archived"):
+        status = pk["status"]
     result = {"ok": True, "name": name, "eval_date": end, "pool_name": pool_name,
               "method": pk.get("method"), "top_n": int(pk.get("top_n") or 10),
               "fwd_days": 5, "oos_windows": len(net), "oos_winrate": oos,
               "avg_net_excess": avg_net, "max_drawdown": max_dd, "sharpe": sharpe,
               "valid_factors": len(factor_vals), "failed_factors": failed,
+              "walk_forward": cv, "regime_validation": regimes,
+              "strategy_version": strategy_version(pk), "policy_version": POLICY_VERSION,
+              "turnover": float(wf["优化组合换手率"].mean()), "cost": .0025,
               "status": status}
     if shadow_ev is not None:
         result["shadow_evidence"] = shadow_ev

@@ -1505,6 +1505,8 @@ def archive_snapshots_daily(target_date: str | None = None) -> int:
         target_date = (datetime.now() - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
     with _conn() as c:
         c.executescript(_ARCHIVE_SCHEMA)
+        if 'available_at' not in {r[1] for r in c.execute('PRAGMA table_info(quote_snapshots_archive)')}:
+            c.execute('ALTER TABLE quote_snapshots_archive ADD COLUMN available_at TEXT')
         # 聚合指定日期的快照
         rows = c.execute(
             """SELECT code,
@@ -1528,9 +1530,9 @@ def archive_snapshots_daily(target_date: str | None = None) -> int:
         c.executemany(
             """INSERT OR REPLACE INTO quote_snapshots_archive
                (date, code, avg_bid_vol, avg_ask_vol, avg_outer, avg_inner,
-                avg_quantity_ratio, avg_turnover, avg_bid1, avg_ask1, avg_price, sample_count)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            [(target_date, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10])
+                avg_quantity_ratio, avg_turnover, avg_bid1, avg_ask1, avg_price, sample_count, available_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            [(target_date, r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10], datetime.now().isoformat())
              for r in rows]
         )
     return len(rows)
@@ -1544,10 +1546,12 @@ def get_archived_snapshots(codes: list[str], start: str, end: str) -> pd.DataFra
     """
     with _conn() as c:
         c.executescript(_ARCHIVE_SCHEMA)
+        if 'available_at' not in {r[1] for r in c.execute('PRAGMA table_info(quote_snapshots_archive)')}:
+            c.execute('ALTER TABLE quote_snapshots_archive ADD COLUMN available_at TEXT')
         marks = ",".join("?" * len(codes))
         df = pd.read_sql(
             f"""SELECT date, code, avg_bid_vol, avg_ask_vol, avg_outer, avg_inner,
-                       avg_quantity_ratio, avg_turnover, avg_bid1, avg_ask1, avg_price, sample_count
+                       avg_quantity_ratio, avg_turnover, avg_bid1, avg_ask1, avg_price, sample_count, available_at
                 FROM quote_snapshots_archive
                 WHERE code IN ({marks}) AND date >= ? AND date <= ?
                 ORDER BY date, code""",

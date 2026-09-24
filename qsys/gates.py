@@ -66,11 +66,11 @@ def _daily_excess(vals: pd.Series, fwd: pd.DataFrame) -> pd.Series:
     x = j.groupby(level="datetime").apply(_x)
     # 持有期一次性扣费（买入持有策略，非日频调仓）
     cost_per_period = 2 * GATE["COST"]  # 双边千一 = 0.2%
-    return (x - cost_per_period).sort_index()
+    return (x - cost_per_period).sort_index().iloc[::GATE["FWD_DAYS"]]
 
 
 def _sharpe(x: pd.Series) -> float:
-    return float(x.mean() / (x.std() + 1e-12) * np.sqrt(252)) if len(x) > 5 else 0.0
+    return float(x.mean() / (x.std() + 1e-12) * np.sqrt(252 / GATE["FWD_DAYS"])) if len(x) > 5 else 0.0
 
 
 def _top_turnover(vals: pd.Series) -> float:
@@ -86,11 +86,12 @@ def _top_turnover(vals: pd.Series) -> float:
 
 
 def _max_dd(nav: pd.Series) -> float:
-    return float(((nav - nav.cummax()) / nav.cummax()).min()) if len(nav) else 0.0
+    return float(((nav - nav.cummax().clip(lower=1)) / nav.cummax().clip(lower=1)).min()) if len(nav) else 0.0
 
 
 def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
-                   library_ics: dict[str, pd.Series] | None = None) -> dict:
+                   library_ics: dict[str, pd.Series] | None = None,
+                   factor_type: str = "量价") -> dict:
     """返回 {pass, reasons, metrics}。library_ics: {因子名: IC序列} 用于相关性闸门。"""
     vals = fe._norm(vals.dropna())
     if GATE["LOOKBACK_DAYS"]:
@@ -101,7 +102,8 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
     fwd = fe.forward_returns(panel, GATE["FWD_DAYS"])
     ic = fe.ic_series(vals, fwd)
     metrics = {}
-    reasons = []
+    from validation_policy import sample_check
+    reasons = sample_check(ic, factor_type)
 
     ic_abs = abs(float(ic.mean())) if len(ic) else 0.0
     metrics["IC"] = round(float(ic.mean()), 4) if len(ic) else 0.0
@@ -112,7 +114,7 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
     n_days = len(ic)
     if n_days >= 20:
         p_val = fe.ic_pvalue_robust(ic)
-        metrics["p_value"] = round(p_val, 6)
+        metrics["p_value"] = float(p_val)
         # 使用更严格的显著性阈值（考虑多重检验）
         if p_val > 0.01:
             reasons.append(f"IC p-value {p_val:.4f} > 0.01（统计不显著）")
@@ -125,7 +127,7 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
     if turnover > GATE["MAX_TURNOVER"]:
         reasons.append(f"Top组平均换手率 {turnover:.1%} > {GATE['MAX_TURNOVER']:.1%}")
     nav = (1 + x).cumprod()
-    net_ann = float(x.mean() * 252) if len(x) else 0.0
+    net_ann = float(x.mean() * 252 / GATE["FWD_DAYS"]) if len(x) else 0.0
     metrics["扣费后年化超额"] = round(net_ann, 4)
     if net_ann < GATE["NET_ANN_MIN"]:
         reasons.append(f"扣费后年化超额 {net_ann:.2%} < {GATE['NET_ANN_MIN']:.2%}")
@@ -136,9 +138,9 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
         xy = x[x.index.year == year]
         if len(xy) < 20:
             return 0.0, 0.0
-        return float(xy.mean() * 252), _sharpe(xy)
+        return float(xy.mean() * 252 / GATE["FWD_DAYS"]), _sharpe(xy)
 
-    now_year = datetime.now().year
+    now_year = int(x.index.max().year) if len(x) else datetime.now().year
     year_results = []
     for year in range(now_year - 1, now_year + 1):
         tag = str(year)
@@ -146,8 +148,8 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
         metrics[f"超额{tag}"] = round(exc, 4)
         metrics[f"夏普{tag}"] = round(shp, 2)
         year_results.append((tag, exc, shp))
-    # 宽松闸门：当年或前年任一满足超额>0且夏普>0.5即可
-    any_year_pass = any(exc > 0 and shp >= GATE["SHARPE_MIN"] for _, exc, shp in year_results)
+    # 两个年度分别通过；缺样本返回不足，不用某个好年份抵消差年份
+    any_year_pass = all(exc > 0 and shp >= GATE["SHARPE_MIN"] for _, exc, shp in year_results)
     if not any_year_pass:
         for tag, exc, shp in year_results:
             if exc <= 0:
@@ -155,7 +157,7 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
             if shp < GATE["SHARPE_MIN"]:
                 reasons.append(f"{tag}夏普 {shp:.2f} < {GATE['SHARPE_MIN']}")
 
-    ann = float(x.mean() * 252) if len(x) else 0.0
+    ann = float(x.mean() * 252 / GATE["FWD_DAYS"]) if len(x) else 0.0
     mdd = _max_dd(nav)
     calmar = abs(ann / mdd) if mdd < 0 else 0.0
     metrics["Calmar"] = round(calmar, 2)
@@ -216,14 +218,21 @@ def evaluate_gates(vals: pd.Series, panel: pd.DataFrame,
     # Gate 14: 因子复杂度检测（表达式越复杂过拟合风险越高）
     # 此闸门由调用方在因子代码可用时单独调用 check_complexity_gate
 
-    # Gate 15（顾问模式）：全局搜索预算——因子 IC 的 t 统计量 vs 全库试验数 N 的
-    # 噪声地板。只记账不拦截，待机制B影子读数校准后再决定是否硬闸。
+    # Gate 15（噪声地板遥测；下方HAC校正为硬闸）：全局搜索预算——因子 IC 的 t 统计量 vs 全库试验数 N 的
+    # 噪声地板。硬拦截以未舍入的HAC p值和试验账本为准。
     if len(ic) >= 20:
         sb = search_budget_check(float(ic.mean()), float(ic.std()), len(ic))
         metrics["搜索预算t值"] = round(sb["t_stat"], 2)
         metrics["搜索预算地板"] = round(sb["t_star"], 2)
         metrics["搜索预算通过"] = sb["passed"]
 
+    trials = global_trial_count()["total"]
+    corrected = min(1.0, float(metrics.get("p_value", 1.0)) * max(1, trials))
+    metrics["搜索试验数"] = trials
+    metrics["搜索校正p值"] = corrected
+    metrics["搜索预算通过"] = bool(trials > 0 and np.isfinite(corrected) and corrected <= .05)
+    if not metrics["搜索预算通过"]:
+        reasons.append("搜索预算未通过：HAC p值经试验次数校正或试验账本不可用")
     return {"pass": len(reasons) == 0, "reasons": reasons, "metrics": metrics}
 
 
@@ -236,24 +245,24 @@ _TRIAL_COUNT_CACHE = {"at": 0.0, "value": {"factor_trials": 0, "strategy_trials"
 
 def global_trial_count() -> dict:
     """跨引擎累计试验数：factor_registry 是全量因子试验账本（含未过闸的），
-    strategies 是策略包试验数。1 小时缓存——evaluate_gates 在挖掘循环里高频调用。"""
+    strategies 是策略包试验数。10 秒缓存（注册表和试验账本可能重复计数，保守取和）——evaluate_gates 在挖掘循环里高频调用。"""
     import time as _time
-    if _time.time() - _TRIAL_COUNT_CACHE["at"] < 3600:
+    if _time.time() - _TRIAL_COUNT_CACHE["at"] < 10:
         return _TRIAL_COUNT_CACHE["value"]
     import datasource
     try:
         with datasource._conn() as c:
-            factors = c.execute("SELECT COUNT(*) FROM factor_registry").fetchone()[0]
+            factors = c.execute("SELECT (SELECT COUNT(*) FROM factor_registry) + (SELECT COUNT(*) FROM tested_hashes)").fetchone()[0]
             try:
-                strategies = c.execute("SELECT COUNT(*) FROM strategies").fetchone()[0]
+                strategies = c.execute("SELECT COUNT(*) FROM strategies").fetchone()[0] + c.execute("SELECT COUNT(*) FROM research_trials").fetchone()[0]
             except Exception:
-                strategies = 0
+                return {"factor_trials": 0, "strategy_trials": 0, "total": 0}
         _TRIAL_COUNT_CACHE["value"] = {
             "factor_trials": int(factors), "strategy_trials": int(strategies),
             "total": int(factors) + int(strategies)}
         _TRIAL_COUNT_CACHE["at"] = _time.time()
     except Exception:
-        pass
+        return {"factor_trials": 0, "strategy_trials": 0, "total": 0}
     return _TRIAL_COUNT_CACHE["value"]
 
 
@@ -282,7 +291,8 @@ _RELAXED_PVALUE = 0.05
 
 
 def evaluate_gates_relaxed(vals: pd.Series, panel: pd.DataFrame,
-                           library_ics: dict[str, pd.Series] | None = None) -> dict:
+                           library_ics: dict[str, pd.Series] | None = None,
+                           factor_type: str = "量价") -> dict:
     """放宽版收益闸门：p-value 阈值 0.05（vs 标准 0.01），其余 11 项不变。
     用于 ev_ 因子的双闸门验证——事件因子样本稀少，统计显著性门槛适当降低。"""
     vals = fe._norm(vals.dropna())
@@ -294,7 +304,8 @@ def evaluate_gates_relaxed(vals: pd.Series, panel: pd.DataFrame,
     fwd = fe.forward_returns(panel, GATE["FWD_DAYS"])
     ic = fe.ic_series(vals, fwd)
     metrics = {}
-    reasons = []
+    from validation_policy import sample_check
+    reasons = sample_check(ic, factor_type)
 
     ic_abs = abs(float(ic.mean())) if len(ic) else 0.0
     metrics["IC"] = round(float(ic.mean()), 4) if len(ic) else 0.0
@@ -304,7 +315,7 @@ def evaluate_gates_relaxed(vals: pd.Series, panel: pd.DataFrame,
     n_days = len(ic)
     if n_days >= 20:
         p_val = fe.ic_pvalue_robust(ic)
-        metrics["p_value"] = round(p_val, 6)
+        metrics["p_value"] = float(p_val)
         if p_val > _RELAXED_PVALUE:
             reasons.append(f"IC p-value {p_val:.4f} > {_RELAXED_PVALUE}（放宽版）")
     else:
@@ -319,9 +330,9 @@ def evaluate_gates_relaxed(vals: pd.Series, panel: pd.DataFrame,
         xy = x[x.index.year == year]
         if len(xy) < 20:
             return 0.0, 0.0
-        return float(xy.mean() * 252), _sharpe(xy)
+        return float(xy.mean() * 252 / GATE["FWD_DAYS"]), _sharpe(xy)
 
-    now_year = datetime.now().year
+    now_year = int(x.index.max().year) if len(x) else datetime.now().year
     year_results = []
     for year in range(now_year - 1, now_year + 1):
         tag = str(year)
@@ -329,8 +340,8 @@ def evaluate_gates_relaxed(vals: pd.Series, panel: pd.DataFrame,
         metrics[f"超额{tag}"] = round(exc, 4)
         metrics[f"夏普{tag}"] = round(shp, 2)
         year_results.append((tag, exc, shp))
-    # 宽松闸门：当年或前年任一满足超额>0且夏普>0.5即可
-    any_year_pass = any(exc > 0 and shp >= GATE["SHARPE_MIN"] for _, exc, shp in year_results)
+    # 两个年度分别通过；缺样本返回不足，不用某个好年份抵消差年份
+    any_year_pass = all(exc > 0 and shp >= GATE["SHARPE_MIN"] for _, exc, shp in year_results)
     if not any_year_pass:
         for tag, exc, shp in year_results:
             if exc <= 0:
@@ -338,7 +349,7 @@ def evaluate_gates_relaxed(vals: pd.Series, panel: pd.DataFrame,
             if shp < GATE["SHARPE_MIN"]:
                 reasons.append(f"{tag}夏普 {shp:.2f} < {GATE['SHARPE_MIN']}")
 
-    ann = float(x.mean() * 252) if len(x) else 0.0
+    ann = float(x.mean() * 252 / GATE["FWD_DAYS"]) if len(x) else 0.0
     mdd = _max_dd(nav)
     calmar = abs(ann / mdd) if mdd < 0 else 0.0
     metrics["Calmar"] = round(calmar, 2)
@@ -391,6 +402,13 @@ def evaluate_gates_relaxed(vals: pd.Series, panel: pd.DataFrame,
         if gap > 0.015 and is_mean > 0.03:
             reasons.append(f"IS/OOS gap {gap:.4f} > 0.015，过拟合风险")
 
+    trials = global_trial_count()["total"]
+    corrected = min(1.0, float(metrics.get("p_value", 1.0)) * max(1, trials))
+    metrics["搜索试验数"] = trials
+    metrics["搜索校正p值"] = corrected
+    metrics["搜索预算通过"] = bool(trials > 0 and np.isfinite(corrected) and corrected <= .05)
+    if not metrics["搜索预算通过"]:
+        reasons.append("搜索预算未通过：HAC p值经试验次数校正或试验账本不可用")
     return {"pass": len(reasons) == 0, "reasons": reasons, "metrics": metrics}
 
 
@@ -606,6 +624,7 @@ def event_labels(panel: pd.DataFrame, kind: str, horizon: int = EVT_GATE["HORIZO
     label_t = 事件在 (t, t+horizon] 任一日发生。"""
     m = fe._event_mask(panel, kind)  # datetime × instrument 布尔
     lab = m.iloc[::-1].rolling(horizon).max().iloc[::-1].shift(-1)  # 反向滚动=向后看
+    lab.iloc[-horizon:] = np.nan  # 尾部标签尚未成熟，禁止把部分窗口当完整事件结果
     return lab.stack().dropna().astype(float)
 
 
@@ -632,6 +651,13 @@ def evaluate_event_gates(vals: pd.Series, panel: pd.DataFrame, kind: str,
     ic = j.groupby(level="datetime").apply(_ic).dropna()
     if len(ic) < 60:
         return {"pass": False, "reasons": ["有效 IC 天数不足"], "metrics": {}}
+    from validation_policy import sample_check
+    reasons.extend(sample_check(ic, "事件记忆"))
+    trials = global_trial_count()["total"]
+    corrected = fe.ic_pvalue_robust(ic) * max(1, trials)
+    metrics["搜索校正p值"] = min(1.0, corrected)
+    if trials <= 0 or not np.isfinite(corrected) or corrected > .05:
+        reasons.append("事件搜索预算未通过")
     ic_abs = abs(float(ic.mean()))
     metrics["事件IC"] = round(float(ic.mean()), 4)
     if ic_abs < EVT_GATE["IC_MIN"]:

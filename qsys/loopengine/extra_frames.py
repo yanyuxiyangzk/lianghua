@@ -81,7 +81,7 @@ def build_fundflow_frames(codes: list[str], end: str, lookback: int = 800) -> di
 def build_financial_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
     """财务基本面帧：从 ifind_financial 表构建（iFinD 三大报表，当前覆盖沪深300）。
 
-    防未来函数：每季值从 报告期+45天（法定披露截止近似）起才在日常帧上可见，
+    时点约束：每季值仅从实际获取时间次日起在日常帧上可见，
     向前填充至下一季可见日。字段（datetime×instrument）：
       fin_np（净利润）/ fin_or（营业收入）/ fin_gp（毛利）/ fin_ncf（经营现金流净额）——累计值
       fin_np_yoy / fin_or_yoy（同比，按同季累计值之比）
@@ -93,7 +93,7 @@ def build_financial_frames(codes: list[str], end: str, lookback: int = 800) -> d
     try:
         with _qconn() as c:
             df = pd.read_sql(
-                "SELECT code, report_date, statement_type, indicator, value "
+                "SELECT code, report_date, statement_type, indicator, value, fetched_at "
                 "FROM ifind_financial WHERE report_date >= ? AND report_date <= ?",
                 c, params=(start, end))
     except Exception:
@@ -111,7 +111,9 @@ def build_financial_frames(codes: list[str], end: str, lookback: int = 800) -> d
     df = df[df["indicator"].isin(IND)]
     if df.empty:
         return {}
-    df["vis_date"] = (pd.to_datetime(df["report_date"]) + pd.Timedelta(days=45)).dt.strftime("%Y-%m-%d")
+    # 缺真实发布时间时仅从本系统实际获取时间之后可见，不推测历史可用性。
+    df["vis_date"] = conservative_available_day(df["fetched_at"])
+    df = df.dropna(subset=["vis_date"])
     df = df[df["vis_date"] <= end]  # 只保留已公开（近似）的数据点
     if df.empty:
         return {}
@@ -251,10 +253,15 @@ def build_lhb_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
     try:
         with _qconn() as c:
             df = pd.read_sql(
-                "SELECT code, date as trade_date, net_buy, inst_buy_pct as inst_ratio FROM lhb_daily WHERE date >= ? AND date <= ?",
+                "SELECT code, date as trade_date, net_buy, inst_buy_pct as inst_ratio, fetched_at FROM lhb_daily WHERE date >= ? AND date <= ?",
                 c, params=(start, end))
     except Exception:
         return {}
+    if df.empty:
+        return {}
+    df["trade_date"] = conservative_available_day(df["fetched_at"])
+    df = df.dropna(subset=["trade_date"])
+    df = df[df["trade_date"] <= end]
     if df.empty:
         return {}
     df = df.sort_values("trade_date")
@@ -285,9 +292,11 @@ def build_tick_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
         df = datasource.get_archived_snapshots(codes, start, end)
     except Exception:
         return {}
-    if df.empty:
-        return {}
-    df["date"] = pd.to_datetime(df["date"])
+    if df.empty or "available_at" not in df:
+        return {}  # 旧日聚合没有生成时间，不能用于时点回测/因子执行
+    df["date"] = pd.to_datetime(conservative_available_day(df["available_at"]))
+    df = df.dropna(subset=["date"])
+    df = df[df["date"] <= pd.Timestamp(end)]
     frames = {}
     # bid_ask_ratio
     pivot_bid = df.pivot_table(index="date", columns="code", values="avg_bid_vol")
@@ -504,7 +513,7 @@ def build_event_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
                 "SELECT code, date, close FROM market_daily WHERE source='ths_ifind' "
                 "AND date >= ? AND date <= ?", c, params=(start, end))
             ann = pd.read_sql(
-                "SELECT code, report_date FROM ifind_announcements", c)
+                "SELECT code, report_date, fetched_at FROM ifind_announcements", c)
     except Exception:
         return {}
     if px.empty:
@@ -548,7 +557,9 @@ def build_event_frames(codes: list[str], end: str, lookback: int = 800) -> dict:
     if not ann.empty and codes:
         ann = ann[ann["code"].isin(set(codes))]
     if not ann.empty:
-        ann["d"] = pd.to_datetime(ann["report_date"])
+        ann["d"] = pd.to_datetime(conservative_available_day(ann["fetched_at"]))
+        ann = ann.dropna(subset=["d"])
+        ann = ann[ann["d"] <= pd.Timestamp(end)]
         cnt = ann.groupby(["d", "code"]).size().rename("n").reset_index()
         pvt = cnt.pivot_table(index="d", columns="code", values="n", aggfunc="sum")
         pvt = pvt.reindex(dates_idx).fillna(0).rolling(7, min_periods=1).sum()
@@ -601,3 +612,9 @@ def frames_with_extras_for(sexpr: str, panel: pd.DataFrame, codes: list[str],
             except Exception:
                 continue
     return build_field_frames(panel, extra or None)
+
+
+def conservative_available_day(values):
+    """Asia/Shanghai 无时区源时间：实际获取次日才用于日频决策，缺失不回填。"""
+    times = pd.to_datetime(values, errors="coerce")
+    return (times.dt.normalize() + pd.Timedelta(days=1)).dt.strftime("%Y-%m-%d")

@@ -655,7 +655,7 @@ class LoopEngine:
                 X = evaluate_tree(tree, frames)
                 vals = X.stack().rename("f").dropna()
                 vals.index = vals.index.set_names(["datetime", "instrument"])
-                result = G.evaluate_gates(vals, panel)
+                result = G.evaluate_gates(vals, panel, factor_type=factor_type)
             except Exception as e:
                 result = {"pass": False, "reasons": [f"eval error: {e}"], "metrics": {}}
 
@@ -914,6 +914,10 @@ class LoopEngine:
                 logger.debug("walk-forward无结果")
                 return None
 
+            library.record_research_trial("loop_strategy")
+            cv = fe.time_series_cv(final_vals, panel, "等权", 10, n_folds=3, fwd_days=5, step=5)
+            if not cv.get("passed"):
+                return None
             net = wf["优化组合扣费超额"]
             oos_wr = float((net > 0).mean())
             logger.debug(f"OOS胜率: {oos_wr:.1%}")
@@ -962,7 +966,7 @@ class LoopEngine:
             # 实战归因按包名累积，每天换名字的包永远是"零实战"、进不了 Top3
             library.save_strategy(pack_name, payload, status="archived")
             current = f"LE_{self.pool_name}_current"
-            library.save_strategy(current, payload, status="active")
+            library.save_strategy(current, payload, status="shadow")
 
             logger.info(f"策略包已保存: {pack_name}(OOS={oos_wr:.0%}) + {current}(固定名)")
             return f"{pack_name}(OOS={oos_wr:.0%})"

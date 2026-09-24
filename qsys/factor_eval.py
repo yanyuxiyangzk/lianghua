@@ -969,7 +969,7 @@ def apply_family_fdr(scorecard: pd.DataFrame, family_map: dict | None = None) ->
 
 
 def compute_weights(scorecard: pd.DataFrame, method: str, names: list[str],
-                    win_col: str = "Top组胜率") -> dict:
+                    win_col: str = "Top组胜率", use_direction_state: bool = True) -> dict:
     """返回 {因子名: (权重, 方向±1)}。方向自动修正：IC 均值为负 → 负向。
     win_col 指定胜率来源列（多周期标准下用所选持有期的胜率，如 "1日胜率"）。
 
@@ -977,7 +977,7 @@ def compute_weights(scorecard: pd.DataFrame, method: str, names: list[str],
     sc = scorecard.set_index("因子")
     if win_col not in sc.columns:
         win_col = "Top组胜率"
-    dmap = direction_map()
+    dmap = direction_map() if use_direction_state else {}
     direction = {n: dmap.get(n) or (1 if sc.loc[n, "IC均值"] >= 0 else -1) for n in names}
     raw = {}
     for n in names:
@@ -1041,7 +1041,7 @@ def factor_group_backtest(vals: pd.Series, panel: pd.DataFrame, n_groups: int = 
     if len(ls_ret) >= 3:
         ann = nav.iloc[-1] ** (252 / step / len(ls_ret)) - 1
         sharpe = ls_ret.mean() / (ls_ret.std() + 1e-12) * np.sqrt(252 / step)
-        mdd = ((nav - nav.cummax()) / nav.cummax()).min()
+        mdd = ((nav - nav.cummax().clip(lower=1)) / nav.cummax().clip(lower=1)).min()
         stats = {"年化多空收益": f"{ann:.2%}", "夏普": f"{sharpe:.2f}",
                  "最大回撤": f"{mdd:.2%}", "胜率": f"{(ls_ret > 0).mean():.0%}",
                  "调仓点数": str(len(ls_ret))}
@@ -1100,21 +1100,20 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
         ic_full = {name: ic_series(s, fwd) for name, s in vals_norm.items()}
     days = sorted(set.intersection(*[set(s.index.get_level_values("datetime").unique())
                                      for s in vals_norm.values()])) if vals_norm else []
-    # 切割 OOS 区间（start_idx/end_idx 用于验证/测试段分离）
-    oos_start = start_idx if start_idx is not None else 0
-    oos_end = end_idx if end_idx is not None else len(days)
-    oos_days = days[oos_start:oos_end]
-    if len(oos_days) < est + fwd_days + step:
+    # start/end 约束应用日期；训练窗口始终位于应用日期之前。
+    # 各折标签必须在该折结束前成熟，且不允许持有期重叠。
+    if step < fwd_days or est <= fwd_days:
+        raise ValueError("step must be >= fwd_days and est > fwd_days")
+    oos_start = max(est, start_idx or 0)
+    oos_end = min(end_idx if end_idx is not None else len(days), len(days))
+    if oos_end - fwd_days <= oos_start:
         return pd.DataFrame()
-
     prev_picks: dict[str, set] = {"优化组合": set(), "等权组合": set()}
     rows = []
-    for t_idx in range(est, len(oos_days) - fwd_days, step):
-        t = oos_days[t_idx]
-        # 估计窗右端：t 之前的 fwd_days 天（IC 观测端点回退防未来函数）
-        t_global = days.index(t)
+    for t_global in range(oos_start, oos_end - fwd_days, step):
+        t = days[t_global]
         est_lo = days[t_global - est]
-        est_hi = days[t_global - fwd_days]  # IC 可观测右端（防未来函数）
+        est_hi = days[t_global - fwd_days - 1]  # IC 可观测右端（防未来函数）
         # 切片统计 → 权重
         stats = {}
         for name, ic in ic_full.items():
@@ -1131,7 +1130,7 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
         sc = pd.DataFrame({n: {"IC均值": v[0], "ICIR": v[1], "Top组胜率": v[2]}
                            for n, v in valid.items()}).T
         names = list(valid.keys())
-        w_opt = compute_weights(sc.reset_index(names="因子"), method, names)
+        w_opt = compute_weights(sc.reset_index(names="因子"), method, names, use_direction_state=False)
         w_eq = {n: (1.0 / len(names), w_opt[n][1]) for n in names}
 
         fr = fwd.loc[t].dropna() if t in fwd.index else pd.Series(dtype=float)
@@ -1168,13 +1167,13 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
         nav = (1 + net).cumprod()
         n_periods = len(net)
         # 年化（假设每期 fwd_days 个交易日）
-        periods_per_year = 252 / fwd_days
-        total_ret = float(nav.iloc[-1] / nav.iloc[0] - 1) if len(nav) > 1 else 0.0
+        periods_per_year = 252 / step
+        total_ret = float(nav.iloc[-1] - 1) if len(nav) else 0.0
         ann_ret = float((1 + total_ret) ** (periods_per_year / n_periods) - 1) if n_periods > 0 else 0.0
         # 夏普
         sharpe = float(net.mean() / (net.std() + 1e-12) * np.sqrt(periods_per_year)) if n_periods > 5 else 0.0
         # 最大回撤
-        max_dd = float(((nav - nav.cummax()) / nav.cummax()).min()) if len(nav) > 1 else 0.0
+        max_dd = float(((nav - nav.cummax().clip(lower=1)) / nav.cummax().clip(lower=1)).min()) if len(nav) > 1 else 0.0
         # 盈亏比
         wins = net[net > 0]
         losses = net[net < 0]
@@ -1266,21 +1265,25 @@ def time_series_cv(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, metho
                  if not s.dropna().empty}
     if not vals_norm:
         return {"median_winrate": 0, "median_excess": 0, "folds": []}
+    import library
+    library.record_research_trial("strategy_cv")
     fwd = forward_returns(panel, fwd_days)
     days_all = sorted(set.intersection(*[set(s.index.get_level_values("datetime").unique())
                                          for s in vals_norm.values()]))
     ic_full = {n: ic_series(vals_norm[n], fwd) for n in vals_norm}
 
-    fold_size = len(days_all) // (n_folds + 1)
-    if fold_size < EST_WINDOW + fwd_days + min_points * step:
-        return {"median_winrate": 0, "median_excess": 0, "folds": [],
-                "error": "样本不足"}
+    if n_folds < 3 or step < fwd_days:
+        raise ValueError("至少三折且step不得小于持有期")
+    fold_size = (len(days_all) - EST_WINDOW) // n_folds
+    if fold_size < fwd_days + min_points * step:
+        return {"passed": False, "median_winrate": 0, "median_excess": 0,
+                "folds": [], "error": "样本不足"}
 
     results = []
     for fold in range(n_folds):
         # 每个 fold：估计窗从 fold_size*(fold) 开始，OOS 从 fold_size*(fold+1) 开始
-        test_start = fold_size * (fold + 1)
-        test_end = min(test_start + fold_size, len(days_all))
+        test_start = EST_WINDOW + fold_size * fold
+        test_end = len(days_all) if fold == n_folds - 1 else test_start + fold_size
         est_start = max(0, test_start - EST_WINDOW)
 
         wf = walk_forward(
@@ -1294,6 +1297,10 @@ def time_series_cv(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, metho
             net = wf["优化组合扣费超额"]
             results.append({
                 "fold": fold,
+                "start": wf["调仓日"].iloc[0], "end": wf["调仓日"].iloc[-1],
+                "sharpe": float(wf.attrs.get("sharpe", 0)),
+                "max_drawdown": float(wf.attrs.get("max_drawdown", -1)),
+                "turnover": float(wf["优化组合换手率"].mean()),
                 "winrate": round(float((net > 0).mean()), 3),
                 "mean_excess": round(float(net.mean()), 4),
                 "n_periods": len(net),
@@ -1304,6 +1311,10 @@ def time_series_cv(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, metho
 
     df = pd.DataFrame(results)
     return {
+        "passed": bool(len(results) == n_folds and all(
+            r["mean_excess"] > 0 and r["sharpe"] >= 0.5 and
+            r["max_drawdown"] >= -0.25 and r["turnover"] <= 0.8 for r in results)),
+        "n_folds": n_folds, "cost": cost, "step": step, "fwd_days": fwd_days,
         "median_winrate": round(float(df["winrate"].median()), 3),
         "median_excess": round(float(df["mean_excess"].median()), 4),
         "std_winrate": round(float(df["winrate"].std()), 3) if len(df) > 1 else 0,
@@ -1356,7 +1367,7 @@ def static_backtest(factor_vals: dict[str, pd.Series], panel: pd.DataFrame,
         row = {"调仓日": str(t)[:10], "池内均值收益": float(fr.mean()),
                "组合收益": ret, "组合超额": ret - float(fr.mean()),
                "组合换手率": turnover,
-               "组合扣费超额": ret - float(fr.median()) - turnover * cost}
+               "组合扣费超额": ret - float(fr.mean()) - turnover * cost}
         if collect_picks:
             row["picks"] = list(picks.index)
         rows.append(row)
@@ -1400,8 +1411,9 @@ def greedy_combo(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
     # 验证段需要足够的样本：est + fwd_days + step
     min_val = EST_WINDOW + fwd_days + step + min_points * step
     if n_val < min_val or n_test < fwd_days + step + min_points * step:
-        # 样本不足，退化为全量 OOS
-        split_idx = len(days_all)
+        return {"selected": [], "history": pd.DataFrame(), "wf": pd.DataFrame(),
+                "wf_test": pd.DataFrame(), "oos_winrate_test": None,
+                "error": "独立测试段样本不足"}
 
     def _eval_segment(names: list[str], si: int | None, ei: int | None):
         wf = walk_forward({n: vals_norm[n] for n in names}, panel, method, top_n,

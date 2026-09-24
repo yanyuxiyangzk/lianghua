@@ -141,8 +141,8 @@ def _fetch_index_panel_from_db(codes: list[str], end: str, lookback_days: int) -
             for code in codes:
                 df = pd.read_sql(
                     "SELECT trade_date, close, volume, amount FROM ifind_daily"
-                    " WHERE code=? AND trade_date>=date(?,?) ORDER BY trade_date",
-                    conn, params=(code, end, f"-{lookback_days} days"))
+                    " WHERE code=? AND trade_date>=date(?,?) AND trade_date<=? ORDER BY trade_date",
+                    conn, params=(code, end, f"-{lookback_days} days", end))
                 if not df.empty:
                     df = df.set_index("trade_date")
                     df.columns = [f"$close", "$volume", "$amount"]
@@ -299,8 +299,8 @@ def _classify_regime(trend_score: float, vol_regime: str,
 def _default_regime() -> dict:
     """默认 regime（数据不足时）。"""
     return {
-        "regime": "sideways",
-        "confidence": 0.3,
+        "regime": "unknown",
+        "confidence": 0.0,
         "details": {
             "trend_score": 0.0,
             "volatility_regime": "normal",

@@ -19,6 +19,11 @@ from common import DATA_DIR, load_json
 from datasource import _qconn
 
 _SCHEMA = """
+CREATE TABLE IF NOT EXISTS research_trials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS factor_registry (
     name TEXT PRIMARY KEY,
     kind TEXT NOT NULL,           -- evolved / builtin
@@ -31,6 +36,7 @@ CREATE TABLE IF NOT EXISTS factor_registry (
     decay_status TEXT, decay_rate REAL  -- 因子衰减状态/衰减率
     ,theory_id TEXT, hypothesis_id TEXT, generation_mode TEXT,
     parent_factor TEXT, source_theory_sexpr TEXT,
+    theory_family TEXT, evidence_type TEXT, regime_scope TEXT,
     validation_status TEXT DEFAULT 'generated', static_passed INTEGER,
     static_reason TEXT, static_checked_at TEXT
 );
@@ -48,7 +54,7 @@ CREATE TABLE IF NOT EXISTS strategies (
     oos_winrate TEXT,
     horizon TEXT,                 -- 决策持有期（1日/5日/20日），调度器共振用
     updated_at TEXT, theory_id TEXT, theory_name TEXT, risk_class TEXT,
-    account_scope TEXT
+    account_scope TEXT, theory_family TEXT, regime_scope TEXT, evidence_type TEXT
 );
 CREATE TABLE IF NOT EXISTS strategy_validation (
     strategy_name TEXT NOT NULL, eval_date TEXT NOT NULL,
@@ -182,7 +188,8 @@ def _lconn():
     c.executescript(_SCHEMA)
     # 迁移：策略包理论/账户归属字段（旧库兼容）
     strategy_cols = {r[1] for r in c.execute("PRAGMA table_info(strategies)")}
-    for col in ("theory_id", "theory_name", "risk_class", "account_scope"):
+    for col in ("theory_id", "theory_name", "risk_class", "account_scope",
+                "theory_family", "regime_scope", "evidence_type"):
         if col not in strategy_cols:
             c.execute(f"ALTER TABLE strategies ADD COLUMN {col} TEXT")
     # 迁移：factor_registry 加骨架/机制族/闸门列
@@ -200,7 +207,8 @@ def _lconn():
             c.execute(f"ALTER TABLE factor_registry ADD COLUMN {col} {ddl}")
     for col, ddl in [("theory_id", "TEXT"), ("hypothesis_id", "TEXT"),
                      ("generation_mode", "TEXT"), ("parent_factor", "TEXT"),
-                     ("source_theory_sexpr", "TEXT")]:
+                     ("source_theory_sexpr", "TEXT"), ("theory_family", "TEXT"),
+                     ("evidence_type", "TEXT"), ("regime_scope", "TEXT")]:
         if col not in cols:
             c.execute(f"ALTER TABLE factor_registry ADD COLUMN {col} {ddl}")
     # 因子验证状态机：只对新因子推进状态，旧因子保持历史数据不回填。
@@ -439,14 +447,20 @@ def sync_factor_registry(factors: list[dict]):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with _lconn() as c:
         for f in factors:
+            f = dict(f)
+            f.setdefault("theory_family", f.get("family"))
+            f.setdefault("evidence_type", f.get("factor_type", "量价"))
+            f.setdefault("regime_scope", "all")
+            if not f.get("theory_id") and not f.get("theory_family"):
+                f.setdefault("validation_status", "shadow_only")
             static_ok, static_reason = static_review_factor(f["name"], f.get("kind", "builtin"), f.get("code"))
             sk = structure.extract_skeleton(f["name"], f.get("code"))
             fam = structure.assign_family(f["name"], sk)
             ft = f.get("factor_type", "量价")
             c.execute(
                 "INSERT INTO factor_registry (name, kind, code, trace, round, decision, first_seen,"
-                " skeleton, family, engine, factor_type, theory_id, hypothesis_id, generation_mode, parent_factor, source_theory_sexpr, validation_status)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " skeleton, family, engine, factor_type, theory_id, hypothesis_id, generation_mode, parent_factor, source_theory_sexpr, theory_family, evidence_type, regime_scope, validation_status)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(name) DO UPDATE SET code=excluded.code, trace=excluded.trace,"
                 "   round=excluded.round, decision=excluded.decision,"
                 "   skeleton=excluded.skeleton, family=excluded.family,"
@@ -459,6 +473,7 @@ def sync_factor_registry(factors: list[dict]):
                  f.get("round"), int(f["decision"]) if f.get("decision") is not None else None, now,
                  sk, fam, f.get("engine", "rdagent"), ft, f.get("theory_id"), f.get("hypothesis_id"),
                  f.get("generation_mode"), f.get("parent_factor"), f.get("source_theory_sexpr"),
+                 f.get("theory_family") or f.get("family"), f.get("evidence_type"), f.get("regime_scope"),
                  f.get("validation_status", "static_passed" if static_ok else "static_rejected")))
 
 
@@ -741,22 +756,33 @@ def list_scorecard_pools() -> list[str]:
 
 
 # ---------------------------------------------------------------- 策略包
+def record_research_trial(kind: str):
+    with _lconn() as c:
+        c.execute("INSERT INTO research_trials(kind,created_at) VALUES (?,?)",
+                  (kind, datetime.now().isoformat()))
+
+
 def save_strategy(name: str, pack: dict, status: str | None = None):
     with _lconn() as c:
         cols = {r[1] for r in c.execute("PRAGMA table_info(strategies)")}
-        for col in ("theory_id", "theory_name", "risk_class", "account_scope"):
+        for col in ("theory_id", "theory_name", "risk_class", "account_scope",
+                    "theory_family", "regime_scope", "evidence_type"):
             if col not in cols:
                 c.execute(f"ALTER TABLE strategies ADD COLUMN {col} TEXT")
+        old = c.execute("SELECT status FROM strategies WHERE name=?", (name,)).fetchone()
+        # 保存候选不允许默认恢复 active；停用/退役状态不被覆盖。
+        status = status or (old[0] if old and old[0] in ("paused", "retired", "archived") else "shadow")
         c.execute(
             "INSERT OR REPLACE INTO strategies (name, pool_name, top_n, method, filters, factors,"
-            " oos_winrate, horizon, is_winrate, updated_at, theory_id, theory_name, risk_class, account_scope)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " oos_winrate, horizon, is_winrate, updated_at, theory_id, theory_name, risk_class, account_scope, theory_family, regime_scope, evidence_type)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (name, pack.get("pool_name"), pack.get("top_n"), pack.get("method"),
              json.dumps(pack.get("filters", []), ensure_ascii=False),
              json.dumps(pack.get("factors", []), ensure_ascii=False),
              pack.get("oos_winrate"), pack.get("horizon"), pack.get("is_winrate"),
              pack.get("updated") or datetime.now().strftime("%Y-%m-%d %H:%M"),
-             pack.get("theory_id"), pack.get("theory_name"), pack.get("risk_class"), pack.get("account_scope")))
+             pack.get("theory_id"), pack.get("theory_name"), pack.get("risk_class"), pack.get("account_scope"),
+             pack.get("theory_family"), pack.get("regime_scope"), pack.get("evidence_type")))
         if status is not None:
             c.execute("UPDATE strategies SET status=? WHERE name=?", (status, name))
 
@@ -765,14 +791,15 @@ def list_strategies() -> dict:
     """返回与 packs.json 相同的结构 {name: pack_dict}，便于各处平滑切换。"""
     with _lconn() as c:
         rows = c.execute("SELECT name, pool_name, top_n, method, filters, factors, oos_winrate,"
-            " horizon, is_winrate, updated_at, status, theory_id, theory_name, risk_class, account_scope FROM strategies").fetchall()
+            " horizon, is_winrate, updated_at, status, theory_id, theory_name, risk_class, account_scope,"
+            " theory_family, regime_scope, evidence_type FROM strategies").fetchall()
     # 旧策略包只保存了因子名称；从注册表补回代码和真实 kind，保证回测/重验可复现。
     with _lconn() as c:
         registry = {r[0]: {"kind": r[1], "code": r[2], "factor_type": r[3]}
                     for r in c.execute(
                         "SELECT name,kind,code,factor_type FROM factor_registry").fetchall()}
     out = {}
-    for (name, pool, top_n, method, filters, factors, oos, horizon, is_wr, updated, status, theory_id, theory_name, risk_class, account_scope) in rows:
+    for (name, pool, top_n, method, filters, factors, oos, horizon, is_wr, updated, status, theory_id, theory_name, risk_class, account_scope, theory_family, regime_scope, evidence_type) in rows:
         fs = json.loads(factors or "[]")
         for fac in fs:
             reg = registry.get(fac.get("name")) or {}
@@ -786,7 +813,9 @@ def list_strategies() -> dict:
                      "filters": json.loads(filters or "[]"), "factors": fs,
                      "oos_winrate": oos, "horizon": horizon, "is_winrate": is_wr, "updated": updated,
                      "status": status or "active", "theory_id": theory_id, "theory_name": theory_name,
-                     "risk_class": risk_class, "account_scope": account_scope}
+                     "risk_class": risk_class, "account_scope": account_scope,
+                     "theory_family": theory_family, "regime_scope": regime_scope,
+                     "evidence_type": evidence_type}
     return out
 
 

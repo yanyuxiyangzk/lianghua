@@ -175,17 +175,20 @@ def _render_tab_today():
 
 
 def _render_observation_only():
-    """只展示最近一次自动选股名单；不读取或操作卫星交易账户。"""
+    """展示正式选股建议，缺失时回退观察名单；执行交由统一账户。"""
     today = get_last_trade_day()
-    st.caption(f"当前交易日 {today} · 自动选股结果仅供观察")
+    st.caption(f"当前交易日 {today} · 卫星选股建议由统一资金账户执行")
     pack = _get_satellite_pack_info()
     if pack:
         _render_pack_info(pack)
-    picks = _get_todays_satellite_pick(True)
+    picks = _get_todays_satellite_pick(False)
+    observation = picks.empty
+    if observation:
+        picks = _get_todays_satellite_pick(True)
     if picks.empty:
         st.info("暂无卫星轨观察名单，请等待自动扫描任务完成。")
         return
-    st.caption(f"观察名单日期：{picks['trade_date'].max()} · 来源：主扫描顺带生成")
+    st.caption(f"名单日期：{picks['trade_date'].max()} · {'观察名单' if observation else '正式卫星选股建议'}")
     try:
         prices = bk._latest_prices(picks["code"].tolist())
     except Exception:
@@ -200,7 +203,10 @@ def _render_observation_only():
                      "策略评分": row["score"], "最新价": cur, "涨跌幅(%)": chg})
     st.subheader(f"候选股票（{len(rows)} 只）")
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-    st.caption("这是主扫描顺带生成的观察名单，只用于积累战绩，不会进入自动持仓。")
+    if observation:
+        st.caption("当前仅有观察名单，待正式扫描确认后交给统一账户评估。")
+    else:
+        st.caption("正式建议通过策略资格、买点及账户风控后，由统一资金账户买入；委托、成交和持仓标记卫星来源。")
 
 
 def _render_tab_performance():

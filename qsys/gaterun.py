@@ -62,7 +62,7 @@ def run_gates_for_pool(pool_name: str = "沪深300", only_pending: bool = True) 
         try:
             fac = {"name": name, "kind": row["kind"], "code": row.get("code")}
             vals = fe.get_factor_values(fac, codes, end)
-            result = G.evaluate_gates(vals, panel, library_ics=passed_ics)
+            result = G.evaluate_gates(vals, panel, library_ics=passed_ics, factor_type=row.get("factor_type") or "量价")
             ic_val = result["metrics"].get("IC", 0.0)
             # Gate 15 遥测：复用 evaluate_gates 的搜索预算顾问字段（零重算），
             # 统计"过了硬闸但会被搜索预算拦截"的因子——硬闸校准的拦击率。

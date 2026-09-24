@@ -255,14 +255,15 @@ class PriceMonitor:
         Returns:
             注册的条件数量
         """
-        db_path = Path("/data/experience.db")
+        import experience
+        db_path = experience.DB_PATH
         if not db_path.exists():
             return 0
 
         try:
             with sqlite3.connect(str(db_path), timeout=30) as c:
                 opens = pd.read_sql(
-                    "SELECT id, code, buy_price, shares, buy_date FROM positions WHERE status='open'",
+                    "SELECT * FROM positions WHERE status='open'",
                     c
                 )
         except Exception as e:
@@ -286,7 +287,7 @@ class PriceMonitor:
                 buy_price=row["buy_price"],
                 shares=row["shares"],
                 buy_date=row["buy_date"],
-                rules=rules
+                rules=experience._get_position_rules(row)
             )
             count += 1
 

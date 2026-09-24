@@ -88,3 +88,75 @@ RD-Agent 的 qlib 场景默认 `market=csi300`。做板块有两条路：
 | **P3** | 自定义股票池/板块进化（含行业成分导入管线） | P1 | 较大 |
 
 建议顺序 P0 → P1 → P2 → P3，每期交付即可用。
+
+---
+
+## 五、Redis 会话持久层与研究记忆（新增开发规划）
+
+### 5.1 建设目标和边界
+
+Redis 用于会话、任务状态、缓存和研究记忆检索；SQLite 继续作为资金、委托、成交、持仓、审批和风控事实源。Redis 不得直接授权下单，也不得成为交易账本的唯一副本。Redis 故障时，系统必须保持“禁止未经批准的新策略开仓、允许查询持仓、允许卖出”的安全降级状态。
+
+### 5.2 数据分层
+
+| 数据 | 存储 | 生命周期 | 用途 |
+|---|---|---|---|
+| 用户会话 | Redis `session:*` | 1–7 天 | 页面状态、筛选条件、最近查看 |
+| 缓存 | Redis `cache:*` | 分钟到小时 | 行情和计算结果缓存 |
+| 循环任务状态 | Redis `job:*` + SQLite 审计 | 任务周期 | 当前阶段、进度、心跳、错误、断点 |
+| 研究记忆 | Redis `memory:*` + 原始报告文件 | 长期 | 因子、策略、回测和复盘检索 |
+| 交易事实 | SQLite | 永久审计 | 资金、委托、成交、持仓、风控 |
+| 原始报告和模型产物 | 文件/对象存储 | 长期 | 回测报告、日志、模型、证据 |
+
+记忆必须区分 `fact`、`research_result`、`reflection`、`proposal`、`approval`。AI 只能新增反思和候选方案，不能修改事实和审批记录。
+
+### 5.3 任务进度可查询设计
+
+Redis 接入后，所有数据更新、因子挖掘、回测、选股、反思和进化任务统一登记任务状态。每个任务使用稳定的 `job_id`，并记录：
+
+```text
+job_id, job_type, run_id, stage, status, progress_pct,
+current_item, total_items, started_at, updated_at,
+heartbeat_at, error_code, error_message, checkpoint_ref,
+result_ref, worker, version
+```
+
+推荐键：
+
+```text
+job:{job_id}                         # 当前状态 Hash/JSON
+job:{job_id}:events                  # 状态变更 Stream
+jobs:active                          # 活跃任务集合
+jobs:recent                          # 最近任务有序集合
+run:{run_id}:jobs                    # 某轮进化的任务清单
+```
+
+状态统一为：`queued`、`running`、`paused`、`succeeded`、`failed`、`cancelled`、`stale`。任务每次阶段变更都写事件，心跳超过阈值则标记 `stale`，不能只依赖进程日志判断进度。
+
+QSYS 增加“任务进度”只读页面/状态卡，支持按任务类型、运行批次、状态和时间筛选，显示当前阶段、完成比例、最近心跳、错误原因和断点链接。页面读取 Redis；任务结果和审计仍链接到 SQLite 或文件报告。
+
+### 5.4 分期实施
+
+| 版本 | 内容 | 验收标准 |
+|---|---|---|
+| R0 | Redis Stack Docker 服务、AOF、备份、ACL、连接池、健康检查 | 容器重启后数据恢复；Redis 不可用时交易安全降级 |
+| R1 | 会话持久化和任务状态登记 | 页面刷新可恢复；任务可查阶段、进度、心跳和错误 |
+| R2 | 结构化研究记忆 | 因子/策略/回测/风控拦截/选股证据可按字段检索，均有 `evidence_ref` |
+| R3 | RediSearch 向量检索 | 先结构化过滤，再向量排序；向量可重建并记录模型版本 |
+| R4 | 接入 AI 反思和自动进化 | AI 只能生成候选和反思；必须经过回测、留出集、影子运行和执行资格闸 |
+
+### 5.5 记忆质量和时间约束
+
+长期记忆必须包含 `asof_date`、`available_at`、`confidence`、`sample_count`、`evaluation_period`、`evidence_ref` 和 `status`。回测按历史时间切片读取记忆，禁止读取未来生成的复盘结论。向量记录 embedding 模型、维度、版本和索引版本，模型升级后支持全量重建。
+
+### 5.6 可靠性和安全要求
+
+- Redis 开启 AOF，并定期 RDB/目录备份；设置内存上限、慢查询和阻塞监控。
+- 使用连接超时、重试上限、熔断和幂等写入；重复任务不得重复产生记忆或进度事件。
+- Redis 只绑定内网，不暴露公网，使用 ACL/密码。
+- `session:*`、`cache:*` 使用 TTL；审批、成交和风控记录不得依赖 TTL。
+- Redis 彻底不可用时，不能自动放开交易，卖出和账本查询仍可运行。
+
+### 5.7 进度查询接口规划
+
+第一版提供内部 Python 接口：`job_start()`、`job_heartbeat()`、`job_progress()`、`job_event()`、`job_finish()`、`job_get()`、`job_list()`；第二版在 QSYS 页面提供只读查询。任何自动任务必须在启动、阶段切换、成功、失败和退出前写入状态。

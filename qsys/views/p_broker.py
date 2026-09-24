@@ -12,6 +12,7 @@ import pandas as pd
 import streamlit as st
 
 import broker
+from trade_display import with_signal_columns
 
 UP, DOWN = "#e54545", "#26a69a"
 
@@ -93,7 +94,7 @@ def _merged_positions() -> pd.DataFrame:
             "浮动盈亏%": a["浮动盈亏%"], "盈亏额": a["浮动盈亏额"],
             "持有交易日": a["持有交易日"],
             "止盈价": a["止盈价"], "止损价": a["止损价"],
-            "来源": str(a["pack_name"] or a["source"]),
+            "来源": ("卫星轨 · " if a["source"] == "satellite_scan" else "主轨 · ") + str(a["pack_name"] or a["source"]),
         })
     return pd.DataFrame(rows) if rows else pd.DataFrame()
 
@@ -210,11 +211,15 @@ def render():
             if orders.empty:
                 st.info("今日无委托")
             else:
-                show = orders[["ts", "code", "name", "source", "side", "price", "shares", "status",
+                orders = with_signal_columns(orders)
+                show = orders[["ts", "code", "name", "source", "signal_source", "strategy_name", "side", "price", "shares", "status",
                                "filled_price", "filled_ts"]].rename(
-                    columns={"ts": "委托时间", "code": "代码", "name": "名称", "source": "类型",
+                    columns={"ts": "委托时间", "code": "代码", "name": "名称", "source": "类型", "signal_source": "选股来源", "strategy_name": "策略名称",
                              "side": "方向", "price": "限价", "shares": "数量", "status": "状态",
                              "filled_price": "成交价", "filled_ts": "成交时间"})
+                show["选股来源"] = show["选股来源"].map(
+                    {"satellite_scan": "卫星轨", "sched_pool_scan": "主轨", "manual": "手动", "reconcile_fix": "对账补记"}
+                ).fillna(show["选股来源"].fillna("历史未标记"))
                 show["方向"] = show["方向"].map({"buy": "买入", "sell": "卖出"})
                 show["类型"] = show["类型"].map({"ai": "AI", "manual": "手动"}).fillna("手动")
                 st.dataframe(show, hide_index=True, width='stretch')
@@ -223,11 +228,15 @@ def render():
             if fills.empty:
                 st.info("今日无成交")
             else:
-                show = fills[["ts", "code", "name", "source", "side", "price", "shares", "amount",
+                fills = with_signal_columns(fills)
+                show = fills[["ts", "code", "name", "source", "signal_source", "strategy_name", "side", "price", "shares", "amount",
                               "fee", "tax"]].rename(
-                    columns={"ts": "成交时间", "code": "代码", "name": "名称", "source": "类型",
+                    columns={"ts": "成交时间", "code": "代码", "name": "名称", "source": "类型", "signal_source": "选股来源", "strategy_name": "策略名称",
                              "side": "方向", "price": "成交价", "shares": "数量", "amount": "成交金额",
                              "fee": "佣金", "tax": "印花税"})
+                show["选股来源"] = show["选股来源"].map(
+                    {"satellite_scan": "卫星轨", "sched_pool_scan": "主轨", "manual": "手动", "reconcile_fix": "对账补记"}
+                ).fillna(show["选股来源"].fillna("历史未标记"))
                 show["方向"] = show["方向"].map({"buy": "买入", "sell": "卖出"})
                 show["类型"] = show["类型"].map({"ai": "AI", "manual": "手动"}).fillna("手动")
                 st.dataframe(show, hide_index=True, width='stretch')

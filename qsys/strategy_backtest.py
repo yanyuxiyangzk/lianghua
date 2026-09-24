@@ -24,6 +24,9 @@ COST = 0.0025  # 双边交易成本
 def backtest_strategy(strategy_name: str, pool_name: str = "沪深300",
                       top_n: int = 10, hold_days: int = 5) -> dict:
     """对策略包做组合回测，返回完整指标。"""
+    if any(isinstance(v, bool) or not isinstance(v, (int, np.integer)) or v <= 0
+           for v in (top_n, hold_days)):
+        return {"ok": False, "msg": "选股数量和持有期必须为正整数"}
     # 读策略包
     with library._lconn() as c:
         row = c.execute(
@@ -81,10 +84,8 @@ def backtest_strategy(strategy_name: str, pool_name: str = "沪深300",
     norms = sig.scoring_norms(list(weights), factors)
 
     # 获取所有交易日
-    all_dates = sorted(set(
-        dt for vals in vals_norm.values()
-        for dt in vals.index.get_level_values("datetime").unique()
-    ))
+    # 持有期以行情交易日为准，不能让因子缺失日期改变回测时钟。
+    all_dates = sorted(fwd.index.unique())
     start_dt = pd.Timestamp(start)
     end_dt = pd.Timestamp(end)
     all_dates = [d for d in all_dates if start_dt <= pd.Timestamp(d) <= end_dt]
@@ -103,10 +104,14 @@ def backtest_strategy(strategy_name: str, pool_name: str = "沪深300",
         dt = all_dates[i]
         dt_str = str(dt)[:10]
 
+        for name, (weight, _) in weights.items():
+            if weight > 0 and dt not in vals_norm[name].index.get_level_values("datetime"):
+                return {"ok": False, "msg": f"调仓日因子 {name} 缺失，不能回测残缺策略"}
+
         # 截面打分：cs_norm 分派 × 权重 × 方向（与 walk_forward 一致；legacy 开关下为原 zscore）
         sc = fe._score_at(vals_norm, weights, dt, norms=norms)
         if sc.empty:
-            continue
+            return {"ok": False, "msg": "调仓日无有效因子评分，回测不完整"}
 
         # 选 Top-N
         ranked = sc.sort_values(ascending=False)
@@ -151,7 +156,7 @@ def backtest_strategy(strategy_name: str, pool_name: str = "沪深300",
 
     nav_series = pd.Series(nav, index=range(len(nav)))
     total_return = nav[-1] / nav[0] - 1
-    years = len(nav_series) * hold_days / 252
+    years = (len(nav_series) - 1) * hold_days / 252
     ann_return = (1 + total_return) ** (1 / max(years, 0.1)) - 1 if total_return > -1 else -1
 
     # 最大回撤

@@ -299,7 +299,10 @@ def _buy_rejection(c, code, source, shares, price, exclude_order=-1) -> str:
             level = state.get('level', 'normal')
             target = min(target, experience.get_account_risk_config().get(level + '_target', target))
             if state.get('target_position_ratio') is not None:
-                target = min(target, float(state['target_position_ratio']))
+                reported_target = float(state['target_position_ratio'])
+                if not math.isfinite(reported_target) or not 0 <= reported_target <= 1:
+                    return '风控拦截：目标仓位无效'
+                target = min(target, reported_target)
     except FileNotFoundError:
         pass  # risk_halt_today 已负责缺失拦截
     except Exception:
@@ -734,7 +737,7 @@ def _day_pnl_by_code(positions: pd.DataFrame, fills: pd.DataFrame, prices: dict)
 
 
 # ---------------------------------------------------------------- 查询
-def get_account() -> dict:
+def get_account(require_fresh: bool = False) -> dict:
     """账户总览：总资产/可用资金/持仓市值/持仓盈亏/今日盈亏。"""
     _init_account()
     _settle_today()
@@ -747,15 +750,26 @@ def get_account() -> dict:
     codes = set(poss['code']) | set(fills['code'])
     prices = _latest_prices(list(codes))
     day_pnl = sum(_day_pnl_by_code(poss, fills, prices).values())
+    invalid_codes = []
+    for code in set(poss.loc[poss['shares'] > 0, 'code']):
+        mark = (prices.get(code) or (None,))[0]
+        try:
+            valid = math.isfinite(float(mark)) and float(mark) > 0
+        except (TypeError, ValueError, OverflowError):
+            valid = False
+        if not valid or (require_fresh and not _quote_fresh(code)):
+            invalid_codes.append(code)
+    valuation = {"估值有效": not invalid_codes and math.isfinite(cash),
+                 "估值异常股票": sorted(invalid_codes)}
     if poss.empty:
         return {"总资产": cash, "可用资金": available, "冻结资金": cash - available, "持仓市值": 0.0,
-                "持仓盈亏": 0.0, "今日盈亏": day_pnl}
+                "持仓盈亏": 0.0, "今日盈亏": day_pnl, **valuation}
     poss["最新价"] = poss["code"].map(lambda x: (prices.get(x) or (None, None))[0])
     poss["昨收"] = poss["code"].map(lambda x: (prices.get(x) or (None, None))[1])
     mv = (poss["最新价"].fillna(poss["cost"]) * poss["shares"]).sum()
     pos_pnl = ((poss["最新价"].fillna(poss["cost"]) - poss["cost"]) * poss["shares"]).sum()
     return {"总资产": cash + mv, "可用资金": available, "冻结资金": cash - available, "持仓市值": mv,
-            "持仓盈亏": pos_pnl, "今日盈亏": day_pnl}
+            "持仓盈亏": pos_pnl, "今日盈亏": day_pnl, **valuation}
 
 
 def get_positions() -> pd.DataFrame:

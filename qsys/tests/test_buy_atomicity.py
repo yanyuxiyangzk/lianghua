@@ -56,6 +56,20 @@ class AtomicBuyTests(unittest.TestCase):
             return tuple(c.execute(f'SELECT COUNT(*) FROM {t}').fetchone()[0]
                          for t in ['broker_orders', 'broker_fills', 'broker_positions'])
 
+    def test_account_marks_missing_and_stale_quotes(self):
+        self.assertIn('已成交', broker.buy_position(self.pid, 100))
+        self.assertTrue(broker.get_account(require_fresh=True)['估值有效'])
+        with patch.object(broker, '_latest_prices', return_value={}):
+            account = broker.get_account(require_fresh=True)
+            self.assertFalse(account['估值有效'])
+            self.assertEqual(account['估值异常股票'], ['SZ002709'])
+        with patch.object(broker, '_quote_fresh', return_value=False):
+            self.assertFalse(broker.get_account(require_fresh=True)['估值有效'])
+
+    def test_empty_account_needs_no_quote(self):
+        with patch.object(broker, '_quote_fresh', return_value=False):
+            self.assertTrue(broker.get_account(require_fresh=True)['估值有效'])
+
     def test_repeat_and_cross_source(self):
         self.assertIn('已成交', broker.buy_position(self.pid, 100))
         self.assertIn('已处理', broker.buy_position(self.pid, 100))
@@ -303,6 +317,15 @@ class AtomicBuyTests(unittest.TestCase):
         with broker._conn() as c:
             self.assertAlmostEqual(c.execute("SELECT SUM(shares*buy_price) FROM positions WHERE status='open'").fetchone()[0],3300.)
         self.assertIn('对账一致',experience.position_reconcile('2026-09-23'))
+
+    def test_invalid_reported_target_cannot_be_ignored(self):
+        import json
+        for value in (float('nan'), float('inf'), -0.1, 1.1):
+            experience._RISK_FLAG.write_text(json.dumps({
+                'date': '2026-09-23', 'halt': False, 'level': 'normal',
+                'target_position_ratio': value}))
+            self.assertIn('目标仓位无效', broker.place_order('SH600000', 'buy', 9.5, 100))
+        self.assertEqual(self.counts(), (0, 0, 0))
 
     def test_account_target_counts_pending_orders(self):
         with patch.object(experience,'get_account_risk_config',lambda:{'normal_target':.02}):

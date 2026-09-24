@@ -37,9 +37,17 @@ def _query(sql, params=()):
 
 def check_sector(code, asof=None):
     asof = asof or datetime.now().strftime("%Y-%m-%d")
-    row = _query("SELECT sector_name FROM stock_industry WHERE code=? AND substr(updated_at,1,10)<=?", (code, asof))
+    row = _query("SELECT sector_name, updated_at FROM stock_industry WHERE code=? AND substr(updated_at,1,10)<=?", (code, asof))
     if not row or not row[0]:
         return _r("insufficient_data", "缺少股票板块归属")
+    try:
+        updated = datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        if updated > datetime.now(ZoneInfo("Asia/Shanghai")):
+            return _r("insufficient_data", "板块归属更新时间在未来")
+    except (TypeError, ValueError):
+        return _r("insufficient_data", "板块归属更新时间无效")
     daily = _query("SELECT date FROM sector_daily WHERE sector_name=? AND date<=? ORDER BY date DESC LIMIT 1", (row[0], asof))
     if not daily:
         return _r("insufficient_data", "缺少板块日线", sector=row[0])
@@ -47,12 +55,17 @@ def check_sector(code, asof=None):
 
 def check_financial(code, asof=None, required=True):
     asof = asof or datetime.now().strftime("%Y-%m-%d")
-    row = _query("SELECT report_date, fetched_at FROM ifind_financial "
+    row = _query("SELECT report_date, fetched_at, value FROM ifind_financial "
                  "WHERE code IN (?,?) AND report_date<=? AND substr(fetched_at,1,10)<=? "
                  "AND value IS NOT NULL ORDER BY report_date DESC LIMIT 1",
                  (code, code[-6:], asof, asof))
     if row is None:
         return _r("insufficient_data", "缺少可用财务数据") if required else _r("pass", "财务数据非必需")
+    try:
+        if not math.isfinite(float(row[2])):
+            return _r("insufficient_data", "财务指标值无效")
+    except (TypeError, ValueError, OverflowError):
+        return _r("insufficient_data", "财务指标值无效")
     try:
         fetched = datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
         if fetched.tzinfo is None:

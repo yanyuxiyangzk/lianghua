@@ -1678,9 +1678,13 @@ def snapshot_nav_today() -> str:
     """每日收盘后落库当日净值（TWR 口径，与 rebuild 同源）。返回日期。"""
     import broker
     acc = broker.get_account()
+    if acc.get("估值有效") is not True:
+        raise ValueError("持仓估值无效，拒绝写入净值快照")
     total = acc.get("总资产", 0) or 0
     cash = (acc.get("可用资金", 0) or 0) + (acc.get("冻结资金", 0) or 0)
     mv = acc.get("持仓市值", 0) or 0
+    if not all(np.isfinite(v) for v in (total, cash, mv)) or total <= 0 or mv < 0:
+        raise ValueError("账户资产数据无效，拒绝写入净值快照")
     day = datetime.now().strftime("%Y-%m-%d")
     with _conn() as c:
         c.executescript(_NAV_SCHEMA)
@@ -1955,9 +1959,16 @@ def portfolio_risk(use_live: bool = False) -> dict:
         return {"ok": False, "reason": "净值序列不足 5 日"}
     with _conn() as c:
         df = pd.read_sql("SELECT date, daily_ret, drawdown FROM account_nav_daily ORDER BY date", c)
-    acc = broker.get_account()
+    acc = broker.get_account(require_fresh=use_live)
+    if acc.get("估值有效") is not True:
+        return {"ok": False, "reason": "持仓估值缺失、无效或行情过期"}
     total = acc.get("总资产", 0) or 0
-    sigma = float(df["daily_ret"].iloc[-20:].std())
+    if not np.isfinite(total) or total <= 0:
+        return {"ok": False, "reason": "账户总资产无效"}
+    returns = pd.to_numeric(df["daily_ret"].iloc[-20:], errors="coerce")
+    if len(returns) < 5 or not np.isfinite(returns.to_numpy()).all():
+        return {"ok": False, "reason": "净值收益序列缺失或无效"}
+    sigma = float(returns.std())
     var_day = 1.65 * sigma * total
     circuit_line = -2 * sigma * np.sqrt(5)
 
@@ -1972,12 +1983,19 @@ def portfolio_risk(use_live: bool = False) -> dict:
                 live_nav = float(last["nav"]) * total / float(last["total_assets"])
                 peak_nav = max(float(nav_df["nav"].max()), live_nav)
                 dd_now = live_nav / peak_nav - 1 if peak_nav > 0 else 0.0
+                nav_values = pd.to_numeric(nav_df["nav"], errors="coerce")
+                if (not np.isfinite(nav_values.to_numpy()).all()
+                        or (nav_values <= 0).any()
+                        or not np.isfinite(float(last["total_assets"]))):
+                    return {"ok": False, "reason": "实时风控净值基准无效"}
             else:
-                dd_now = float(df["drawdown"].iloc[-1])
+                return {"ok": False, "reason": "实时风控缺少净值基准"}
         except Exception:
-            dd_now = float(df["drawdown"].iloc[-1])
+            return {"ok": False, "reason": "实时风控净值计算失败"}
     else:
         dd_now = float(df["drawdown"].iloc[-1])
+    if not np.isfinite(dd_now) or not -1 <= dd_now <= 0:
+        return {"ok": False, "reason": "账户回撤无效"}
 
     # σ 地板：净值近乎不动的账户（新建/空仓）熔断线≈0 会永久停开仓——无波动信号不熔断
     # P1-5修复：降低 σ 地板到 0.001，减少新账户豁免

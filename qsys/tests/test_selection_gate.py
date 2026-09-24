@@ -78,6 +78,19 @@ class GateTests(unittest.TestCase):
         self.db.execute('UPDATE ifind_financial SET fetched_at=?',(future,))
         self.assertEqual(gate.check_financial('SZ002709').status,'insufficient_data')
 
+    def test_future_intraday_sector_rejected(self):
+        self.seed()
+        from datetime import timedelta
+        future = (datetime.now(ZoneInfo('Asia/Shanghai')) + timedelta(seconds=30)).isoformat()
+        self.db.execute('UPDATE stock_industry SET updated_at=?', (future,))
+        self.assertEqual(gate.check_sector('SZ002709').status, 'insufficient_data')
+
+    def test_nonfinite_financial_rejected(self):
+        self.seed()
+        for value in (float('inf'), -float('inf'), 'invalid'):
+            self.db.execute('UPDATE ifind_financial SET value=?', (value,))
+            self.assertEqual(gate.check_financial('SZ002709').status, 'insufficient_data')
+
     def test_invalid_price_and_stale_time(self):
         self.seed()
         self.db.execute('UPDATE ifind_realtime SET price=-1')

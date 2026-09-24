@@ -1622,6 +1622,8 @@ def rebuild_nav_history() -> int:
         px = pd.read_sql(
             "SELECT code, date, close FROM market_daily WHERE source='ths_ifind' AND date>=?",
             c, params=(first_day,))
+    if px.empty:
+        raise ValueError("行情为空，拒绝覆盖历史净值")
     cal = sorted(px["date"].unique())
     close = px.pivot(index="date", columns="code", values="close").ffill()  # 停牌沿用前收
 
@@ -1656,8 +1658,9 @@ def rebuild_nav_history() -> int:
             for cd, sh in hold.items():
                 if sh > 0:
                     p = prow.get(cd)
-                    if pd.notna(p):
-                        mv += p * sh
+                    if pd.isna(p) or not np.isfinite(float(p)) or float(p) <= 0:
+                        raise ValueError(f"{day} {cd} 持仓缺少有效价格，拒绝覆盖历史净值")
+                    mv += float(p) * sh
         total = cash + mv
         if prev_total:
             r = (total - ext) / prev_total - 1

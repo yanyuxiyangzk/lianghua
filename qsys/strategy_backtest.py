@@ -68,8 +68,15 @@ def backtest_strategy(strategy_name: str, pool_name: str = "沪深300",
     weights = {}
     for f in factors:
         if f["name"] in factor_vals:
-            weights[f["name"]] = (f.get("weight", 1.0), f.get("direction", 1))
-    if not weights:
+            try:
+                weight = float(f.get("weight", 1.0))
+                direction = float(f.get("direction", 1))
+            except (TypeError, ValueError, OverflowError):
+                return {"ok": False, "msg": "因子权重或方向无效"}
+            if not np.isfinite(weight) or weight < 0 or direction not in (-1, 1):
+                return {"ok": False, "msg": "因子权重或方向无效"}
+            weights[f["name"]] = (weight, direction)
+    if not weights or not any(w > 0 for w, _ in weights.values()):
         return {"ok": False, "msg": "无有效权重"}
 
     # 预计算归一化因子值（z-score）

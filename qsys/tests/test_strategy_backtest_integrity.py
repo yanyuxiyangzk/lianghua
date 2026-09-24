@@ -56,6 +56,25 @@ class Tests(unittest.TestCase):
         self.assertFalse(result['ok'])
         self.assertIn('调仓日', result['msg'])
 
+    def test_invalid_weights_and_directions_rejected(self):
+        panel, vals = _make_panel_and_vals(n_days=40)
+        configs = [{'weight': v} for v in (float('nan'), float('inf'), -1, None, 0)]
+        configs += [{'direction': v} for v in (0, 2, float('nan'), None)]
+        for cfg in configs:
+            with self.subTest(cfg=cfg), ExitStack() as st:
+                conn = MagicMock()
+                conn.__enter__.return_value.execute.return_value.fetchone.return_value = (
+                    json.dumps([{'name': 'a', **cfg}]), '等权', 'fixture')
+                st.enter_context(patch.object(sb.library, '_lconn', return_value=conn))
+                st.enter_context(patch.object(sb, 'all_pools', return_value={'fixture': list(range(35))}))
+                st.enter_context(patch.object(sb, 'get_last_trade_day', return_value='2023-03-01'))
+                st.enter_context(patch.object(sb, 'trade_day_offset', return_value='2023-01-01'))
+                st.enter_context(patch.object(sb.sig, 'get_panel_cached', return_value=panel))
+                st.enter_context(patch.object(sb.fe, 'get_factor_values', return_value=vals))
+                result = sb.backtest_strategy('fixture')
+                self.assertFalse(result['ok'])
+                self.assertIn('权重', result['msg'])
+
     def test_failed_factor_invalidates_report(self):
         panel, vals = _make_panel_and_vals(n_days=40)
         conn=MagicMock()

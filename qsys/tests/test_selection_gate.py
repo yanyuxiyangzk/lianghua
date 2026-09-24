@@ -85,6 +85,16 @@ class GateTests(unittest.TestCase):
         self.db.execute('UPDATE stock_industry SET updated_at=?', (future,))
         self.assertEqual(gate.check_sector('SZ002709').status, 'insufficient_data')
 
+    def test_historical_asof_uses_shanghai_date(self):
+        self.seed()
+        self.db.execute("UPDATE ifind_financial SET report_date='2020-01-01', fetched_at='2020-01-02T20:00:00+00:00'")
+        self.db.execute("UPDATE stock_industry SET updated_at='2020-01-02T20:00:00+00:00'")
+        self.db.execute("UPDATE sector_daily SET date='2020-01-02'")
+        self.assertEqual(gate.check_financial('SZ002709', asof='2020-01-02').status, 'insufficient_data')
+        self.assertEqual(gate.check_sector('SZ002709', asof='2020-01-02').status, 'insufficient_data')
+        self.assertEqual(gate.check_financial('SZ002709', asof='2020-01-03').status, 'pass')
+        self.assertEqual(gate.check_sector('SZ002709', asof='2020-01-03').status, 'pass')
+
     def test_nonfinite_financial_rejected(self):
         self.seed()
         for value in (float('inf'), -float('inf'), 'invalid'):

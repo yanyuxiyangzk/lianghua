@@ -190,9 +190,11 @@ def backtest_strategy(strategy_name: str, pool_name: str = "沪深300",
         dt = all_dates[i]
         if dt in fwd.index:
             day_fwd = fwd.loc[dt]
-            available = [c for c in day_fwd.index if pd.notna(day_fwd[c])]
-            if available:
-                eq_ret = float(day_fwd[available].mean())
+            available_returns = day_fwd.dropna()
+            if not np.isfinite(available_returns.to_numpy(dtype=float)).all():
+                return {"ok": False, "msg": "对照组合未来收益非有限值，回测不完整"}
+            if not available_returns.empty:
+                eq_ret = float(available_returns.mean())
                 eq_nav.append(eq_nav[-1] * (1 + eq_ret))
     eq_total = eq_nav[-1] / eq_nav[0] - 1 if len(eq_nav) > 1 else 0
     eq_ann = (1 + eq_total) ** (1 / max(years, 0.1)) - 1 if eq_total > -1 else 0

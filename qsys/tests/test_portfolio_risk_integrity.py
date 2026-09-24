@@ -35,6 +35,19 @@ class Tests(unittest.TestCase):
         for value in (False, None):
             self.assertFalse(self.run_risk(valuation=value)['ok'])
 
+    def test_satellite_rechecks_changed_risk_state(self):
+        import json
+        flag = MagicMock()
+        for state in ({'date': '2026-09-23', 'halt': False, 'level': 'normal'},
+                      {'date': '2026-09-24', 'halt': True, 'level': 'normal'},
+                      {'date': '2026-09-24', 'halt': 'false', 'level': 'normal'}):
+            flag.read_text.return_value = json.dumps(state)
+            with patch.object(experience, 'risk_halt_today', return_value=(False, '')), patch.object(experience, '_RISK_FLAG', flag):
+                self.assertTrue(experience.satellite_halt_today('2026-09-24')[0])
+        flag.read_text.return_value = json.dumps({'date': '2026-09-24', 'halt': False, 'level': 'normal'})
+        with patch.object(experience, 'risk_halt_today', return_value=(False, '')), patch.object(experience, '_RISK_FLAG', flag):
+            self.assertFalse(experience.satellite_halt_today('2026-09-24')[0])
+
     def test_valid_live_drawdown(self):
         result = self.run_risk()
         self.assertTrue(result['ok'])

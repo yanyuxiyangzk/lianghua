@@ -44,6 +44,8 @@ def check_sector(code, asof=None):
         updated = datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
         if updated.tzinfo is None:
             updated = updated.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        if updated.astimezone(ZoneInfo("Asia/Shanghai")).date() > datetime.fromisoformat(asof).date():
+            return _r("insufficient_data", "板块归属在查询日期之后才可用")
         if updated > datetime.now(ZoneInfo("Asia/Shanghai")):
             return _r("insufficient_data", "板块归属更新时间在未来")
     except (TypeError, ValueError):
@@ -70,6 +72,8 @@ def check_financial(code, asof=None, required=True):
         fetched = datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
         if fetched.tzinfo is None:
             fetched = fetched.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        if fetched.astimezone(ZoneInfo("Asia/Shanghai")).date() > datetime.fromisoformat(asof).date():
+            return _r("insufficient_data", "财务数据在查询日期之后才可用")
         if fetched > datetime.now(ZoneInfo("Asia/Shanghai")):
             return _r("insufficient_data", "财务采集时间在未来")
     except (TypeError, ValueError):

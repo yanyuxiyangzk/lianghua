@@ -2028,7 +2028,10 @@ def satellite_halt_today(today: str) -> tuple[bool, str]:
         return halt, reason
     try:
         state = json.loads(_RISK_FLAG.read_text())
-        return state.get("level") != "normal", state.get("reason", "账户风险预警")
+        if (state.get("date") != today or state.get("halt") is not False
+                or state.get("level") != "normal"):
+            return True, state.get("reason") or "卫星来源风控状态无效或限制开仓"
+        return False, state.get("reason", "")
     except Exception:
         return True, "风控状态读取失败"
 

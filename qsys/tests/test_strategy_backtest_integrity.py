@@ -75,6 +75,27 @@ class Tests(unittest.TestCase):
                 self.assertFalse(result['ok'])
                 self.assertIn('权重', result['msg'])
 
+    def test_infinite_benchmark_return_invalidates_report(self):
+        panel, vals = _make_panel_and_vals(n_days=40)
+        fwd = sb.fe.forward_returns(panel, 5)
+        fwd.iloc[0, -1] = float('inf')
+        conn = MagicMock()
+        conn.__enter__.return_value.execute.return_value.fetchone.return_value = (
+            json.dumps([{'name': 'a'}]), '等权', 'fixture')
+        with ExitStack() as st:
+            st.enter_context(patch.object(sb.library, '_lconn', return_value=conn))
+            st.enter_context(patch.object(sb, 'all_pools', return_value={'fixture': list(range(35))}))
+            st.enter_context(patch.object(sb, 'get_last_trade_day', return_value='2023-03-01'))
+            st.enter_context(patch.object(sb, 'trade_day_offset', return_value='2023-01-01'))
+            st.enter_context(patch.object(sb.sig, 'get_panel_cached', return_value=panel))
+            st.enter_context(patch.object(sb.sig, 'scoring_norms', return_value=None))
+            st.enter_context(patch.object(sb.fe, 'get_factor_values', return_value=vals))
+            st.enter_context(patch.object(sb.fe, 'forward_returns', return_value=fwd))
+            st.enter_context(patch.object(sb.fe, '_score_at', return_value=pd.Series([1.], index=[fwd.columns[0]])))
+            result = sb.backtest_strategy('fixture', top_n=1)
+        self.assertFalse(result['ok'])
+        self.assertIn('对照组合', result['msg'])
+
     def test_failed_factor_invalidates_report(self):
         panel, vals = _make_panel_and_vals(n_days=40)
         conn=MagicMock()

@@ -1000,34 +1000,20 @@ def job_loopengine(batch: int = 50, **_ignored) -> str:
     """LoopEngine 演化引擎：每轮 生成→审查→验证→入库（检查点自动保存）。
     按 iteration 轮转 DEFAULT_FACTOR_TYPES 全部因子类型（含财务/支撑阻力/事件记忆）。
     每 4 轮自动插入 1 轮事件定向挖掘（涨停/大涨/跌停轮转）。"""
-    from loopengine.engine import LoopEngine, DEFAULT_FACTOR_TYPES
-
-    eng = LoopEngine("沪深300")
-    factor_type = DEFAULT_FACTOR_TYPES[eng.state["iteration"] % len(DEFAULT_FACTOR_TYPES)]
-    r = eng.run_round(batch=batch, factor_type=factor_type)
-    msg = (f"第{r['iteration']}轮[{factor_type}] · 测试{r['tested']} · 过审拒绝{r.get('rejected_review', 0)} · "
-           f"LLM否决{r.get('llm_rejected', 0)} · 重复{r.get('dup', 0)} · FSA拦截{r.get('frozen', 0)} · 入库{r.get('passed', 0)} {r.get('new', [])[:3]}")
-    ev = r.get("event_round")
-    if ev:
-        msg += f" | 事件[{ev['kind']}]:测试{ev['tested']}·重复{ev['dup']}·入库{ev['passed']} {ev.get('new', [])[:2]}"
-    return msg
+    return "全天轮动入口已停用，请使用每日盘后批次"
 
 
 def job_multitype_mine(batch_per_type: int = 25, pool_name: str = "沪深300",
                        factor_types: str = "", **_ignored) -> str:
     """多类型因子挖掘：遍历 DEFAULT_FACTOR_TYPES 的全部类型。
     factor_types 为空时挖掘全部类型，逗号分隔可指定子集。"""
-    from loopengine.engine import LoopEngine, DEFAULT_FACTOR_TYPES
-
-    eng = LoopEngine(pool_name)
+    from mining_policy import run_daily
     types = [t.strip() for t in factor_types.split(",") if t.strip()] if factor_types else None
-    result = eng.run_multi_type_round(batch_per_type=batch_per_type, factor_types=types)
-    rounds = result.get("rounds", {})
-    parts = []
-    for ft, r in rounds.items():
-        parts.append(f"{ft}:{r['passed']}个")
-    return (f"多类型挖掘完成 · 类型={','.join(result.get('types_mined', []))} · "
-            f"{' · '.join(parts)}")
+    return run_daily(pool_name, batch_per_type, types,
+                     daily_batches=_ignored.get('daily_batches', 1),
+                     rotations=_ignored.get('rotations', 1),
+                     skip_unchanged=_ignored.get('skip_unchanged', True),
+                     manual=_ignored.get('manual', False))
 
 
 def job_event_mine(kind: str = "涨停", batch: int = 30, horizon: int = 5,
@@ -1035,12 +1021,7 @@ def job_event_mine(kind: str = "涨停", batch: int = 30, horizon: int = 5,
     """事件定向挖因子：围绕「涨停/大涨/跌停/创新高」做事件目标演化，
     入库前缀 ev_（gate_status=2 事件闸门，区别于收益管线）。
     factor_type 可切换挖掘字段域（如 资金流——汉王复盘：首板的核心是资金突变）。"""
-    from loopengine.engine import LoopEngine
-
-    eng = LoopEngine(pool_name)
-    r = eng.run_event_round(kind, batch=batch, horizon=horizon, factor_type=factor_type)
-    return (f"事件[{kind}|{horizon}日] 第{r['iteration']}轮 · 测试{r['tested']} · "
-            f"重复{r['dup']} · FSA拦截{r['frozen']} · 入库{r['passed']} {r['new'][:3]}")
+    return "独立事件挖掘已停用，统一使用每日盘后批次"
 
 
 def job_ev_dual_gate(pool_name: str = "沪深300", **_ignored) -> str:
@@ -2235,118 +2216,13 @@ def job_ifind_cleanup(**_ignored) -> str:
 
 
 def job_le_factor_eval(batch: int = 500, pool_name: str = "沪深300") -> str:
-    """因子滚动体检（每日三批）：经典层全量重评 + 进化层边际价值清队列。
-
-    两层结构：
-      经典层（tech/builtin，每次全量重评）——评分卡驱动每日策略包选因子/定权重/定方向，
-        必须当日新鲜（2026-09-11 踩坑：LE 包用了 17 天前的评分，方向与最新 IC 相反）；
-      进化层（loopengine，按边际价值排序清未体检队列）：
-        1. 非量价因子优先（资金流/板块轮动/龙虎榜/盘口异动/指数）—— 多元化验证
-        2. gate_detail_log 中 IC 最高的未体检因子 —— 高质量因子优先验证
-        3. 与已体检因子相关性 < 0.70 的因子 —— 增加多样性
-        4. 族配额兜底：同族覆盖越少越优先 —— 避免单一族垄断
-    """
-    import factor_eval as fe
-    import library
-
-    reg = library.get_factor_registry()
-    le = reg[reg["engine"] == "loopengine"] if not reg.empty else reg
-    # 经典层 = tech/builtin + manual（在线因子实验室手工入库的因子同管线每日体检）
-    classic = reg[reg["kind"].isin(["tech", "builtin", "manual"])] if not reg.empty else reg
-    if le.empty and classic.empty:
-        return "无因子，跳过"
-
-    with library._lconn() as c:
-        # 已体检因子
-        evaluated = dict(c.execute(
-            "SELECT name, MAX(updated_at) FROM factor_scorecards GROUP BY name").fetchall())
-        # 闸门IC数据（用于质量排序）
-        ic_map = {}
-        for row in c.execute(
-            "SELECT factor_name, CAST(json_extract(metrics, '$.IC') AS REAL) "
-            "FROM gate_detail_log WHERE passed=1"
-        ).fetchall():
-            ic_map[row[0]] = abs(row[1]) if row[1] else 0
-
-    # 经典层也做滚动重评。经典因子虽只有约百个，但每次全量构建多周期回测会
-    # 长时间占用调度线程，进而阻塞选股/持仓任务。优先选择最久未评估的因子，
-    # 单轮最多占 batch 的 20%（至少 10、最多 30 个）。
-    classic_quota = min(30, max(10, int(batch) // 5))
-    classic = classic.assign(
-        _eval_at=classic["name"].map(lambda n: evaluated.get(n, ""))) if not classic.empty else classic
-    classic_pick = classic.sort_values("_eval_at", na_position="first").head(classic_quota)
-    classic_facs = [{"name": r["name"], "kind": r["kind"], "code": None,
-                     "first_seen": r.get("first_seen")}
-                    for _, r in classic_pick.iterrows()]
-
-    # 进化层：未体检队列按边际价值取剩余配额
-    picked = pd.DataFrame()
-    if not le.empty:
-        # 标记未体检因子
-        le = le.assign(
-            _eval_at=le["name"].map(lambda n: evaluated.get(n, "")),
-            _ic=le["name"].map(lambda n: ic_map.get(n, 0)),
-        )
-        le["_fam"] = le["family"].fillna("其他").astype(str) if "family" in le.columns else "其他"
-        uneval = le[le["_eval_at"] == ""].copy()
-    else:
-        uneval = le
-    if not uneval.empty:
-        fam_cov = le.groupby("_fam", dropna=False)["_eval_at"].apply(lambda s: int((s != "").sum()))
-        fam_total = le.groupby("_fam", dropna=False).size()
-        # 族覆盖率越低，优先级越高（0~1，越小越优先）
-        uneval["_fam_score"] = uneval["_fam"].map(
-            lambda f: fam_cov.get(f, 0) / max(fam_total.get(f, 1), 1))
-
-        # 因子类型权重：非量价优先
-        type_weights = {"量价": 0.0, "资金流": 1.0, "板块轮动": 0.9,
-                        "龙虎榜": 0.8, "盘口异动": 0.7, "指数": 0.6}
-        uneval["_type_weight"] = uneval["factor_type"].map(
-            lambda t: type_weights.get(t, 0.3) if pd.notna(t) else 0.3)
-
-        # 综合边际价值分 = IC质量(40%) + 类型多样性(35%) + 族覆盖(25%)
-        uneval["_marginal"] = (
-            uneval["_ic"].clip(0, 0.1) / 0.1 * 0.4   # IC归一化到0~1
-            + uneval["_type_weight"] * 0.35
-            + (1 - uneval["_fam_score"]) * 0.25         # 族覆盖越少分越高
-        )
-
-        # 按边际价值降序取剩余配额（经典层占掉的名额先扣）
-        quota = max(int(batch) - len(classic_facs), 0)
-        picked = uneval.nlargest(quota, "_marginal") if quota else uneval.iloc[0:0]
-
-    codes = all_pools().get(pool_name) or []
-    if len(codes) < 30:
-        return f"池 {pool_name} 为空，跳过"
-    end = get_last_trade_day()
-    train_end = trade_day_offset(end, -250)
-    facs = classic_facs + [{"name": r["name"], "kind": "loopengine", "code": r["code"],
-                            "first_seen": r.get("first_seen")}
-                           for _, r in picked.iterrows()]
-    if not facs:
-        return "所有进化因子已体检，经典层无可评，跳过"
-
-    # P2+P3+P4: 批量计算因子值（一次构建面板，批量计算所有因子，跳过已有缓存，大批次并行）
-    if len(facs) > 50:
-        # 调度器进程可能由 Streamlit 动态加载模块；跨进程提交模块函数会触发
-        # "not the same object as factor_eval._eval_single_factor" 的 pickle 错误。
-        # 调度体检优先保证可靠完成，使用串行 worker（内部仍复用面板/因子值缓存）。
-        card = fe.build_scorecard_parallel(facs, codes, end, train_end=train_end, max_workers=1)
-    else:
-        card = fe.build_scorecard_batch(facs, codes, end, train_end=train_end)
-    library.save_scorecard(card, pool_name, end)
-    ok = card.dropna(subset=["ICIR"])
-
-    # 统计边际价值分布
-    type_counts = picked["factor_type"].value_counts() if not picked.empty else {}
-    type_summary = " ".join(f"{t}:{n}" for t, n in type_counts.items()) if len(type_counts) else ""
-
-    n_le = len(facs) - len(classic_facs)
-    n_le_new = n_le - len([n for n in picked["name"] if n in evaluated]) if "name" in picked else n_le
-    return (f"体检 {len(facs)} 个（经典 {len(classic_facs)} · 进化 {n_le} · 有效 {len(ok)} 个），"
-            f"类型: {type_summary or '—'}，"
-            f"进化累计已评估 {len(evaluated) + n_le_new}"
-            f"/{len(reg[reg['engine']=='loopengine'])}")
+    """统一版本化体检队列，生成唤醒与定时任务共用跨进程锁。"""
+    from factor_evaluation_queue import run, coverage
+    message = run(pool_name, batch)
+    c = coverage(pool_name)
+    # Pending count is intentionally explicit: valid/sample-insufficient are terminal
+    # research outcomes for this window, not silently counted as successful factors.
+    return f"{message} · 覆盖 {c['done']}/{c['total']} ({c['coverage']:.2%}) · 待处理 {c['pending']}"
 
 
 def job_fundflow_sync(pool_name: str = "自选股", lookback_days: int = 30, **_ignored) -> str:
@@ -2434,17 +2310,27 @@ def _get_top_factors_for_pack(pool_name: str, top_n: int = 15, asof: str | None 
             # builtin + evolved 因子都参与，按 ICIR 绝对值排序
             rows = c.execute('''
                 SELECT fs.name, fs.kind, fs.ic_mean, fs.icir, fs.ic_winrate,
-                       fs.top_winrate, fs.direction, fr.code, fr.theory_id, fr.hypothesis_id, fr.family, fr.theory_family, fr.regime_scope, fr.evidence_type, fr.factor_type
+                       fs.top_winrate, fs.direction, fr.code, fr.theory_id, fr.hypothesis_id, fr.family, fr.theory_family, fr.regime_scope, fr.evidence_type, fr.factor_type, fs.eval_date
                 FROM factor_scorecards fs
                 LEFT JOIN factor_registry fr ON fs.name = fr.name
                 WHERE fs.pool_name = ? AND fs.eval_date BETWEEN date(?, '-30 days') AND ? AND fr.first_seen <= ?
                   AND fs.icir IS NOT NULL
-                  AND fs.kind IN ('内置', '技术指标', 'loopengine')
+                  AND fs.kind IN ('内置', '技术指标', 'loopengine', '演化引擎', '进化')
                 ORDER BY ABS(fs.icir) DESC
             ''', (pool_name, asof, asof, asof + " 23:59:59")).fetchall()
             
             factors = []
-            for name, kind, ic_mean, icir, ic_wr, top_wr, direction, code, theory_id, hypothesis_id, family, theory_family, regime_scope, evidence_type, factor_type in rows:
+            from factor_evaluation_queue import factor_version
+            import library
+            registry = library.get_factor_registry()
+            versions = {r['name']:factor_version(r) for r in registry.to_dict('records')}
+            with library._lconn() as lc:
+                verified = {(n, d):v for n,d,v in lc.execute(
+                    "SELECT name,eval_date,factor_version FROM factor_scorecards WHERE evaluation_status='valid' AND policy_version=? AND pool_name=?",
+                    (__import__('factor_evaluation_queue').POLICY,pool_name)).fetchall()}
+            for name, kind, ic_mean, icir, ic_wr, top_wr, direction, code, theory_id, hypothesis_id, family, theory_family, regime_scope, evidence_type, factor_type, score_date in rows:
+                if verified.get((name,score_date)) != versions.get(name) or name not in versions:
+                    continue
                 if icir is None:
                     continue
                 # kind 映射：scorecards 用中文，策略包用英文
@@ -2633,32 +2519,9 @@ def _generate_pack_candidates(pool_name: str, top_n: int = 10,
                 "avg_excess": avg_excess,
                 "data_end": end,  # P1-2：生成数据截止日（holdout 带左端）
             }
-            # 理论属性快照：策略必须说明因子为何可能有效，以及适用环境。
-            selected_meta = [f for f in factors if f.get("name") in selected]
-            families = {f.get("theory_family") or f.get("family") for f in selected_meta if f.get("theory_family") or f.get("family")}
-            regimes = {r for f in selected_meta for r in (f.get("regime_scope") or "all").split(",") if r}
-            evidence = {f.get("evidence_type") or f.get("factor_type") or "unclassified" for f in selected_meta}
-            pack_def["theory_family"] = ",".join(sorted(families)) if families else "unclassified"
-            pack_def["regime_scope"] = ",".join(sorted(regimes)) if regimes else "all"
-            pack_def["evidence_type"] = ",".join(sorted(evidence))
-            # 理论一致性：只有所有因子属于同一明确理论时才标记理论策略包；
-            # 历史/未归属因子仍可生成 legacy 包，但不冒充理论包。
-            theory_ids = {f.get("theory_id") for f in factors
-                          if f.get("name") in selected and f.get("theory_id")}
-            factor_theory_map = {f.get("name"): f.get("theory_id") for f in factors}
-            selected_theories = {factor_theory_map.get(n) for n in selected}
-            if len(selected_theories) == 1 and None not in selected_theories:
-                tid = next(iter(selected_theories))
-                pack_def["theory_id"] = tid
-                pack_def["theory_name"] = str(tid)
-                pack_def["risk_class"] = "event" if any(str(f.get("name", "")).startswith("ev_") for f in factors if f.get("name") in selected) else "stable"
-                pack_def["account_scope"] = "satellite" if pack_def["risk_class"] == "event" else "main"
-            else:
-                pack_def["theory_id"] = None
-                pack_def["theory_name"] = None
-                pack_def["risk_class"] = "unclassified"
-                pack_def["account_scope"] = "none"
-            
+            from theory_policy import inherit_strategy_theory
+            pack_def = inherit_strategy_theory(pack_def, {f["name"]: f for f in factors})
+
             # 尝试计算IS胜率：用静态回测（非walk-forward）
             try:
                 from factor_eval import static_backtest, compute_weights
@@ -2736,60 +2599,116 @@ def job_strategy_gen(pool_name: str = "沪深300", top_n: int = 10,
     return f"策略包自动生成：无新包（候选{len(candidates)}个，均未达门槛）"
 
 
-def revalidate_strategy(name: str) -> dict:
+def revalidate_strategy(name: str, timeout_seconds: float | None = None, *, isolated: bool = False) -> dict:
+    """Persist success and failure evidence; never publish a partial report."""
+    import library
+    from research_backtest import window_contract
+    from execution_gate import strategy_version
+    from validation_policy import POLICY_VERSION
+    pk = library.list_strategies().get(name)
+    if not pk:
+        return {"ok": False, "name": name, "error": "策略包不存在"}
+    if pk.get("status") in ("paused", "retired", "archived"):
+        return {"ok": False, "name": name, "error": "策略停用状态保持不变"}
+    end = get_last_trade_day()
+    from validation_trace import Trace, trace_run, ValidationTimeout
+    trace = Trace(name)
+    try:
+        with trace_run(trace, None if isolated else timeout_seconds):
+            if isolated:
+                from validation_worker import compute_isolated
+                result = compute_isolated(name, pk, end, timeout_seconds or 180)
+            else:
+                result = _compute_strategy_validation(name, pk, end)
+    except (Exception, ValidationTimeout) as exc:
+        result = {"ok": False, "error": str(exc), "error_type": type(exc).__name__}
+    result["run_id"] = trace.run_id
+    result["stage_events"] = trace.events
+    if not result.get("ok"):
+        result.update(name=name, eval_date=end, pool_name=pk.get("pool_name"),
+                      method=pk.get("method"), status="degraded", assessment_status="compute_failed",
+                      strategy_snapshot=pk, policy_version=POLICY_VERSION)
+        result.update(window_contract())
+    else:
+        result["assessment_status"] = "completed"
+    if result.get("error_type") == "ValidationTimeout":
+        result.update(assessment_status="timeout", strategy_version=strategy_version(pk))
+        saved = library.save_strategy_validation(name, result, publish=False)
+        trace.emit('run', 'timeout_archived', report_id=saved['report_id'])
+        return saved
+    # Detect definition drift before publishing evidence for the captured pack.
+    latest = library.list_strategies().get(name)
+    if latest is None or strategy_version(latest) != strategy_version(pk):
+        result.update(ok=False, error="计算期间策略版本已变更，结果仅归档", assessment_status="stale_version")
+        result["strategy_version"] = strategy_version(pk)
+        return library.save_strategy_validation(name, result, publish=False)
+    result["strategy_version"] = strategy_version(pk)
+    saved = library.save_strategy_validation(name, result, update_status=True,
+                                             expected_version=strategy_version(pk))
+    trace.emit('run', 'finished', report_id=saved['report_id'], published=saved['published'])
+    return saved
+
+
+def _compute_strategy_validation(name: str, pk: dict, end: str) -> dict:
     """单策略Walk-forward重验并持久化；自动选股资格由该结果控制。"""
+    from validation_trace import stage, ValidationTimeout
     import factor_eval as fe
     import library
     import numpy as np
-    packs = library.list_strategies()
-    pk = packs.get(name)
-    if not pk:
-        return {"ok": False, "name": name, "error": "策略包不存在"}
     pool_name = pk.get("pool_name") or "沪深300"
-    codes = all_pools().get(pool_name) or all_pools().get("沪深300")
-    end = get_last_trade_day()
-    panel = sig.get_panel_cached(codes, end, 800, source=datasource.get_loop_source())
+    with stage("universe"):
+        codes = all_pools().get(pool_name)
+    if not codes:
+        raise ValueError("策略股票池为空，禁止回退到其他股票池")
+    with stage("market_panel"):
+        panel = sig.get_panel_cached(codes, end, 800, source=datasource.get_loop_source())
     factor_vals = {}
     failed = []
     for fac in pk.get("factors", []):
         try:
-            vals = fe.get_factor_values(fac, codes, end, lookback_days=800,
-                                        source=datasource.get_loop_source())
+            with stage("factor:" + fac["name"]):
+                vals = fe.get_factor_values(fac, codes, end, lookback_days=800,
+                                            source=datasource.get_loop_source())
             if not vals.dropna().empty:
                 factor_vals[fac["name"]] = vals
+            else:
+                failed.append(f"{fac.get('name')}:empty_values")
+        except ValidationTimeout:
+            raise
         except Exception as exc:
             failed.append(f"{fac.get('name')}:{type(exc).__name__}")
     if pk.get("status") in ("paused", "retired", "archived"):
         return {"ok": False, "name": name, "error": "策略停用状态保持不变"}
-    if len(factor_vals) < 2:
-        result = {"ok": False, "name": name, "error": "有效因子不足2个",
+    if len(factor_vals) < 2 or failed or len(factor_vals) != len(pk.get('factors', [])):
+        result = {"ok": False, "name": name, "error": "有效因子不足或部分因子失败，不能重验残缺策略",
                   "valid_factors": len(factor_vals), "failed_factors": failed}
-        library.update_strategy_oos(name, 0.0, status="degraded")
         return result
-    wf = fe.walk_forward(factor_vals, panel, pk.get("method", "等权"),
-                         int(pk.get("top_n") or 10), fwd_days=5, step=10, min_factors=2)
+    with stage("walk_forward"):
+        wf = fe.walk_forward(factor_vals, panel, pk.get("method", "等权"),
+                             int(pk.get("top_n") or 10), fwd_days=5, step=10, min_factors=2)
     if wf.empty or "优化组合扣费超额" not in wf:
-        library.update_strategy_oos(name, 0.0, status="degraded")
         return {"ok": False, "name": name, "error": "Walk-forward无有效窗口"}
     net = wf["优化组合扣费超额"].dropna()
     oos = float((net > 0).mean()) if len(net) else 0.0
     avg_net = float(net.mean()) if len(net) else 0.0
-    nav = (1 + net).cumprod()
-    max_dd = float((nav / nav.cummax().clip(lower=1) - 1).min()) if len(nav) else 0.0
-    sharpe = float(net.mean() / (net.std() + 1e-12) * np.sqrt(252 / 10)) if len(net) > 1 else 0.0
+    max_dd = float(wf.attrs.get("max_drawdown", float("nan")))
+    sharpe_value = wf.attrs.get("sharpe")
+    sharpe = float(sharpe_value) if sharpe_value is not None and np.isfinite(sharpe_value) else None
     from validation_policy import regime_report, POLICY_VERSION
     from execution_gate import strategy_version
-    cv = fe.time_series_cv(factor_vals, panel, pk.get("method", "等权"),
-                           int(pk.get("top_n") or 10), n_folds=3, fwd_days=5, step=5)
+    with stage("cross_validation"):
+        cv = fe.time_series_cv(factor_vals, panel, pk.get("method", "等权"),
+                               int(pk.get("top_n") or 10), n_folds=3, fwd_days=5, step=5)
     from loopengine.regime import detect_regime
-    labels = {}
-    for day in wf["调仓日"]:
-        rg = detect_regime(end=day)
-        if rg.get("confidence", 0) > 0:
-            labels[day] = rg.get("regime")
+    with stage("regime_history"):
+        labels = {}
+        for day in wf["调仓日"]:
+            rg = detect_regime(end=day)
+            if rg.get("confidence", 0) > 0:
+                labels[day] = rg.get("regime")
     regimes = regime_report(wf, labels, pk.get("regime_scope"))
     passed = (len(net) >= 30 and oos >= .55 and avg_net > 0 and max_dd >= -.25
-              and sharpe >= .5 and cv.get("passed", False) and regimes["passed"]
+              and sharpe is not None and sharpe >= .5 and cv.get("passed", False) and regimes["passed"]
               and not failed and len(factor_vals) == len(pk.get("factors", [])))
     # 冷静期转正：shadow 包的晋级评估只用 holdout 带内窗口——生成没见过这批数据
     # （_generate_pack_candidates 的 end 回退 HOLDOUT_TRADE_DAYS），walk-forward
@@ -2826,12 +2745,17 @@ def revalidate_strategy(name: str) -> dict:
               "strategy_version": strategy_version(pk), "policy_version": POLICY_VERSION,
               "turnover": float(wf["优化组合换手率"].mean()), "cost": .0025,
               "status": status}
+    from research_backtest import window_contract
+    result.update(window_contract())
+    result["windows"] = wf.to_dict("records")
+    result["window_metrics"] = dict(wf.attrs)
+    result["strategy_snapshot"] = pk
+    result["step_days"] = 10
+    result["metric_notes"] = "持有5日、间隔10日；存在空仓间隔，不提供连续持有期夏普。"
     if shadow_ev is not None:
         result["shadow_evidence"] = shadow_ev
     if holdout_info is not None:
         result["holdout"] = holdout_info
-    library.update_strategy_oos(name, oos, status=status)
-    library.save_strategy_validation(name, result)
     return result
 
 
@@ -2839,9 +2763,12 @@ def job_strategy_revalidate(pool_name: str = "沪深300") -> str:
     """每周重验所有策略包的 OOS 表现，淘汰退化包。"""
     import library
     results = []
-    for name in library.list_strategies():
+    from validation_worker import run_bounded
+    for name, pack in library.list_strategies().items():
+        if pack.get('pool_name') != pool_name or pack.get('status') in ('paused', 'retired', 'archived'):
+            continue
         try:
-            r = revalidate_strategy(name)
+            r = run_bounded(name, timeout_seconds=180)
             if r.get("ok"):
                 results.append(f"{name}: {r['status']} OOS {r['oos_winrate']:.0%}")
             else:
@@ -3266,13 +3193,13 @@ JOBS = {
                                         "params": {"interval_sec": 30},
                                         "trigger": "interval"}},
     "loopengine": {"name": "🧬 LoopEngine 演化引擎", "func": job_loopengine,
-                   "default": {"enabled": True, "hour": 0, "minute": 0,
-                               "params": {"batch": 50, "interval_sec": 300},
+                   "default": {"enabled": False, "hour": 0, "minute": 0,
+                               "params": {"batch": 15, "interval_sec": 86400},
                                "trigger": "interval"}},
     "multitype_mine": {"name": "🌐 多类型因子挖掘（全类型轮转）",
                        "func": job_multitype_mine,
-                       "default": {"enabled": True, "hour": 1, "minute": 0,
-                                   "params": {"batch_per_type": 25, "factor_types": ""}}},
+                       "default": {"enabled": True, "hour": 19, "minute": 30,
+                                   "params": {"batch_per_type": 15, "factor_types": ""}}},
     "top5_composite": {"name": "🏆 Top5 复合因子（每日合成）", "func": job_top5_composite,
                        "default": {"enabled": True, "hour": 18, "minute": 20, "params": {}}},
     "trade_simulate": {"name": "📈 模拟交易回填（每日）", "func": job_trade_simulate,
@@ -3297,7 +3224,7 @@ JOBS = {
                         "default": {"enabled": True, "hour": 9, "minute": 26, "params": {}}},
     "le_factor_eval": {"name": "🧪 LoopEngine 因子滚动体检", "func": job_le_factor_eval,
                        "default": {"enabled": True, "hour": 21, "minute": 30,
-                                   "params": {"batch": 1000, "pool_name": "沪深300"}}},
+                                   "params": {"batch": 100, "pool_name": "沪深300"}}},
     "fundflow_sync": {"name": "💰 个股资金流入库（盘后·iFinD）", "func": job_fundflow_sync,
                        "default": {"enabled": True, "hour": 17, "minute": 45,
                                    "params": {"pool_name": "自选股", "lookback_days": 30}}},
@@ -3312,10 +3239,10 @@ JOBS = {
                                      "day_of_week": "sun"}},
     "le_factor_eval_noon": {"name": "🧪 LoopEngine 因子体检（午间）", "func": job_le_factor_eval,
                              "default": {"enabled": True, "hour": 12, "minute": 30,
-                                         "params": {"batch": 500, "pool_name": "沪深300"}}},
+                                         "params": {"batch": 100, "pool_name": "沪深300"}}},
     "le_factor_eval_pm": {"name": "🧪 LoopEngine 因子体检（盘后）", "func": job_le_factor_eval,
                             "default": {"enabled": True, "hour": 18, "minute": 0,
-                                        "params": {"batch": 500, "pool_name": "沪深300"}}},
+                                        "params": {"batch": 100, "pool_name": "沪深300"}}},
     "strategy_gen": {"name": "🧬 策略包自动生成", "func": job_strategy_gen,
                      "default": {"enabled": True, "hour": 18, "minute": 30,
                                  "params": {"pool_name": "沪深300", "top_n": 10, "max_packs": 3}}},
@@ -3389,6 +3316,33 @@ class SchedulerManager:
             time.sleep(self._HEARTBEAT_S)
             self._write_owner(pid)
             self._write_live()
+            try:
+                if not any(k in self._running for k in ('multitype_mine', 'le_factor_eval', 'le_factor_eval_noon', 'le_factor_eval_pm')):
+                    from factor_evaluation_queue import claim_drain
+                    eval_pool = claim_drain()
+                    if eval_pool:
+                        import threading
+                        def drain_evaluations(pool=eval_pool):
+                            try:
+                                from factor_evaluation_queue import run
+                                run(pool, 20)
+                            except Exception:
+                                logging.exception('生成后体检失败，队列保留到下一定时窗口')
+                        threading.Thread(target=drain_evaluations, daemon=True,
+                                         name='factor-evaluation-drain').start()
+                if 'multitype_mine' not in self._running:
+                    from mining_policy import manual_request, finish_manual_request
+                    rid = manual_request('claim')
+                    if rid:
+                        def run_requested(request_id=rid):
+                            try:
+                                self._run('multitype_mine', manual=True)
+                            finally:
+                                finish_manual_request(request_id)
+                        import threading
+                        threading.Thread(target=run_requested, daemon=True).start()
+            except Exception:
+                logging.exception('手动挖掘请求处理失败')
             # 配置热更新：页面进程（被动）改状态文件后，owner 在本心跳内重新应用
             try:
                 m = SCHED_STATE_FILE.stat().st_mtime
@@ -3445,6 +3399,22 @@ class SchedulerManager:
                 if existing:
                     self.sched.remove_job(key)
                 continue
+            if key == "multitype_mine":
+                from mining_policy import schedule_hours
+                mp = cfg.get("params", {})
+                hours = schedule_hours(dict(daily_batches=mp.get('daily_batches',1),
+                    rotations=mp.get('rotations',1),batch_per_type=mp.get('batch_per_type',15),
+                    hour=cfg['hour'],minute=cfg['minute'],interval_hours=mp.get('interval_hours',1)))
+                from apscheduler.triggers.cron import CronTrigger
+                trigger = CronTrigger(day_of_week=cfg.get('day_of_week','mon-fri'),
+                                      hour=hours, minute=cfg['minute'], timezone=TZ)
+                if existing:
+                    if str(existing.trigger) != str(trigger):
+                        self.sched.reschedule_job(key, trigger=trigger)
+                else:
+                    self.sched.add_job(lambda k=key: self._run(k), trigger, id=key,
+                                       executor='le', replace_existing=True)
+                continue
             if cfg.get("trigger") == "interval":
                 executor = "le" if key in ("loopengine",) else "interval"
                 params = {"seconds": int(cfg["params"].get("interval_sec", 30)),
@@ -3469,12 +3439,14 @@ class SchedulerManager:
                                    **params, replace_existing=True)
 
     # ---- 运行与记录 ----
-    def _run(self, key: str):
+    def _run(self, key: str, manual: bool = False):
         # 高频卫星撮合只在连续竞价时段进入完整执行链路；在调度入口拦截，
         # 避免夜间、午休和非交易日每 5 分钟写一条无意义日志。
         if key == "satellite_fill" and not _satellite_market_open():
             return
         cfg = self._state()[key]
+        if manual and key == 'multitype_mine':
+            cfg = {**cfg, 'params': {**cfg.get('params', {}), 'manual': True}}
         t0 = time.time()
         run_id = f"{key}-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
         self._running[key] = t0
@@ -3564,6 +3536,22 @@ class SchedulerManager:
                         "last": last.get(key), "running_since": running}
         return out
 
+    def set_mining_config(self, enabled, daily_batches, rotations, batch_per_type,
+                          hour, minute, interval_hours, skip_unchanged):
+        from mining_policy import validate_config
+        validate_config(daily_batches, rotations, batch_per_type, hour, minute, interval_hours)
+        if not isinstance(enabled, bool) or not isinstance(skip_unchanged, bool):
+            raise ValueError('开关参数必须为布尔值')
+        state = self._state()
+        cfg = state['multitype_mine']
+        cfg.update(enabled=enabled, hour=hour, minute=minute, trigger='cron', day_of_week='mon-fri')
+        cfg['params'] = {**cfg.get('params', {}), 'daily_batches':daily_batches,
+            'rotations':rotations, 'batch_per_type':batch_per_type,
+            'interval_hours':interval_hours, 'skip_unchanged':skip_unchanged}
+        state['loopengine']['enabled'] = False
+        self._save_state(state)
+        self._apply_state()
+
     def set_enabled(self, key: str, enabled: bool):
         state = self._state()
         state[key]["enabled"] = enabled
@@ -3582,6 +3570,9 @@ class SchedulerManager:
         self._save_state(state)
 
     def run_now(self, key: str):
+        if key == 'multitype_mine':
+            from mining_policy import manual_request
+            return manual_request()
         import threading
 
         threading.Thread(target=self._run, args=(key,), daemon=True).start()

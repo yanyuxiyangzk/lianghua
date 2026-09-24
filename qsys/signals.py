@@ -78,7 +78,7 @@ def run_factor_code(code: str, name: str, codes: list[str], end: str, lookback_d
 
     source = source or datasource.get_source()
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    ck = _cache_key("evo", source + code + "|".join(codes) + end)
+    ck = _cache_key("evo", source + code + "|".join(codes) + end + f"|lookback={lookback_days}|input-v2")
     if ck.exists():
         hit = _read_parquet_safe(ck)
         if hit is not None:
@@ -87,7 +87,17 @@ def run_factor_code(code: str, name: str, codes: list[str], end: str, lookback_d
     start = (pd.Timestamp(end) - pd.Timedelta(days=int(lookback_days * 1.6))).strftime("%Y-%m-%d")
     with tempfile.TemporaryDirectory() as td:
         td = Path(td)
-        build_daily_pv_h5(codes, start, end, td / "daily_pv.h5", source=source)
+        from validation_trace import stage
+        with stage("factor_input:" + name):
+            if source == "qlib_local":
+                # Preserve Qlib's actual adjustment-factor field.
+                build_daily_pv_h5(codes, start, end, td / "daily_pv.h5", source=source)
+            else:
+                # Reuse the same source/window panel already loaded by validation.
+                panel = get_panel_cached(codes, end, lookback_days, source=source).copy()
+                panel = panel.reorder_levels(['datetime', 'instrument']).sort_index()
+                panel['$factor'] = 1.0
+                panel.to_hdf(str(td / 'daily_pv.h5'), key='data')
         (td / "factor.py").write_text(code)
         # PYTHONPATH 带上 app 根目录：手工/演化因子代码可能 import loopengine 等项目模块
         # （python factor.py 的 sys.path[0] 是临时目录，默认找不到 /app）
@@ -95,8 +105,9 @@ def run_factor_code(code: str, name: str, codes: list[str], end: str, lookback_d
         env = dict(os.environ)
         app_root = str(Path(__file__).resolve().parent)
         env["PYTHONPATH"] = app_root + os.pathsep + env.get("PYTHONPATH", "")
-        proc = subprocess.run([sys.executable, "factor.py"], cwd=td, capture_output=True,
-                              text=True, timeout=300, env=env)
+        with stage("factor_python:" + name):
+            proc = subprocess.run([sys.executable, "factor.py"], cwd=td, capture_output=True,
+                                  text=True, timeout=300, env=env)
         if proc.returncode != 0 or not (td / "result.h5").exists():
             raise RuntimeError(f"因子 {name} 执行失败: {proc.stderr[-400:]}")
         res = pd.read_hdf(td / "result.h5", key="data")

@@ -32,6 +32,8 @@ def check(pack, approval, regime, today):
         return '策略账户范围未确认'
     if not pack.get('factors') or any(not f.get('theory_id') for f in pack['factors']):
         return '因子理论来源未确认'
+    if any(f.get('theory_id') != pack.get('theory_id') for f in pack['factors']):
+        return '策略与因子理论归属不一致'
     if regime not in ('bull', 'bear', 'sideways', 'transition'):
         return '市场状态未知'
     scopes = tokens(pack['regime_scope'])

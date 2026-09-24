@@ -345,7 +345,7 @@ S表达式格式要求（严格遵守）：
     
     @staticmethod
     def generate(patterns: list[dict], theories: dict = None,
-                 track_record: dict = None) -> list[dict]:
+                 track_record: dict = None, budget=None) -> list[dict]:
         """从模式生成假说。track_record：理论战绩（有效/已证伪），注入 user 段
         明令禁止重提已证伪方向——前缀纪律：system 常量不变，战绩只在 user。"""
         if not patterns:
@@ -389,11 +389,16 @@ S表达式格式要求（严格遵守）：
 
 请为每个模式提出1-2个可检验的假说，并形式化为S表达式。"""
             
-            text = llm_chat(HypothesisGenerator.SYSTEM_PROMPT, user_prompt,
-                            max_tokens=1500, label="theory_hypothesis") or ""
+            from theory_policy import Budget
+            budget = budget or Budget("unscoped-theory-hypothesis", calls=0)
+            text = budget.chat(HypothesisGenerator.SYSTEM_PROMPT, user_prompt,
+                               max_tokens=1500, label="theory_hypothesis") or ""
             return _extract_hypotheses(text)
 
         except Exception as e:
+            from theory_policy import BudgetExceeded
+            if isinstance(e, BudgetExceeded):
+                raise
             log.warning(f"假说生成失败: {e}")
 
         return []
@@ -618,35 +623,10 @@ class TheoryNamer:
     
     @staticmethod
     def name_theory(sexpr: str, validation_result: dict, pattern: dict) -> dict:
-        """命名理论。"""
-        try:
-            from llmutil import llm_chat
-            
-            user_prompt = f"""因子表达式: {sexpr}
-验证结果:
-- IC均值: {validation_result.get('ic_mean', 'N/A')}
-- ICIR: {validation_result.get('icir', 'N/A')}
-- IC胜率: {validation_result.get('ic_winrate', 'N/A')}
-- 夏普: {validation_result.get('sharpe', 'N/A')}
-
-发现模式: {pattern.get('type', 'N/A')} - {pattern.get('description', 'N/A')}"""
-            
-            text = llm_chat(TheoryNamer.SYSTEM_PROMPT, user_prompt,
-                            max_tokens=350, label="theory_name") or ""
-            import re
-            m = re.search(r"\{.*\}", text, re.S)
-            if m:
-                return json.loads(m.group(0))
-            
-        except Exception as e:
-            log.debug(f"理论命名失败: {e}")
-        
-        # 默认命名
-        return {
-            "name": f"发现_{hash(sexpr) % 10000}",
-            "family": "其他",
-            "description": f"从{pattern.get('type', '未知')}模式发现的因子",
-        }
+        """稳定程序命名，不调用LLM。"""
+        from theory_policy import digest
+        return {"name": "候选_" + digest(sexpr)[:16], "family": "其他",
+                "description": "待独立验证的研究假设"}
 
 
 # ---------------------------------------------------------------- 知识图谱
@@ -872,7 +852,7 @@ class TheoryDiscoveryEngine:
             max_validate: int = 5) -> dict:
         """运行一轮理论发现。"""
         import signals as sig
-        from scheduler import all_pools, get_last_trade_day
+        from common import all_pools, get_last_trade_day
         
         log.info("=== 理论发现引擎启动 ===")
         
@@ -892,11 +872,23 @@ class TheoryDiscoveryEngine:
         patterns = patterns[:max_patterns]
         log.info(f"发现 {len(patterns)} 个模式")
         
+        from theory_policy import Budget, BudgetExceeded, claim_discovery, digest
+        if not patterns or not np.isfinite(panel.select_dtypes(include="number").to_numpy()).any():
+            return {"skipped": "无新增有效数据或模式"}
+        data_hash = digest([list(map(str, panel.columns)), pd.util.hash_pandas_object(panel, index=True).tolist()])
+        week, reason = claim_discovery(data_hash, digest(patterns))
+        if not week:
+            return {"skipped": reason}
+        budget = Budget("discovery:" + week, calls=1, tokens=16000, input_chars=6000)
+
         # 3. 假说生成（回喂理论战绩：有效方向借鉴、已证伪方向禁提+同构丢弃）
         log.info("Step 2: 假说生成")
         hg = HypothesisGenerator()
         track_record = load_theory_track_record()
-        hypotheses = hg.generate(patterns, KNOWN_THEORIES, track_record)
+        try:
+            hypotheses = hg.generate(patterns, KNOWN_THEORIES, track_record, budget=budget)
+        except BudgetExceeded as exc:
+            return {"skipped": str(exc)}
         hypotheses = _filter_falsified(hypotheses, track_record)
         hypotheses = hypotheses[:max_hypotheses]
         log.info(f"生成 {len(hypotheses)} 个假说"
@@ -955,8 +947,10 @@ class TheoryDiscoveryEngine:
             
             name_result = namer.name_theory(v["sexpr"], v.get("validation", {}), pattern_clean)
             
+            from theory_policy import research_theory_id
             theory_data = {
-                "theory": v,
+                "theory": {**v, "theory_id": research_theory_id(v["sexpr"]),
+                           "hypothesis_id": name_result["name"]},
                 "family": name_result.get("family", "其他"),
                 "sexpr": v["sexpr"],
                 "validation": v.get("validation", {}),
@@ -1001,11 +995,14 @@ def register_theory_factor(name: str, sexpr: str, family: str, validation: dict)
     """
     try:
         import library
+        from theory_policy import research_theory_id
         code = f"# sexpr: {sexpr}\n# theory: {name}（{family}）"
         library.sync_factor_registry([{
             "name": f"theory_{name}", "kind": "loopengine", "code": code,
             "engine": "theory", "generation_mode": "theory_discovery",
-            "factor_type": "量价",
+            "factor_type": "量价", "theory_id": research_theory_id(sexpr),
+            "theory_family": family, "hypothesis_id": name,
+            "source_theory_sexpr": sexpr, "validation_status": "shadow_only",
         }])
         return True
     except Exception as e:
@@ -1018,6 +1015,8 @@ def run_theory_discovery(pool_name: str = "沪深300", **kwargs) -> str:
     engine = TheoryDiscoveryEngine(pool_name)
     result = engine.run(**kwargs)
     
+    if "skipped" in result:
+        return "理论发现跳过：" + result["skipped"]
     if "error" in result:
         return f"理论发现失败: {result['error']}"
     

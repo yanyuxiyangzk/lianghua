@@ -83,24 +83,30 @@ def _render_factor_detail(pick: str, pool_name: str, row: pd.Series, reg_map: di
             panel = sig.get_panel_cached(codes, end, 800)
             st.session_state[f"fl_bt_{pool_name}_{pick}"] = fe.factor_group_backtest(vals, panel)
     bt = st.session_state.get(f"fl_bt_{pool_name}_{pick}")
+    if bt and bt.get("policy") != "factor-group-v2":
+        st.info("回测口径已更新，请重新运行以替换旧缓存结果。")
+        bt = None
     if bt:
+        st.caption(bt.get("note", "历史缓存结果，请重新运行评估"))
+        if bt.get("status") != "valid":
+            st.warning("研究报告不完整：" + "；".join(bt.get("reasons", [])[:3]))
         c1, c2 = st.columns([2, 1])
         with c1:
             st.markdown("**累计 IC 曲线**（因子预测力的稳定性）")
             st.line_chart(bt["ic"].cumsum(), height=220)
         with c2:
-            st.markdown("**多空对冲绩效**（顶组多-底组空）")
+            st.markdown("**理论多空研究绩效**（未模拟成交）")
             st.table(pd.DataFrame(bt["ls_stats"], index=["值"]).T if bt["ls_stats"] else pd.DataFrame({"提示": ["数据不足"]}, index=[0]))
         c3, c4 = st.columns(2)
         with c3:
-            st.markdown("**十分层平均 20 日收益**（单调性检验：应沿 G1→G10 单调）")
+            st.markdown("**十分层平均 5 日收益**（单调性检验：应沿 G1→G10 单调）")
             gm = pd.Series(bt["group_mean"]).dropna()
             fig = go.Figure(go.Bar(x=gm.index, y=gm.values,
                                    marker_color=["#2ca02c" if v < 0 else "#e54545" for v in gm.values]))
             fig.update_layout(height=260, margin=dict(l=10, r=10, t=10, b=10))
             st.plotly_chart(fig, width='stretch')
         with c4:
-            st.markdown("**多空对冲净值曲线**")
+            st.markdown("**理论多空研究净值（持有期末）**")
             st.line_chart(bt["ls_nav"], height=260)
 
 

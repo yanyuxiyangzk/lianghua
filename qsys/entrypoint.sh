@@ -33,4 +33,7 @@ while True:
     time.sleep(3600)
 PY
 
+# Independent durable mining event collector (no trading or job triggering).
+python /app/mining_event_journal.py &
+
 exec streamlit run /app/app.py --server.address=0.0.0.0 --server.port=8501

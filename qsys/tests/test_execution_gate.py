@@ -26,6 +26,11 @@ class GateTests(unittest.TestCase):
         self.approval['shadow']['matured_windows'] = 20
         self.approval['data_quality']['point_in_time_passed'] = True
 
+    def test_mismatched_factor_theory_rejected(self):
+        self.pack['factors'][0]['theory_id']='value'
+        self.approval['version']=strategy_version(self.pack)
+        self.assertIn('理论归属不一致',check(self.pack,self.approval,'bull','2026-09-23'))
+
     def test_verified_version(self):
         self.assertEqual(check(self.pack,self.approval,'bull','2026-09-23'),'')
 

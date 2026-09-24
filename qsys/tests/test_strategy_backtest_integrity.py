@@ -111,5 +111,7 @@ class Tests(unittest.TestCase):
             result=sb.backtest_strategy('fixture')
         self.assertFalse(result['ok'])
         self.assertIn('部分因子',result['msg'])
+        self.assertEqual(result['factor_errors'][0]['factor'], 'b')
+        self.assertEqual(result['factor_errors'][0]['reason'], 'failed')
 
 if __name__=='__main__': unittest.main()

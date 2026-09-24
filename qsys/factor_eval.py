@@ -8,6 +8,7 @@
 """
 
 import hashlib
+from factor_evaluation_queue import factor_version
 import random
 from datetime import datetime
 from pathlib import Path
@@ -202,7 +203,10 @@ def backtest_credibility_score(wf_result: pd.DataFrame) -> dict:
     score += sample_score
 
     # 3. 夏普比率（20分）
-    if sharpe >= 2.0:
+    if sharpe is None or not np.isfinite(sharpe):
+        sharpe_score = 0
+        warnings.append("夏普不可用：窗口不连续或有效波动样本不足")
+    elif sharpe >= 2.0:
         sharpe_score = 20
     elif sharpe >= 1.0:
         sharpe_score = 15
@@ -255,8 +259,8 @@ def backtest_credibility_score(wf_result: pd.DataFrame) -> dict:
         mw_score = 4
     else:
         mw_score = 0
-        warnings.append(f"月度胜率偏低: {monthly_wr:.1%}")
-    details["月度胜率"] = mw_score
+        warnings.append(f"到期月归集胜率偏低: {monthly_wr:.1%}")
+    details["到期月归集胜率" if attrs.get("monthly_basis") == "window_return_booked_at_maturity" else "月度胜率"] = mw_score
     score += mw_score
 
     # 评级
@@ -322,7 +326,7 @@ def _cache(name: str, payload: str) -> Path:
 
 def forward_returns(panel: pd.DataFrame, days: int) -> pd.DataFrame:
     """datetime × instrument 的远期收益表。"""
-    close = panel["$close"].unstack("instrument")
+    close = panel["$close"].unstack("instrument").sort_index()
     return close.shift(-days) / close - 1
 
 
@@ -348,7 +352,7 @@ def get_factor_values(fac: dict, codes: list[str], end: str, lookback_days: int 
     import datasource
 
     source = source or _eval_source()
-    ck = _cache("fvals", f"{source}|{fac['name']}|{fac['kind']}|{'|'.join(sorted(codes))}|{end}|{lookback_days}")
+    ck = _cache("fvals", f"{source}|{factor_version(fac)}|{fac.get('_data_revision', '')}|{fac['name']}|{fac['kind']}|{'|'.join(sorted(codes))}|{end}|{lookback_days}")
     if ck.exists():
         hit = sig._read_parquet_safe(ck)
         if hit is not None:
@@ -431,7 +435,7 @@ def get_ic_series(fac: dict, codes: list[str], end: str, fwd_days: int = MAIN_FW
     import datasource
 
     source = source or _eval_source()
-    ck = _cache("ic", f"{source}|{fac['name']}|{fac['kind']}|{'|'.join(sorted(codes))}|{end}|{fwd_days}|{lookback_days}")
+    ck = _cache("ic", f"{source}|{factor_version(fac)}|{fac.get('_data_revision', '')}|{fac['name']}|{fac['kind']}|{'|'.join(sorted(codes))}|{end}|{fwd_days}|{lookback_days}")
     if ck.exists():
         hit = sig._read_parquet_safe(ck)
         if hit is not None:
@@ -498,8 +502,10 @@ def build_scorecard(factors: list[dict], codes: list[str], end: str,
                     panel = panel[panel.index.get_level_values("datetime") <= train_end]
                 fwds = {d: forward_returns(panel, d) for d in WIN_HORIZONS.values()}
             if train_end:
-                ic = ic[ic.index <= train_end]
-                vals = vals[vals.index.get_level_values("datetime") <= train_end]
+                from common import trade_day_offset
+                safe_end = trade_day_offset(train_end, -MAIN_FWD)
+                ic = ic[ic.index <= safe_end]
+                vals = vals[vals.index.get_level_values("datetime") <= safe_end]
                 if ic.empty or vals.empty:
                     raise RuntimeError("预选窗内无数据")
             kind_label = {"evolved": "进化", "builtin": "内置", "tech": "技术指标",
@@ -520,7 +526,9 @@ def build_scorecard(factors: list[dict], codes: list[str], end: str,
         except Exception as e:
             rows.append({"因子": fac["name"], "来源": fac["kind"], "IC均值": np.nan,
                          "ICIR": np.nan, "IC胜率": np.nan, "Top组_winrate": np.nan,
-                         "建议方向": f"评估失败: {str(e)[:40]}", "天数": 0})
+                         "建议方向": f"评估失败: {str(e)[:120]}", "天数": 0,
+                         "评估状态": ('sample_insufficient' if any(t in str(e) for t in ('预选窗', 'IC 序列为空')) else 'data_error' if '因子值为空' in str(e) else 'compute_failed'),
+                         "评估原因": str(e)})
     return pd.DataFrame(rows)
 
 
@@ -555,6 +563,12 @@ def build_scorecard_batch(factors: list[dict], codes: list[str], end: str,
         except Exception:
             continue
     frames = build_field_frames(panel, extra or None)
+    digest = hashlib.sha256(pd.util.hash_pandas_object(panel, index=True).values.tobytes())
+    for field, frame in sorted(extra.items()):
+        digest.update(field.encode())
+        digest.update(pd.util.hash_pandas_object(frame, index=True).values.tobytes())
+    data_revision = digest.hexdigest()
+    factors = [{**f, '_data_revision':data_revision} for f in factors]
 
     # 2. 批量计算所有因子的值（树直算快速路径）
     factor_values = {}
@@ -568,7 +582,7 @@ def build_scorecard_batch(factors: list[dict], codes: list[str], end: str,
                 continue
 
             # P4: 检查缓存是否已存在（"800f"=全窗口值）
-            ck = _cache("fvals", f"{source}|{fac['name']}|{fac['kind']}|{ck_prefix}|{end}|800f")
+            ck = _cache("fvals", f"{source}|{factor_version(fac)}|{fac.get('_data_revision', '')}|{fac['name']}|{fac['kind']}|{ck_prefix}|{end}|800f")
             if ck.exists():
                 hit = sig._read_parquet_safe(ck)
                 if hit is not None:
@@ -600,6 +614,7 @@ def build_scorecard_batch(factors: list[dict], codes: list[str], end: str,
             continue
 
         try:
+            oos = {}
             vals = factor_values[fname]
             if vals.empty:
                 raise RuntimeError("因子值为空")
@@ -608,35 +623,44 @@ def build_scorecard_batch(factors: list[dict], codes: list[str], end: str,
             ic = ic_series(vals, fwds[MAIN_FWD])
             if ic.empty:
                 raise RuntimeError("IC 序列为空")
-            oos = _oos_stats(ic, fac.get("first_seen"), train_end,
+            oos = _oos_stats(ic, fac.get("version_seen_at") or fac.get("first_seen"), train_end,
                              engine_selected=fac.get("kind") not in ("builtin", "tech"))
 
             if train_end:
-                ic = ic[ic.index <= train_end]
-                vals = vals[vals.index.get_level_values("datetime") <= train_end]
+                from common import trade_day_offset
+                safe_end = trade_day_offset(train_end, -MAIN_FWD)
+                ic = ic[ic.index <= safe_end]
+                vals = vals[vals.index.get_level_values("datetime") <= safe_end]
                 if ic.empty or vals.empty:
                     raise RuntimeError("预选窗内无数据")
 
+            train_panel = panel[panel.index.get_level_values("datetime") <= train_end] if train_end else panel
+            train_fwds = {d: forward_returns(train_panel, d) for d in WIN_HORIZONS.values()} if train_end else fwds
             kind_label = {"evolved": "进化", "builtin": "内置", "tech": "技术指标",
                           "loopengine": "演化引擎"}.get(fac["kind"], fac["kind"])
             row = {
                 "因子": fname, "来源": kind_label,
                 "IC均值": ic.mean(), "ICIR": ic.mean() / (ic.std() + 1e-12),
                 "IC胜率": (ic > 0).mean(),
-                "Top组胜率": top_group_winrate(vals, panel, fwd=fwds[MAIN_FWD]),
+                "Top组胜率": top_group_winrate(vals, train_panel, fwd=train_fwds[MAIN_FWD]),
                 "建议方向": "正向" if ic.mean() >= 0 else "负向",
                 "天数": len(ic),
                 **oos,
             }
             for label, d in WIN_HORIZONS.items():
                 row[f"{label}胜率"] = top_group_winrate(
-                    vals, panel, fwd_days=d, step=(5 if d <= 5 else STEP_DAYS), fwd=fwds[d])
+                    vals, train_panel, fwd_days=d, step=(5 if d <= 5 else STEP_DAYS), fwd=train_fwds[d])
             rows.append(row)
         except Exception as e:
             rows.append({"因子": fname, "来源": fac["kind"], "IC均值": np.nan,
                          "ICIR": np.nan, "IC胜率": np.nan, "Top组_winrate": np.nan,
-                         "建议方向": f"评估失败: {str(e)[:40]}", "天数": 0})
+                         "建议方向": f"评估失败: {str(e)[:120]}", "天数": 0,
+                         "评估状态": ('sample_insufficient' if any(t in str(e) for t in ('预选窗', 'IC 序列为空')) else 'data_error' if '因子值为空' in str(e) else 'compute_failed'),
+                         "评估原因": str(e), **oos})
 
+    for row in rows:
+        row['data_revision'] = data_revision
+        row['train_end'] = train_end
     df = pd.DataFrame(rows)
     # 批量评估后应用 FDR 校正：解决多重比较问题
     if len(df) > 1:
@@ -712,6 +736,7 @@ def _eval_single_factor(args):
     """单因子评估函数（用于并行执行）。"""
     fac, vals, panel, fwds, train_end = args
     fname = fac["name"]
+    oos = {}
     try:
         if vals is None or vals.empty:
             raise RuntimeError("因子值为空")
@@ -720,15 +745,19 @@ def _eval_single_factor(args):
         ic = ic_series(vals, fwds[MAIN_FWD])
         if ic.empty:
             raise RuntimeError("IC 序列为空")
-        oos = _oos_stats(ic, fac.get("first_seen"), train_end,
+        oos = _oos_stats(ic, fac.get("version_seen_at") or fac.get("first_seen"), train_end,
                          engine_selected=fac.get("kind") not in ("builtin", "tech"))
 
         if train_end:
-            ic = ic[ic.index <= train_end]
-            vals = vals[vals.index.get_level_values("datetime") <= train_end]
+            from common import trade_day_offset
+            safe_end = trade_day_offset(train_end, -MAIN_FWD)
+            ic = ic[ic.index <= safe_end]
+            vals = vals[vals.index.get_level_values("datetime") <= safe_end]
             if ic.empty or vals.empty:
                 raise RuntimeError("预选窗内无数据")
 
+        panel = panel[panel.index.get_level_values("datetime") <= train_end] if train_end else panel
+        fwds = {d: forward_returns(panel,d) for d in WIN_HORIZONS.values()} if train_end else fwds
         kind_label = {"evolved": "进化", "builtin": "内置", "tech": "技术指标",
                       "loopengine": "演化引擎"}.get(fac["kind"], fac["kind"])
         row = {
@@ -747,7 +776,9 @@ def _eval_single_factor(args):
     except Exception as e:
         return {"因子": fname, "来源": fac["kind"], "IC均值": np.nan,
                 "ICIR": np.nan, "IC胜率": np.nan, "Top组_winrate": np.nan,
-                "建议方向": f"评估失败: {str(e)[:40]}", "天数": 0}
+                "建议方向": f"评估失败: {str(e)[:120]}", "天数": 0,
+                "评估状态": ('sample_insufficient' if any(t in str(e) for t in ('预选窗', 'IC 序列为空')) else 'data_error' if '因子值为空' in str(e) else 'compute_failed'),
+                "评估原因": str(e), **oos}
 
 
 def build_scorecard_parallel(factors: list[dict], codes: list[str], end: str,
@@ -794,7 +825,7 @@ def build_scorecard_parallel(factors: list[dict], codes: list[str], end: str,
                 continue
 
             # P4: 检查缓存（"800f"=全窗口值；旧的截断窗口缓存在口径变更后作废）
-            ck = _cache("fvals", f"{source}|{fac['name']}|{fac['kind']}|{ck_prefix}|{end}|800f")
+            ck = _cache("fvals", f"{source}|{factor_version(fac)}|{fac.get('_data_revision', '')}|{fac['name']}|{fac['kind']}|{ck_prefix}|{end}|800f")
             if ck.exists():
                 hit = sig._read_parquet_safe(ck)
                 if hit is not None:
@@ -1009,44 +1040,11 @@ def icir_var_hint(sc: pd.DataFrame, n: str) -> float:
 # ---------------------------------------------------------------- 单因子回测（分层 + 多空对冲）
 def factor_group_backtest(vals: pd.Series, panel: pd.DataFrame, n_groups: int = 10,
                           fwd_days: int = MAIN_FWD, step: int = STEP_DAYS) -> dict:
-    """单因子分层回测：每 step 天按因子值分 n_groups 组，
-    输出各组平均 forward 收益 + 顶组-底组多空净值曲线与绩效。"""
-    fwd = forward_returns(panel, fwd_days)
-    v = _norm(vals.dropna())
-    days = v.index.get_level_values("datetime").unique()[::step]
-    group_rets = {i: [] for i in range(n_groups)}
-    ls = {}
-    for t in days:
-        if t not in fwd.index:
-            continue
-        cross = v[v.index.get_level_values("datetime") == t].droplevel("datetime")
-        fr = fwd.loc[t].dropna()
-        cross = cross[cross.index.isin(fr.index)]
-        if len(cross) < n_groups * 5:
-            continue
-        ranks = cross.rank(pct=True)
-        for i in range(n_groups):
-            sel = cross[(ranks > i / n_groups) & (ranks <= (i + 1) / n_groups)]
-            if len(sel):
-                group_rets[i].append(float(fr[sel.index].median()))  # 中位数抗妖股 outliers
-        top = cross[ranks > 1 - 1 / n_groups]
-        bot = cross[ranks <= 1 / n_groups]
-        if len(top) and len(bot):
-            ls[str(t)[:10]] = float(fr[top.index].median() - fr[bot.index].median())
-
-    group_mean = {f"G{i + 1}": (float(np.mean(rs)) if rs else None) for i, rs in group_rets.items()}
-    ls_ret = pd.Series(ls).sort_index()
-    nav = (1 + ls_ret).cumprod()
-    stats = {}
-    if len(ls_ret) >= 3:
-        ann = nav.iloc[-1] ** (252 / step / len(ls_ret)) - 1
-        sharpe = ls_ret.mean() / (ls_ret.std() + 1e-12) * np.sqrt(252 / step)
-        mdd = ((nav - nav.cummax().clip(lower=1)) / nav.cummax().clip(lower=1)).min()
-        stats = {"年化多空收益": f"{ann:.2%}", "夏普": f"{sharpe:.2f}",
-                 "最大回撤": f"{mdd:.2%}", "胜率": f"{(ls_ret > 0).mean():.0%}",
-                 "调仓点数": str(len(ls_ret))}
-    return {"group_mean": group_mean, "ls_ret": ls_ret, "ls_nav": nav, "ls_stats": stats,
-            "ic": ic_series(vals, forward_returns(panel, fwd_days))}
+    """统一的非重叠等权分层研究报告；不代表可执行交易绩效。"""
+    from research_backtest import group_research
+    result = group_research(vals, panel, n_groups, fwd_days, step)
+    result["ic"] = ic_series(vals, forward_returns(panel, fwd_days))
+    return result
 # ---------------------------------------------------------------- 截面打分（walk_forward / static_backtest 共用）
 def _score_at(vals_norm: dict[str, pd.Series], weights: dict, t,
               norms: dict[str, str] | None = None) -> pd.Series:
@@ -1086,7 +1084,10 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
     start_idx/end_idx：可选，限制 walk-forward 仅使用 days[start_idx:end_idx] 区间，
     用于将 OOS 数据切分为验证段和测试段（防过拟合：选择用验证段，评估用测试段）。
     """
+    from research_backtest import validate_windows, window_metrics, benchmark_returns, window_contract
+    validate_windows(fwd_days, step, top_n, cost)
     fwd = forward_returns(panel, fwd_days)
+    close = panel["$close"].unstack("instrument").sort_index()
     # 全历史 IC 序列（每个因子算一次，应用点只做切片统计 → 快）
     vals_norm = {}
     for name, s in factor_vals.items():
@@ -1098,8 +1099,7 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
         norms = sig.scoring_norms(list(vals_norm))
     if ic_full is None:
         ic_full = {name: ic_series(s, fwd) for name, s in vals_norm.items()}
-    days = sorted(set.intersection(*[set(s.index.get_level_values("datetime").unique())
-                                     for s in vals_norm.values()])) if vals_norm else []
+    days = list(fwd.index) if vals_norm else []
     # start/end 约束应用日期；训练窗口始终位于应用日期之前。
     # 各折标签必须在该折结束前成熟，且不允许持有期重叠。
     if step < fwd_days or est <= fwd_days:
@@ -1109,6 +1109,7 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
     if oos_end - fwd_days <= oos_start:
         return pd.DataFrame()
     prev_picks: dict[str, set] = {"优化组合": set(), "等权组合": set()}
+    previous_end = None
     rows = []
     for t_global in range(oos_start, oos_end - fwd_days, step):
         t = days[t_global]
@@ -1133,12 +1134,13 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
         w_opt = compute_weights(sc.reset_index(names="因子"), method, names, use_direction_state=False)
         w_eq = {n: (1.0 / len(names), w_opt[n][1]) for n in names}
 
-        fr = fwd.loc[t].dropna() if t in fwd.index else pd.Series(dtype=float)
-        if fr.empty:
-            continue
+        fr = benchmark_returns(close, fwd, t)
         # 基准改为等权均值（消除中位数低估超额的偏差）
-        row = {"调仓日": str(t)[:10], "池内均值收益": fr.mean()}
+        row = {"调仓日": str(t)[:10], "收益到期日": str(days[t_global + fwd_days])[:10], "池内均值收益": fr.mean()}
         for label, weights in [("优化组合", w_opt), ("等权组合", w_eq)]:
+            for name in weights:
+                if t not in vals_norm[name].index.get_level_values("datetime"):
+                    raise ValueError(f"调仓日因子 {name} 缺失，不能压缩回测日历")
             sc_t = _score_at(vals_norm, weights, t, norms=norms)
             ranked = sc_t.dropna().sort_values(ascending=False)
             prev = prev_picks[label]
@@ -1150,11 +1152,13 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
             else:
                 picks_codes = list(ranked.index[:top_n])
             picks = ranked[ranked.index.isin(picks_codes)]
+            if len(picks) < max(3, top_n // 2):
+                raise ValueError("调仓日可用股票不足，回测不完整")
             if len(picks) >= max(3, top_n // 2):
-                if fr.reindex(picks.index).isna().any():
+                if not np.isfinite(fr.reindex(picks.index)).all():
                     raise ValueError("所选股票未来收益缺失：回测不完整，禁止按未来可用性换股")
                 cur = set(picks.index)
-                turnover = 1.0 if not prev else 1 - len(cur & prev) / len(picks)
+                turnover = 1.0 if not prev or previous_end != t else 1 - len(cur & prev) / len(picks)
                 prev_picks[label] = cur
                 row[f"{label}收益"] = fr[picks.index].mean()
                 row[f"{label}超额"] = row[f"{label}收益"] - fr.mean()
@@ -1162,20 +1166,17 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
                 row[f"{label}扣费超额"] = row[f"{label}超额"] - turnover * cost
         if "优化组合超额" in row:
             rows.append(row)
+            previous_end = days[t_global + fwd_days]
     df = pd.DataFrame(rows)
     # 计算汇总指标：年化收益/夏普/最大回撤/盈亏比/利润因子/月度胜率
     if not df.empty and "优化组合扣费超额" in df.columns:
         net = df["优化组合扣费超额"]
-        nav = (1 + net).cumprod()
+        metrics = window_metrics(net, df["调仓日"], df["收益到期日"], days)
         n_periods = len(net)
-        # 年化（假设每期 fwd_days 个交易日）
-        periods_per_year = 252 / step
-        total_ret = float(nav.iloc[-1] - 1) if len(nav) else 0.0
-        ann_ret = float((1 + total_ret) ** (periods_per_year / n_periods) - 1) if n_periods > 0 else 0.0
-        # 夏普
-        sharpe = float(net.mean() / (net.std() + 1e-12) * np.sqrt(periods_per_year)) if n_periods > 5 else 0.0
-        # 最大回撤
-        max_dd = float(((nav - nav.cummax().clip(lower=1)) / nav.cummax().clip(lower=1)).min()) if len(nav) > 1 else 0.0
+        ann_ret = metrics["ann_return"]
+        total_ret = metrics["total_return"]
+        sharpe = metrics["sharpe"] if metrics["sharpe"] is not None else float("nan")
+        max_dd = metrics["max_drawdown"]
         # 盈亏比
         wins = net[net > 0]
         losses = net[net < 0]
@@ -1185,19 +1186,12 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
         win_loss_ratio = avg_win / avg_loss
         # 胜率
         win_rate = float((net > 0).mean())
-        # 月度胜率（按 fwd_days*22 个周期聚合）
-        month_len = max(1, int(22 / fwd_days))
-        monthly = net.groupby(net.index // month_len).sum()
-        monthly_wr = float((monthly > 0).mean()) if len(monthly) > 0 else 0.0
-        # 最大连续亏损月数
-        max_consec_loss = 0
-        cur_consec = 0
-        for m in monthly:
-            if m <= 0:
-                cur_consec += 1
-                max_consec_loss = max(max_consec_loss, cur_consec)
-            else:
-                cur_consec = 0
+        monthly_wr = metrics["monthly_winrate"]
+        max_consec_loss = metrics["max_consec_loss_months"]
+        df.attrs.update(metrics)
+        df.attrs.update(window_contract())
+        df.attrs["assessment_kind"] = "research_forward_excess_not_execution"
+        df.attrs["cost_model"] = "replacement_fraction_times_roundtrip_cost"
         # 汇总到 df 的属性（供外部读取）
         df.attrs["ann_return"] = ann_ret
         df.attrs["sharpe"] = sharpe
@@ -1279,8 +1273,7 @@ def time_series_cv(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, metho
     import library
     library.record_research_trial("strategy_cv")
     fwd = forward_returns(panel, fwd_days)
-    days_all = sorted(set.intersection(*[set(s.index.get_level_values("datetime").unique())
-                                         for s in vals_norm.values()]))
+    days_all = list(fwd.index)
     ic_full = {n: ic_series(vals_norm[n], fwd) for n in vals_norm}
 
     if n_folds < 3 or step < fwd_days:
@@ -1348,46 +1341,53 @@ def static_backtest(factor_vals: dict[str, pd.Series], panel: pd.DataFrame,
     IS 胜率高、OOS 胜率低 = 权重过拟合样本内的直接证据。
     collect_picks=True 时附 "picks" 列（每点名单），供策略组合投票复用。
     norms=None 时按全局开关解析（legacy=原 zscore 口径）。"""
+    from research_backtest import validate_windows, benchmark_returns, window_contract
+    validate_windows(fwd_days, step, top_n, cost)
     # 截止日约束标签成熟时间，而不只是调仓日。
     if upto:
         panel = panel[panel.index.get_level_values("datetime") <= pd.Timestamp(upto)]
     fwd = forward_returns(panel, fwd_days)
+    close = panel["$close"].unstack("instrument").sort_index()
     vals_norm = {n: _norm(s.dropna()) for n, s in factor_vals.items() if not s.dropna().empty}
     if not vals_norm:
         return pd.DataFrame()
     if norms is None:
         norms = sig.scoring_norms(list(vals_norm))
-    days = sorted(set.intersection(*[set(s.index.get_level_values("datetime").unique())
-                                     for s in vals_norm.values()]))
+    days = list(fwd.index)
     if upto:
         days = [d for d in days if str(d)[:10] <= str(upto)[:10]]
     prev: set = set()
     rows = []
-    for t in days[::step]:
+    for pos in range(0, len(days) - fwd_days, step):
+        t = days[pos]
+        for name, (weight, _) in weights.items():
+            if weight > 0 and (name not in vals_norm or t not in vals_norm[name].index.get_level_values("datetime")):
+                raise ValueError(f"调仓日因子 {name} 缺失，不能压缩回测日历")
         if t not in fwd.index:
             continue
-        fr = fwd.loc[t].dropna()
-        if fr.empty:
-            continue
+        fr = benchmark_returns(close, fwd, t)
         sc_t = _score_at(vals_norm, weights, t, norms=norms)
         ranked = sc_t.dropna().sort_values(ascending=False)
         picks = ranked.head(top_n)
         if len(picks) < max(3, top_n // 2):
-            continue
-        if fr.reindex(picks.index).isna().any():
+            raise ValueError("调仓日可用股票不足，回测不完整")
+        if not np.isfinite(fr.reindex(picks.index)).all():
             raise ValueError("所选股票未来收益缺失：回测不完整，禁止按未来可用性换股")
         cur = set(picks.index)
-        turnover = 1.0 if not prev else 1 - len(cur & prev) / len(picks)
+        turnover = 1.0 if not prev or step > fwd_days else 1 - len(cur & prev) / len(picks)
         prev = cur
         ret = float(fr[picks.index].mean())
-        row = {"调仓日": str(t)[:10], "池内均值收益": float(fr.mean()),
+        row = {"调仓日": str(t)[:10], "收益到期日": str(days[pos + fwd_days])[:10], "池内均值收益": float(fr.mean()),
                "组合收益": ret, "组合超额": ret - float(fr.mean()),
                "组合换手率": turnover,
                "组合扣费超额": ret - float(fr.mean()) - turnover * cost}
         if collect_picks:
             row["picks"] = list(picks.index)
         rows.append(row)
-    return pd.DataFrame(rows)
+    result = pd.DataFrame(rows)
+    result.attrs.update(window_contract())
+    result.attrs["assessment_kind"] = "research_forward_excess_not_execution"
+    return result
 
 
 # ---------------------------------------------------------------- 贪心组合推荐（OOS 前向选择）
@@ -1417,8 +1417,7 @@ def greedy_combo(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
     ic_full = {n: ic_series(vals_norm[n], fwd) for n in avail}
 
     # --- 计算验证段/测试段边界 ---
-    days_all = sorted(set.intersection(*[set(s.index.get_level_values("datetime").unique())
-                                         for s in vals_norm.values()])) if vals_norm else []
+    days_all = list(fwd.index) if vals_norm else []
     split_idx = int(len(days_all) * (1 - oos_test_ratio)) if oos_test_ratio > 0 else len(days_all)
     # 验证段：0..split_idx（用于 greedy 选择）
     # 测试段：split_idx..end（用于最终评估）
@@ -1572,8 +1571,7 @@ def mmr_combo(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method: st
     ic_full = {n: ic_series(vals_norm[n], fwd) for n in avail}
 
     # --- 计算验证段/测试段边界 ---
-    days_all = sorted(set.intersection(*[set(s.index.get_level_values("datetime").unique())
-                                         for s in vals_norm.values()])) if vals_norm else []
+    days_all = list(fwd.index) if vals_norm else []
     split_idx = int(len(days_all) * (1 - oos_test_ratio)) if oos_test_ratio > 0 else len(days_all)
 
     def _eval_segment(names: list[str], si: int | None, ei: int | None):
@@ -1650,7 +1648,7 @@ def _limit_ratio(code: str) -> float:
 
 def _event_mask(panel: pd.DataFrame, kind: str) -> pd.DataFrame:
     """事件布尔矩阵（datetime × instrument）。"""
-    close = panel["$close"].unstack("instrument")
+    close = panel["$close"].unstack("instrument").sort_index()
     ret = close.pct_change()
     if kind == "创60日新高":
         return close >= close.rolling(60).max() * 0.999
@@ -1665,7 +1663,7 @@ def _event_mask(panel: pd.DataFrame, kind: str) -> pd.DataFrame:
 def find_events(panel: pd.DataFrame, kind: str = "涨停") -> pd.DataFrame:
     """在面板上找事件点，返回 [(datetime, instrument)] 索引 + 当日涨幅列。
     涨停判定用日涨幅阈值（留 0.2% 余量）；创60日新高为收盘≥60日最高价×0.999。"""
-    close = panel["$close"].unstack("instrument")
+    close = panel["$close"].unstack("instrument").sort_index()
     ret = close.pct_change()
     m = _event_mask(panel, kind)
     hit = m.stack().rename("hit")
@@ -2306,7 +2304,7 @@ def compute_factor_ic_matured(score_date: str, eval_date: str, pool_name: str,
     lookback = 250
     if panel is None:
         panel = sig.get_panel_cached(codes, eval_date, lookback, source=_eval_source())
-    close = panel["$close"].unstack("instrument")
+    close = panel["$close"].unstack("instrument").sort_index()
     fwd = close.shift(-fwd_days) / close - 1
     score_ts = pd.Timestamp(score_date)
     if score_ts not in fwd.index:

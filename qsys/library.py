@@ -186,6 +186,10 @@ _CARD_DIR = DATA_DIR / "factor_cards"
 def _lconn():
     c = _qconn()
     c.executescript(_SCHEMA)
+    card_cols = {r[1] for r in c.execute("PRAGMA table_info(factor_scorecards)")}
+    for col in ('factor_version', 'evaluation_status', 'evaluation_reason', 'policy_version'):
+        if col not in card_cols:
+            c.execute(f"ALTER TABLE factor_scorecards ADD COLUMN {col} TEXT")
     # 迁移：策略包理论/账户归属字段（旧库兼容）
     strategy_cols = {r[1] for r in c.execute("PRAGMA table_info(strategies)")}
     for col in ("theory_id", "theory_name", "risk_class", "account_scope",
@@ -194,6 +198,8 @@ def _lconn():
             c.execute(f"ALTER TABLE strategies ADD COLUMN {col} TEXT")
     # 迁移：factor_registry 加骨架/机制族/闸门列
     cols = [r[1] for r in c.execute("PRAGMA table_info(factor_registry)")]
+    if 'version_seen_at' not in cols:
+        c.execute("ALTER TABLE factor_registry ADD COLUMN version_seen_at TEXT")
     for col, ddl in [("skeleton", "TEXT"), ("family", "TEXT"), ("gate_status", "INTEGER"),
                      ("engine", "TEXT DEFAULT 'rdagent'"), ("factor_type", "TEXT DEFAULT '量价'"),
                      ("norm", "TEXT")]:  # norm: 截面归一化人工覆盖（NULL=按类型自动映射）
@@ -444,6 +450,21 @@ def sync_factor_registry(factors: list[dict]):
     """同步因子注册表（自动提取骨架/机制族）。factors: [{name, kind, code?, trace?, round?, decision?, factor_type?}]"""
     import structure
 
+    from theory_policy import associate
+    # Network classification happens before acquiring the market DB write connection.
+    prepared = []
+    with _lconn() as c:
+        for incoming in factors:
+            f = dict(incoming)
+            old = c.execute("SELECT code,kind,factor_type,theory_id,theory_family,hypothesis_id,regime_scope,evidence_type,source_theory_sexpr FROM factor_registry WHERE name=?", (f["name"],)).fetchone()
+            unchanged = (old and (f.get("code"), f.get("kind"), f.get("factor_type", "量价")) == tuple(old[:3])
+                         and all(k not in f or f[k] == old[i] for k,i in
+                                 (("theory_id",3),("theory_family",4),("hypothesis_id",5),("regime_scope",6),("evidence_type",7),("source_theory_sexpr",8))))
+            if unchanged:
+                f.update(theory_id=old[3], theory_family=old[4], hypothesis_id=old[5], regime_scope=old[6], evidence_type=old[7], source_theory_sexpr=old[8])
+            prepared.append((f, bool(unchanged)))
+    changed_names = {f["name"] for f, unchanged in prepared if not unchanged}
+    factors = [f if unchanged else {**f, **associate(f)} for f, unchanged in prepared]
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with _lconn() as c:
         for f in factors:
@@ -451,7 +472,7 @@ def sync_factor_registry(factors: list[dict]):
             f.setdefault("theory_family", f.get("family"))
             f.setdefault("evidence_type", f.get("factor_type", "量价"))
             f.setdefault("regime_scope", "all")
-            if not f.get("theory_id") and not f.get("theory_family"):
+            if not f.get("theory_id") or f.get("association_source") == "llm_suggestion":
                 f.setdefault("validation_status", "shadow_only")
             static_ok, static_reason = static_review_factor(f["name"], f.get("kind", "builtin"), f.get("code"))
             sk = structure.extract_skeleton(f["name"], f.get("code"))
@@ -461,20 +482,33 @@ def sync_factor_registry(factors: list[dict]):
                 "INSERT INTO factor_registry (name, kind, code, trace, round, decision, first_seen,"
                 " skeleton, family, engine, factor_type, theory_id, hypothesis_id, generation_mode, parent_factor, source_theory_sexpr, theory_family, evidence_type, regime_scope, validation_status)"
                 " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
-                " ON CONFLICT(name) DO UPDATE SET code=excluded.code, trace=excluded.trace,"
+                " ON CONFLICT(name) DO UPDATE SET code=excluded.code, kind=excluded.kind, trace=excluded.trace,"
                 "   round=excluded.round, decision=excluded.decision,"
                 "   skeleton=excluded.skeleton, family=excluded.family,"
-                "   factor_type=excluded.factor_type, theory_id=COALESCE(excluded.theory_id,factor_registry.theory_id),"
-                "   hypothesis_id=COALESCE(excluded.hypothesis_id,factor_registry.hypothesis_id),"
+                "   factor_type=excluded.factor_type, theory_id=excluded.theory_id, theory_family=excluded.theory_family, evidence_type=excluded.evidence_type, regime_scope=excluded.regime_scope,"
+                "   hypothesis_id=excluded.hypothesis_id,"
                 "   generation_mode=COALESCE(excluded.generation_mode,factor_registry.generation_mode),"
                 "   parent_factor=COALESCE(excluded.parent_factor,factor_registry.parent_factor),"
-                "   source_theory_sexpr=COALESCE(excluded.source_theory_sexpr,factor_registry.source_theory_sexpr)",
+                "   source_theory_sexpr=excluded.source_theory_sexpr",
                 (f["name"], f["kind"], f.get("code"), f.get("trace"),
                  f.get("round"), int(f["decision"]) if f.get("decision") is not None else None, now,
                  sk, fam, f.get("engine", "rdagent"), ft, f.get("theory_id"), f.get("hypothesis_id"),
                  f.get("generation_mode"), f.get("parent_factor"), f.get("source_theory_sexpr"),
                  f.get("theory_family") or f.get("family"), f.get("evidence_type"), f.get("regime_scope"),
                  f.get("validation_status", "static_passed" if static_ok else "static_rejected")))
+            if f["name"] in changed_names:
+                c.execute("UPDATE factor_registry SET gate_status=NULL,validation_status='shadow_only',version_seen_at=? WHERE name=?", (now,f["name"]))
+                # Keep immutable historical evidence before invalidating metrics used by legacy readers.
+                c.execute("CREATE TABLE IF NOT EXISTS factor_scorecard_archive AS SELECT *, CAST(NULL AS TEXT) AS archived_at FROM factor_scorecards WHERE 0")
+                c.execute("INSERT INTO factor_scorecard_archive SELECT *, ? FROM factor_scorecards WHERE name=? AND COALESCE(evaluation_status,'')<>'stale_version'", (now,f["name"]))
+                c.execute("UPDATE factor_scorecards SET evaluation_status='stale_version',icir=NULL,ic_oos=NULL,icir_oos=NULL WHERE name=?",(f["name"],))
+
+    if changed_names:
+        from factor_evaluation_queue import enqueue
+        with _lconn() as c:
+            c.row_factory = __import__('sqlite3').Row
+            fresh = [dict(c.execute('SELECT * FROM factor_registry WHERE name=?',(name,)).fetchone()) for name in changed_names]
+        enqueue(fresh, '沪深300')
 
 
 def static_review_factor(name: str, kind: str, code: str | None = None) -> tuple[bool, str]:
@@ -695,7 +729,9 @@ def save_scorecard(card: pd.DataFrame, pool_name: str, eval_date: str):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     win_cols = [c for c in card.columns if c.endswith("日胜率")]
     rows = []
+    from factor_evaluation_queue import classify, POLICY
     for _, r in card.iterrows():
+        evaluation_status, evaluation_reason = classify(r)
         winrates = {c: _f(r.get(c)) for c in win_cols} if win_cols else {}
         rows.append((r["因子"], pool_name, eval_date, r.get("来源"),
                      _f(r.get("IC均值")), _f(r.get("ICIR")), _f(r.get("IC胜率")),
@@ -703,13 +739,13 @@ def save_scorecard(card: pd.DataFrame, pool_name: str, eval_date: str):
                      _safe_int(r.get("天数", 0)),
                      json.dumps(winrates, ensure_ascii=False), now,
                      _f(r.get("IC_OOS")), _f(r.get("ICIR_OOS")),
-                     _safe_int(r.get("OOS天数", 0))))
+                     _safe_int(r.get("OOS天数", 0)), r.get("factor_version"), evaluation_status, evaluation_reason, POLICY))
     with _lconn() as c:
         c.executemany(
             "INSERT OR REPLACE INTO factor_scorecards (name, pool_name, eval_date, kind,"
             " ic_mean, icir, ic_winrate, top_winrate, direction, days, winrates, updated_at,"
-            " ic_oos, icir_oos, oos_days)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+            " ic_oos, icir_oos, oos_days,factor_version,evaluation_status,evaluation_reason,policy_version)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
 
 
 def _f(v):
@@ -788,27 +824,38 @@ def save_strategy(name: str, pack: dict, status: str | None = None):
 
 
 def list_strategies() -> dict:
-    """返回与 packs.json 相同的结构 {name: pack_dict}，便于各处平滑切换。"""
+    """Load strategy definitions and fallback factor definitions consistently."""
     with _lconn() as c:
-        rows = c.execute("SELECT name, pool_name, top_n, method, filters, factors, oos_winrate,"
-            " horizon, is_winrate, updated_at, status, theory_id, theory_name, risk_class, account_scope,"
-            " theory_family, regime_scope, evidence_type FROM strategies").fetchall()
-    # 旧策略包只保存了因子名称；从注册表补回代码和真实 kind，保证回测/重验可复现。
-    with _lconn() as c:
-        registry = {r[0]: {"kind": r[1], "code": r[2], "factor_type": r[3]}
-                    for r in c.execute(
-                        "SELECT name,kind,code,factor_type FROM factor_registry").fetchall()}
+        return _strategies_on_connection(c)
+
+
+def resolve_strategy_factors(factors, registry):
+    """Fill legacy references without replacing explicit strategy code snapshots."""
+    result = []
+    for original in factors:
+        fac = dict(original)
+        reg = registry.get(fac.get('name')) or {}
+        has_snapshot = bool(fac.get('code'))
+        if not has_snapshot and reg.get('code'):
+            fac['code'] = reg['code']
+        if reg.get('kind') and (not fac.get('kind') or
+                               (fac.get('kind') == 'evolved' and not has_snapshot)):
+            fac['kind'] = reg['kind']
+        if reg.get('factor_type') and not fac.get('factor_type'):
+            fac['factor_type'] = reg['factor_type']
+        result.append(fac)
+    return result
+
+
+def _strategies_on_connection(c) -> dict:
+    rows = c.execute("SELECT name, pool_name, top_n, method, filters, factors, oos_winrate,"
+        " horizon, is_winrate, updated_at, status, theory_id, theory_name, risk_class, account_scope,"
+        " theory_family, regime_scope, evidence_type FROM strategies").fetchall()
+    registry = {r[0]: {"kind": r[1], "code": r[2], "factor_type": r[3]}
+                for r in c.execute("SELECT name,kind,code,factor_type FROM factor_registry").fetchall()}
     out = {}
     for (name, pool, top_n, method, filters, factors, oos, horizon, is_wr, updated, status, theory_id, theory_name, risk_class, account_scope, theory_family, regime_scope, evidence_type) in rows:
-        fs = json.loads(factors or "[]")
-        for fac in fs:
-            reg = registry.get(fac.get("name")) or {}
-            if reg.get("code") and not fac.get("code"):
-                fac["code"] = reg["code"]
-            if reg.get("kind") and fac.get("kind") in (None, "evolved"):
-                fac["kind"] = reg["kind"]
-            if reg.get("factor_type") and not fac.get("factor_type"):
-                fac["factor_type"] = reg["factor_type"]
+        fs = resolve_strategy_factors(json.loads(factors or "[]"), registry)
         out[name] = {"pool_name": pool, "top_n": top_n, "method": method,
                      "filters": json.loads(filters or "[]"), "factors": fs,
                      "oos_winrate": oos, "horizon": horizon, "is_winrate": is_wr, "updated": updated,
@@ -819,9 +866,52 @@ def list_strategies() -> dict:
     return out
 
 
-def save_strategy_validation(name: str, result: dict) -> None:
+def save_strategy_validation(name: str, result: dict, *, update_status: bool = False,
+                             publish: bool = True, expected_version: str | None = None) -> dict:
+    """Append evidence and update the daily projection/status in one transaction."""
+    import math
+    import uuid
+    def clean(value):
+        if isinstance(value, dict):
+            return {k: clean(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [clean(v) for v in value]
+        if isinstance(value, float) and not math.isfinite(value):
+            return None
+        return value
+    result = clean(dict(result))
+    result.setdefault('report_id', uuid.uuid4().hex)
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with _lconn() as c:
+        c.execute('''CREATE TABLE IF NOT EXISTS strategy_validation_reports (
+            report_id TEXT PRIMARY KEY, strategy_name TEXT NOT NULL,
+            eval_date TEXT NOT NULL, created_at TEXT NOT NULL, report_json TEXT NOT NULL)''')
+        # Serialize definition reads and publication against other SQLite writers.
+        c.execute('BEGIN IMMEDIATE')
+        if publish and expected_version is not None:
+            from execution_gate import strategy_version
+            current = _strategies_on_connection(c).get(name)
+            if (current is None or strategy_version(current) != expected_version
+                    or current.get('status') in ('paused', 'retired', 'archived')):
+                publish = False
+                result.update(ok=False, assessment_status='stale_version',
+                              error='发布时策略已变更或停用，结果仅归档')
+        result['published'] = publish
+        # Preserve the pre-journal daily record before replacing it.
+        old = c.execute('SELECT metrics_json,created_at FROM strategy_validation WHERE strategy_name=? AND eval_date=?',
+                        (name, result['eval_date'])).fetchone()
+        if old:
+            import hashlib
+            legacy_id = 'legacy-' + hashlib.sha256((name + result['eval_date'] + old[0]).encode()).hexdigest()
+            prior = json.loads(old[0])
+            if not prior.get('report_id'):
+                c.execute('INSERT OR IGNORE INTO strategy_validation_reports VALUES (?,?,?,?,?)',
+                          (legacy_id, name, result['eval_date'], old[1] or now, old[0]))
+        payload = json.dumps(result, ensure_ascii=False, allow_nan=False)
+        c.execute('INSERT INTO strategy_validation_reports VALUES (?,?,?,?,?)',
+                  (result['report_id'], name, result['eval_date'], now, payload))
+        if not publish:
+            return result
         c.execute(
             "INSERT OR REPLACE INTO strategy_validation"
             "(strategy_name,eval_date,pool_name,method,top_n,fwd_days,oos_windows,"
@@ -831,7 +921,12 @@ def save_strategy_validation(name: str, result: dict) -> None:
              result.get("top_n"), result.get("fwd_days"), result.get("oos_windows"),
              result.get("oos_winrate"), result.get("avg_net_excess"),
              result.get("max_drawdown"), result.get("sharpe"), result.get("status"),
-             json.dumps(result, ensure_ascii=False), now))
+             payload, now))
+        if update_status:
+            winrate = result.get('oos_winrate')
+            c.execute("UPDATE strategies SET status=?,oos_winrate=?,updated_at=? WHERE name=? AND status NOT IN ('paused','retired','archived')",
+                      (result['status'], f'{winrate:.0%}' if winrate is not None else None, now, name))
+    return result
 
 
 def update_strategy_oos(name: str, new_oos: float, status: str = "active"):

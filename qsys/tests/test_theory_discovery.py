@@ -1,9 +1,12 @@
 """理论发现引擎测试：注册闭环与 LLM prompt 前缀缓存纪律。"""
 import sys
+import os
 import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_TMP = tempfile.TemporaryDirectory()
+os.environ['QSYS_DATA_DIR'] = _TMP.name
 import datasource
 from loopengine.theory_discovery import (HypothesisGenerator, TheoryNamer,
                                          _extract_hypotheses, _filter_falsified,
@@ -101,7 +104,7 @@ def test_track_record_and_falsified_filter_and_prompt():
         try:
             HypothesisGenerator.generate(
                 [{"type": "尾盘缩量", "description": "尾盘缩量上涨", "severity": 0.7}],
-                {}, rec)
+                {}, rec, budget=__import__("theory_policy").Budget("test-hypothesis"))
         finally:
             llmutil.llm_chat = original
         assert "已被证伪" in captured["user"] and "已验证有效" in captured["user"]

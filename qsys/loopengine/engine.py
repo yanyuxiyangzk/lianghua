@@ -504,7 +504,7 @@ class LoopEngine:
         experience.update_signal_shadow_bias(row["date"], snapshot)
 
     # ---------------- 单轮 ----------------
-    def run_round(self, batch: int = 30, factor_type: str = "量价") -> dict:
+    def run_round(self, batch: int = 30, factor_type: str = "量价", include_events: bool = True, prepared=None) -> dict:
         """单轮挖掘：factor_type 指定因子类型（量价/资金流/板块轮动/龙虎榜/盘口异动/指数）。"""
         s = self.state
         import time as _time
@@ -519,7 +519,7 @@ class LoopEngine:
 
         # Step 1: 构建面板
         bus.push(EventType.STEP_UPDATE, step=1, name="构建面板", status="running")
-        panel, frames, codes, end = self._frames(factor_type)
+        panel, frames, codes, end = prepared if prepared is not None else self._frames(factor_type)
         bus.push(EventType.STEP_UPDATE, step=1, name="构建面板", status="done")
 
         # 非量价类型：检查额外帧是否为空，为空则跳过本轮
@@ -749,7 +749,7 @@ class LoopEngine:
         _EVENT_MINE_BATCH = 15
         _EVENT_MINE_HORIZON = 5
         ev_result = None
-        if s["iteration"] % 4 == 0:
+        if include_events and s["iteration"] % 4 == 0:
             ev_kind = _EVENT_KINDS_ROTATION[s["iteration"] % len(_EVENT_KINDS_ROTATION)]
             try:
                 ev_result = self.run_event_round(ev_kind, batch=_EVENT_MINE_BATCH,

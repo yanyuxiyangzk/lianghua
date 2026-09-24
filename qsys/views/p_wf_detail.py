@@ -23,6 +23,10 @@ def _load_wf_data():
 
 def render():
     st.markdown("## 📉 Walk-Forward 衰减分析")
+    from validation_report_reader import render_reports
+    render_reports()
+    st.divider()
+    st.markdown('### 历史实验日志（独立查看）')
 
     df = _load_wf_data()
     if df.empty:
@@ -44,6 +48,14 @@ def render():
             pass
         return
 
+    # Never stitch separate experiments into one equity curve.
+    if "run_id" not in df or df["run_id"].isna().any():
+        st.warning("历史记录缺少实验编号，仅展示原始记录，不能合成回测净值。")
+        st.dataframe(df, hide_index=True)
+        return
+    run_id = st.selectbox("回测实验", df["run_id"].drop_duplicates().tolist())
+    df = df.loc[df["run_id"].eq(run_id)].copy()
+    st.caption("仅统计所选实验；历史记录不自动获得新版口径认证。")
     # 概览
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -76,21 +88,11 @@ def render():
 
     with tab2:
         st.markdown("### 净值曲线对比")
-        if "opt_net_excess" in df and "eq_net_excess" in df:
-            wf = df.sort_values("trade_date")
-            wf["opt_nav"] = (1 + wf["opt_net_excess"]).cumprod()
-            wf["eq_nav"] = (1 + wf["eq_net_excess"]).cumprod()
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=wf["trade_date"], y=wf["opt_nav"],
-                                     name="优化组合", line=dict(color="steelblue")))
-            fig.add_trace(go.Scatter(x=wf["trade_date"], y=wf["eq_nav"],
-                                     name="等权对照", line=dict(color="coral", dash="dash")))
-            fig.update_layout(height=350, margin=dict(l=20, r=20, t=30, b=20),
-                              xaxis_title="日期", yaxis_title="净值")
-            st.plotly_chart(fig, width="stretch")
+        st.info("此日志未保存可验证的完整收益窗口与新版计算契约，停止展示累计净值。研究结果请以重新评估的版本化报告为准。")
+        st.dataframe(df, hide_index=True)
 
     with tab3:
-        st.markdown("### 月度聚合")
+        st.markdown("### 按信号月份统计窗口均值（非自然月收益）")
         if "trade_date" in df and "opt_net_excess" in df:
             wf = df.copy()
             wf["month"] = pd.to_datetime(wf["trade_date"]).dt.to_period("M").astype(str)

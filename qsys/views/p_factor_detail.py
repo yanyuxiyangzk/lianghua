@@ -1,4 +1,4 @@
-"""🔬 因子详情：单因子时序曲线、IC衰减、十分层收益、多空对冲净值。
+"""🔬 因子详情：单因子时序曲线、滚动IC、十分层收益、多空对冲净值。
 
 数据来源：
   - factor_registry：因子元数据
@@ -22,7 +22,7 @@ from common import DATA_DIR, all_pools, get_last_trade_day
 
 def render():
     st.title("🔬 因子详情")
-    st.caption("选择因子 → 查看时序曲线、IC衰减、十分层收益、多空对冲净值")
+    st.caption("选择因子 → 查看时序曲线、滚动IC、十分层收益、多空对冲净值")
 
     registry = library.get_factor_registry()
     if registry.empty:
@@ -59,6 +59,8 @@ def render():
     # 体检指标
     scorecard = library.get_latest_scorecard(pool_name)
     if not scorecard.empty:
+        from scorecard_evidence import current_valid_mask
+        scorecard = scorecard.loc[current_valid_mask(scorecard, registry)]
         sc_row = scorecard[scorecard["因子"] == selected]
         if not sc_row.empty:
             sc = sc_row.iloc[0]
@@ -181,8 +183,8 @@ def render():
                           xaxis_title="日期", yaxis_title="因子值")
         st.plotly_chart(fig, width="stretch")
 
-    # 2. IC衰减曲线
-    st.markdown("#### IC 衰减曲线（滚动20日IC均值）")
+    # 2. 滚动IC曲线
+    st.markdown("#### 滚动IC（20日前向收益，20日滚动均值）")
     fwd = fe.forward_returns(panel, 20)
     ic = fe.ic_series(vals, fwd)
     if not ic.empty:
@@ -198,53 +200,27 @@ def render():
         st.plotly_chart(fig, width="stretch")
         st.caption(f"IC 均值: {ic.mean():.4f} | ICIR: {ic.mean()/(ic.std()+1e-12):.3f} | IC胜率: {(ic>0).mean():.0%}")
 
-    # 3. 十分层收益柱状图
-    st.markdown("#### 十分层平均20日收益")
-    fwd_vals = fe.forward_returns(panel, 20)
-    j = vals.rename("f").to_frame().join(fwd_vals.stack().rename("r"), how="inner").dropna()
-    if not j.empty:
-        def _group_mean(g):
-            k = max(1, int(len(g) * 0.10))
-            groups = {}
-            for pct in range(10):
-                lo = g["f"].quantile(pct / 10)
-                hi = g["f"].quantile((pct + 1) / 10)
-                mask = (g["f"] >= lo) & (g["f"] <= hi) if pct < 9 else (g["f"] >= lo)
-                groups[f"G{pct+1}"] = g.loc[mask, "r"].mean() if mask.any() else 0
-            return pd.Series(groups)
-
-        gm = j.groupby(level="datetime").apply(_group_mean).mean()
-        colors = ["#d62728" if v < 0 else "#2ca02c" for v in gm.values]
-        fig = go.Figure(go.Bar(x=gm.index, y=gm.values, marker_color=colors))
-        fig.update_layout(height=300, margin=dict(l=20, r=20, t=10, b=20),
-                          xaxis_title="分组", yaxis_title="平均20日收益")
+    # Shared non-overlapping research engine; never compound overlapping labels.
+    bt = fe.factor_group_backtest(vals, panel, n_groups=10, fwd_days=20, step=20)
+    st.caption(bt["note"])
+    if bt["status"] != "valid":
+        st.warning("研究报告不完整，停止展示净值与绩效。" + "；".join(bt["reasons"][:3]))
+    st.markdown("#### 十分层平均20日收益（非重叠取样）")
+    gm = pd.Series(bt["group_mean"], dtype=float).dropna()
+    if not gm.empty:
+        fig = go.Figure(go.Bar(x=gm.index, y=gm.values))
+        fig.update_layout(height=300, yaxis_tickformat=".1%")
         st.plotly_chart(fig, width="stretch")
-        # 单调性检验
-        monotonic = all(gm.values[i] <= gm.values[i+1] for i in range(len(gm.values)-1))
-        st.caption(f"{'✅ 单调性良好' if monotonic else '⚠️ 单调性一般'} | 多空收益: {gm.iloc[-1]-gm.iloc[0]:.2%}")
-
-    # 4. 多空对冲净值
-    st.markdown("#### 多空对冲净值曲线")
-    if not j.empty:
-        def _ls_nav(g):
-            k = max(1, int(len(g) * 0.10))
-            top = g.nlargest(k, "f")["r"].mean()
-            bottom = g.nsmallest(k, "f")["r"].mean()
-            return top - bottom
-
-        ls = j.groupby(level="datetime").apply(_ls_nav)
-        nav = (1 + ls).cumprod()
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=nav.index, y=nav.values, mode="lines",
-                                 fill="tozeroy", line=dict(color="steelblue")))
-        fig.update_layout(height=300, margin=dict(l=20, r=20, t=10, b=20),
-                          xaxis_title="日期", yaxis_title="净值")
-        st.plotly_chart(fig, width="stretch")
-        ann_ret = float(ls.mean() * 252)
-        ann_vol = float(ls.std() * np.sqrt(252))
-        sharpe = ann_ret / (ann_vol + 1e-12)
-        mdd = float(((nav - nav.cummax()) / nav.cummax()).min())
-        st.caption(f"年化收益: {ann_ret:.2%} | 年化波动: {ann_vol:.2%} | Sharpe: {sharpe:.2f} | MaxDD: {mdd:.2%}")
+    if not bt["ls_nav"].empty:
+        st.markdown("#### 理论多空研究净值（持有期末）")
+        st.line_chart(bt["ls_nav"])
+        st.caption(" · ".join(f"{k}: {v}" for k, v in bt["ls_stats"].items()))
+    st.markdown("#### 持有期IC诊断")
+    horizon_rows = []
+    for horizon in (1, 5, 10, 20):
+        series = fe.ic_series(vals, fe.forward_returns(panel, horizon))
+        horizon_rows.append({"前向交易日": horizon, "IC均值": series.mean(), "有效日期数": len(series)})
+    st.dataframe(pd.DataFrame(horizon_rows), hide_index=True)
 
     # 5. 因子值分布直方图
     st.markdown("#### 因子值分布")

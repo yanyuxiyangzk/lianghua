@@ -145,7 +145,7 @@ def _fig_nav(nav: pd.Series) -> go.Figure:
                                line=dict(color="#7c3aed", width=2), name="多空净值"))
     fig.add_hline(y=1, line_dash="dash", line_color="#999")
     fig.update_layout(height=300, margin=dict(l=10, r=10, t=30, b=10),
-                      title="顶组-底组 多空净值", template="plotly_white")
+                      title="理论多空研究净值（5日持有期末）", template="plotly_white")
     return fig
 
 
@@ -230,9 +230,15 @@ def render():
 
     # ---- 结果区 ----
     ev = st.session_state.get("lab_eval")
+    if ev and ev["result"]["bt"].get("policy") != "factor-group-v2":
+        st.info("回测口径已更新，请重新运行评估。")
+        ev = None
     if ev:
         vals, res = ev["vals"], ev["result"]
         ic = res["ic"]
+        st.caption(res["bt"].get("note", "历史缓存结果，请重新运行评估"))
+        if res["bt"].get("status") != "valid":
+            st.warning("研究报告不完整：" + "；".join(res["bt"].get("reasons", [])[:3]))
         st.markdown("---")
         st.markdown(f"#### 评估结果：`{ev['name']}` · {ev['pool']} · 截至 {res['last_day']}")
         m1, m2, m3, m4 = st.columns(4)

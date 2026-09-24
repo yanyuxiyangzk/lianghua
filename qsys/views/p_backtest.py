@@ -7,6 +7,11 @@ import streamlit as st
 from common import LOG_DIR, WORKSPACE_ROOT, quick_stats
 
 st.title("📊 回测浏览")
+view = st.radio("查看内容", ["日期回测明细", "Qlib历史产物"], horizontal=True)
+if view == "日期回测明细":
+    from execution_detail_view import render
+    render()
+    st.stop()
 st.caption("RD-Agent 每轮实验的 Qlib 回测产物（mlruns） · 数据源固定为 qlib 本地库")
 
 

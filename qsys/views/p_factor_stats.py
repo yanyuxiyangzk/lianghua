@@ -18,6 +18,9 @@ def render():
     st.title("📈 因子体检统计")
     st.caption("体检结果全局统计 · IC/胜率分布 · 因子对比 · 多周期热力图")
 
+    from factor_eval_ui import render_evaluation_status
+    render_evaluation_status()
+
     pools = library.list_scorecard_pools()
     if not pools:
         st.info("暂无体检数据。到 🧩选股组合 页运行体检。")
@@ -30,8 +33,20 @@ def render():
         st.info(f"「{pool_name}」暂无体检数据。")
         return
 
-    # 合并 factor_type 和 family
+    from scorecard_evidence import current_valid_mask
     registry = library.get_factor_registry()
+    valid_mask = current_valid_mask(card, registry)
+    st.caption(f'评分记录 {len(card)} · 当前版本有效研究评分 {int(valid_mask.sum())} · 其他记录 {int((~valid_mask).sum())}；研究评分不代表交易批准。')
+    show_history = st.checkbox("显示历史、样本不足及其他未验证记录（仅诊断）", value=False)
+    if not show_history:
+        card = card.loc[valid_mask].copy()
+    else:
+        st.warning("诊断模式包含未验证结果，统计值不可解释为有效因子的整体表现。")
+    if card.empty:
+        st.info("当前无符合此筛选条件的评分。")
+        return
+    valid_mask = valid_mask.reindex(card.index)
+    # 合并 factor_type 和 family
     if not registry.empty:
         ft_map = registry.set_index("name")["factor_type"].to_dict() if "factor_type" in registry.columns else {}
         fam_map = registry.set_index("name")["family"].to_dict() if "family" in registry.columns else {}
@@ -46,7 +61,7 @@ def render():
 
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            st.metric("已体检因子", f"{len(card):,}")
+            st.metric("当前版本有效评分", f"{int(valid_mask.sum()):,}")
         with c2:
             ic_mean = card["IC均值"].mean() if "IC均值" in card.columns else 0
             st.metric("平均IC均值", f"{ic_mean:.4f}")

@@ -1,6 +1,11 @@
 """全流程工作流可视化 — 单页纵向流程图 + KPI仪表盘 + 阶段展开日志。"""
 
 import json
+from html import escape
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+from workflow_status import MINING_JOBS, read_live_status, read_mining_progress
 
 import pandas as pd
 import streamlit as st
@@ -185,7 +190,7 @@ def _load_data():
             r2 = c.execute("""
                 SELECT
                     (SELECT COUNT(*) FROM factor_registry WHERE engine='loopengine') as reg_loop,
-                    (SELECT COUNT(DISTINCT name) FROM factor_scorecards) as sc_count,
+                    (SELECT COUNT(DISTINCT s.name) FROM factor_scorecards s JOIN factor_registry r ON r.name=s.name WHERE r.engine='loopengine' AND s.days>0 AND s.icir IS NOT NULL) as sc_count,
                     (SELECT COUNT(*) FROM strategies) as st_count,
                     (SELECT COUNT(*) FROM factor_registry) as reg_total
             """).fetchone()
@@ -212,7 +217,7 @@ def _load_data():
 
             data["recent_mines"] = [{"msg": r[0], "time": r[1]} for r in c.execute(
                 "SELECT message, started_at FROM sched_exec_log "
-                "WHERE job_key='loopengine' ORDER BY id DESC LIMIT 12")]
+                "WHERE job_key IN ('loopengine','multitype_mine') ORDER BY id DESC LIMIT 12")]
 
         # picks/positions 在 experience.db
         exp_db = DATA_DIR / "experience.db"
@@ -295,7 +300,7 @@ def _render_gen(data):
              ("FSA拦截", "g" if tt > 0 else "n"),
              ("硬闸门", "g" if gt > 0 else ("y" if h else "n")), ("入库", "g" if rl > 0 else "n")]
     st.markdown(_vf_stage("🧬", "因子生成 LoopEngine", f"迭代 {it} 轮 · 入库 {acc} 个 · 通过率 {rate}", steps,
-                          "done" if rl > 0 else ("running" if h else "pending"),
+                          "done" if rl > 0 else "pending",
                           link_url="/le-realtime" if h else None), unsafe_allow_html=True)
 
 
@@ -311,49 +316,15 @@ def _render_stage_status_bar(data):
         if k not in last_runs:
             last_runs[k] = r
 
-    # 计算下一轮任务信息
-    iteration = data.get("iteration", 0)
-    factor_types = ["量价", "资金流", "板块轮动", "指数", "盘口异动", "龙虎榜", "爆量抢筹", "财务", "支撑阻力", "事件记忆"]
-    next_type = factor_types[iteration % len(factor_types)]
-    next_iteration = iteration + 1
-
-    # 类型描述
-    type_desc = {
-        "量价": "K线形态/量价关系",
-        "资金流": "主力资金流向",
-        "板块轮动": "行业板块轮动",
-        "指数": "指数相关性",
-        "盘口异动": "盘口买卖盘变化",
-        "龙虎榜": "龙虎榜数据",
-        "爆量抢筹": "盘口吸筹信号", "财务": "财务质量/估值指标", "支撑阻力": "支撑阻力位置", "事件记忆": "历史事件记忆",
-    }
-    next_desc = type_desc.get(next_type, next_type)
-
-    # 类型颜色
-    type_colors = {
-        "量价": "#667eea", "资金流": "#11998e", "板块轮动": "#f7971e",
-        "指数": "#eb3349", "盘口异动": "#764ba2", "龙虎榜": "#e91e63",
-        "爆量抢筹": "#ff5722", "财务": "#795548", "支撑阻力": "#607d8b", "事件记忆": "#9c27b0",
-    }
-    next_color = type_colors.get(next_type, "#999")
-
-    # 轮转进度条
-    rotation_html = ""
-    for i, ft in enumerate(factor_types):
-        is_current = (i == (iteration - 1) % len(factor_types)) and iteration > 0
-        is_next = i == (iteration % len(factor_types))
-        bg = type_colors.get(ft, "#ddd")
-        opacity = "1" if is_current or is_next else "0.3"
-        border = f"2px solid {bg}" if is_next else "1px solid #ddd"
-        rotation_html += f'<div style="width:18px;height:18px;border-radius:50%;background:{bg};opacity:{opacity};border:{border};display:flex;align-items:center;justify-content:center;font-size:7px;color:#fff;font-weight:700" title="{ft}">{ft[0]}</div>'
-        if i < len(factor_types) - 1:
-            rotation_html += '<div style="width:12px;height:2px;background:#ddd;align-self:center"></div>'
+    # Current type cannot be inferred from historical iteration counts.
+    live = data.get("live", {})
+    live_json = json.dumps(live)
 
     stages_json = json.dumps([
         {"id": "gen", "label": "因子生成", "icon": "🧬",
-         "jobs": ["loopengine", "fundflow_sync", "lhb_sync"]},
+         "jobs": ["multitype_mine", "loopengine"]},
         {"id": "eval", "label": "因子回测", "icon": "📊",
-         "jobs": ["le_factor_eval", "gate_check"]},
+         "jobs": ["le_factor_eval", "le_factor_eval_noon", "le_factor_eval_pm", "gate_check"]},
         {"id": "pick", "label": "自动选股", "icon": "🎯",
          "jobs": ["pool_scan", "auto_scan", "watchlist_signals", "auction_confirm"]},
         {"id": "pos", "label": "持仓管理", "icon": "💼",
@@ -409,19 +380,6 @@ def _render_stage_status_bar(data):
   </span>
 </div>
 </div>
-<!-- 下一轮任务预告 -->
-<div style="background:#f8f9fa;border-radius:8px;padding:10px 14px;margin-bottom:12px;border:1px dashed #dee2e6">
-<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-  <span style="font-size:11px;color:#666">⏭️ 下一轮</span>
-  <span style="font-size:12px;font-weight:700;color:#333">第{next_iteration}轮</span>
-  <span style="font-size:10px;padding:2px 8px;border-radius:10px;color:#fff;font-weight:600;background:{next_color}">{next_type}</span>
-  <span style="font-size:10px;color:#999;margin-left:auto">{next_desc}</span>
-</div>
-<div style="display:flex;align-items:center;gap:4px">
-  <span style="font-size:9px;color:#999;margin-right:4px">轮转:</span>
-  {rotation_html}
-</div>
-</div>
 
 <style>
 @keyframes sbPulse{{0%,100%{{opacity:1}}50%{{opacity:.5}}}}
@@ -442,6 +400,7 @@ def _render_stage_status_bar(data):
 (function(){{
   const STAGES = {stages_json};
   const LAST_RUNS = {last_runs_json};
+  const LIVE = {live_json};
   const COLORS = {ft_colors};
   const STEP_NAMES = ['构建面板','机制族引导','FSA重算','生成候选','规则审查','LLM审查','去重','FSA拦截','硬闸门','入库'];
   const JOB_TO_STAGE = {{}};
@@ -488,6 +447,26 @@ def _render_stage_status_bar(data):
   setInterval(function() {{ timeEl.textContent = new Date().toLocaleTimeString('zh-CN',{{hour12:false}}); }}, 1000);
   timeEl.textContent = new Date().toLocaleTimeString('zh-CN',{{hour12:false}});
 
+  if (LIVE.fresh) {{
+    Object.keys(LIVE.running).forEach(key => {{
+      const sid = JOB_TO_STAGE[key];
+      if (sid) setStage(sid, 'running', '运行中');
+    }});
+    if (LIVE.running.multitype_mine || LIVE.running.loopengine) {{
+      wrapEl.style.display = 'block';
+      roundEl.textContent = '因子挖掘批次运行中';
+      stepEl.textContent = '等待实时阶段事件；当前类型和完成比例尚未确认';
+      if (LIVE.progress) {{
+        const p = LIVE.progress;
+        typeEl.textContent = p.factor_type;
+        typeEl.style.background = COLORS[p.factor_type] || '#999';
+        stepEl.textContent = p.status === 'round_complete' ? '本轮已完成，等待下一类型状态' : p.status === 'skipped' ? '本轮跳过' : p.source === 'events' ? '正在挖掘 · 引擎第 ' + p.iteration + ' 轮' : p.status === 'preparing' ? '准备数据' : '本类型第 ' + p.rotation + '/' + p.rotations + ' 轮';
+      }}
+    }}
+  }} else {{
+    setStage('gen', '', '心跳不可用，运行状态待确认');
+  }}
+
   const es = new EventSource('{sse_url}/events');
   es.addEventListener('job_start', function(e) {{
     try {{ const d = JSON.parse(e.data); const sid = JOB_TO_STAGE[d.job_key]; if (sid) setStage(sid, 'running', '🔄 ' + d.job_name); }} catch(err) {{}}
@@ -526,10 +505,10 @@ def _render_stage_status_bar(data):
       setTimeout(function() {{ wrapEl.style.display = 'none'; }}, 5000);
     }} catch(err) {{}}
   }});
-  es.onerror = function() {{ stepEl.textContent = 'SSE 未连接'; pulseEl.style.animation = 'none'; }};
+  es.onerror = function() {{ stepEl.textContent = '实时阶段连接不可用；批次状态见上方心跳信息'; pulseEl.style.animation = 'none'; }};
 }})();
 </script>"""
-    st.components.v1.html(html, height=90, scrolling=False)
+    st.components.v1.html(html, height=190, scrolling=True)
 
 
 def _render_eval(data):
@@ -538,7 +517,7 @@ def _render_eval(data):
     steps = [("因子体检", "g" if sc > 0 else "n"), ("多周期胜率", "g" if sc > 0 else "n"),
              ("去冗余", "g" if sc > 0 else "n"), ("组合搜索", "y"),
              ("Walk-Forward", "y"), ("策略固化", "g" if stc > 0 else "n")]
-    st.markdown(_vf_stage("📊", "因子回测", f"已体检 {sc} 个 · 策略包 {stc} 个 · 通过闸门 {tp} 个", steps,
+    st.markdown(_vf_stage("📊", "因子回测", f"历史有效评分 {sc} 个 · 策略包 {stc} 个 · 通过闸门 {tp} 个", steps,
                           "done" if stc > 0 else ("running" if sc > 0 else "pending"),
                           link_url="/factor-stats" if sc > 0 else None), unsafe_allow_html=True)
 
@@ -603,22 +582,47 @@ FACTOR_TYPE_COLORS = {
 }
 FACTOR_TYPES_ORDER = ["量价", "资金流", "板块轮动", "指数", "盘口异动", "龙虎榜", "爆量抢筹", "财务", "支撑阻力", "事件记忆"]
 
-def _render_rotation(data):
-    iteration = data.get("iteration", 0)
-    # iteration 表示已完成轮数；最近完成的类型是第 iteration-1 个，避免页面落后一轮
-    current_idx = (iteration - 1) % len(FACTOR_TYPES_ORDER) if iteration > 0 else -1
-    current_type = FACTOR_TYPES_ORDER[current_idx] if current_idx >= 0 else "-"
+def _progress_phase(progress):
+    if progress.get("status") in ("queued", "complete", "failed"):
+        return {"queued": "批次已排队", "complete": "批次已完成", "failed": "批次失败"}[progress["status"]]
+    if progress.get("status") == "round_complete":
+        return "本轮已完成，等待下一类型状态"
+    if progress.get("status") == "skipped":
+        return "本轮跳过：" + progress.get("reason", "")
+    if progress.get("source") == "events":
+        return f"正在挖掘 · 引擎第 {progress.get('iteration', '?')} 轮"
+    if progress["status"] == "preparing":
+        return "准备数据"
+    return f"第 {progress['rotation']}/{progress['rotations']} 次全类型轮动 · 正在挖掘"
 
-    dots = ""
-    for i, ft in enumerate(FACTOR_TYPES_ORDER):
-        cls = "active" if i == current_idx else ("done" if i < current_idx else "")
-        short = ft[:2]
-        dots += f'<div class="rot-dot {cls}">{short}</div>'
-        if i < len(FACTOR_TYPES_ORDER) - 1:
-            dots += '<span class="rot-arrow">→</span>'
-    st.markdown(f"""<div class="rot-wrap">
-        <span class="rot-label">当前轮转:</span>{dots}
-    </div>""", unsafe_allow_html=True)
+
+def _render_rotation(data):
+    live = data.get("live", {})
+    progress = live.get("progress") if live.get("fresh") else None
+    current = progress.get("factor_type") if progress else None
+    st.markdown("#### 因子类型轮动目录")
+    queue = (progress or {}).get("queue") or []
+    next_item = next((item for item in queue if item.get("status") == "queued"), None)
+    waiting = current if (progress or {}).get("status") == "preparing" else (
+        next_item.get("factor_type") if next_item else None)
+    if (progress or {}).get("status") in ("failed", "complete"):
+        waiting = None
+    chips = []
+    for ft in FACTOR_TYPES_ORDER:
+        active = ft == current and progress.get("status") == "running"
+        pending = not active and ft == waiting
+        background = "#15803d" if active else "#facc15" if pending else "#f0f2f6"
+        color = "#fff" if active else "#422006" if pending else "#31333f"
+        state = "运行中" if active else "等待中" if pending else "未执行或状态待确认"
+        chips.append(
+            f'<span data-factor-type="{escape(ft, quote=True)}" '
+            f'data-active="{str(active).lower()}" data-waiting="{str(pending).lower()}" '
+            f'title="{escape(ft)}：{state}" aria-label="{escape(ft)}：{state}" '
+            f'style="display:inline-block;padding:8px 12px;border-radius:8px;'
+            f'background:{background};color:{color};font-size:14px;'
+            f'white-space:nowrap">{escape(ft)}</span>')
+    st.markdown('<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:12px">'
+                + ''.join(chips) + '</div>', unsafe_allow_html=True)
 
 
 def _render_type_chart(data):
@@ -746,9 +750,50 @@ def _render_details(data):
             st.info("暂无因子类型数据")
 
 
+@st.cache_resource
+def _mining_observer():
+    from mining_event_monitor import get_observer
+    return get_observer()
+
+
+@st.fragment(run_every="10s")
+def _render_live_status():
+    from common import DATA_DIR
+    live = read_live_status(DATA_DIR)
+    from mining_event_journal import snapshot
+    live["progress"] = read_mining_progress(DATA_DIR, live) or snapshot(live)
+    st.markdown("### 因子挖掘实时状态")
+    if not live["fresh"]:
+        st.warning("调度心跳缺失或超过 180 秒未更新，无法确认任务是否仍在运行。")
+    else:
+        active = [key for key in MINING_JOBS if key in live["running"]]
+        if active:
+            import time
+            started = min(live["running"][key] for key in active)
+            start_text = datetime.fromtimestamp(started, ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d %H:%M:%S")
+            elapsed = int(time.time() - started)
+            st.info(f"🧬 因子挖掘批次运行中 · 开始于 {start_text} · 已运行 {elapsed // 60} 分 {elapsed % 60} 秒")
+            progress = live["progress"]
+            if progress:
+                phase = _progress_phase(progress)
+                st.write(f"类型状态：{progress.get('factor_type', '批次')} · {phase}")
+                st.caption("按执行记录显示；类型顺序不代表完成百分比，运行中也不代表已有新因子通过验证。")
+            else:
+                st.caption("当前批次未提供可核验的类型记录，类型和轮次待确认；运行标记不代表已生成新因子。")
+        else:
+            st.info("当前调度心跳未报告正在运行的因子挖掘任务。")
+        heartbeat = datetime.fromtimestamp(live["ts"], ZoneInfo("Asia/Shanghai")).strftime("%H:%M:%S")
+        st.caption(f"心跳 {heartbeat}（北京时间） · 页面每 10 秒刷新，调度心跳约每 60 秒更新 · 下次调度检查：{live['next_mining'] or '未安排'}（仍受配额和数据变化条件限制）")
+    _render_rotation({"live": live})
+    data = dict(_load_data())
+    data["live"] = live
+    _render_stage_status_bar(data)
+
+
 # ---------- 主页面 ----------
 def render():
     st.markdown("## 🔗 全流程工作流")
+    _render_live_status()
     data = _load_data()
     if "error" in data:
         st.error(f"数据加载失败: {data['error']}")
@@ -756,15 +801,14 @@ def render():
 
     _render_kpi(data)
 
-    _render_stage_status_bar(data)
-
-    _render_rotation(data)
     _render_type_chart(data)
 
     st.markdown('<div class="vflow-wrap"><div class="vflow-line"></div>', unsafe_allow_html=True)
     _render_gen(data)
     st.markdown(_vf_arrow(), unsafe_allow_html=True)
     _render_eval(data)
+    from factor_eval_ui import render_evaluation_status
+    render_evaluation_status()
     st.markdown(_vf_arrow(), unsafe_allow_html=True)
     _render_pick(data)
     st.markdown(_vf_arrow(), unsafe_allow_html=True)

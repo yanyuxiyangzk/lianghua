@@ -255,7 +255,7 @@ def llm_available() -> bool:
 
 
 def llm_chat(system: str, user: str, max_tokens: int = 4096, model: str | None = None,
-             label: str = "", use_cache: bool = True) -> str | None:
+             label: str = "", use_cache: bool = True, max_retries: int | None = None) -> str | None:
     """调用一次 chat completion，返回纯文本；无 key / 调用异常返回 None。
     use_cache: 是否使用响应缓存（默认启用，相同prompt直接返回缓存）。"""
     if not llm_available():
@@ -285,7 +285,7 @@ def llm_chat(system: str, user: str, max_tokens: int = 4096, model: str | None =
             messages=messages,
             max_tokens=max_tokens,
             temperature=0.2,
-            **_completion_options(model),
+            **{**_completion_options(model), **({"num_retries": max_retries} if max_retries is not None else {})},
         )
         pre_hit, pre_miss = _log_cache_usage(r, label or "chat")
         response = (r.choices[0].message.content or "").strip()

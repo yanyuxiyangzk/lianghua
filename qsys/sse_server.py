@@ -416,3 +416,22 @@ async def trigger_loopengine():
 @app.get("/stats")
 async def stats():
     return bus.stats
+
+
+@app.get('/factor-eval/events')
+async def factor_eval_events(request: __import__('fastapi').Request, after: int = 0):
+    """Durable replay cursor also supports workers outside the scheduler process."""
+    from factor_evaluation_queue import read_events
+    try:
+        cursor = max(after, int(request.headers.get('last-event-id', '0')))
+    except ValueError:
+        cursor = max(after, 0)
+    async def generate():
+        nonlocal cursor
+        while not await request.is_disconnected():
+            rows = await asyncio.to_thread(read_events, cursor)
+            for eid, event in rows:
+                cursor = eid
+                yield {'id':str(eid),'event':'factor_eval_progress','data':json.dumps(event,ensure_ascii=False)}
+            await asyncio.sleep(2)
+    return EventSourceResponse(generate(),ping=15)

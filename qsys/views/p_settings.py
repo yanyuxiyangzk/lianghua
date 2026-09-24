@@ -43,6 +43,48 @@ st.caption("💡 切到 ths_ifind 后，演化因子全部基于同花顺数据�
 st.caption("⚠️ 进化闭环与回测（🧬/📊）固定使用 qlib 本地库，切换只影响分析展示层；"
            "akshare 为前复权口径，与 qlib 价格基准不同（水平差异属正常，形态一致）。")
 
+# ---------------------------------------------------------------- 因子挖掘
+st.subheader("因子挖掘频率与轮动")
+from scheduler import get_scheduler
+from mining_policy import schedule_hours
+from datetime import time as clock_time
+mining_manager = get_scheduler()
+mining_cfg = mining_manager._state()['multitype_mine']
+mining_params = mining_cfg.get('params', {})
+st.caption("每天批次是任务启动次数；每类轮数是在一个批次内，对每个类型连续挖掘的轮数。仅周一至周五盘后运行；RD-Agent和每周理论发现不受此处控制。")
+with st.form('factor_mining_config'):
+    mining_enabled = st.checkbox('启用盘后因子挖掘', value=mining_cfg['enabled'])
+    c1, c2, c3 = st.columns(3)
+    mining_daily = c1.number_input('每天最多挖掘批次',1,4,int(mining_params.get('daily_batches',1)))
+    mining_rotations = c2.number_input('每批每类挖掘轮数',1,3,int(mining_params.get('rotations',1)))
+    mining_candidates = c3.number_input('每轮每类候选数量',1,50,int(mining_params.get('batch_per_type',15)))
+    mining_time = st.time_input('首批启动时间（北京时间，16:00之后）',value=clock_time(mining_cfg['hour'],mining_cfg['minute']))
+    mining_interval = st.number_input('批次启动间隔（小时）',1,7,int(mining_params.get('interval_hours',1)))
+    mining_skip = st.checkbox('无新增有效数据时跳过（推荐）',value=mining_params.get('skip_unchanged',True))
+    st.caption('默认：每天1批 × 每类1轮 × 每轮15个候选。失败批次也占当天额度；正在运行的批次沿用启动时参数，修改不重置已用次数。任务超时重叠时跳过，不保证完成设定批次数。')
+    if st.form_submit_button('保存因子挖掘配置'):
+        try:
+            mining_manager.set_mining_config(mining_enabled,mining_daily,mining_rotations,
+                mining_candidates,mining_time.hour,mining_time.minute,mining_interval,mining_skip)
+            st.success('已保存；调度器自动加载，下一批次生效，无需重启。')
+        except ValueError as exc:
+            st.error(str(exc))
+try:
+    _current = mining_manager._state()['multitype_mine']
+    _params = _current.get('params',{})
+    _hours = schedule_hours(dict(daily_batches=_params.get('daily_batches',1),rotations=_params.get('rotations',1),batch_per_type=_params.get('batch_per_type',15),hour=_current['hour'],minute=_current['minute'],interval_hours=_params.get('interval_hours',1)))
+    st.caption('已保存启动时点：' + '、'.join(f"{int(h):02d}:{_current['minute']:02d}" for h in _hours.split(',')) + ('（已启用）' if _current['enabled'] else '（已停用）'))
+except ValueError as exc:
+    st.error(f'挖掘配置无效：{exc}')
+
+st.caption("手动触发使用已保存参数，可在当前时刻运行一次；仍遵守每日额度、互斥及数据去重，计入当天批次。不会修改自动调度开关或交易权限。")
+_mining_view = mining_manager.view()['multitype_mine']
+if st.button('立即手动挖掘一次', disabled=bool(_mining_view.get('running_since'))):
+    request_id = mining_manager.run_now('multitype_mine')
+    st.success(f'已提交一次性请求：{request_id[:8]}。调度器将在心跳检查时启动，请在定时任务页面查看进度。')
+if _mining_view.get('running_since'):
+    st.info('因子挖掘批次正在运行，可在定时任务页面查看。')
+
 # ---------------------------------------------------------------- 持仓风控参数
 st.subheader("持仓风控参数")
 st.caption("卫星轨只负责选股，成交后进入主轨账户统一管理；卫星来源仍使用独立的小仓位风控参数。")

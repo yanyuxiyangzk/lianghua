@@ -29,6 +29,7 @@ class EventType(str, Enum):
     JOB_END = "job_end"
     # 价格监控事件
     PRICE_ALERT = "price_alert"
+    FACTOR_EVAL_PROGRESS = "factor_eval_progress"
 
 
 class EventBus:

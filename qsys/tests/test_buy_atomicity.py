@@ -216,9 +216,38 @@ class AtomicBuyTests(unittest.TestCase):
         with broker._conn() as c:
             oid=c.execute("SELECT id FROM broker_orders WHERE side='sell'").fetchone()[0]
         broker.cancel_order(oid)
-        experience.position_reconcile('2026-09-23')
+        # 必须立即恢复，不依赖后续对账。
         with broker._conn() as c:
             self.assertEqual(c.execute('SELECT status,shares FROM positions WHERE id=?',(self.pid,)).fetchone(),('open',200))
+
+    def test_expired_sell_reopens_immediately(self):
+        self.make_sellable()
+        broker.sell_position(self.pid, 100, 10.5)
+        with broker._conn() as c:
+            c.execute("UPDATE broker_orders SET date='2026-09-22' WHERE side='sell'")
+        self.assertEqual(broker.expire_day_orders(), 1)
+        with broker._conn() as c:
+            self.assertEqual(c.execute('SELECT status,shares,sell_order_id FROM positions WHERE id=?',
+                                      (self.pid,)).fetchone(), ('open', 200, None))
+
+    def test_stale_existing_holding_blocks_new_buy(self):
+        self.make_sellable()
+        pid = self.pending('SH600000')
+        with patch.object(broker, '_quote_fresh', lambda code: code != 'SZ002709'):
+            self.assertIn('持仓行情过期', broker.buy_position(pid,100))
+        self.assertEqual(self.counts(), (1,1,1))
+
+    def test_limit_down_sell_uses_valid_limit_price(self):
+        self.make_sellable()
+        with patch.object(broker, '_latest_prices', lambda codes:{c:(9.,10.,10.,11.,9.) for c in codes}):
+            self.assertIn('已挂单',broker.sell_position(self.pid,100))
+        with broker._conn() as c:
+            self.assertEqual(c.execute("SELECT price FROM broker_orders WHERE side='sell'").fetchone()[0],9.)
+
+    def test_order_cannot_borrow_other_stock_task(self):
+        result = broker.place_order('SH600000','buy',None,100,source='ai',_position_id=self.pid)
+        self.assertIn('不一致',result)
+        self.assertEqual(self.counts(),(0,0,0))
 
     def test_manual_buy_cannot_bypass_concentration(self):
         self.assertIn('15%',broker.place_order('SH600000','buy',None,3100))

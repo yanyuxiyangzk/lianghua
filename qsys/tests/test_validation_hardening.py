@@ -102,6 +102,55 @@ class ValidationTests(unittest.TestCase):
                 result = fn(self.vals, self.panel)
                 self.assertTrue(any('2024年超额' in r for r in result['reasons']))
 
+    def test_combo_significance_uses_test_only(self):
+        test = pd.DataFrame({'优化组合扣费超额':[.01, .02, -.01, float('nan')]})
+        n, wr = fe._independent_test_stats(test)
+        self.assertEqual(n, 3)
+        self.assertAlmostEqual(wr, 2/3)
+        self.assertEqual(fe._independent_test_stats(pd.DataFrame()), (0, .5))
+
+    def test_chase_uses_previous_close_not_open(self):
+        import experience
+        self.assertAlmostEqual(experience._quote_change_pct((10.6, 10.5, 10)), 6.)
+        self.assertIsNone(experience._quote_change_pct((10.6, 10.5, None)))
+
+    def test_missing_future_return_cannot_change_picks(self):
+        days = sorted(self.vals.index.get_level_values('datetime').unique())
+        fake_forward = fe.forward_returns(self.panel, 5)
+        chosen = list(fake_forward.columns[:5])
+        fake_forward.loc[days[250], chosen[0]] = np.nan
+        scores = pd.Series([100-i for i in range(5)], index=chosen)
+        with patch.object(fe, 'forward_returns', return_value=fake_forward), \
+             patch.object(fe, '_score_at', return_value=scores):
+            with self.assertRaisesRegex(ValueError, '未来收益缺失'):
+                self.wf(start_idx=250, end_idx=270)
+
+    def test_invalid_drawdown_never_normal(self):
+        import experience
+        cfg={'red_target':0, 'red_drawdown':.1, 'orange_drawdown':.05,
+             'yellow_drawdown':.03, 'orange_target':.2, 'yellow_target':.4, 'normal_target':.8}
+        for value in (float('nan'), float('inf'), None, 'bad'):
+            self.assertEqual(experience.account_risk_level(value,cfg), ('red',0))
+
+    def test_combo_missing_return_rejects(self):
+        dates = sorted(self.vals.index.get_level_values('datetime').unique())
+        fwd = fe.forward_returns(self.panel,5)
+        codes=list(fwd.columns[:5])
+        fwd.loc[dates[0],codes[0]]=np.nan
+        packs=[dict(name=n,weights={'f':(1,1)},fvals={'f':self.vals},top_n=5) for n in ('a','b')]
+        with patch.object(fe,'forward_returns',return_value=fwd), \
+             patch.object(fe,'_score_at',return_value=pd.Series(range(5),index=codes)), \
+             patch('signals.scoring_norms',return_value=None):
+            with self.assertRaisesRegex(ValueError,'未来收益缺失'):
+                fe.combo_backtest(packs,self.panel)
+
+    def test_static_cutoff_requires_matured_labels(self):
+        dates = sorted(self.vals.index.get_level_values('datetime').unique())
+        result = fe.static_backtest({'f':self.vals}, self.panel, {'f':(1,1)}, 5,
+                                   upto=str(dates[100])[:10], norms={'f':'zscore'})
+        self.assertFalse(result.empty)
+        self.assertLessEqual(pd.Timestamp(result['调仓日'].iloc[-1]), dates[95])
+
     def test_save_never_reactivates_paused(self):
         library.save_strategy('fixture', {}, status='paused')
         library.save_strategy('fixture', {})

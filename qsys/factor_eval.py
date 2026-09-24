@@ -1140,7 +1140,7 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
         row = {"调仓日": str(t)[:10], "池内均值收益": fr.mean()}
         for label, weights in [("优化组合", w_opt), ("等权组合", w_eq)]:
             sc_t = _score_at(vals_norm, weights, t, norms=norms)
-            ranked = sc_t[sc_t.index.isin(fr.index)].sort_values(ascending=False)
+            ranked = sc_t.dropna().sort_values(ascending=False)
             prev = prev_picks[label]
             if buffer_n > 0 and prev:
                 # 缓冲带：上期持仓未跌出 Top(top_n+buffer_n) 的保留，空位按分补
@@ -1151,6 +1151,8 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
                 picks_codes = list(ranked.index[:top_n])
             picks = ranked[ranked.index.isin(picks_codes)]
             if len(picks) >= max(3, top_n // 2):
+                if fr.reindex(picks.index).isna().any():
+                    raise ValueError("所选股票未来收益缺失：回测不完整，禁止按未来可用性换股")
                 cur = set(picks.index)
                 turnover = 1.0 if not prev else 1 - len(cur & prev) / len(picks)
                 prev_picks[label] = cur
@@ -1211,6 +1213,15 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
 
 
 # ---------------------------------------------------------------- 组合级多重检验校正
+def _independent_test_stats(wf_test):
+    if wf_test.empty or "优化组合扣费超额" not in wf_test:
+        return 0, 0.5
+    net = wf_test["优化组合扣费超额"].dropna()
+    if net.empty or not np.isfinite(net).all():
+        return 0, 0.5
+    return len(net), float((net > 0).mean())
+
+
 def combo_false_discovery_rate(n_candidates: int, n_rounds: int,
                                 selected_winrate: float, n_oos_periods: int) -> float:
     """估计组合选择的假发现率（简化版 White's Reality Check）。
@@ -1337,6 +1348,9 @@ def static_backtest(factor_vals: dict[str, pd.Series], panel: pd.DataFrame,
     IS 胜率高、OOS 胜率低 = 权重过拟合样本内的直接证据。
     collect_picks=True 时附 "picks" 列（每点名单），供策略组合投票复用。
     norms=None 时按全局开关解析（legacy=原 zscore 口径）。"""
+    # 截止日约束标签成熟时间，而不只是调仓日。
+    if upto:
+        panel = panel[panel.index.get_level_values("datetime") <= pd.Timestamp(upto)]
     fwd = forward_returns(panel, fwd_days)
     vals_norm = {n: _norm(s.dropna()) for n, s in factor_vals.items() if not s.dropna().empty}
     if not vals_norm:
@@ -1356,10 +1370,12 @@ def static_backtest(factor_vals: dict[str, pd.Series], panel: pd.DataFrame,
         if fr.empty:
             continue
         sc_t = _score_at(vals_norm, weights, t, norms=norms)
-        ranked = sc_t[sc_t.index.isin(fr.index)].sort_values(ascending=False)
+        ranked = sc_t.dropna().sort_values(ascending=False)
         picks = ranked.head(top_n)
         if len(picks) < max(3, top_n // 2):
             continue
+        if fr.reindex(picks.index).isna().any():
+            raise ValueError("所选股票未来收益缺失：回测不完整，禁止按未来可用性换股")
         cur = set(picks.index)
         turnover = 1.0 if not prev else 1 - len(cur & prev) / len(picks)
         prev = cur
@@ -1452,9 +1468,8 @@ def greedy_combo(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
             oos_winrate_test = obj_test[0]
 
     # 组合级多重检验 p-value
-    n_oos = len(best_wf) if not best_wf.empty else 0
-    final_wr = oos_winrate_test if oos_winrate_test is not None else (
-        float((best_wf["优化组合扣费超额"] > 0).mean()) if not best_wf.empty and "优化组合扣费超额" in best_wf else 0.5)
+    # 显著性只使用独立测试段；不借用选择段样本数。
+    n_oos, final_wr = _independent_test_stats(wf_test)
     combo_fdr = combo_false_discovery_rate(
         n_candidates=len(candidates), n_rounds=len(selected),
         selected_winrate=final_wr, n_oos_periods=n_oos)
@@ -1608,9 +1623,8 @@ def mmr_combo(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method: st
             oos_winrate_test = obj_test[0]
 
     # 组合级多重检验 p-value
-    n_oos = len(best_wf) if not best_wf.empty else 0
-    final_wr = oos_winrate_test if oos_winrate_test is not None else (
-        float((best_wf["优化组合扣费超额"] > 0).mean()) if not best_wf.empty and "优化组合扣费超额" in best_wf else 0.5)
+    # 显著性只使用独立测试段；不借用选择段样本数。
+    n_oos, final_wr = _independent_test_stats(wf_test)
     combo_fdr = combo_false_discovery_rate(
         n_candidates=len(avail), n_rounds=len(combos),
         selected_winrate=final_wr, n_oos_periods=n_oos)
@@ -1743,10 +1757,12 @@ def combo_backtest(pack_defs: list[dict], panel: pd.DataFrame, min_votes: int = 
         votes: dict[str, int] = {}
         for p in packs:
             sc_t = _score_at(p["vals"], p["weights"], t, norms=p["norms"])
-            ranked = sc_t[sc_t.index.isin(fr.index)].sort_values(ascending=False)
+            ranked = sc_t.dropna().sort_values(ascending=False)
             picks = list(ranked.head(p["top_n"]).index)
             if len(picks) < max(3, p["top_n"] // 2):
                 continue
+            if fr.reindex(picks).isna().any():
+                raise ValueError("组合回放所选股票未来收益缺失")
             row[f"{p['name']}超额"] = float(fr[picks].mean()) - med
             for c in picks:
                 votes[c] = votes.get(c, 0) + 1

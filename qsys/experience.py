@@ -787,6 +787,14 @@ def _trade_days_between(d0: str, d1: str) -> int:
     return n
 
 
+def _quote_change_pct(quote):
+    """本模块快照顺序为(price, open, prev_close)，涨幅以昨收为基准。"""
+    if quote and len(quote) >= 3 and quote[0] and quote[2] and quote[2] > 0:
+        value = (quote[0] / quote[2] - 1) * 100
+        return float(value) if pd.notna(value) and abs(value) != float('inf') else None
+    return None
+
+
 def position_open_from_picks(trade_date: str, today: str) -> str:
     """盘中委托买入：对名单挂限价单（限价 = 名单参考买入价 = 扫描日收盘价）。
 
@@ -868,9 +876,9 @@ def position_open_from_picks(trade_date: str, today: str) -> str:
                 rt = _latest_prices(codes)
                 for code in codes:
                     pr = rt.get(code)
-                    if pr and pr[0] and pr[1] and pr[1] > 0:
-                        # 用 (当前价 - 昨收) / 昨收 计算日内涨幅
-                        ref_chg[code] = (pr[0] / pr[1] - 1) * 100
+                    change = _quote_change_pct(pr)
+                    if change is not None:
+                        ref_chg[code] = change
             except Exception:
                 pass
             # 该名单的支撑阻力上下文（≤名单生成日，无未来信息）
@@ -1723,7 +1731,14 @@ _RISK_FLAG = DATA_DIR / "risk_state.json"  # 当日风控状态（开仓闸）
 def account_risk_level(drawdown: float, cfg: dict | None = None) -> tuple[str, float]:
     """按正数回撤幅度返回 normal/yellow/orange/red 及目标仓位。"""
     cfg = cfg or get_account_risk_config()
-    dd = abs(min(float(drawdown or 0), 0.0))
+    import math
+    try:
+        value = float(drawdown)
+    except (TypeError, ValueError):
+        return "red", cfg["red_target"]
+    if not math.isfinite(value):
+        return "red", cfg["red_target"]
+    dd = abs(min(value, 0.0))
     if dd >= cfg["red_drawdown"]:
         return "red", cfg["red_target"]
     if dd >= cfg["orange_drawdown"]:

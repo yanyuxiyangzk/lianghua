@@ -64,6 +64,28 @@ class GateTests(unittest.TestCase):
         self.approval['regime_validation']['regimes'] = {'bear':dict(windows=10, mean_net_excess=.01)}
         self.assertIn('市场', check(self.pack, self.approval, 'bull', '2026-09-23'))
 
+    def test_position_rechecks_candidate_before_execution(self):
+        import sqlite3, types, json, execution_gate
+        from unittest.mock import patch
+        c=sqlite3.connect(':memory:')
+        self.addCleanup(c.close)
+        c.execute('CREATE TABLE positions(id INTEGER,pack_name TEXT,source TEXT,code TEXT,status TEXT,buy_date TEXT)')
+        c.execute("INSERT INTO positions VALUES(1,'p','satellite_scan','SZ002709','pending','2026-09-23')")
+        with patch.dict(sys.modules, {'library':types.SimpleNamespace(list_strategies=lambda:{'p':self.pack})}), \
+             patch('loopengine.regime.detect_regime',return_value={'regime':'bull'}), \
+             patch.object(Path,'read_text',return_value=json.dumps({'p':self.approval})), \
+             patch('selection_gate.evaluate_candidate',return_value=types.SimpleNamespace(status='reject',reason='quote stale')) as evaluate:
+            reason=execution_gate.position_rejection(c,1,'2026-09-23')
+            self.assertIn('成交前选股复核',reason)
+            evaluate.assert_called_once_with('SZ002709',self.pack,'bull')
+
+    def test_impossible_fold_metrics_rejected(self):
+        import copy
+        for key,value in [('n_periods',8.5),('max_drawdown',.1)]:
+            approval=copy.deepcopy(self.approval)
+            approval['walk_forward']['folds'][0][key]=value
+            self.assertTrue(check(self.pack,approval,'bull','2026-09-23'))
+
     def test_missing_factor_theory(self):
         del self.pack['factors'][0]['theory_id']
         self.assertIn('因子',check(self.pack,self.approval,'bull','2026-09-23'))

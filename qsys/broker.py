@@ -277,7 +277,9 @@ def _buy_rejection(c, code, source, shares, price, exclude_order=-1) -> str:
     quotes = _latest_prices([r[0] for r in holdings])
     values = {}
     for cd, sh, cost in holdings:
-        mark = (quotes.get(cd) or (cost,))[0] or cost
+        if not _quote_fresh(cd):
+            return '风控拦截：持仓行情过期，无法确认总敞口'
+        mark = (quotes.get(cd) or (None,))[0]
         if mark is None or not math.isfinite(float(mark)) or mark <= 0:
             return '风控拦截：持仓估值不可用'
         values[cd] = values.get(cd, 0) + sh * mark
@@ -395,6 +397,10 @@ def place_order(code: str, side: str, price: float | None, shares: int,
     with (_conn() if _connection is None else nullcontext(_connection)) as c:
         if _connection is None:
             c.execute("BEGIN IMMEDIATE")
+        if source == 'ai' and _position_id is not None:
+            task = c.execute('SELECT code FROM positions WHERE id=?', (_position_id,)).fetchone()
+            if not task or task[0] != code:
+                return '风控拦截：委托股票与策略持仓任务不一致'
         if source == 'ai' and side == 'buy':
             import execution_gate
             rejection = execution_gate.position_rejection(c, _position_id, _today())
@@ -422,8 +428,8 @@ def place_order(code: str, side: str, price: float | None, shares: int,
         if side == "buy" and at_limit_up:
             return f"已涨停（{limit_up}），买单无法成交（实盘规则：涨停买不进）"
         if side == "sell" and at_limit_down and is_market:
-            # 市价卖单打在跌停板上无法成交 → 自动转为限价挂（略低于现价，等开板）
-            price = round(cur * 0.995, 2)
+            # 市价卖单打在跌停板上无法成交 → 自动转为跌停价限价挂单（等开板）
+            price = float(limit_down)
             is_market = False
         # 市价单立即成交检查现金；限价卖单挂在跌停价上也不予成交（等开板）
         fill_now = is_market or (cur is not None and (
@@ -512,6 +518,10 @@ def _fill(c, order_id: int, fill_price: float):
         return False
     if not math.isfinite(fill_price) or fill_price <= 0:
         return False
+    if source == 'ai' and (side == 'buy' or position_id is not None):
+        task = c.execute('SELECT code FROM positions WHERE id=?', (position_id,)).fetchone()
+        if not task or task[0] != code:
+            return False
     if side == "buy":
         if source == 'ai':
             import execution_gate
@@ -617,16 +627,27 @@ def fill_pending_orders() -> int:
         return n
 
 
+def _reopen_cancelled_sales(c):
+    """撤销与持仓状态恢复在同一事务完成，不改动股数。"""
+    if not c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='positions'").fetchone():
+        return
+    c.execute("UPDATE positions SET status='open',sell_order_id=NULL,sell_reason=NULL "
+              "WHERE status='closing' AND sell_order_id IN "
+              "(SELECT id FROM broker_orders WHERE side='sell' AND status='已撤')")
+
+
 def expire_day_orders() -> int:
     """日终撤单（实盘规则：委托当日有效）：15:00 后把当日未成交挂单全部撤销。
     次日由止盈止损/开仓逻辑按当时价格重新评估重新挂单。"""
     today = _today()
     now_hm = datetime.now().strftime("%H%M")
     with _conn() as c:
+        c.execute("BEGIN IMMEDIATE")
         n = c.execute(
             "UPDATE broker_orders SET status='已撤', cancel_ts=? WHERE status='已报' "
             "AND (date<? OR (date=? AND ? >= '1500'))",
             (_now(), today, today, now_hm)).rowcount
+        _reopen_cancelled_sales(c)
     return n
 
 
@@ -668,6 +689,7 @@ def cancel_order(order_id: int) -> str:
             return "只能撤销已报状态的委托"
         c.execute("UPDATE broker_orders SET status='已撤', cancel_ts=? WHERE id=?",
                   (_now(), order_id))
+        _reopen_cancelled_sales(c)
     return f"委托 #{order_id} 已撤销"
 
 

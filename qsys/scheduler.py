@@ -1792,10 +1792,14 @@ def job_risk_guard(**_ignored) -> str:
     import experience
     today = now.strftime("%Y-%m-%d")
     # P1-3修复：use_live=True 从实时持仓计算当前回撤
-    rk = experience.portfolio_risk(use_live=True)
-    if not rk.get("ok"):
-        return f"风控评估跳过：{rk.get('reason')}"
-    return _apply_account_risk(today, rk)
+    try:
+        rk = experience.portfolio_risk(use_live=True)
+        if not isinstance(rk, dict) or not rk.get("ok"):
+            raise ValueError("风控评估结果缺失或无效")
+        return _apply_account_risk(today, rk)
+    except Exception as exc:
+        experience._write_risk_flag(today, True, "风控计算异常，暂停买入", level="red")
+        return f"风控计算异常，已暂停买入：{type(exc).__name__}"
 
 
 def job_risk_guard_intraday(**_ignored) -> str:
@@ -1815,11 +1819,14 @@ def job_risk_guard_intraday(**_ignored) -> str:
     import experience
     today = now.strftime("%Y-%m-%d")
     # P1-3修复：use_live=True 从实时持仓计算当前回撤
-    rk = experience.portfolio_risk(use_live=True)
-    if not rk.get("ok"):
-        return f"盘中风控跳过：{rk.get('reason')}"
-
-    return _apply_account_risk(today, rk, prefix="盘中")
+    try:
+        rk = experience.portfolio_risk(use_live=True)
+        if not isinstance(rk, dict) or not rk.get("ok"):
+            raise ValueError("风控评估结果缺失或无效")
+        return _apply_account_risk(today, rk, prefix="盘中")
+    except Exception as exc:
+        experience._write_risk_flag(today, True, "风控计算异常，暂停买入", level="red")
+        return f"风控计算异常，已暂停买入：{type(exc).__name__}"
 
 
 def job_account_snapshot(**_ignored) -> str:
@@ -3169,10 +3176,11 @@ JOBS = {
                          "default": {"enabled": True, "hour": 15, "minute": 36, "params": {}}},
     "risk_guard": {"name": "🛡 组合风控评估（开盘前）", "func": job_risk_guard,
                    "default": {"enabled": True, "hour": 9, "minute": 20, "params": {}}},
-    "risk_guard_intraday": {"name": "🛡 盘中风控重评估（10:00/13:30）", "func": job_risk_guard_intraday,
+    "risk_guard_intraday": {"name": "🛡 盘中风控重评估（10:00）", "func": job_risk_guard_intraday,
                             "default": {"enabled": True, "hour": 10, "minute": 0,
-                                        "params": {}, "trigger": "cron",
-                                        "cron_expr": "0 10,13 * * 1-5"}},
+                                        "params": {}, "trigger": "cron"}},
+    "risk_guard_afternoon": {"name": "🛡 午后风控重评估（13:30）", "func": job_risk_guard_intraday,
+                             "default": {"enabled": True, "hour": 13, "minute": 30, "params": {}}},
     "factor_direction": {"name": "🧭 因子方向状态机（磁滞日更）", "func": job_factor_direction,
                          "default": {"enabled": True, "hour": 21, "minute": 45, "params": {}}},
     "factor_cluster": {"name": "🧩 因子相关性聚类（周更）", "func": job_factor_cluster,

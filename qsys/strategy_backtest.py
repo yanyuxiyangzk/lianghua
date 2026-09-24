@@ -56,6 +56,8 @@ def backtest_strategy(strategy_name: str, pool_name: str = "沪深300",
         except Exception:
             continue
 
+    if len(factor_vals) != len(factors):
+        return {"ok": False, "msg": "部分因子求值失败，不能回测残缺策略"}
     if not factor_vals:
         return {"ok": False, "msg": "无有效因子值"}
 
@@ -71,8 +73,9 @@ def backtest_strategy(strategy_name: str, pool_name: str = "沪深300",
     vals_norm = {}
     for name, s in factor_vals.items():
         s2 = fe._norm(s.dropna())
-        if not s2.empty:
-            vals_norm[name] = s2
+        if s2.empty or not np.isfinite(s2.to_numpy(dtype=float)).all():
+            return {"ok": False, "msg": f"因子 {name} 无有效有限值，不能回测残缺策略"}
+        vals_norm[name] = s2
 
     # 归一化分派：pack 快照（factors 条目的 norm 键）> 全局开关自动映射；legacy → None
     norms = sig.scoring_norms(list(weights), factors)
@@ -118,8 +121,12 @@ def backtest_strategy(strategy_name: str, pool_name: str = "沪深300",
         turnovers.append(turnover)
 
         # 组合收益（扣费）
+        if dt not in fwd.index:
+            return {"ok": False, "msg": "选股日期未来收益缺失，回测不完整"}
         if dt in fwd.index:
             day_fwd = fwd.loc[dt]
+            if not np.isfinite(day_fwd.reindex(top_codes).to_numpy(dtype=float)).all():
+                return {"ok": False, "msg": "选中股票未来收益缺失，回测不完整"}
             returns = []
             for code in top_codes:
                 if code in day_fwd.index:

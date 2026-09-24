@@ -72,7 +72,7 @@ def _approval_evidence_rejection(approval, version):
             if not all(math.isfinite(x) for x in vals):
                 return 'walk_forward指标无效'
             n, mean, sharpe, dd, turnover = vals
-            if n < 8 or mean <= 0 or sharpe < .5 or dd < -.25 or not 0 <= turnover <= .8:
+            if not n.is_integer() or n < 8 or mean <= 0 or sharpe < .5 or not -.25 <= dd <= 0 or not 0 <= turnover <= .8:
                 return 'walk_forward折未达门槛'
         except (KeyError, TypeError, ValueError):
             return 'walk_forward折证据不完整'

@@ -61,14 +61,23 @@ def check(pack, approval, regime, today):
 def position_rejection(c, position_id, today):
     """只读资格检查；任一依赖异常关闭买入闸，不影响卖出。"""
     try:
-        row = c.execute('SELECT pack_name,source FROM positions WHERE id=?', (position_id,)).fetchone()
+        row = c.execute('SELECT pack_name,source,code,status,buy_date FROM positions WHERE id=?', (position_id,)).fetchone()
         if not row or not row[0] or row[1] in ('le_shadow', 'sched_satellite_scan'):
             return '未关联正式策略，只有影子资格'
+        if row[3] != 'pending' or row[4] != today:
+            return '持仓任务非当日待买入状态'
         import library
         from loopengine.regime import detect_regime
         pack = library.list_strategies().get(row[0], {})
         approvals = json.loads(APPROVAL_FILE.read_text())
         regime = (detect_regime() or {}).get('regime', 'unknown')
-        return check(pack, approvals.get(row[0]), regime, today)
+        rejection = check(pack, approvals.get(row[0]), regime, today)
+        if rejection:
+            return rejection
+        import selection_gate
+        result = selection_gate.evaluate_candidate(row[2], pack, regime)
+        if result.status != 'pass':
+            return '成交前选股复核未通过：' + result.reason
+        return ''
     except Exception:
         return '执行资格或验证证据不可用，暂停自动买入'

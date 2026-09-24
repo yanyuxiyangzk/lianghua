@@ -2,6 +2,9 @@
 from dataclasses import dataclass, field
 from datetime import datetime
 import math
+import sqlite3
+from contextlib import closing
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 @dataclass
@@ -20,12 +23,14 @@ def check_market_state(pack=None, regime="unknown"):
     if scope == "all":
         return _r("pass", regime=regime)
     allowed = scope if isinstance(scope, (list, tuple, set)) else [x.strip() for x in str(scope).split(",")]
-    return _r("pass", regime=regime) if regime in allowed else _r("reject", f"市场状态{regime}不匹配策略范围{scope}", regime=regime)
+    return _r("pass", regime=regime) if "all" in allowed or regime in allowed else _r("reject", f"市场状态{regime}不匹配策略范围{scope}", regime=regime)
 
 def _query(sql, params=()):
     import datasource
     try:
-        with datasource._qconn() as c:
+        with closing(sqlite3.connect(
+                Path(datasource.MKT_DB).resolve().as_uri() + "?mode=ro",
+                uri=True, timeout=2)) as c:
             return c.execute(sql, params).fetchone()
     except Exception:
         return None
@@ -48,6 +53,14 @@ def check_financial(code, asof=None, required=True):
                  (code, code[-6:], asof, asof))
     if row is None:
         return _r("insufficient_data", "缺少可用财务数据") if required else _r("pass", "财务数据非必需")
+    try:
+        fetched = datetime.fromisoformat(str(row[1]).replace("Z", "+00:00"))
+        if fetched.tzinfo is None:
+            fetched = fetched.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+        if fetched > datetime.now(ZoneInfo("Asia/Shanghai")):
+            return _r("insufficient_data", "财务采集时间在未来")
+    except (TypeError, ValueError):
+        return _r("insufficient_data", "财务采集时间无效")
     return _r("pass", "财务数据存在（不代表财务质量达标）", report_date=row[0], fetched_at=row[1])
 
 def check_technical(code, max_minutes=10):

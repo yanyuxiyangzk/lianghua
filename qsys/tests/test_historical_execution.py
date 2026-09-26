@@ -95,7 +95,9 @@ class ExecutionTests(unittest.TestCase):
         r = simulate(self.signal(), self.prices().swaplevel())
         self.assertEqual(len(r['fills']), 1)
         p = self.prices(); p['limit_up'] = float('nan')
-        with self.assertRaises(ValueError): simulate(self.signal(), p)
+        r = simulate(self.signal(), p)
+        self.assertEqual(r['orders'].iloc[0].reason, 'unknown_execution_constraint')
+        self.assertEqual(r['data_quality_status'], 'incomplete')
         with self.assertRaises(ValueError): simulate(self.signal(), pd.concat([p,p]))
 
 if __name__ == '__main__': unittest.main()

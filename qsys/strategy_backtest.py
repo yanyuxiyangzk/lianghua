@@ -115,7 +115,7 @@ def backtest_strategy(strategy_name: str, pool_name: str = "沪深300",
 
     if mode == "execution":
         return _execution_result(strategy_name, pool, method, factors, panel,
-                                 vals_norm, weights, norms, all_dates, top_n, hold_days)
+                                 vals_norm, weights, norms, all_dates, top_n, hold_days, source=source)
 
     # 逐日选股 + 计算收益
     nav = [1.0]
@@ -237,7 +237,7 @@ def backtest_strategy(strategy_name: str, pool_name: str = "沪深300",
 
 
 def _execution_result(strategy_name, pool, method, factors, panel, vals_norm,
-                      weights, norms, all_dates, top_n, hold_days):
+                      weights, norms, all_dates, top_n, hold_days, source=None):
     """Independent execution path: never use forward returns or research metrics."""
     from historical_execution import simulate, performance
     records, picks = [], []
@@ -265,6 +265,8 @@ def _execution_result(strategy_name, pool, method, factors, panel, vals_norm,
         dates = pd.to_datetime(prices.index.get_level_values("datetime"))
         prices = prices[(dates >= pd.Timestamp(all_dates[0])) & (dates <= pd.Timestamp(all_dates[-1]))].copy()
         prices.index = prices.index.set_names(["date", "code"])
+        from execution_constraints import attach
+        prices = attach(prices, source)
         ledger = simulate(pd.DataFrame(records), prices)
         metrics = performance(ledger)
     except (ValueError, KeyError, TypeError, OverflowError) as exc:

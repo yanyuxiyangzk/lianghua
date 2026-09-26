@@ -1,0 +1,242 @@
+[
+  {
+    "experiment_id": "fcbff23d4d8e4c7baf38b44b0b94f75e",
+    "code": "SH600664",
+    "source": "日线量价",
+    "input_hash": "956a7851e5a8b0b07d8ebdb53b65e99b009a70462b22a48551af67a2e65eb908",
+    "start": "2024-09-25",
+    "end": "2026-09-24",
+    "test_start": "2026-02-26",
+    "candidates": [
+      {
+        "name": "return_5",
+        "train_samples": 330,
+        "holdout_samples": 141,
+        "train_rank_ic": -0.14407897340187606,
+        "holdout_rank_ic": 0.02058185756883631,
+        "direction": -1,
+        "status": "reviewed"
+      },
+      {
+        "name": "volatility_20",
+        "train_samples": 315,
+        "holdout_samples": 141,
+        "train_rank_ic": -0.018956000370353384,
+        "holdout_rank_ic": 0.09750432929076129,
+        "direction": -1,
+        "status": "reviewed"
+      },
+      {
+        "name": "volume_ratio_20",
+        "train_samples": 316,
+        "holdout_samples": 141,
+        "train_rank_ic": -0.2603557733575404,
+        "holdout_rank_ic": 0.16149812866434224,
+        "direction": -1,
+        "status": "reviewed"
+      }
+    ],
+    "contract": "snapshot-review-v1",
+    "note": "单股时序诊断；未复权收盘价5交易日收益；留出段已反复使用，不是独立盲测；非成交收益。分钟特征可能来自旧版汇总，未视为全部通过新版原始数据校验。"
+  },
+  {
+    "experiment_id": "bf814e8510d54b1ab2bdf3650c63a51c",
+    "code": "SH600664",
+    "source": "分钟日内特征",
+    "input_hash": "2b2b24290f868d18483940fbc9e51cb282bf000225dc5bcfa3e7b1a85adf8535",
+    "start": "2024-09-25",
+    "end": "2026-09-24",
+    "test_start": "2026-02-26",
+    "candidates": [
+      {
+        "name": "tail_ret_30m",
+        "train_samples": 335,
+        "holdout_samples": 141,
+        "train_rank_ic": -0.09450140610715468,
+        "holdout_rank_ic": -0.13038721067315404,
+        "direction": -1,
+        "status": "reviewed"
+      },
+      {
+        "name": "realized_vol",
+        "train_samples": 335,
+        "holdout_samples": 141,
+        "train_rank_ic": -0.052378124843616126,
+        "holdout_rank_ic": 0.05444924643079395,
+        "direction": -1,
+        "status": "reviewed"
+      },
+      {
+        "name": "close_vwap_gap",
+        "train_samples": 335,
+        "holdout_samples": 141,
+        "train_rank_ic": -0.02580714457974567,
+        "holdout_rank_ic": 0.051576569116960604,
+        "direction": -1,
+        "status": "reviewed"
+      }
+    ],
+    "contract": "snapshot-review-v1",
+    "note": "单股时序诊断；未复权收盘价5交易日收益；留出段已反复使用，不是独立盲测；非成交收益。分钟特征可能来自旧版汇总，未视为全部通过新版原始数据校验。"
+  },
+  {
+    "experiment_id": "70aad18493f64bc39226b27d0334f0d6",
+    "code": "SH603893",
+    "source": "日线量价",
+    "input_hash": "284b7e5e965eb11b0c84ce957d3556b7b6216970dd561b553b61a2036b71936c",
+    "start": "2024-09-25",
+    "end": "2026-09-24",
+    "test_start": "2026-02-26",
+    "candidates": [
+      {
+        "name": "return_5",
+        "train_samples": 330,
+        "holdout_samples": 141,
+        "train_rank_ic": -0.015323790434672996,
+        "holdout_rank_ic": -0.1997688257202791,
+        "direction": -1,
+        "status": "reviewed"
+      },
+      {
+        "name": "volatility_20",
+        "train_samples": 315,
+        "holdout_samples": 141,
+        "train_rank_ic": -0.015474366800658827,
+        "holdout_rank_ic": -0.050562952181172134,
+        "direction": -1,
+        "status": "reviewed"
+      },
+      {
+        "name": "volume_ratio_20",
+        "train_samples": 316,
+        "holdout_samples": 141,
+        "train_rank_ic": 0.05803655807249626,
+        "holdout_rank_ic": -0.09869001241491501,
+        "direction": 1,
+        "status": "reviewed"
+      }
+    ],
+    "contract": "snapshot-review-v1",
+    "note": "单股时序诊断；未复权收盘价5交易日收益；留出段已反复使用，不是独立盲测；非成交收益。分钟特征可能来自旧版汇总，未视为全部通过新版原始数据校验。"
+  },
+  {
+    "experiment_id": "d4edfa312e45437e928282ec9a18f798",
+    "code": "SH603893",
+    "source": "分钟日内特征",
+    "input_hash": "922a5d9ad2f7c9acd14998696026e646386cdaccc5a682f662c2de5f35b5ea21",
+    "start": "2024-09-25",
+    "end": "2026-09-24",
+    "test_start": "2026-02-26",
+    "candidates": [
+      {
+        "name": "tail_ret_30m",
+        "train_samples": 335,
+        "holdout_samples": 141,
+        "train_rank_ic": -0.009453835258859965,
+        "holdout_rank_ic": 0.023387381603522803,
+        "direction": -1,
+        "status": "reviewed"
+      },
+      {
+        "name": "realized_vol",
+        "train_samples": 335,
+        "holdout_samples": 141,
+        "train_rank_ic": 0.07525056496814474,
+        "holdout_rank_ic": -0.10220471766770836,
+        "direction": 1,
+        "status": "reviewed"
+      },
+      {
+        "name": "close_vwap_gap",
+        "train_samples": 335,
+        "holdout_samples": 141,
+        "train_rank_ic": -0.08619083794032405,
+        "holdout_rank_ic": -0.021893060490603192,
+        "direction": -1,
+        "status": "reviewed"
+      }
+    ],
+    "contract": "snapshot-review-v1",
+    "note": "单股时序诊断；未复权收盘价5交易日收益；留出段已反复使用，不是独立盲测；非成交收益。分钟特征可能来自旧版汇总，未视为全部通过新版原始数据校验。"
+  },
+  {
+    "experiment_id": "ebff7785bdf245559800743800b7e1cb",
+    "code": "SZ001216",
+    "source": "日线量价",
+    "input_hash": "c832ee387f7db65f24745f027d145255be7eb68af41abb195225ed82f65ff787",
+    "start": "2024-09-25",
+    "end": "2026-09-24",
+    "test_start": "2026-02-26",
+    "candidates": [
+      {
+        "name": "return_5",
+        "train_samples": 330,
+        "holdout_samples": 141,
+        "train_rank_ic": -0.10498426638897643,
+        "holdout_rank_ic": 0.054777719032747606,
+        "direction": -1,
+        "status": "reviewed"
+      },
+      {
+        "name": "volatility_20",
+        "train_samples": 315,
+        "holdout_samples": 141,
+        "train_rank_ic": 0.0029390078132499223,
+        "holdout_rank_ic": -0.15325372795690093,
+        "direction": 1,
+        "status": "reviewed"
+      },
+      {
+        "name": "volume_ratio_20",
+        "train_samples": 316,
+        "holdout_samples": 141,
+        "train_rank_ic": -0.08850675535819144,
+        "holdout_rank_ic": -0.0257995053293368,
+        "direction": -1,
+        "status": "reviewed"
+      }
+    ],
+    "contract": "snapshot-review-v1",
+    "note": "单股时序诊断；未复权收盘价5交易日收益；留出段已反复使用，不是独立盲测；非成交收益。分钟特征可能来自旧版汇总，未视为全部通过新版原始数据校验。"
+  },
+  {
+    "experiment_id": "35c8c9dff1bb495f9393c9885430af74",
+    "code": "SZ001216",
+    "source": "分钟日内特征",
+    "input_hash": "1dd567a52c05bcab09e5398a5763698cff10ae99e7c989ab36a9b5295bfd97ce",
+    "start": "2024-09-25",
+    "end": "2026-09-24",
+    "test_start": "2026-02-26",
+    "candidates": [
+      {
+        "name": "tail_ret_30m",
+        "train_samples": 94,
+        "holdout_samples": 141,
+        "train_rank_ic": -0.10143624811244942,
+        "holdout_rank_ic": 0.01630146331838834,
+        "direction": -1,
+        "status": "reviewed"
+      },
+      {
+        "name": "realized_vol",
+        "train_samples": 94,
+        "holdout_samples": 141,
+        "train_rank_ic": -0.4244615751853746,
+        "holdout_rank_ic": -0.21768529835459208,
+        "direction": -1,
+        "status": "reviewed"
+      },
+      {
+        "name": "close_vwap_gap",
+        "train_samples": 94,
+        "holdout_samples": 141,
+        "train_rank_ic": -0.126700526697859,
+        "holdout_rank_ic": -0.03827440873840647,
+        "direction": -1,
+        "status": "reviewed"
+      }
+    ],
+    "contract": "snapshot-review-v1",
+    "note": "单股时序诊断；未复权收盘价5交易日收益；留出段已反复使用，不是独立盲测；非成交收益。分钟特征可能来自旧版汇总，未视为全部通过新版原始数据校验。"
+  }
+]

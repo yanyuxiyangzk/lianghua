@@ -352,7 +352,8 @@ def get_factor_values(fac: dict, codes: list[str], end: str, lookback_days: int 
     import datasource
 
     source = source or _eval_source()
-    ck = _cache("fvals", f"{source}|{factor_version(fac)}|{fac.get('_data_revision', '')}|{fac['name']}|{fac['kind']}|{'|'.join(sorted(codes))}|{end}|{lookback_days}")
+    from daily_integrity import revision
+    ck = _cache("fvals", f"{revision(codes, source)}|{source}|{factor_version(fac)}|{fac.get('_data_revision', '')}|{fac['name']}|{fac['kind']}|{'|'.join(sorted(codes))}|{end}|{lookback_days}")
     if ck.exists():
         hit = sig._read_parquet_safe(ck)
         if hit is not None:
@@ -435,7 +436,8 @@ def get_ic_series(fac: dict, codes: list[str], end: str, fwd_days: int = MAIN_FW
     import datasource
 
     source = source or _eval_source()
-    ck = _cache("ic", f"{source}|{factor_version(fac)}|{fac.get('_data_revision', '')}|{fac['name']}|{fac['kind']}|{'|'.join(sorted(codes))}|{end}|{fwd_days}|{lookback_days}")
+    from daily_integrity import revision
+    ck = _cache("ic", f"{revision(codes, source)}|{source}|{factor_version(fac)}|{fac.get('_data_revision', '')}|{fac['name']}|{fac['kind']}|{'|'.join(sorted(codes))}|{end}|{fwd_days}|{lookback_days}")
     if ck.exists():
         hit = sig._read_parquet_safe(ck)
         if hit is not None:

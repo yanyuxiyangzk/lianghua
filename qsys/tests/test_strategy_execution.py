@@ -13,6 +13,7 @@ class IntegrationTests(unittest.TestCase):
         codes = list(panel.index.get_level_values('instrument').unique())
         days = sorted(panel.index.get_level_values('datetime').unique())
         panel['$open'] = 10.; panel['$close'] = 10.
+        panel['$suspended'] = 0.; panel['$limit_up'] = 11.; panel['$limit_down'] = 9.
         if missing:
             panel.loc[(days[1], codes[0]), '$open'] = float('nan')
         if reverse: panel = panel.swaplevel()

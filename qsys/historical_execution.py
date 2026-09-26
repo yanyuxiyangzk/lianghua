@@ -93,10 +93,10 @@ def simulate(signals, prices, initial_cash=200000., lot=100, cost_rate=.00025,
             for code, delta in sorted(changes, key=lambda x: (x[1] > 0, str(x[0]))):
                 if not delta:
                     continue
-                op = quote(day, code, 'open', '成交')
+                if (day, code) not in px.index:
+                    raise ValueError(f'{day} {code}缺少成交行情')
                 q = px.loc[(day, code)]
                 side, shares = ('buy', delta) if delta > 0 else ('sell', -delta)
-                price = op * (1 + slippage if side == 'buy' else 1 - slippage)
                 reason = None
                 for column in ('volume', 'suspended', 'limit_up', 'limit_down'):
                     if column in px.columns:
@@ -108,17 +108,20 @@ def simulate(signals, prices, initial_cash=200000., lot=100, cost_rate=.00025,
                                 (column.startswith('limit_') and value <= 0) or
                                 (column == 'volume' and value < 0) or
                                 (column == 'suspended' and value not in (0, 1))):
-                            if column == 'volume':
-                                reason = 'unknown_volume'
-                                data_issues.append(dict(date=day, code=code, field=column,
-                                                        reason='成交量缺失或无效，无法确认可成交，委托拒绝'))
-                                continue
-                            raise ValueError(f'{day} {code}成交限制字段{column}无效')
-                if reason:
-                    pass
-                elif q.get('suspended', 0) or q.get('volume', 1) == 0:
+                            reason = 'unknown_volume' if column == 'volume' else 'unknown_execution_constraint'
+                            data_issues.append(dict(date=day, code=code, field=column,
+                                                    reason='成交约束缺失或无效，无法确认可成交，委托拒绝'))
+                if q.get('suspended', 0) == 1 or q.get('volume', 1) == 0:
                     reason = 'suspended_or_zero_volume'
-                elif side == 'buy' and 'limit_up' in q and (op >= q.limit_up or price > q.limit_up):
+                if reason:
+                    orders.append(dict(signal_date=signal_day, date=day, code=code, side=side,
+                                       shares=shares, status='rejected', reason=reason))
+                    continue
+                op = quote(day, code, 'open', '成交')
+                price = op * (1 + slippage if side == 'buy' else 1 - slippage)
+                if ('limit_up' in q and 'limit_down' in q and q.limit_down > q.limit_up):
+                    raise ValueError(f'{day} {code}涨跌停价格上下限颠倒')
+                if side == 'buy' and 'limit_up' in q and (op >= q.limit_up or price > q.limit_up):
                     reason = 'limit_up'
                 elif side == 'sell' and 'limit_down' in q and (op <= q.limit_down or price < q.limit_down):
                     reason = 'limit_down'
@@ -169,7 +172,10 @@ def simulate(signals, prices, initial_cash=200000., lot=100, cost_rate=.00025,
                 equity=pd.DataFrame(equity), positions={c: n for c, n in positions.items() if n},
                 assessment_kind='historical_next_open_daily_simulation',
                 calculation_contract='execution-next-open-v1', constraints_applied=constraints,
-                constraints_missing=[c for c in ('volume','suspended','limit_up','limit_down') if c not in constraints],
+                constraints_missing=[c for c in ('volume','suspended','limit_up','limit_down')
+                                     if c not in constraints or px[c].isna().any()],
+                constraint_coverage={c: {'rows': len(px), 'known': int(px[c].notna().sum()) if c in px else 0}
+                                     for c in ('volume','suspended','limit_up','limit_down')},
                 limitations=LIMITATIONS)
 
 

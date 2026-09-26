@@ -18,6 +18,8 @@ LOCK = DATA_DIR / 'mining.lock'
 def fingerprint(frames):
     h = hashlib.sha256()
     for name, frame in sorted(frames.items()):
+        if not isinstance(frame, (pd.Series, pd.DataFrame)):
+            raise TypeError(f'{name}: 挖掘输入必须为Series或DataFrame')
         h.update(str(name).encode())
         h.update(str(list(frame.columns) if isinstance(frame, pd.DataFrame) else [frame.name]).encode())
         h.update(pd.util.hash_pandas_object(frame, index=True).values.tobytes())
@@ -136,13 +138,14 @@ def run_daily(pool_name, batch_per_type=15, factor_types=None, daily_batches=1, 
                                 parts.append(ft+':数据未变跳过')
                                 progress('skipped', reason='数据未变', **position)
                                 continue
-                            # Reserve once per type and batch; later rotations reuse eligibility.
-                            with c:
-                                c.execute('INSERT OR REPLACE INTO inputs VALUES (?,?,?)',(pool_name,ft,stamp))
                             eligible.add(ft)
                         progress('running', **position)
                         result = eng.run_round(batch=batch_per_type, factor_type=ft,
                                                include_events=False, prepared=(panel,frames,codes,end))
+                        # Only a successful round can consume an unchanged-data receipt.
+                        if rotation == 1:
+                            with c:
+                                c.execute('INSERT OR REPLACE INTO inputs VALUES (?,?,?)',(pool_name,ft,stamp))
                         parts.append(f"{ft}第{rotation}轮:{result['passed']}个")
                         completed[ft] = rotation
                         position['completed'] = dict(completed)
@@ -154,8 +157,8 @@ def run_daily(pool_name, batch_per_type=15, factor_types=None, daily_batches=1, 
                 from factor_evaluation_queue import request_drain
                 request_drain(pool_name)
                 return '盘后挖掘完成 · '+' · '.join(parts)
-            except Exception:
-                progress('failed')
+            except Exception as exc:
+                progress('failed', reason=f'{type(exc).__name__}: {exc}')
                 with c:
                     c.execute('UPDATE batch_attempts SET status=? WHERE day=? AND attempt=?',('failed',day,attempt))
                 raise

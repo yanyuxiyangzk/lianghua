@@ -88,4 +88,15 @@ class Tests(unittest.TestCase):
         Clock.day=26
         self.assertIn('跳过',mp.run_daily('fixture'))
         self.assertEqual(Engine.calls,[])
+    def test_series_fingerprint_and_failure_does_not_consume_data(self):
+        values={'x':pd.Series([1.,2.],name='x')}
+        self.assertEqual(mp.fingerprint(values),mp.fingerprint(values))
+        with patch.object(Engine,'run_round',side_effect=RuntimeError('fixture failure')):
+            with self.assertRaises(RuntimeError):mp.run_daily('fixture',factor_types=['量价'])
+        import sqlite3,json
+        with sqlite3.connect(mp.DB) as c:self.assertEqual(c.execute('SELECT COUNT(*) FROM inputs').fetchone()[0],0)
+        self.assertIn('fixture failure',json.loads((mp.DB.parent/'mining_progress.json').read_text())['reason'])
+        Clock.day=25
+        self.assertIn('完成',mp.run_daily('fixture',factor_types=['量价']))
+
 if __name__=='__main__':unittest.main()

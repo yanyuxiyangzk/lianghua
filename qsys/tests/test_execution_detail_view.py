@@ -6,6 +6,15 @@ from execution_detail_view import daily_table
 
 
 class DetailTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        state = patch('common.DATA_DIR', Path(self.tmp.name))
+        state.start()
+        self.addCleanup(state.stop)
+
     def test_daily_rows_reconcile(self):
         report = IntegrationTests().run_fixture()
         frame = daily_table(report)
@@ -20,7 +29,7 @@ class DetailTests(unittest.TestCase):
         with patch('library.list_strategies', return_value={'fixture': {'factors': [{'name':'a'}]}}), patch('strategy_backtest.backtest_strategy', return_value=report):
             app = AppTest.from_string('from execution_detail_view import render\nrender()').run()
             self.assertFalse(app.exception)
-            app.button[0].click().run()
+            next(b for b in app.button if b.label == "运行回测并显示列表").click().run()
             self.assertFalse(app.exception)
             self.assertGreater(len(app.dataframe), 0)
             dates = report['nav_dates']
@@ -34,7 +43,8 @@ class DetailTests(unittest.TestCase):
         with patch('library.list_strategies', return_value={'fixture': {'factors':[{'name':'a'}]}}), patch('strategy_backtest.backtest_strategy', return_value={'ok':False,'msg':'缺少行情'}):
             app = AppTest.from_string('from execution_detail_view import render\nrender()')
             app.session_state['execution_detail_report'] = report
-            app.run().button[0].click().run()
+            app.run()
+            next(b for b in app.button if b.label == "运行回测并显示列表").click().run()
             self.assertFalse(app.exception)
             self.assertEqual(len(app.dataframe), 0)
             self.assertIn('缺少行情', app.error[0].value)

@@ -7,6 +7,7 @@ LABELS = {'signal_date': '信号日期', 'execution_date': '计划执行日期',
           'amount': '资金变动', 'balance': '现金余额'}
 VALUES = {'buy': '买入', 'sell': '卖出', 'filled': '已成交', 'rejected': '未成交',
           'unknown_volume': '成交量未知，保守拒单（数据不完整）',
+          'unknown_execution_constraint': '停牌或涨跌停数据未知，保守拒单',
           'insufficient_cash': '现金不足', 'limit_up': '涨停限制', 'limit_down': '跌停限制',
           'suspended_or_zero_volume': '停牌或零成交量',
           't_plus_one_or_insufficient_position': 'T+1或持仓不足'}
@@ -52,6 +53,51 @@ def render():
 
     st.subheader('按日期查看回测明细')
     st.caption('历史日频执行模拟 · 收盘决策，下一交易日开盘执行 · 初始资金20万元 · 最近约500个交易日（以实际数据为准）')
+    with st.expander('补充历史停牌和涨跌停数据'):
+        st.caption('iFinD独立历史字段，按股票和日期补抓；每批最多30只，不使用当前快照或前值填充。补充后需重新运行回测。')
+        with st.form('execution_constraint_sync'):
+            constraint_codes = st.text_input('股票代码（逗号分隔）', value='SH600664,SH603893,SZ001216')
+            from datetime import date, timedelta
+            c1, c2 = st.columns(2)
+            begin = c1.date_input('补充开始日期', value=date.today()-timedelta(days=400))
+            finish = c2.date_input('补充结束日期', value=date.today()-timedelta(days=1))
+            sync_requested = st.form_submit_button('补充历史成交约束')
+        if sync_requested:
+            from execution_constraints import sync
+            try:
+                with st.spinner('正在补抓历史交易状态与涨跌停价…'):
+                    sync_rows = sync([x.strip().upper() for x in constraint_codes.replace('，', ',').split(',') if x.strip()],
+                                     begin.isoformat(), finish.isoformat())
+                st.dataframe(sync_rows, hide_index=True, width='stretch')
+                if any('error' in r or r.get('known', 0) < r.get('rows', 0) for r in sync_rows):
+                    st.warning('部分字段仍缺失或抓取失败，请查看结果；不会用零值代替。')
+                else:
+                    st.success('返回记录已保存，请重新运行回测。日期全覆盖以回测中的缺失检查为准。')
+            except Exception as exc:
+                st.error(f'补抓失败：{exc}')
+    from common import DATA_DIR
+    daily_status = DATA_DIR / 'daily_repair_status.json'
+    if daily_status.exists():
+        with st.expander('基础日线缺失修复进度'):
+            import json
+            try:
+                st.write(json.loads(daily_status.read_text()))
+                st.caption('按本地交易日历检查历史缺日和无效OHLCV；停牌、无数据等未补齐项单独记录，不伪造价格。')
+            except (ValueError, OSError):
+                st.caption('暂无法读取日线补抓进度。')
+    progress_file = DATA_DIR / 'constraint_worker_status.json'
+    if progress_file.exists():
+        with st.expander('全库成交约束补抓与自动增量进度'):
+            import json
+            try:
+                progress = json.loads(progress_file.read_text())
+                st.caption(f"状态：{progress.get('state')} · 更新时间：{progress.get('updated_at')} · 股票数：{progress.get('stocks')}")
+                st.write(progress.get('tasks', {}))
+                if progress.get('current'): st.write(progress['current'])
+                if progress.get('failures'): st.dataframe(progress['failures'], hide_index=True, width='stretch')
+                st.caption('任务按股票、年份、字段计数。自动跟随本地日线新增日期；失败退避重试，连续3次未补齐则阻塞。done不代表其他行情字段完整。')
+            except (ValueError, OSError):
+                st.caption('暂无法读取后台进度。')
     packs = library.list_strategies()
     names = [name for name, pack in packs.items() if pack.get('factors')]
     if not names:
@@ -85,7 +131,7 @@ def render():
     st.caption(f"当前显示已完成结果：{report['strategy']} · 股票池 {report['pool']} · {report['period']}")
     st.warning(report['execution_limitations'])
     if report.get('data_quality_status') == 'incomplete':
-        st.error('数据不完整：部分委托因成交量未知被拒绝。以下仅用于排查和保守模拟，不是完整数据下的策略绩效或验收通过结果。')
+        st.error('数据不完整：部分委托因成交约束数据未知被拒绝。以下仅用于排查和保守模拟，不是完整数据下的策略绩效或验收通过结果。')
         with st.expander('查看行情缺失明细', expanded=True):
             st.dataframe(pd.DataFrame(report['data_issues']).rename(columns={
                 'date': '日期', 'code': '股票代码', 'field': '缺失字段', 'reason': '处理原因'}),

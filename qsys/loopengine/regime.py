@@ -116,6 +116,9 @@ def _fetch_index_panel(codes: list[str], end: str | None, lookback_days: int) ->
 
     start = (pd.Timestamp(end) - pd.Timedelta(days=int(lookback_days * 1.6))).strftime("%Y-%m-%d")
 
+    import os
+    if os.environ.get("QSYS_RESEARCH_LOCAL_ONLY") == "1":
+        return sig.get_panel_cached(codes,end,lookback_days,source=datasource.get_loop_source())
     try:
         panel = sig.fetch_panel(codes, start, end, ["$close", "$volume", "$amount"],
                                 source=datasource.get_loop_source())

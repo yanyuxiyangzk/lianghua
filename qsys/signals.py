@@ -78,7 +78,8 @@ def run_factor_code(code: str, name: str, codes: list[str], end: str, lookback_d
 
     source = source or datasource.get_source()
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    ck = _cache_key("evo", source + code + "|".join(codes) + end + f"|lookback={lookback_days}|input-v2")
+    from daily_integrity import revision
+    ck = _cache_key("evo", revision(codes, source) + source + code + "|".join(codes) + end + f"|lookback={lookback_days}|input-v2")
     if ck.exists():
         hit = _read_parquet_safe(ck)
         if hit is not None:
@@ -517,14 +518,30 @@ def get_panel_cached(codes: list[str], end: str, lookback_days: int = 400,
     import datasource
 
     source = source or datasource.get_source()
+    import os
+    local_only = os.environ.get('QSYS_RESEARCH_LOCAL_ONLY') == '1' and source == 'ths_ifind'
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    ck = _cache_key("panel", source + "|".join(sorted(codes)) + end + str(lookback_days))
+    from daily_integrity import revision
+    ck = _cache_key("panel", revision(codes, source) + source + ("|local-v1|" if local_only else "") + "|".join(sorted(codes)) + end + str(lookback_days))
     if ck.exists():
         hit = _read_parquet_safe(ck)
         if hit is not None:
             return hit
     start = (pd.Timestamp(end) - pd.Timedelta(days=int(lookback_days * 1.6))).strftime("%Y-%m-%d")
-    df = fetch_panel(codes, start, end, _PANEL_FIELDS, source=source)
+    if local_only:
+        with datasource._conn() as c:
+            parts=[]
+            for offset in range(0,len(codes),400):
+                chunk=codes[offset:offset+400]
+                parts.append(pd.read_sql_query("SELECT code,date,open,high,low,close,volume,amount FROM market_daily WHERE source='ths_ifind' AND date BETWEEN ? AND ? AND code IN ("+','.join('?'*len(chunk))+")",c,params=(start,end,*chunk)))
+        raw=pd.concat(parts,ignore_index=True) if parts else pd.DataFrame()
+        if raw.empty: raise RuntimeError('本地日线面板为空，未发起补抓')
+        raw['date']=pd.to_datetime(raw['date'])
+        df=raw.rename(columns={k:'$'+k for k in ['open','high','low','close','volume','amount']}).set_index(['code','date']).sort_index()
+        df.index=df.index.set_names(['instrument','datetime'])
+        df=df[_PANEL_FIELDS]
+    else:
+        df = fetch_panel(codes, start, end, _PANEL_FIELDS, source=source)
     if df.empty:
         raise RuntimeError("取数为空")
     _write_parquet_atomic(df, ck)

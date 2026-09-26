@@ -1467,6 +1467,11 @@ def job_ifind_daily_sync(pool_name: str = "自选股", lookback_days: int = 10, 
     from zoneinfo import ZoneInfo
 
     codes = load_watchlist() if pool_name == "自选股" else (all_pools().get(pool_name) or [])
+    if pool_name == "自选股":
+        with datasource._conn() as c:
+            local = [r[0] for r in c.execute("SELECT DISTINCT code FROM stock_history_jobs_v2 WHERE status <> 'deleted' AND row_count > 0")]
+        codes = sorted(set(codes) | set(local))
+
     if not codes:
         return f"{pool_name} 为空，跳过"
     now = datetime.now(ZoneInfo(TZ))
@@ -2204,6 +2209,14 @@ def job_sector_daily(**_ignored) -> str:
     sf.backfill_sector_daily(days=3, background=False)
     s = sf.sector_daily_status()
     return f"板块日线聚合完成：{s['rows']} 行 · 最新 {s['max_date']}"
+
+
+def job_research_incremental(**_ignored):
+    from research_retention import run_incremental, sync_research_calendars
+    calendars = sync_research_calendars()
+    results = run_incremental(limit=40, search=datetime.now(__import__('zoneinfo').ZoneInfo(TZ)).weekday() == 4)
+    failed = {code: r['error'] for code, r in results.items() if 'error' in r}
+    return f"日历：{calendars}；增量特征检查 {len(results)} 只；异常 {len(failed)}：{str(failed)[:500]}"
 
 
 def job_ifind_cleanup(**_ignored) -> str:
@@ -3070,6 +3083,8 @@ def job_orderbook_sync(**_ignored) -> str:
 
 # ---------------------------------------------------------------- 调度器
 JOBS = {
+    "research_incremental": {"name": "每日特征归档与滚动保留", "func": job_research_incremental,
+                             "default": {"enabled": True, "hour": 20, "minute": 30, "params": {}}},
     "update_data": {"name": "📥 每日数据更新", "func": job_update_data,
                     "default": {"enabled": True, "hour": 17, "minute": 35, "params": {}}},
     "ifind_daily_sync": {"name": "📡 iFinD 日线入库（盘后）", "func": job_ifind_daily_sync,

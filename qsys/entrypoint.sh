@@ -2,6 +2,18 @@
 # QSYS 容器入口：调度器 + SSE 同进程 + Streamlit
 set -e
 
+# Research consumes local history; dedicated collection jobs own network backfill.
+export QSYS_RESEARCH_LOCAL_ONLY=${QSYS_RESEARCH_LOCAL_ONLY:-1}
+
+# Previous container processes are gone; their short-lived owner lease must not
+# prevent the new scheduler from registering jobs (PID values may be reused).
+python - <<'PY'
+import os
+from pathlib import Path
+root = Path(os.environ.get('QSYS_DATA_DIR', '/data'))
+(root / 'scheduler_owner.json').unlink(missing_ok=True)
+PY
+
 # Scheduler + SSE server (同一进程，共享 event_bus)
 python - <<'PY' &
 import sys, time, threading
@@ -33,7 +45,14 @@ while True:
     time.sleep(3600)
 PY
 
+( while true; do python /app/single_stock_jobs.py; sleep 5; done ) &
+
 # Independent durable mining event collector (no trading or job triggering).
 python /app/mining_event_journal.py &
+
+# Resumable history backfill and daily incremental constraint collector.
+( while true; do python /app/constraint_worker.py; sleep 30; done ) &
+
+( while true; do python /app/daily_repair_worker.py; sleep 30; done ) &
 
 exec streamlit run /app/app.py --server.address=0.0.0.0 --server.port=8501

@@ -288,7 +288,15 @@ def _render_stock_rows(inventory: pd.DataFrame):
                          help="跳转到该股票的概率模型页"):
                 st.session_state["prob_preselect"] = row.code
                 st.switch_page("views/p_stock_probability.py")
-            if b4.button("删除", key=f"stock_delete_{row.code}", use_container_width=True):
+            r1, r2 = st.columns(2)
+            if r1.button("因子挖掘", key=f"stock_factor_mine_{row.code}", use_container_width=True):
+                _go("factor_mine", row.code)
+            if r2.button("因子回测", key=f"stock_factor_backtest_{row.code}", use_container_width=True):
+                _go("factor_backtest", row.code)
+            if st.button("清理高频", key=f"stock_hf_cleanup_{row.code}", use_container_width=True,
+                         help="手动清理盘口/逐笔，可选分钟线；保留日线和研究报告"):
+                _go("factor_cleanup", row.code)
+            if b4.button("全删", key=f"stock_delete_{row.code}", use_container_width=True):
                 st.session_state["stock_history_delete"] = row.code
                 st.rerun()
         if st.session_state.get("stock_history_delete") == row.code:
@@ -462,6 +470,9 @@ def _render_stock_detail(code: str):
         return
     count_map = (minute_counts.set_index("date")["minute_count"].to_dict()
                  if not minute_counts.empty else {})
+    if st.button("刷新分钟入库状态", key=f"refresh_minute_status_{code}"):
+        st.rerun()
+    st.caption("分钟状态按数据库中当前实际记录计算；历史同步成功后若清理了分钟数据，会重新显示待同步。")
     synced_days = sum(1 for day in daily["date"].astype(str) if int(count_map.get(day, 0)) >= 200)
     p1, p2, p3, p4 = st.columns(4)
     p1.metric("日线交易日", len(daily))
@@ -490,13 +501,14 @@ def _render_stock_detail(code: str):
                 _record_job(code, "minute_1m", range_start, range_end, total_rows,
                             "success" if not completeness["missing_count"] else "partial",
                             completeness=completeness)
-            message = (f"一次性同步完成：单次接口返回并写入/覆盖 {result['written']:,} 条，"
+            message = (f"分钟同步请求已结束：本次分段接口共写入/覆盖 {result['written']:,} 条，"
                        f"覆盖 {result['days']} 个交易日（完整 {result['complete_days']} 天），"
                        f"重算日内特征 {features['computed_days']} 天；"
                        f"数据范围 {result['first']} 至 {result['last']}。")
             if completeness["missing_count"]:
                 message += f" 与日线相比仍缺少或不完整 {completeness['missing_count']} 天。"
-            st.session_state["stock_history_detail_flash"] = ("success", message)
+            level = "warning" if completeness["missing_count"] else "success"
+            st.session_state["stock_history_detail_flash"] = (level, message)
             st.rerun()
         except Exception as exc:
             st.session_state["stock_history_detail_flash"] = (
@@ -647,6 +659,10 @@ def render():
     code = st.session_state.get("stock_history_code", "")
     trade_date = st.session_state.get("stock_history_day", "")
     minute_ts = st.session_state.get("stock_history_minute", "")
+    if view in ("factor_mine", "factor_backtest", "factor_cleanup") and code:
+        from stock_factor_view import render as render_factor
+        render_factor(code, view.removeprefix("factor_"))
+        return
     if view == "depth" and code and trade_date and minute_ts:
         _render_market_depth(code, trade_date, minute_ts)
         return

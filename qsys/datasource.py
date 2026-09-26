@@ -523,7 +523,9 @@ def _ths_fetch_daily(code: str, start: str, end: str) -> int:
       - volume 单位（股/手）与其他源是否一致，不一致则在此 ×100 对齐
       - THS_HQ 默认不复权；如需前复权在第三个参数加复权标志（以官方文档为准）
     """
-    df, _res, _err = ths_history([code], "open,high,low,close,volume,amount", start, end, "")
+    df, _res, _err = ths_history([code], "open,high,low,close,volume,amount", start, end, "Fill:Original,Interval:D")
+    if _err not in (0, None):
+        raise RuntimeError(f"iFinD日线接口失败: {_err}")
     if df is None or df.empty:
         return 0
     # 列名归一：time/date/trade_date → date；数值列小写对齐
@@ -545,6 +547,8 @@ def _ths_fetch_daily(code: str, start: str, end: str) -> int:
             " VALUES ('ths_ifind',?,?,?,?,?,?,?,?,?,?)",
             [(code, r.date, r.open, r.high, r.low, r.close, r.volume, r.amount, now, stock_id)
              for r in df.itertuples()])
+    from daily_integrity import bump_revision
+    bump_revision(code)
     return len(df)
 
 
@@ -869,15 +873,19 @@ def ths_basic(codes: list[str], indicators: str, params: str = "", date: str = "
     return _sdk_or_http(sdk, http)
 
 
-def ths_date_serial(code: str, indicators: str, start: str, end: str, params: str = ""):
+def ths_date_serial(code: str, indicators: str, start: str, end: str, params: str = "",
+                    fill: str = "Previous"):
     """日期序列（SDK: THS_DateSerial / HTTP: date_sequence）：基本面/专题指标的时序。"""
+    if fill not in ("Previous", "Original"):
+        raise ValueError("不支持的日期序列填充方式")
     cs = _to_ths_code(code)
     inds = [x.strip() for x in indicators.replace("；", ";").replace(",", ";").split(";") if x.strip()]
     return _sdk_or_http(
-        lambda: ths_call("THS_DateSerial", cs, indicators, params, "", start, end),
+        lambda: ths_call("THS_DateSerial", cs, indicators, params,
+                         "Fill:Original" if fill == "Original" else "", start, end),
         lambda: _ths_http("date_sequence",
                           {"codes": cs, "startdate": start, "enddate": end,
-                           "functionpara": {"Days": "Tradedays", "Fill": "Previous", "Interval": "D"},
+                           "functionpara": {"Days": "Tradedays", "Fill": fill, "Interval": "D"},
                            "indipara": [{"indicator": i, "indiparams": [params]} for i in inds]}))
 
 
@@ -1177,7 +1185,11 @@ def _cached_daily(code: str, start: str, end: str, source: str) -> pd.DataFrame:
     with _conn() as c:
         have = c.execute("SELECT MIN(date), MAX(date), COUNT(*) FROM market_daily"
                          " WHERE source=? AND code=?", (source, code)).fetchone()
-    if not (have and have[2] > 0 and have[0] <= start and have[1] >= end):
+    gaps = []
+    if source == 'ths_ifind':
+        from daily_integrity import missing_dates
+        gaps = missing_dates(code, start, end)
+    if gaps or not (have and have[2] > 0 and have[0] <= start and have[1] >= end):
         try:
             fetcher(code, start, end)
             time.sleep(0.1)
@@ -1454,7 +1466,7 @@ def fetch_tencent_float_mv(codes: list[str], chunk: int = 50) -> dict[str, dict]
 
 
 def save_snapshots(rows: list[dict], ts: str | None = None) -> int:
-    """快照批次落库（quote_snapshots，保留3天）。"""
+    """快照批次落库（清理由版本化研究保留策略统一管理）。"""
     if not rows:
         return 0
     ts = ts or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1469,9 +1481,7 @@ def save_snapshots(rows: list[dict], ts: str | None = None) -> int:
             " bid1, ask1, volume, amount, bid_vol_sum, ask_vol_sum, last_tick_vol, turnover,"
             " limit_up, limit_down, avg_price, outer_vol, inner_vol, quantity_ratio, trade_time, source)"
             " VALUES (" + ",".join(["?"] * 23) + ",'tencent')", vals)
-        # 保留最近3天（每批一次廉价清理）
-        cutoff = (datetime.now() - pd.Timedelta(days=3)).strftime("%Y-%m-%d %H:%M:%S")
-        c.execute("DELETE FROM quote_snapshots WHERE ts < ?", (cutoff,))
+        # Raw retention is handled by research_retention after archive verification.
     return len(rows)
 
 
@@ -1809,6 +1819,18 @@ def fetch_indexlist_to_db() -> int:
 
 
 # ---------------------------------------------------------------- 分钟线落库（分时/分钟K 页面读库）
+def _research_guard(func):
+    """Shared per-stock lock for historical capture, feature calculation and cleanup."""
+    from functools import wraps
+    @wraps(func)
+    def wrapped(code, *args, **kwargs):
+        from research_retention import stock_lock
+        with stock_lock(code):
+            return func(code, *args, **kwargs)
+    return wrapped
+
+
+@_research_guard
 def fetch_minute_to_db(code: str, day: str = "", interval: str = "1min") -> int:
     """THS_HF 拉取 code 在 day（YYYY-MM-DD）的分钟线，写入 ifind_minute（SQLite）。
 
@@ -1889,6 +1911,7 @@ def _hf_collect(ths_code: str, indicators: str, start: str, end: str,
     return frames
 
 
+@_research_guard
 def fetch_minute_period_to_db(code: str, start: str, end: str,
                               interval: str = "1min") -> dict:
     """抓取一个日期区间的分钟线并批量入库。
@@ -2017,6 +2040,7 @@ def _orderbook_build_rows(code: str, d: pd.DataFrame) -> list[tuple]:
     return rows
 
 
+@_research_guard
 def _orderbook_write(code: str, day: str, rows: list[tuple]) -> tuple[int, int]:
     """写入盘口行并返回 (written, new_rows)。"""
     start, end = f"{day} 09:25:00", f"{day} 15:05:00"
@@ -2031,6 +2055,7 @@ def _orderbook_write(code: str, day: str, rows: list[tuple]) -> tuple[int, int]:
     return len(rows), max(0, after - before)
 
 
+@_research_guard
 def fetch_orderbook_day_to_db(code: str, day: str) -> dict:
     """从同花顺 THS_SS 单次拉取指定交易日五档盘口快照并严格校验日期后落库。
 
@@ -2107,6 +2132,7 @@ def fetch_orderbook_batch_to_db(codes: list[str], day: str,
     return {"synced": synced, "failed": failed, "written": written, "day": day}
 
 
+@_research_guard
 def fetch_ticks_tx_to_db(code: str, day: str) -> dict:
     """从腾讯分笔接口（akshare stock_zh_a_tick_tx_js）拉取当日分笔成交并落库 tick_data。
 
@@ -2441,6 +2467,7 @@ def _max_streak(flags: pd.Series, target: bool) -> int:
     return best
 
 
+@_research_guard
 def compute_intraday_features(code: str, start: str, end: str,
                               min_rows_per_day: int = 200) -> dict:
     """把完整1分钟线压缩为逐股票逐日特征，幂等覆盖。"""
@@ -2525,6 +2552,7 @@ def get_intraday_features(code: str, start: str | None = None,
             + " ORDER BY trade_date", c, params=params)
 
 
+@_research_guard
 def compute_orderbook_features(code: str, start: str, end: str,
                                min_snapshots: int = 500) -> dict:
     """把当日五档盘口快照（ifind_realtime）压缩为逐股票逐日盘口特征，幂等覆盖。
@@ -3161,9 +3189,11 @@ def cleanup_old_data(retention_days: dict = None):
                 cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
                 c.execute(f"DELETE FROM {table} WHERE ctime < ?", (cutoff,))
             elif table in ("ifind_realtime", "ifind_minute", "tick_data"):
-                cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
-                c.execute(f"DELETE FROM {table} WHERE datetime < ?", (cutoff,))
-            elif table in ("market_daily", "ifind_basic_daily"):
+                # Never bypass verified feature archives or per-stock opt-in.
+                continue
+            elif table == "market_daily":
+                continue  # Historical daily bars are permanently retained.
+            elif table == "ifind_basic_daily":
                 cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
                 c.execute(f"DELETE FROM {table} WHERE date < ?", (cutoff,))
 

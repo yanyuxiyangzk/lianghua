@@ -19,11 +19,13 @@ def connect():
 
 def submit(code,kind,params):
     w.valid_code(code)
-    if kind not in ('mine','backtest','constraints'):raise ValueError('未知任务')
+    if kind not in ('mine','backtest','constraints','cleanup'):raise ValueError('未知任务')
     if kind=='mine':
         if params.get('source') not in w.SOURCES:raise ValueError('未知来源')
         if not 10<=int(params.get('budget',60))<=300:raise ValueError('候选预算须为10～300')
         if params['start']>params['end'] or params['end']>=rr.now().date().isoformat():raise ValueError('仅使用已结束日期')
+    elif kind=='cleanup':
+        rr.preview(code,params['start'],params['end'])
     else:
         exp=w.get_result(params['experiment_id'],'experiments')
         if exp['code']!=code:raise ValueError('股票与研究批次不一致')
@@ -144,6 +146,8 @@ def run_once():
     try:
         p=json.loads(raw)
         if kind=='mine':result=mine(code,p,emit,rid)
+        elif kind=='cleanup':
+            result=rr.archive_and_cleanup(code,p['start'],p['end'],emit)
         elif kind=='constraints':
             import execution_constraints as ec
             exp=w.get_result(p['experiment_id'],'experiments')
@@ -162,7 +166,8 @@ def run_once():
             if exp['code']!=code:raise ValueError('股票不一致')
             emit(30,'按固定方向与阈值执行留出段回测')
             result=w.backtest(p['experiment_id'],p['candidate'])
-        with closing(connect()) as c,c:c.execute("UPDATE single_jobs SET status='completed',progress=100,message=?,result_id=? WHERE id=?",('已完成；请检查结果与数据质量',result['id'],rid))
+        message=(f"归档清理完成：实际删除 {sum(result['deleted'].values())} 行；保留 {result['remaining_rows']} 行；原因：{result['remaining_reasons']}" if kind=='cleanup' else '已完成；请检查结果与数据质量')
+        with closing(connect()) as c,c:c.execute("UPDATE single_jobs SET status='completed',progress=100,message=?,result_id=? WHERE id=?",(message,result['id'],rid))
     except Exception as exc:
         with closing(connect()) as c,c:c.execute("UPDATE single_jobs SET status='failed',message=? WHERE id=?",(str(exc),rid))
     return True

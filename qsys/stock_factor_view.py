@@ -25,7 +25,7 @@ def task_status(code):
         st.rerun()
     if rows:
         st.subheader("单股任务状态（每2秒刷新）")
-    kinds={'mine':'因子挖掘','backtest':'因子回测','constraints':'成交约束补抓'}
+    kinds={'mine':'因子挖掘','backtest':'因子回测','constraints':'成交约束补抓','cleanup':'自动归档并清理'}
     states={'queued':'排队中，尚未开始','running':'执行中','completed':'已完成','failed':'失败'}
     for row in rows[:3]:
         label=f"{kinds.get(row['kind'],row['kind'])} · {states.get(row['status'],row['status'])}"

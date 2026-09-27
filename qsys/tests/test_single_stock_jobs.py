@@ -76,6 +76,31 @@ class JobsTests(TestCase):
         self.assertTrue(any('不足150日' in x.value for x in app.error))
         self.assertEqual(len(j.jobs('SH600664')),2)
 
+    def test_cleanup_job_submission_and_execution(self):
+        rid=j.submit('SH600664','cleanup',dict(start='2025-01-01',end='2025-12-31'))
+        self.assertEqual(j.jobs('SH600664')[0]['status'],'queued')
+        self.assertTrue(j.run_once())
+        row=next(x for x in j.jobs('SH600664') if x['id']==rid)
+        self.assertEqual(row['status'],'completed')
+        self.assertIn('实际删除',row['message'])
+        with datasource._conn() as c:
+            self.assertIsNotNone(c.execute('SELECT payload FROM research_cleanup_log WHERE id=?',(row['result_id'],)).fetchone())
+
+    def test_cleanup_page_queues_and_displays_completion(self):
+        from streamlit.testing.v1 import AppTest
+        app=AppTest.from_string("from stock_factor_view import render\nrender('SH600664','cleanup')").run()
+        self.assertTrue(next(b for b in app.button if b.label=='一键归档并清理').disabled)
+        next(x for x in app.checkbox if x.label.startswith('确认仅删除')).check().run()
+        next(b for b in app.button if b.label=='一键归档并清理').click().run()
+        self.assertFalse(app.exception)
+        self.assertEqual(j.jobs('SH600664')[0]['kind'],'cleanup')
+        self.assertEqual(j.jobs('SH600664')[0]['status'],'queued')
+        j.run_once()
+        app.run()
+        self.assertFalse(app.exception)
+        self.assertTrue(any('实际删除' in x.value for x in app.success))
+        self.assertEqual(len(j.jobs('SH600664')),1)
+
     def test_constraint_repair_job_records_unresolved_result(self):
         exp=self.fixture.exp
         rid=j.submit('SH600664','constraints',dict(experiment_id=exp['id']))

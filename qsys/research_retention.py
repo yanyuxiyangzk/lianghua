@@ -233,6 +233,32 @@ def prepare_cleanup(code,start,end,limit=40):
     return dict(processed=counts,remaining=max(0,len(pending)-limit))
 
 
+def archive_and_cleanup(code,start,end,emit):
+    """Visit each selected raw day once, then revalidate deletion in one transaction."""
+    with stock_lock(code):
+        plan=preview(code,start,end)
+        rows=plan['details']
+        counts={}
+        for index,row in enumerate(rows):
+            with datasource._conn() as c:
+                ready=c.execute("SELECT 1 FROM research_day_archive a JOIN research_raw_revision r ON r.code=a.code AND r.day=a.day AND r.source=a.source AND r.revision=a.revision WHERE a.code=? AND a.day=? AND a.source=? AND a.version=? AND a.quality='ready'",
+                                (code,row['day'],row['table'],VERSION)).fetchone()
+            state='ready' if ready else process_day(code,row['day'],row['table'])
+            counts[state]=counts.get(state,0)+1
+            emit(5+int(85*(index+1)/max(1,len(rows))),f"归档 {index+1}/{len(rows)}：{row['day']} {row['table']} · {state}")
+        emit(92,'归档结束，重新检查保留期、人工保护和数据版本后删除')
+        result=cleanup(code,start,end)
+        remaining=preview(code,start,end)
+        reasons={}
+        for row in remaining['details']:
+            reason=row['reason'] or '数据已变化，待重新检查'
+            reasons[reason]=reasons.get(reason,0)+row['rows']
+        result.update(archive_counts=counts,remaining_rows=sum(row['rows'] for row in remaining['details']),remaining_reasons=reasons)
+        with datasource._conn() as c:
+            c.execute('UPDATE research_cleanup_log SET payload=? WHERE id=?',(json.dumps(result,ensure_ascii=False),result['id']))
+        return result
+
+
 def cleanup(code,start,end,report_id=None,automatic=False):
     preview(code,start,end)
     with stock_lock(code), datasource._conn() as c:

@@ -77,7 +77,7 @@ def render(code):
         if not preview['details']:
             st.info('当前日期范围内没有原始高频数据，无需清理；可调整清理日期范围。')
         else:
-            st.warning('无法清理：当前范围内符合删除条件的记录为 0 行，勾选确认也不会启用按钮。')
+            st.warning('当前符合删除条件的记录为 0 行；可使用“一键归档并清理”先自动处理归档。')
             reasons={}
             for row in preview['details']:
                 if not row['eligible']:
@@ -89,7 +89,16 @@ def render(code):
             if any('特征' in reason or '归档' in reason for reason in reasons):
                 st.caption('处理办法：点击“校验并归档所选范围（不删除）”生成并校验归档，再检查预览；校验失败的具体原因见日期明细。')
             st.caption('日线因子挖掘完成不代表分钟、盘口等原始数据已完成特征归档。')
-    confirm=st.checkbox('确认仅删除预览中符合条件的原始分钟、盘口、快照和逐笔记录，保留历史日线与全部研究特征')
+    st.caption('一键归档并清理会在后台处理所选范围全部日期/来源，无需反复点击40日归档；只删除归档通过且超过保留期的数据。关闭页面不影响后台任务。')
+    confirm=st.checkbox('确认仅删除所选范围内归档合格且超过保留期的原始分钟、盘口、快照和逐笔记录，保留历史日线与全部研究特征')
+    if st.button('一键归档并清理',disabled=not confirm or not preview['details'],type='primary'):
+        try:
+            import single_stock_jobs as jobs
+            rid=jobs.submit(code,'cleanup',dict(start=start.isoformat(),end=end.isoformat()))
+            st.session_state[f'cleanup_receipt_{code}']=f'任务 {rid} 已进入后台队列，进度见上方任务状态；若已有任务，将先显示已有任务。'
+            st.rerun()
+        except Exception as exc:
+            st.error(f'任务提交失败：{exc}')
     if eligible_rows and not confirm:
         st.info(f'可清理 {eligible_rows:,} 行：请先勾选上方确认框，再点击“确认清理原始高频”。')
     if st.button('确认清理原始高频',disabled=not confirm or not any(preview['eligible'].values()),type='primary'):

@@ -45,7 +45,7 @@ while True:
     time.sleep(3600)
 PY
 
-( while true; do python /app/single_stock_jobs.py; sleep 5; done ) &
+python /app/single_stock_jobs.py >/tmp/single_stock_jobs.log 2>&1 &
 
 # Independent durable mining event collector (no trading or job triggering).
 python /app/mining_event_journal.py &

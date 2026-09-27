@@ -128,6 +128,25 @@ class RetentionTests(TestCase):
             self.assertEqual(c.execute('SELECT COUNT(*) FROM ifind_minute').fetchone()[0],0)
             self.assertEqual(c.execute('SELECT COUNT(*) FROM market_daily').fetchone()[0],100)
 
+    def test_archive_cleanup_covers_more_than_one_batch_and_keeps_blocked(self):
+        days=[str(x.date()) for x in pd.bdate_range('2025-01-02',periods=43)]
+        for day in days[1:]:
+            self.insert_minute(day)
+        rr.set_policy(self.code,1,1,False)
+        with datasource._conn() as c:
+            c.execute('UPDATE ifind_minute SET volume=-1 WHERE code=? AND substr(datetime,1,10)=?',(self.code,days[-1]))
+        events=[]
+        result=rr.archive_and_cleanup(self.code,'2025-01-01','2025-12-31',lambda p,m:events.append((p,m)))
+        self.assertEqual(result['deleted']['ifind_minute'],42*240)
+        self.assertEqual(result['remaining_rows'],240)
+        self.assertEqual(result['archive_counts'],{'ready':42,'blocked':1})
+        self.assertTrue(result['remaining_reasons'])
+        self.assertTrue(any('43/43' in m for _,m in events))
+        with datasource._conn() as c:
+            self.assertEqual(c.execute('SELECT COUNT(*) FROM market_daily').fetchone()[0],100)
+            saved=json.loads(c.execute('SELECT payload FROM research_cleanup_log WHERE id=?',(result['id'],)).fetchone()[0])
+        self.assertEqual(saved['remaining_rows'],240)
+
     def test_legacy_cleanup_does_not_delete_unarchived_raw(self):
         datasource.cleanup_old_data()
         with datasource._conn() as c:self.assertEqual(c.execute('SELECT COUNT(*) FROM ifind_minute').fetchone()[0],240)

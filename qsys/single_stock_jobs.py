@@ -176,7 +176,8 @@ def run_once():
 def worker():
     w.DATA_DIR.mkdir(parents=True,exist_ok=True)
     with (w.DATA_DIR/'single_stock_worker.lock').open('a') as lock:
-        try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        try:fcntl.flock(lock,fcntl.LOCK_EX)
+            # wait for any previous worker to release the shared lock
         except BlockingIOError:return
         # An exclusive worker lock proves previous in-flight jobs were interrupted.
         with closing(connect()) as c,c:

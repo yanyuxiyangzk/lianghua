@@ -3,7 +3,68 @@ import numpy as np
 import pandas as pd
 
 POLICY = 'factor-group-v2'
-WINDOW_POLICY = 'research-window-v3'
+WINDOW_POLICY = 'research-window-v4'
+
+
+class BenchmarkDataError(ValueError):
+    """An incomplete benchmark is unavailable evidence, not strategy underperformance."""
+
+
+def research_close(panel):
+    """Explicit research marks must never replace raw OHLC used by execution."""
+    column = '$valuation_close' if '$valuation_close' in panel else '$close'
+    return panel[column].unstack('instrument').sort_index()
+
+
+def suspension_valuations(panel, source, observations=None):
+    """Carry a known mark only across independently confirmed suspended sessions.
+
+    No raw prices are changed. Unknown gaps break the chain; no backfill from
+    future prices. These marks are for research NAV, never execution prices.
+    """
+    close = panel['$close'].unstack('instrument').sort_index()
+    if source != 'ths_ifind' or close.empty:
+        return panel
+    if observations is None:
+        import sqlite3
+        from contextlib import closing
+        from execution_constraints import DB
+        if not DB.exists():
+            return panel
+        rows = []
+        codes = list(close.columns)
+        with closing(sqlite3.connect(DB.resolve().as_uri() + '?mode=ro', uri=True, timeout=5)) as c:
+            for offset in range(0, len(codes), 400):
+                chunk = codes[offset:offset+400]
+                rows.extend(c.execute(
+                    "SELECT date,code,value FROM observations WHERE source=? AND field='suspended' "
+                    "AND date BETWEEN ? AND ? AND code IN (" + ','.join('?' for _ in chunk) + ')',
+                    (source, str(close.index[0])[:10], str(close.index[-1])[:10], *chunk)).fetchall())
+        observations = pd.DataFrame(rows, columns=['date', 'code', 'value'])
+    flags = pd.DataFrame(False, index=close.index, columns=close.columns)
+    if not observations.empty:
+        obs = observations.copy()
+        obs['date'] = pd.to_datetime(obs['date'])
+        flags = obs.pivot(index='date', columns='code', values='value').reindex(
+            index=close.index, columns=close.columns).eq(1)
+    values = close.to_numpy(dtype=float, copy=True)
+    previous = np.full(len(close.columns), np.nan)
+    filled = 0
+    for i in range(len(close)):
+        mask = np.isnan(values[i]) & flags.iloc[i].to_numpy() & np.isfinite(previous) & (previous > 0)
+        values[i, mask] = previous[mask]
+        filled += int(mask.sum())
+        previous = values[i].copy()
+    marks = pd.DataFrame(values, index=close.index, columns=close.columns)
+    marks.index.name = 'datetime'
+    marks.columns.name = 'instrument'
+    marks = marks.stack(dropna=False).rename('$valuation_close')
+    # Complete the row grid for valuation only; raw OHLC remain missing on suspended days.
+    result = panel.reorder_levels(['datetime', 'instrument']).reindex(marks.index).copy()
+    result['$valuation_close'] = marks
+    result.attrs['research_valuation'] = dict(policy='confirmed-suspension-carry-v1',
+                                             marked_cells=filled, execution_eligible=False)
+    return result
 
 
 def window_contract():
@@ -25,10 +86,14 @@ def benchmark_returns(close, forward, date):
     start = close.loc[date]
     members = start.index[np.isfinite(start) & (start > 0)]
     if not len(members):
-        raise ValueError('对照组合起始日无有效价格')
+        raise BenchmarkDataError(f'对照组合起始日无有效价格：日期={date}')
     ret = forward.loc[date].reindex(members)
     if not np.isfinite(ret).all() or (ret <= -1).any():
-        raise ValueError('对照组合未来收益缺失或非有限值，禁止事后剔除股票')
+        invalid = ret.index[~np.isfinite(ret) | (ret <= -1)]
+        raise BenchmarkDataError(
+            f'对照组合未来收益缺失或非有限值，禁止事后剔除股票；'
+            f'起始日期={date}；异常股票数={len(invalid)}；'
+            f'股票={",".join(map(str, invalid[:20]))}')
     return ret
 
 

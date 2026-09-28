@@ -122,7 +122,7 @@ class RetentionTests(TestCase):
         next(x for x in app.checkbox if x.label.startswith('确认仅删除')).check().run()
         next(b for b in app.button if b.label=='确认清理原始高频').click().run()
         self.assertFalse(app.exception)
-        self.assertTrue(any('本次实际删除 240 行' in x.value for x in app.success))
+        self.assertTrue(any('本次实际删除 240 行' in x.value for x in app.get('toast')))
         self.assertTrue(next(b for b in app.button if b.label=='确认清理原始高频').disabled)
         with datasource._conn() as c:
             self.assertEqual(c.execute('SELECT COUNT(*) FROM ifind_minute').fetchone()[0],0)

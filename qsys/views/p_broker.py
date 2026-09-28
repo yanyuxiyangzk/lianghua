@@ -17,21 +17,6 @@ from trade_display import with_signal_columns
 UP, DOWN = "#e54545", "#26a69a"
 
 
-def _is_calendar_trade_day(day: str, trade_dates: set[str]) -> bool:
-    """判断开市日；交易日历未覆盖到的未来/当天工作日按工作日兜底。
-
-    日历覆盖区间内缺失代表真实休市；超过日历最新日期通常只是同步滞后，
-    不能直接判为休市。
-    """
-    target = pd.Timestamp(day)
-    if not trade_dates:
-        return target.weekday() < 5
-    first, last = min(trade_dates), max(trade_dates)
-    if first <= day <= last:
-        return day in trade_dates
-    return target.weekday() < 5
-
-
 def _money(v) -> str:
     return f"{v:,.2f}" if v is not None and pd.notna(v) else "-"
 
@@ -135,8 +120,12 @@ def render():
     c2.metric("可用资金", _money(acc["可用资金"]))
     c3.metric("持仓市值", _money(acc["持仓市值"]))
     c4.metric("持仓盈亏", _pnl(acc["持仓盈亏"]))
-    c5.metric("今日盈亏", _pnl(acc["今日盈亏"]))
-    st.caption(f"初始资金 {broker.INIT_CASH:,.0f} 元 · 佣金万2.5(最低5元)双边 · 印花税0.05%仅卖出 · T+1 · 100股整手")
+    c5.metric("今日盈亏", _pnl(acc["今日盈亏"]) if acc.get('日盈亏有效') else "待更新")
+    st.caption(f"盈亏日期：{acc.get('盈亏日期', '未知')} · {acc.get('日盈亏状态', '')} · "
+               f"行情采集日期：{acc.get('行情采集日期', '未知')}（采集日期不等于行情交易日）")
+    st.caption(f"初始入金 {acc['初始入金']:,.0f} 元 · 佣金万2.5(最低5元)双边 · 印花税0.05%仅卖出 · T+1 · 100股整手")
+    from account_controls_view import render as render_account_controls
+    render_account_controls()
 
     tab_pos, tab_buy, tab_sell, tab_cancel, tab_query, tab_calendar = st.tabs(
         ["💼 持仓", "🛒 买入", "💰 卖出", "❌ 撤单", "🔍 查询", "📅 收益日历"])
@@ -213,10 +202,11 @@ def render():
             else:
                 orders = with_signal_columns(orders)
                 show = orders[["ts", "code", "name", "source", "signal_source", "strategy_name", "side", "price", "shares", "status",
-                               "filled_price", "filled_ts"]].rename(
+                               "filled_price", "filled_ts", "strategy_version", "signal_batch_id", "attribution_status", "decision_reason", "risk_plan_id", "factor_snapshot"]].rename(
                     columns={"ts": "委托时间", "code": "代码", "name": "名称", "source": "类型", "signal_source": "选股来源", "strategy_name": "策略名称",
                              "side": "方向", "price": "限价", "shares": "数量", "status": "状态",
-                             "filled_price": "成交价", "filled_ts": "成交时间"})
+                             "filled_price": "成交价", "filled_ts": "成交时间", "strategy_version":"策略版本", "signal_batch_id":"信号批次",
+                             "attribution_status":"归因状态", "decision_reason":"下单原因", "risk_plan_id":"降仓方案", "factor_snapshot":"因子快照"})
                 show["选股来源"] = show["选股来源"].map(
                     {"satellite_scan": "卫星轨", "sched_pool_scan": "主轨", "manual": "手动", "reconcile_fix": "对账补记"}
                 ).fillna(show["选股来源"].fillna("历史未标记"))
@@ -230,10 +220,11 @@ def render():
             else:
                 fills = with_signal_columns(fills)
                 show = fills[["ts", "code", "name", "source", "signal_source", "strategy_name", "side", "price", "shares", "amount",
-                              "fee", "tax"]].rename(
+                              "fee", "tax", "strategy_version", "signal_batch_id", "attribution_status", "decision_reason", "risk_plan_id", "factor_snapshot"]].rename(
                     columns={"ts": "成交时间", "code": "代码", "name": "名称", "source": "类型", "signal_source": "选股来源", "strategy_name": "策略名称",
                              "side": "方向", "price": "成交价", "shares": "数量", "amount": "成交金额",
-                             "fee": "佣金", "tax": "印花税"})
+                             "fee": "佣金", "tax": "印花税", "strategy_version":"策略版本", "signal_batch_id":"信号批次",
+                             "attribution_status":"归因状态", "decision_reason":"下单原因", "risk_plan_id":"降仓方案", "factor_snapshot":"因子快照"})
                 show["选股来源"] = show["选股来源"].map(
                     {"satellite_scan": "卫星轨", "sched_pool_scan": "主轨", "manual": "手动", "reconcile_fix": "对账补记"}
                 ).fillna(show["选股来源"].fillna("历史未标记"))
@@ -257,88 +248,11 @@ def render():
 
 @st.cache_data(ttl=60, show_spinner=False)
 def _load_equity_curve() -> tuple[pd.DataFrame, dict]:
-    """逐交易日重建账户总资产（现金 + 持仓市值×收盘价），计算日收益。
-
-    - 现金取资金流水的 balance（权威记录，含手动出入金）；持仓由 broker_fills 回放
-    - 出入金属于外部现金流，日收益按修正迪茨法剔除：ret = 权益/(昨日权益+今日净入金) - 1
-    - 不能用现金余额直接算收益率：买入让现金下降，建仓会被误判为大亏
-    """
-    import sqlite3
-    if not broker.DB_PATH.exists():
-        return pd.DataFrame(), {}
+    """与风控、看板共用已校验的交易日净值。"""
     try:
-        with sqlite3.connect(str(broker.DB_PATH), timeout=30) as c:
-            c.execute("PRAGMA busy_timeout=30000")
-            fills = pd.read_sql(
-                "SELECT date, code, side, price, shares, amount, fee, tax"
-                " FROM broker_fills ORDER BY date, id", c)
-            flows = pd.read_sql(
-                "SELECT ts, type, amount, balance FROM broker_cashflows ORDER BY id", c)
-    except Exception:
-        return pd.DataFrame(), {}
-    if fills.empty or flows.empty:
-        return pd.DataFrame(), {}
-
-    flows["date"] = flows["ts"].str[:10]
-    eod_cash = flows.groupby("date")["balance"].last().astype(float)
-    ext = flows[~flows["type"].isin(["买入", "卖出"])].groupby("date")["amount"].sum()
-    init_cash = float(flows.loc[flows["type"] == "初始入金", "amount"].sum())
-    if init_cash <= 0:
-        init_cash = broker.INIT_CASH
-    start = str(min(flows["date"].min(), fills["date"].min()))
-    today = datetime.now().strftime("%Y-%m-%d")
-
-    # 各持仓股票的日线收盘价（含今日实时合并）；缺行情的日用最近价/成本兜底
-    import datasource
-    close = {}
-    for code in fills["code"].unique():
-        try:
-            d = datasource.get_daily_from_db(code, start, today)
-        except Exception:
-            d = pd.DataFrame()
-        if not d.empty:
-            s = pd.to_numeric(d.set_index("date")["close"], errors="coerce").dropna()
-            close[code] = s[~s.index.duplicated(keep="last")]
-
-    days = sorted({x for s in close.values() for x in s.index}
-                  | set(fills["date"]) | set(eod_cash.index))
-    days = [str(d) for d in days if start <= str(d) <= today]
-    eod_cash = eod_cash.reindex(days).ffill()
-
-    fills_by_date = {d: g for d, g in fills.groupby("date")}
-    shares, px_last, cost_last = {}, {}, {}
-    rows = []
-    for d in days:
-        g = fills_by_date.get(d)
-        if g is not None:
-            for f in g.itertuples():
-                if f.side == "buy":
-                    shares[f.code] = shares.get(f.code, 0) + int(f.shares)
-                else:
-                    left = shares.get(f.code, 0) - int(f.shares)
-                    if left > 0:
-                        shares[f.code] = left
-                    else:
-                        shares.pop(f.code, None)
-                cost_last[f.code] = float(f.price)
-        for code, s in close.items():
-            v = s.get(d)
-            if v is not None:
-                px_last[code] = float(v)
-        mv = sum(n * px_last.get(c_, cost_last.get(c_, 0.0)) for c_, n in shares.items())
-        cash = float(eod_cash[d]) if pd.notna(eod_cash[d]) else 0.0
-        equity = cash + mv
-        denom = (rows[-1]["equity"] if rows else 0.0) + float(ext.get(d, 0.0))
-        pnl = equity - denom
-        rows.append({"date": d, "cash": round(cash, 2), "mv": round(mv, 2),
-                     "equity": round(equity, 2), "pnl": round(pnl, 2),
-                     "ret_pct": pnl / denom * 100 if denom else 0.0})
-    if not rows:
-        return pd.DataFrame(), {}
-    eq = pd.DataFrame(rows)
-    eq["date"] = pd.to_datetime(eq["date"])
-    meta = {"init": init_cash, "ext_total": float(ext.sum())}
-    return eq, meta
+        return broker.get_nav_history()
+    except Exception as exc:
+        return pd.DataFrame(), {'error': str(exc)}
 
 
 def _render_calendar_tab():
@@ -348,7 +262,7 @@ def _render_calendar_tab():
 
     eq, meta = _load_equity_curve()
     if eq.empty:
-        st.info("暂无成交记录——完成交易后将自动生成收益日历")
+        st.info(meta.get("error") or "暂无有效盘后净值，请先完成净值重建或盘后快照")
         return
     init_cash = meta.get("init", broker.INIT_CASH)
 
@@ -365,7 +279,7 @@ def _render_calendar_tab():
     c4.metric("日胜率", f"{win / n * 100:.1f}%")
     c5.metric("最大单日涨幅", f"{eq['ret_pct'].max():+.2f}%")
     c6.metric("最大单日跌幅", f"{eq['ret_pct'].min():+.2f}%")
-    st.caption("累计盈亏 = 当前总资产 − 累计净入金（含已实现+未实现盈亏）；"
+    st.caption(f"统计截至 {meta.get('asof', '未知')} 收盘。累计盈亏 = 该日总资产 − 截至该日累计净入金（含已实现+未实现盈亏）；"
                "持仓盈亏 = (当前价−成本价)×持仓股数（仅未实现盈亏）；"
                "两者差异 = 已实现盈亏（已卖出股票的盈亏）")
 
@@ -404,23 +318,8 @@ def _render_calendar_tab():
 
     today_str = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y-%m-%d")
 
-    # 加载交易日历（区分"休市"与"交易日无成交"）
-    trade_dates = set()
-    try:
-        import sqlite3 as _sqlite3
-        from pathlib import Path as _P
-        # 优先挂载卷 /data/market.db（实时更新），fallback 到 /app/data/ 镜像副本
-        for _db in ["/data/market.db", str(_P(__file__).resolve().parent.parent / "data" / "market.db")]:
-            try:
-                with _sqlite3.connect(f"file:{_db}?mode=ro", uri=True, timeout=5) as _c:
-                    _rows = _c.execute("SELECT date FROM ifind_calendar WHERE exchange='SSE'").fetchall()
-                    trade_dates = {r[0] for r in _rows}
-                    if trade_dates:
-                        break
-            except Exception:
-                continue
-    except Exception:
-        pass
+    from trading_calendar import calendar_data, day_status
+    calendar = calendar_data()
 
     def _cell(day: int) -> str:
         if day == 0:
@@ -431,11 +330,15 @@ def _render_calendar_tab():
             if date_str > today_str:
                 return (f"<td class='cal-off'><div class='cal-d' style='opacity:.3'>"
                         f"{day}</div></td>")
-            if not _is_calendar_trade_day(date_str, trade_dates):
+            state = day_status(date_str, calendar)
+            if state is None:
+                return (f"<td class='cal-closed'><div class='cal-d'>{day}</div>"
+                        "<div class='cal-r' style='opacity:.35'>日历待核实</div></td>")
+            if state is False:
                 return (f"<td class='cal-closed'><div class='cal-d'>{day}</div>"
                         f"<div class='cal-r' style='opacity:.35'>休市</div></td>")
             return (f"<td class='cal-closed'><div class='cal-d'>{day}</div>"
-                    f"<div class='cal-r' style='opacity:.35'>无交易</div></td>")
+                    f"<div class='cal-r' style='opacity:.35'>净值待更新</div></td>")
         ret, pnl = r.ret_pct, r.pnl
         a = 0.10 + 0.62 * min(abs(ret) / max_abs, 1.0)
         if ret > 0:

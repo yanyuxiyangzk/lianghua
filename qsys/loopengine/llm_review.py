@@ -1,7 +1,7 @@
 """P4：双 LLM 分离 —— 独立审查 sub-agent（与生成端隔离，防单一模型自我说服）。
 
 生成端（engine._llm_generate）：创造性 prompt，按机制族出题。
-审查端（本模块）：严格审查 prompt，随机抽样候选做边界精判，可一票否决。
+审查端（本模块）：严格审查通过统计闸门的新候选，结果只作风险标注。
 """
 
 import json
@@ -40,16 +40,27 @@ def _extract_json(text: str) -> dict | None:
         return None
 
 
-def llm_review(sexpr: str) -> tuple[bool, str]:
+def _valid_review(text):
+    d=_extract_json(text or '')
+    return isinstance(d,dict) and d.get('verdict') in ('pass','reject') and isinstance(d.get('reason'),str)
+
+
+def llm_review(sexpr: str, factor_type: str = "量价") -> tuple[bool, str]:
     """独立审查 sub-agent。无 key/调用失败时回退到规则审查（fail-strict，非fail-open）。"""
-    if not os.environ.get("DEEPSEEK_API_KEY"):
+    from llmutil import llm_available
+    if not llm_available():
         return _rule_review(sexpr), "no-llm-fallback"
     try:
         from llmutil import llm_chat
-        text = llm_chat(_REVIEWER_SYS, _REVIEWER_USER.format(sexpr=sexpr),
-                        max_tokens=350, label="loopengine_review")
+        from loopengine.tree import parse, FIELD_INFO
+        sexpr=parse(sexpr).sexpr()
+        fields={name:meaning for name,meaning in FIELD_INFO.items() if re.search(r'\b'+re.escape(name)+r'\b',sexpr)}
+        context=json.dumps({'review_version':'semantic-v2','factor_type':factor_type,'fields':fields},ensure_ascii=False,sort_keys=True)
+        text = llm_chat(_REVIEWER_SYS, context+'\n'+_REVIEWER_USER.format(sexpr=sexpr),
+                        max_tokens=350, label="loopengine_review",max_retries=0,
+                        cache_ttl=30*86400,cache_validator=_valid_review)
         d = _extract_json(text or "")
-        if d is None:
+        if not _valid_review(text):
             return _rule_review(sexpr), "llm-error-fallback"
         verdict = str(d.get("verdict", "pass")).lower()
         return verdict == "pass", str(d.get("reason", ""))[:120]

@@ -7,7 +7,7 @@ import numpy as np
 import stock_factor_workbench as w
 import datasource
 import research_retention as rr
-VERSION='single-expression-v1'
+VERSION='single-expression-v2'
 
 
 def connect():
@@ -32,8 +32,10 @@ def submit(code,kind,params):
         if kind=='backtest' and params['candidate'] not in [c['name'] for c in exp['candidates'] if c['status']=='research_candidate']:raise ValueError('候选不可回测')
     with closing(connect()) as c,c:
         c.execute('BEGIN IMMEDIATE')
-        existing=c.execute("SELECT id FROM single_jobs WHERE code=? AND status IN ('queued','running')",(code,)).fetchone()
-        if existing:return existing[0]
+        existing=c.execute("SELECT id,kind,params FROM single_jobs WHERE code=? AND status IN ('queued','running')",(code,)).fetchone()
+        if existing:
+            if existing[1]==kind and json.loads(existing[2])==params:return existing[0]
+            raise ValueError('该股票已有其他任务或不同参数的任务，请等待完成后再提交')
         rid=uuid.uuid4().hex
         c.execute('INSERT INTO single_jobs VALUES(?,?,?,?,?,?,?,?,?)',(rid,code,kind,'queued',json.dumps(params),'0','已排队，等待独立工作进程',None,datetime.now().isoformat()))
     return rid
@@ -59,6 +61,44 @@ def evaluate(expr,d):
     raise ValueError('未知运算')
 
 
+def validated_daily(code, daily, expected):
+    """Keep calendar gaps, permitting only independently confirmed suspensions."""
+    from execution_constraints import attach
+    if daily.index.duplicated().any() or not daily.index.isin(expected).all():
+        raise ValueError('日线日期重复或不在可信交易日历内')
+    d=daily.reindex(expected).copy()
+    d.index.name='date'
+    numeric=d.apply(pd.to_numeric,errors='coerce')
+    prices=numeric.assign(code=code).reset_index().set_index(['date','code'])
+    states=attach(prices,'ths_ifind')['suspended'].to_numpy()
+    suspended=pd.Series(states==1,index=d.index)
+    invalid=~np.isfinite(numeric)
+    invalid.loc[:,['open','high','low','close']] |= numeric[['open','high','low','close']]<=0
+    invalid.loc[:,['volume','amount']] |= numeric[['volume','amount']]<0
+    bad=invalid.any(axis=1) & ~suspended
+    if bad.any():
+        details=['{} [{}]'.format(day,','.join(invalid.columns[invalid.loc[day]])) for day in d.index[bad][:8]]
+        raise ValueError(f'日线存在无效价格或成交量额：{code}，{int(bad.sum())}日；'+'；'.join(details)+'；未确认全天停牌，请补抓行情或独立历史停牌状态')
+    ohlc=(numeric.high<numeric[['open','close','low']].max(axis=1)) | (numeric.low>numeric[['open','close','high']].min(axis=1))
+    if (ohlc & ~suspended).any():
+        raise ValueError('日线OHLC关系异常：'+','.join(d.index[ohlc & ~suspended][:8]))
+    # Never fabricate OHLCV, compress the calendar, or use vendor-filled
+    # suspension prices as observations for discovery.
+    numeric.loc[suspended,:]=np.nan
+    quality=dict(policy='confirmed-suspension-mask-v1',calendar_days=len(d),
+                 valid_days=int((~suspended).sum()),suspension_dates=d.index[suspended].tolist(),
+                 missing_calendar_rows=d.index[~d.index.isin(daily.index)].tolist())
+    return numeric,quality
+
+
+def uninterrupted_return(close, periods=5, forward=False):
+    """Returns require every session in the window, including both endpoints."""
+    complete=close.rolling(periods+1).count().eq(periods+1)
+    if forward:
+        return (close.shift(-periods)/close-1).where(complete.shift(-periods,fill_value=False))
+    return close.pct_change(periods,fill_method=None).where(complete)
+
+
 def mine(code,p,emit,identifier):
     rr.setup()
     with rr.stock_lock(code):
@@ -73,13 +113,11 @@ def mine(code,p,emit,identifier):
         a,b=d.index[0],d.index[-1]
         expected=[day for day in cal if a<=day<=b]
         if not any(lo<=a and hi>=b and rr._hash(json.loads(raw))==digest and expected==[t for t in json.loads(raw) if a<=t<=b] for lo,hi,raw,digest in receipts):raise ValueError('研究区间缺少完整可信交易日历，请先补齐日历')
-        if list(d.index)!=expected:raise ValueError('日线存在缺失交易日；需补齐或选择连续区间')
-        numeric=d.apply(pd.to_numeric,errors='coerce')
-        if not np.isfinite(numeric.to_numpy()).all() or (numeric[['open','high','low','close']]<=0).any().any() or (numeric[['volume','amount']]<0).any().any():raise ValueError('日线存在无效价格或成交量额')
-        if ((numeric.high<numeric[['open','close','low']].max(axis=1)) | (numeric.low>numeric[['open','close','high']].min(axis=1))).any():raise ValueError('日线OHLC关系异常')
-        d=numeric
+        d,daily_quality=validated_daily(code,d,expected)
+        if daily_quality['valid_days']<180:raise ValueError('扣除已确认停牌后，至少需要180个有效日线日期用于训练、验证和最终留出')
+        emit(10,f"日线校验：有效{daily_quality['valid_days']}日，已确认停牌{len(daily_quality['suspension_dates'])}日；保留日历，不填充行情")
         if source=='日线量价':
-            d['return_5']=d.close.pct_change(5,fill_method=None)
+            d['return_5']=uninterrupted_return(d.close)
             d['volatility_20']=d.close.pct_change(fill_method=None).rolling(20).std()
             d['volume_ratio_20']=d.volume/d.volume.rolling(20).mean().replace(0,np.nan)-1
             provenance='daily-snapshot'
@@ -97,7 +135,8 @@ def mine(code,p,emit,identifier):
             provenance={day:dict(hash=r[1],revision=r[2],version=rr.VERSION) for day,r in valid.items()}
             if d[w.SOURCES[source]].notna().all(axis=1).sum()<150:raise ValueError('所选来源通过版本化归档的特征不足150日；请先校验归档原始数据，不使用未认证旧汇总代替')
         fields=w.SOURCES[source];n=len(d);train_stop=int(n*.5);test_start=int(n*.75)
-        future=d.close.shift(-5)/d.close-1
+        d.loc[daily_quality['suspension_dates'],fields]=np.nan
+        future=uninterrupted_return(d.close,forward=True)
         rng=random.Random(int(p.get('seed',42)));seen=set();trials=[];values={};budget=int(p.get('budget',60))
         def leaf():return ['field',rng.choice(fields)]
         def tree(depth=2):
@@ -130,6 +169,7 @@ def mine(code,p,emit,identifier):
         snapshot=json.loads(d.reset_index().to_json(orient='records',double_precision=15))
         result=dict(id=identifier,code=code,source=source,created=datetime.now().isoformat(),start=a,end=b,split=test_start,test_start=d.index[test_start],candidates=candidates,inputs=snapshot,feature_version=rr.VERSION if source!='日线量价' else VERSION,calendar_receipts=[dict(start=lo,end=hi,digest=digest) for lo,hi,raw,digest in receipts if lo<=a and hi>=b],input_hash=rr._hash(snapshot),contract=VERSION,research_type='expression-search',trials=trials,seed=int(p.get('seed',42)),budget=budget,feature_provenance=provenance,train_end=d.index[train_stop-1],validation_end=d.index[test_start-1],note='单股日频表达式探索；50%训练/25%验证/25%最终留出，5日标签边界净化；最终留出未参与选优。未复权收益、重复搜索存在选优偏差；仅供研究，不是交易批准。保存快照不自动授权清理。')
         emit(90,'保存表达式、全部搜索尝试、特征版本及因子值快照')
+        result['daily_quality']=daily_quality
         w.save('experiments',result)
         return result
 
@@ -166,7 +206,7 @@ def run_once():
             if exp['code']!=code:raise ValueError('股票不一致')
             emit(30,'按固定方向与阈值执行留出段回测')
             result=w.backtest(p['experiment_id'],p['candidate'])
-        message=(f"归档清理完成：实际删除 {sum(result['deleted'].values())} 行；保留 {result['remaining_rows']} 行；原因：{result['remaining_reasons']}" if kind=='cleanup' else '已完成；请检查结果与数据质量')
+        message=(f"{'删除完成' if sum(result['deleted'].values()) else '检查完成，本次未删除数据'}：实际删除 {sum(result['deleted'].values())} 行；保留 {result['remaining_rows']} 行；原因：{result['remaining_reasons']}" if kind=='cleanup' else '已完成；请检查结果与数据质量')
         with closing(connect()) as c,c:c.execute("UPDATE single_jobs SET status='completed',progress=100,message=?,result_id=? WHERE id=?",(message,result['id'],rid))
     except Exception as exc:
         with closing(connect()) as c,c:c.execute("UPDATE single_jobs SET status='failed',message=? WHERE id=?",(str(exc),rid))

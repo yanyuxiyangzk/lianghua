@@ -803,6 +803,10 @@ def position_open_from_picks(trade_date: str, today: str) -> str:
     已有 open/closing/pending 时不新增；柜台在事务内再次校验，禁止自动加仓。
     """
     from common import SIGNALS_DIR
+    from selection_policy import signal_date_rejection
+    stale = signal_date_rejection(trade_date, today)
+    if stale:
+        return stale
     picks = picks_on_date(trade_date)
     if picks.empty:
         return "无名单可委托"
@@ -1608,10 +1612,11 @@ def rebuild_nav_history() -> int:
     import broker
 
     with broker._conn() as c:
+        c.execute('BEGIN')
         fills = pd.read_sql(
-            "SELECT date, ts, code, side, amount, fee, tax, shares FROM broker_fills ORDER BY ts", c)
+            "SELECT date, ts, code, side, amount, fee, tax, shares FROM broker_fills WHERE source!='satellite' ORDER BY ts,id", c)
         cfs = pd.read_sql(
-            "SELECT ts, type, amount FROM broker_cashflows ORDER BY ts", c)
+            "SELECT ts, type, amount FROM broker_cashflows WHERE source!='satellite' ORDER BY ts,id", c)
     if fills.empty and cfs.empty:
         return 0
     first_day = min(fills["date"].min() if not fills.empty else "9999",
@@ -1624,8 +1629,21 @@ def rebuild_nav_history() -> int:
             c, params=(first_day,))
     if px.empty:
         raise ValueError("行情为空，拒绝覆盖历史净值")
-    cal = sorted(px["date"].unique())
-    close = px.pivot(index="date", columns="code", values="close").ffill()  # 停牌沿用前收
+    from trading_calendar import calendar_data, day_status
+    calendar = calendar_data()
+    current = datetime.now()
+    today = current.strftime('%Y-%m-%d')
+    px = px[(px['date'] < today) | ((px['date'] == today) & (current.strftime('%H%M') >= '1500'))]
+    if px.empty:
+        raise ValueError("尚无已收盘行情，拒绝覆盖历史净值")
+    end = px['date'].max()
+    if not any(start <= first_day and stop >= end for start, stop in calendar[1]):
+        raise ValueError("净值回放区间缺少可信交易日历覆盖，拒绝覆盖历史净值")
+    cal = sorted(d for d in calendar[0] if first_day <= d <= end and day_status(d, calendar) is True)
+    if not cal:
+        raise ValueError("净值回放区间没有已确认交易日")
+    # 缺日线不能自动假定停牌；无法完整估值时保留原净值并报错。
+    close = px.pivot(index="date", columns="code", values="close")
 
     cash, hold = 0.0, {}
     fills_by_date = {d: g for d, g in fills.groupby("date")} if not fills.empty else {}
@@ -1640,38 +1658,60 @@ def rebuild_nav_history() -> int:
     nav, peak_nav, prev_total = 1.0, 1.0, None
     rows = []
     now = datetime.now().strftime("%F %T")
-    for day in cal:
+    pending_ext = 0.0
+    sessions = set(cal)
+    days = sorted(sessions | {d for d in fills_by_date if d <= cal[-1]}
+                  | {d for d in ext_by_date if d <= cal[-1]})
+    for day in days:
         ext = ext_by_date.get(day, 0.0)
+        pending_ext += ext
         g = fills_by_date.get(day)
         if g is not None:
             for f in g.itertuples():
                 if f.side == "buy":
-                    cash -= (f.amount or 0) + (f.fee or 0)
+                    cash -= (f.amount or 0) + (f.fee or 0) + (f.tax or 0)
                     hold[f.code] = hold.get(f.code, 0) + (f.shares or 0)
                 else:
                     cash += (f.amount or 0) - (f.fee or 0) - (f.tax or 0)
                     hold[f.code] = hold.get(f.code, 0) - (f.shares or 0)
         cash += ext  # 当日净入金
+        if day not in sessions:
+            continue  # 休市现金流和历史异常成交仍入账，损益归入下一交易区间
         mv = 0.0
-        if day in close.index:
-            prow = close.loc[day]
-            for cd, sh in hold.items():
-                if sh > 0:
-                    p = prow.get(cd)
-                    if pd.isna(p) or not np.isfinite(float(p)) or float(p) <= 0:
-                        raise ValueError(f"{day} {cd} 持仓缺少有效价格，拒绝覆盖历史净值")
-                    mv += float(p) * sh
+        prow = close.loc[day] if day in close.index else {}
+        for cd, sh in hold.items():
+            if sh < 0:
+                raise ValueError(f"{day} {cd} 回放出现负持仓，拒绝覆盖历史净值")
+            if sh > 0:
+                p = prow.get(cd)
+                if pd.isna(p) or not np.isfinite(float(p)) or float(p) <= 0:
+                    raise ValueError(f"{day} {cd} 持仓缺少有效价格，拒绝覆盖历史净值")
+                mv += float(p) * sh
         total = cash + mv
+        if not all(np.isfinite(v) for v in (cash, mv, total)) or total <= 0:
+            raise ValueError(f"{day} 回放资产无效，拒绝覆盖历史净值")
         if prev_total:
-            r = (total - ext) / prev_total - 1
+            r = (total - pending_ext) / prev_total - 1
+            nav *= (1 + r)
+        else:
+            r = total / pending_ext - 1 if pending_ext > 0 else 0.0
             nav *= (1 + r)
         peak_nav = max(peak_nav, nav)
         dd = nav / peak_nav - 1
         rows.append((day, round(total, 2), round(cash, 2), round(mv, 2),
-                     round(nav, 6), round(r if prev_total else 0.0, 6), round(dd, 6), now))
+                     round(nav, 6), round(r, 6), round(dd, 6), now))
         prev_total = total
+        pending_ext = 0.0
     with _conn() as c:
         c.executescript(_NAV_SCHEMA)
+        c.execute('CREATE TABLE IF NOT EXISTS account_nav_rebuild_audit('
+                  'id INTEGER PRIMARY KEY, created_at TEXT, previous_rows TEXT)')
+        c.execute('BEGIN IMMEDIATE')
+        old_rows = c.execute('SELECT * FROM account_nav_daily ORDER BY date').fetchall()
+        if any(row[0] > cal[-1] and day_status(row[0], calendar) is not False for row in old_rows):
+            raise ValueError('已有更晚的交易日净值，行情尚未覆盖；拒绝删除较新快照')
+        c.execute('INSERT INTO account_nav_rebuild_audit(created_at,previous_rows) VALUES (?,?)',
+                  (now, json.dumps(old_rows, ensure_ascii=False)))
         c.execute("DELETE FROM account_nav_daily")
         c.executemany("INSERT INTO account_nav_daily VALUES (?,?,?,?,?,?,?,?)", rows)
     return len(rows)
@@ -1688,17 +1728,22 @@ def snapshot_nav_today() -> str:
     mv = acc.get("持仓市值", 0) or 0
     if not all(np.isfinite(v) for v in (total, cash, mv)) or total <= 0 or mv < 0:
         raise ValueError("账户资产数据无效，拒绝写入净值快照")
+    from trading_calendar import day_status, previous_session
     day = datetime.now().strftime("%Y-%m-%d")
+    if day_status(day) is not True or acc.get('收盘估值有效') is not True:
+        raise ValueError("非已确认交易日或缺少当日收盘行情，拒绝写入净值快照")
     with _conn() as c:
         c.executescript(_NAV_SCHEMA)
         # prev 必须是"今日之前"的最后净值——同日已存在回放行时拿来当基准会把日收益算成 0
-        prev = c.execute("SELECT total_assets, nav FROM account_nav_daily WHERE date<? "
+        prev = c.execute("SELECT total_assets, nav, date FROM account_nav_daily WHERE date<? "
                          "ORDER BY date DESC LIMIT 1", (day,)).fetchone()
         peak_nav = c.execute("SELECT MAX(nav) FROM account_nav_daily WHERE date<?", (day,)).fetchone()[0] or 1.0
+    if prev and prev[2] != previous_session(day):
+        raise ValueError("前一交易日净值缺失或日历范围未核实，请重建净值；拒绝把区间收益记为日收益")
     with broker._conn() as c:
-        ext = c.execute("SELECT COALESCE(SUM(amount),0) FROM broker_cashflows WHERE ts LIKE ?"
-                        " AND type IN ('入金','初始入金','出金')",  # 买卖腿在 fills 里，不重复计
-                        (day + "%",)).fetchone()[0]
+        ext = c.execute("SELECT COALESCE(SUM(amount),0) FROM broker_cashflows WHERE substr(ts,1,10)>? AND substr(ts,1,10)<=?"
+                        " AND source!='satellite' AND type IN ('入金','初始入金','出金')",  # 买卖腿在 fills 里，不重复计
+                        (prev[2] if prev else '', day)).fetchone()[0]
     if prev and prev[0]:
         r = (total - ext) / prev[0] - 1
         nav = prev[1] * (1 + r)
@@ -1765,43 +1810,31 @@ def build_risk_reduction_plan(rk: dict, today: str, level_override: str | None =
         level = level_override
     if target_override is not None:
         target = float(target_override)
-    acc = broker.get_account()
-    total = float(acc.get("总资产", 0) or 0)
-    opens = get_open_positions()
-    current_mv = float(opens["市值"].sum()) if (not opens.empty and "市值" in opens) else 0.0
-    current_ratio = current_mv / total if total > 0 else 0.0
-    release = max(0.0, current_mv - total * target)
+    import account_controls
+    snap = account_controls.snapshot()
+    if not snap['valid'] or not np.isfinite(target) or not 0 <= target <= 1:
+        raise ValueError('账户估值或目标仓位无效，不能生成减仓建议')
+    snap['target'] = target
+    current_mv = sum(r['market_value'] for r in snap['rows'])
+    snap['total_excess'] = max(0., current_mv-snap['total']*target)
+    amounts, fee_allowance = account_controls.reduction_amounts(snap)
+    current_ratio = snap['position_ratio']
+    release = sum(amounts.values())
     rows = []
-    if release > 0 and not opens.empty:
-        for _, p in opens.iterrows():
-            source = str(p.get("source") or "")
-            pnl = float(p.get("浮动盈亏%") or 0) / 100
-            hold = int(p.get("持有交易日") or 0)
-            rules = _get_position_rules(p)
-            score = 0.0
-            reasons = []
-            if source in ("satellite_scan", "sched_satellite_scan"):
-                score += 35; reasons.append("卫星来源")
-            if pnl < 0:
-                score += min(25, abs(pnl) * 200); reasons.append("当前浮亏")
-            if hold >= int(rules["hold_days"]):
-                score += 20; reasons.append("已到持有期")
-            if str(p.get("sell_reason") or ""):
-                score += 20; reasons.append(str(p.get("sell_reason")))
-            value = float(p.get("市值") or 0)
-            rows.append({"position_id": int(p["id"]), "code": p["code"],
-                         "name": p.get("name") or "", "source": source,
-                         "market_value": round(value, 2), "risk_score": round(score, 2),
-                         "reasons": reasons})
-        rows.sort(key=lambda x: (x["risk_score"], x["market_value"]), reverse=True)
-        remain = release
-        for row in rows:
-            suggested = min(row["market_value"], remain)
-            row["suggested_sell_value"] = round(max(0.0, suggested), 2)
-            remain -= suggested
+    for row in snap['rows']:
+        amount = amounts[row['code']]
+        if amount <= .01:
+            continue
+        rows.append({'position_id':None, 'code':row['code'], 'name':row['name'],
+                     'source':'账户合并（手动及策略持仓）', 'market_value':round(row['market_value'],2),
+                     'risk_score':round(row['excess_value']/snap['total']*100,2),
+                     'reasons':['单股超限' if row['excess_value'] > .01 else '账户总仓位超限'],
+                     'suggested_sell_value':round(amount,2)})
+    rows.sort(key=lambda row:(row['risk_score'],row['market_value']),reverse=True)
     plan = {"date": today, "level": level, "drawdown": rk.get("dd_now"),
             "target_position_ratio": target, "current_position_ratio": current_ratio,
             "required_release": round(release, 2), "shadow_only": True,
+            "review_required": True, "valuation_fresh": snap["fresh"], "fee_allowance": round(fee_allowance,2),
             "positions": rows, "created_at": datetime.now().strftime("%F %T")}
     tmp = RISK_PLAN_FILE.with_suffix(".tmp")
     tmp.write_text(json.dumps(plan, ensure_ascii=False, indent=2, default=str))

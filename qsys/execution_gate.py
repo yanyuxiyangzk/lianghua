@@ -76,6 +76,25 @@ def position_rejection(c, position_id, today):
         rejection = check(pack, approvals.get(row[0]), regime, today)
         if rejection:
             return rejection
+        from strategy_progress import latest_reports, research_reason
+        research = research_reason(pack, latest_reports().get(row[0]))
+        if research:
+            return '当前策略研究资格未通过：' + research
+        signal = c.execute(
+            'SELECT p.trade_date,e.risk_json FROM positions pos '
+            'JOIN picks p ON p.id=pos.pick_id '
+            'LEFT JOIN pick_decision_evidence e ON e.pick_id=p.id WHERE pos.id=?',
+            (position_id,)).fetchone()
+        if not signal:
+            return '缺少可追溯的选股名单，暂停自动买入'
+        from selection_policy import signal_date_rejection, SELECTION_POLICY
+        rejection = signal_date_rejection(signal[0], today)
+        if rejection:
+            return rejection
+        evidence = json.loads(signal[1] or '{}')
+        if (evidence.get('strategy_version') != strategy_version(pack)
+                or evidence.get('selection_policy') != SELECTION_POLICY):
+            return '选股名单与当前策略版本或选股规则不一致，须重新生成名单'
         import selection_gate
         result = selection_gate.evaluate_candidate(row[2], pack, regime)
         if result.status != 'pass':

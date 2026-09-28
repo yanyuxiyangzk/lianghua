@@ -10,6 +10,17 @@ import single_stock_jobs as jobs
 @st.fragment(run_every=2)
 def task_status(code):
     rows=jobs.jobs(code)
+    active_cleanup=next((r for r in rows if r['kind']=='cleanup' and r['status'] in ('queued','running')),None)
+    watched_key=f'cleanup_popup_task_{code}'
+    watched=st.session_state.get(watched_key)
+    finished=next((r for r in rows if r['id']==watched and r['status'] in ('completed','failed')),None)
+    if finished:
+        st.session_state[f'cleanup_toast_{code}']=finished['message'] if finished['status']=='completed' else '删除失败：'+finished['message']
+        st.session_state.pop(watched_key,None)
+    if active_cleanup:
+        st.session_state[watched_key]=active_cleanup['id']
+        stage='已排队，等待开始' if active_cleanup['status']=='queued' else ('正在删除…' if int(active_cleanup['progress'])>=92 else '正在归档，完成后自动删除…')
+        st.markdown(f'<div role="status" aria-live="polite" style="position:fixed;right:24px;top:72px;z-index:99999;padding:16px 22px;border-radius:10px;background:#17324d;color:white;box-shadow:0 4px 16px #0003">{stage} {int(active_cleanup["progress"])}%</div>',unsafe_allow_html=True)
     # A fragment refresh alone cannot reload the result selectors below it.
     # Acknowledge terminal transitions before requesting one full rerun.
     terminal={r['id']:r['status'] for r in rows if r['status'] in ('completed','failed')}
@@ -23,12 +34,25 @@ def task_status(code):
             if latest:
                 st.session_state[f'{selection}_{code}']=latest['result_id']
         st.rerun()
+    toast=st.session_state.pop(f'cleanup_toast_{code}',None)
+    if toast:
+        st.toast(toast)
     if rows:
         st.subheader("单股任务状态（每2秒刷新）")
     kinds={'mine':'因子挖掘','backtest':'因子回测','constraints':'成交约束补抓','cleanup':'自动归档并清理'}
     states={'queued':'排队中，尚未开始','running':'执行中','completed':'已完成','failed':'失败'}
-    for row in rows[:3]:
-        label=f"{kinds.get(row['kind'],row['kind'])} · {states.get(row['status'],row['status'])}"
+    latest_by_kind={}
+    historical=[]
+    for row in rows:
+        if row['kind'] in latest_by_kind:
+            historical.append(row)
+        else:
+            latest_by_kind[row['kind']]=row
+    for row in latest_by_kind.values():
+        state=states.get(row['status'],row['status'])
+        if row['kind']=='cleanup' and row['status']=='running':
+            state='删除中' if int(row['progress'])>=92 else '归档中'
+        label=f"{kinds.get(row['kind'],row['kind'])} · {state}"
         if row['status']=='completed':
             if row['kind']=='mine' and row['result_id']:
                 exp=work.get_result(row['result_id'],'experiments')
@@ -45,6 +69,12 @@ def task_status(code):
             st.info(f"{label}：{row['message']}")
         st.progress(int(row['progress']),text=f"{label} · {row['message']}")
         st.caption(f"任务 {row['id']} · 提交时间 {row['created']} · 结果 {row['result_id'] or '尚未保存'}")
+    if historical:
+        with st.expander(f"历史任务（{len(historical)} 条，不代表当前状态）",expanded=False):
+            for row in historical:
+                st.caption(f"历史记录 · {kinds.get(row['kind'],row['kind'])} · {states.get(row['status'],row['status'])} · {row['created']}")
+                st.write(row['message'])
+                st.caption(f"任务 {row['id']} · 结果 {row['result_id'] or '未保存'}")
     if rows and st.button("刷新已保存结果",key=f"refresh_jobs_{code}"):
         st.rerun()
 
@@ -94,6 +124,14 @@ def render(code, action):
             st.metric('候选数量', len(exp['candidates']))
             st.dataframe(research_table(exp['candidates']),hide_index=True,width='stretch')
             st.caption(exp['note'])
+            quality=exp.get('daily_quality')
+            if quality:
+                suspended=quality.get('suspension_dates',[])
+                st.info(f"日线质量：有效 {quality['valid_days']} 日，已确认停牌 {len(suspended)} 日。停牌日期保留，行情未填充；停牌日及跨停牌缺口的收益标签不参与挖掘。")
+                if suspended:
+                    with st.expander('已确认停牌日期与处理说明'):
+                        st.write('、'.join(suspended))
+                        st.caption('依据独立历史停牌状态；因子滚动窗口还可能因预热不足而缺值。挖掘完成不代表成交回测的数据约束已全部满足。')
             if exp.get('trials'):
                 with st.expander('全部表达式及淘汰原因'):
                     st.dataframe(research_table(exp['trials']),hide_index=True,width='stretch')

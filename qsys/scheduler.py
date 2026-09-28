@@ -102,96 +102,9 @@ def job_watchlist_signals() -> str:
 
 
 def _best_pack(packs: dict) -> str:
-    """综合评分选择策略包：实际表现优先 + 样本量置信度 + OOS验证。
-    
-    选择逻辑（P0+P1优化）：
-      1. 过滤低质量包：OOS<55% 或 gap>25% 的包不参与选择
-      2. 有实际数据：score = 实战胜率×0.5 + OOS×0.2 + 置信度×0.3
-      3. 无实际数据：score = OOS×0.7（打折表示不确定性）
-      4. 样本量置信度：min(n_trades/30, 1.0)
-    """
-    import sqlite3
-    from pathlib import Path
-    
-    # 获取各策略包的实际胜率和交易次数
-    actual_stats = {}
-    try:
-        db_path = Path("/data/experience.db")
-        with sqlite3.connect(str(db_path), timeout=30) as c:
-            rows = c.execute('''
-                SELECT p.pack_name, 
-                       SUM(CASE WHEN t.pnl_pct > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as winrate,
-                       COUNT(*) as n_trades
-                FROM trades t
-                JOIN picks p ON t.pick_id = p.id
-                WHERE t.pnl_pct IS NOT NULL AND p.pack_name IS NOT NULL
-                GROUP BY p.pack_name
-            ''').fetchall()
-            for pack_name, wr, n in rows:
-                # 贝叶斯收缩：小样本向50%收缩
-                prior_wr, prior_n = 0.5, 10
-                shrunk_wr = (wr * n + prior_wr * prior_n) / (n + prior_n)
-                actual_stats[pack_name] = {
-                    "winrate": wr * 100,
-                    "shrunk_wr": shrunk_wr * 100,
-                    "n_trades": n,
-                    "confidence": min(n / 30, 1.0),
-                }
-    except Exception:
-        pass
-    
-    try:
-        from loopengine.regime import detect_regime
-        current_regime = str((detect_regime() or {}).get("regime", "unknown"))
-    except Exception:
-        current_regime = "unknown"
-    best, best_score = "", -1.0
-    for name, pk in packs.items():
-        scope = str(pk.get("regime_scope") or "all").replace(" ", "").split(",")
-        if current_regime != "unknown" and "all" not in scope and current_regime not in scope:
-            continue
-        if not pk.get("theory_family") or pk.get("theory_family") == "unclassified":
-            continue  # 没有理论属性的策略包只可影子运行
-        v = str(pk.get("oos_winrate") or "")
-        if not v.endswith("%"):
-            continue
-        try:
-            oos_wr = float(v.rstrip("%"))
-        except ValueError:
-            continue
-        
-        # P1: 质量门槛 - OOS太低或太虚的包直接排除
-        if oos_wr < 55:
-            continue
-        
-        # 排除退化包（定期重验标记）与归档包（LE 日期版仅留档，固定名 current 参赛）
-        if pk.get("status") in ("degraded", "archived"):
-            continue
-        
-        stats = actual_stats.get(name)
-        
-        if stats is not None:
-            actual_wr = stats["winrate"]
-            shrunk_wr = stats["shrunk_wr"]
-            confidence = stats["confidence"]
-            n_trades = stats["n_trades"]
-            
-            gap = abs(oos_wr - actual_wr)
-            
-            # P1: gap过大（过拟合）直接排除
-            if gap > 25:
-                continue
-            
-            # 综合评分：实际表现为主 + OOS验证 + 样本量置信度
-            # 实战胜率用贝叶斯收缩版本（更稳定）
-            score = shrunk_wr * 0.5 + oos_wr * 0.2 + confidence * 30
-        else:
-            # 无实际数据：OOS打折
-            score = oos_wr * 0.7
-        
-        if score > best_score:
-            best, best_score = name, score
-    return best
+    """Use the same versioned research gate as multi-pack selection."""
+    candidates = _top_packs(packs, top_n=1)
+    return candidates[0][0] if candidates else ""
 
 
 def _top_packs(packs: dict, top_n: int = 3) -> list[tuple[str, dict]]:
@@ -201,8 +114,9 @@ def _top_packs(packs: dict, top_n: int = 3) -> list[tuple[str, dict]]:
     
     actual_stats = {}
     try:
-        db_path = Path("/data/experience.db")
-        with sqlite3.connect(str(db_path), timeout=30) as c:
+        from common import DATA_DIR
+        db_path = DATA_DIR / 'experience.db'
+        with sqlite3.connect(db_path.resolve().as_uri() + '?mode=ro', uri=True, timeout=5) as c:
             rows = c.execute('''
                 SELECT p.pack_name, 
                        SUM(CASE WHEN t.pnl_pct > 0 THEN 1 ELSE 0 END) * 1.0 / COUNT(*) as winrate,
@@ -224,10 +138,21 @@ def _top_packs(packs: dict, top_n: int = 3) -> list[tuple[str, dict]]:
     except Exception:
         pass
     
+    from strategy_progress import latest_reports, research_reason
+    from selection_gate import check_market_state
+    reports = latest_reports()
+    try:
+        from loopengine.regime import detect_regime
+        regime = (detect_regime() or {}).get("regime", "unknown")
+    except Exception:
+        regime = "unknown"
     scored = []
     for name, pk in packs.items():
-        # 退化/归档/停赛包不参与投票（M6：paused 由 pack_lifecycle 每日评估写入）
-        if pk.get("status") in ("degraded", "archived", "paused"):
+        if pk.get("status") not in ("active", "shadow") or research_reason(pk, reports.get(name)):
+            continue
+        if not pk.get("theory_family") or pk.get("theory_family") == "unclassified":
+            continue
+        if check_market_state(pk, regime).status != "pass":
             continue
         v = str(pk.get("oos_winrate") or "")
         if not v.endswith("%"):
@@ -255,15 +180,16 @@ def _top_packs(packs: dict, top_n: int = 3) -> list[tuple[str, dict]]:
 
 def compute_pack_picks(pk: dict, codes: list[str], end: str, top_n: int):
     """按策略包配置计算 Top-N 名单（job_pool_scan 与 🧩选股组合页共用，同一套逻辑）。
-    返回 (picks 综合分 Series, note, weights, f_series)；因子全部无法解析时抛错。"""
+    返回 (picks 综合分 Series, note, weights, f_series)；任一因子失败时停止。"""
     import library
 
+    from selection_policy import validate_factors, complete_cross_section
+    validate_factors(pk.get("factors", []))
     f_series, weights = {}, {}
     # 纯技术/内置策略最长窗口通常不超过 60 日；读取 400 日 × 中证1000
     # 会让每日选股首次运行耗时数分钟。保留足够预热窗口，同时显著缩短取数。
     factor_kinds = {str(f.get("kind") or "") for f in pk.get("factors", [])}
     panel_lookback = 180 if factor_kinds and factor_kinds <= {"tech", "builtin"} else 400
-    panel = sig.get_panel_cached(codes, end, lookback_days=panel_lookback)
     # 策略包：按其因子+权重+方向+过滤器
     evolved_by_name = {f["name"]: f for f in get_evolved_factors(only_accepted=False)}
     # LoopEngine 因子从注册表取代码（之前只查 evolved，loopengine/tech 因子会被静默丢弃）
@@ -272,7 +198,14 @@ def compute_pack_picks(pk: dict, codes: list[str], end: str, top_n: int):
         le_code = {r["name"]: r["code"] for _, r in reg[reg["engine"] == "loopengine"].iterrows()}
     except Exception:
         le_code = {}
-    dropped = []
+    from loopengine.tree import parse, required_observations
+    for f in pk["factors"]:
+        code = f.get("code") or (evolved_by_name.get(f["name"]) or {}).get("code") or le_code.get(f["name"]) or ""
+        if code.startswith("# sexpr:"):
+            tree = parse(code.split("\n", 1)[0].split(":", 1)[1].strip())
+            # get_panel_cached converts to calendar days; allow holidays/gaps.
+            panel_lookback = max(panel_lookback, int(required_observations(tree) * 1.15) + 30)
+    panel = sig.get_panel_cached(codes, end, lookback_days=panel_lookback)
     for f in pk["factors"]:
         kind, fname = f.get("kind"), f["name"]
         if kind == "builtin":
@@ -282,10 +215,9 @@ def compute_pack_picks(pk: dict, codes: list[str], end: str, top_n: int):
                 else sig.compute_tech(panel, fname)
         else:
             ef = evolved_by_name.get(fname)
-            code = (ef or {}).get("code") or le_code.get(fname)
+            code = f.get("code") or (ef or {}).get("code") or le_code.get(fname)
             if not code:
-                dropped.append(fname)
-                continue
+                raise ValueError(f"因子{fname}无法解析，禁止使用残缺策略出名单")
             if code.startswith("# sexpr:"):
                 # 树因子进程内向量直算（和 le_factor_eval 同款快速路径，~0.1s/个；
                 # 避开 run_factor_code 的子进程——慢且会因子代码缺陷挂起，2026-09 实测把扫描拖死）
@@ -306,56 +238,9 @@ def compute_pack_picks(pk: dict, codes: list[str], end: str, top_n: int):
     if not weights:
         raise RuntimeError("策略包因子全部无法解析，未出名单")
     
-    # 尝试用最新评分卡重算权重（避免使用过时的快照权重）
-    try:
-        sc = library.get_latest_scorecard(pk["pool_name"])
-        if not sc.empty:
-            scm = sc.drop_duplicates(subset=["因子"]).set_index("因子")
-            updated_weights = {}
-            for fname, (old_weight, direction) in weights.items():
-                if fname in scm.index and "ICIR" in scm.columns and pd.notna(scm.loc[fname, "ICIR"]):
-                    # 用最新ICIR重算权重
-                    icir = abs(float(scm.loc[fname, "ICIR"]))
-                    updated_weights[fname] = (max(icir, 0.0), direction)
-                else:
-                    updated_weights[fname] = (old_weight, direction)
-            # 归一化
-            total = sum(w for w, _ in updated_weights.values())
-            if total > 0:
-                weights = {n: (w / total, d) for n, (w, d) in updated_weights.items()}
-    except Exception:
-        pass  # 使用原权重
-    
-    score = sig.composite_score(f_series, weights,
-                                norms=sig.scoring_norms(list(weights), pk.get("factors")))
-    survived = sig.apply_filters(score.index.tolist(), panel, pk.get("filters", []))
-    sel = score[score.index.isin(survived)]
-    reso_note = ""
-    # 多周期共振：包带持有期时，用最新评分卡在 主口径+另一短线口径 各配权取交集
-    try:
-        sc = library.get_latest_scorecard(pk["pool_name"])
-        if not sc.empty and pk.get("horizon"):
-            scm = sc.drop_duplicates(subset=["因子"]).set_index("因子")
-            h_main = pk["horizon"] if pk["horizon"] in ("1日", "5日") else "5日"
-            h_pair = "1日" if h_main == "5日" else "5日"
-
-            def _hw(h):
-                col = f"{h}胜率"
-                out = {}
-                for f in pk["factors"]:
-                    n = f["name"]
-                    if n in scm.index and col in scm.columns and pd.notna(scm.loc[n, col]):
-                        out[n] = (max(float(scm.loc[n, col]) - 0.5, 0.0), f["direction"])
-                t = sum(w for w, _ in out.values())
-                return {n: (w / t, d) for n, (w, d) in out.items()} if t > 0 else None
-
-            wa, wb = _hw(h_main), _hw(h_pair)
-            if wa and wb and len(wa) >= 2:
-                sel = sig.resonance_select(f_series, wa, wb, top_n, k=top_n * 3)
-                sel = sel[sel.index.isin(survived)]
-                reso_note = f"·{h_main}+{h_pair}共振"
-    except Exception:
-        pass
+    # 正式名单只使用保存的策略权重；动态重配必须另存版本并重新验证。
+    from selection_policy import rank_snapshot
+    sel, complete_count = rank_snapshot(f_series, pk["factors"], panel, codes, end, pk.get("filters", []))
     # 单股票概率模型只作为二级影子校验：先记录潜在修正，不改变正式策略名单。
     prob_note = ""
     try:
@@ -367,9 +252,8 @@ def compute_pack_picks(pk: dict, codes: list[str], end: str, top_n: int):
             prob_note = f"·概率影子覆盖{covered}/{len(prob_diag)}可用{usable}"
     except Exception:
         pass
-    picks = sig.industry_cap_select(sel, cap=2).head(top_n)
-    note = f"{len(weights)} 因子·行业≤2{reso_note}{prob_note}" + \
-        (f"，{len(dropped)} 个无法解析已跳过" if dropped else "")
+    picks = sel.head(top_n)
+    note = f"{len(weights)} 因子·固定版本权重·完整截面{complete_count}只·行业≤2{prob_note}"
 
     # 记录因子使用
     try:
@@ -773,23 +657,34 @@ def _selection_decision_evidence(pack: dict | None, codes: list[str], end: str) 
         state = info.get("regime", "unknown")
     except Exception:
         state = "unknown"
+    from execution_gate import strategy_version
+    from selection_policy import SELECTION_POLICY
     evidence = (pack or {}).get("evidence_type", "")
     return {
         "market_state": state,
         "sector": {"required": True, "source": "sector_daily", "status": "advisory" if "板块" in str(evidence) else "not_required"},
         "financial": {"required": "基本面" in str(evidence) or "财务" in str(evidence), "source": "ifind_financial", "status": "advisory"},
         "technical": {"required": True, "source": "market_daily/ifind_realtime", "status": "applied"},
-        "risk": {"status": "checked_at_execution", "theory_family": (pack or {}).get("theory_family", "unclassified")},
+        "risk": {"status": "checked_at_execution", "theory_family": (pack or {}).get("theory_family", "unclassified"),
+                 "strategy_version": strategy_version(pack) if pack else None,
+                 "selection_policy": SELECTION_POLICY},
     }
 
 
 def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "") -> str:
     """板块/池任务：综合打分输出 Top-N。pack 为空时自动选用 OOS 胜率最高的策略包。
     主包扫完后顺带扫卫星包（涨停轨），今日执行页两条轨每天都有当天名单。"""
-    end = get_last_trade_day()
+    from selection_policy import completed_signal_day
+    end = completed_signal_day()
     import library
-    packs = library.list_strategies()
-    
+    all_packs = library.list_strategies()
+    if pack and (pack not in all_packs or all_packs[pack].get("pool_name") != pool_name):
+        raise ValueError("指定策略不存在或股票池与扫描任务不一致")
+    packs = {n: p for n, p in all_packs.items() if p.get("pool_name") == pool_name}
+    pools = all_pools()
+    if not pools.get(pool_name):
+        raise ValueError(f"股票池{pool_name}为空，禁止回退到其他股票池")
+
     # P2: 多包投票机制 - 用Top3包投票选股票
     if not pack:
         top_list = _top_packs(packs, top_n=3)
@@ -858,21 +753,18 @@ def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "")
         picks, pnote, weights, f_series = compute_pack_picks(pk, codes, end, top_n)
         pack_name = pack or pk.get("name", "")
         note = f"策略包「{pack_name}」（{pnote}）"
-    elif not pk:  # 默认组合：最新进化因子 + 内置三件套
-        panel = sig.get_panel_cached(codes, end)
-        f_series, weights = {}, {}
-        factors = _pick_evolved_factors(2)
-        for f in factors:
-            df = sig.run_factor_code(f["code"], f["name"], codes, end)
-            f_series[f["name"]] = df.iloc[:, 0]
-            weights[f["name"]] = (1.0, 1)
-        for b in ["mom_20d", "vol_20d", "volume_ratio_5_20"]:
-            f_series[b] = sig.compute_builtin(panel, b)
-        weights.update({"mom_20d": (1.0, 1), "vol_20d": (1.0, -1), "volume_ratio_5_20": (1.0, -1)})
-        score = sig.composite_score(f_series, weights)
-        picks = score.head(top_n)
-        note = f"默认组合（进化因子 {len(factors)} 个参与）"
+    elif not pk:
+        # 没有合格策略时仅产出固定基准观察名单，不能把最新未验证因子接入正式策略。
+        pk = {"pool_name": pool_name, "top_n": top_n, "method": "固定基准观察（未验证）",
+              "filters": [], "factors": [
+                  {"name": n, "kind": "builtin", "weight": 1.0, "direction": d}
+                  for n, d in (("mom_20d", 1), ("vol_20d", -1), ("volume_ratio_5_20", -1))]}
+        picks, pnote, weights, f_series = compute_pack_picks(pk, codes, end, top_n)
+        note = f"固定基准观察，仅研究、无自动买入资格（{pnote}）"
         pack_name = None
+
+    if picks.empty:
+        raise RuntimeError(f"{pool_name} {end} 无完整合格候选，未发布名单")
 
     out = pd.DataFrame({"score": picks})
     SIGNALS_DIR.mkdir(parents=True, exist_ok=True)
@@ -884,7 +776,8 @@ def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "")
     _norms = sig.scoring_norms(list(weights), pk.get("factors") if pk else None) or {}
     # norm 快照仅在 typed_v2 下写入——legacy 期保持旧 JSON 形状（避免存量包被
     # "zscore" 快照钉死、切换后享受不到 rank 分派；身份与存储分离见 experience.save_pick）
-    fcfg = [{"name": n, "kind": ("builtin" if n in sig.BUILTIN_FACTORS else "evolved"),
+    definitions = {f["name"]: f for f in (pk or {}).get("factors", [])}
+    fcfg = [{**definitions.get(n, {"name": n, "kind": "builtin" if n in sig.BUILTIN_FACTORS else "evolved"}),
              "weight": float(w), "direction": int(d),
              **({"norm": _norms[n]} if _norms else {})}
             for n, (w, d) in weights.items()]
@@ -898,7 +791,7 @@ def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "")
         pk = pk or {}
         fs = pk.get("factors", [])
         return {"theory_family": pk.get("theory_family") or ",".join(sorted({f.get("theory_family") or f.get("family") for f in fs if f.get("theory_family") or f.get("family")})) or "unclassified",
-                "regime_scope": pk.get("regime_scope") or "all", "evidence_type": pk.get("evidence_type") or ",".join(sorted({f.get("evidence_type") or f.get("factor_type") for f in fs})), "risk_class": pk.get("risk_class") or "unclassified"}
+                "regime_scope": pk.get("regime_scope") or "all", "evidence_type": pk.get("evidence_type") or ",".join(sorted({str(f.get("evidence_type") or f.get("factor_type")) for f in fs if f.get("evidence_type") or f.get("factor_type")})), "risk_class": pk.get("risk_class") or "unclassified"}
     meta = _meta(pk)
     experience.save_pick(source="sched_pool_scan", pool_name=pool_name, top_n=top_n,
                          method=(pk.get("method") if pk else "默认组合"), filters=(pk.get("filters", []) if pk else []),
@@ -947,6 +840,33 @@ def job_pool_scan(pool_name: str = "沪深300", top_n: int = 10, pack: str = "")
     except Exception as e:
         shadow_msg = f" · LE影子名单失败({e})"
     return f"{end} {pool_name} 扫描完成：Top{top_n} 已出（{note}）{sat_msg}{shadow_msg}"
+
+
+def job_selection_health() -> str:
+    """Check persisted outputs, independently of task enabled/success labels."""
+    from selection_policy import completed_signal_day
+    import experience
+    expected = completed_signal_day()
+    saved = load_json(SCHED_STATE_FILE, {})
+    missing, checked = [], []
+    with experience._conn() as c:
+        for key in ('pool_scan', 'pool_scan_zz500', 'satellite_scan'):
+            cfg = {**JOBS[key]['default'], **saved.get(key, {})}
+            if not cfg['enabled']:
+                continue
+            pool = cfg['params'].get('pool_name', '沪深300')
+            source = 'satellite_scan' if key == 'satellite_scan' else 'sched_pool_scan'
+            row = c.execute(
+                'SELECT MAX(p.trade_date) FROM picks p WHERE p.source=? AND p.pool_name=? '
+                'AND EXISTS(SELECT 1 FROM pick_items i WHERE i.pick_id=p.id)', (source, pool)).fetchone()
+            latest = row[0] if row else None
+            if latest != expected:
+                missing.append(f'{key}/{pool} 最新名单={latest or "无"}，要求={expected}')
+            else:
+                checked.append(key)
+    if missing:
+        raise RuntimeError('选股产出未达标（未产出、失败或无合格候选均需核查）：' + '；'.join(missing))
+    return f'选股产出核验通过：{expected} · {len(checked)}个任务'
 
 
 def job_auto_scan(pool_name: str = "沪深300", top_n: int = 10, **_ignored) -> str:
@@ -1491,16 +1411,12 @@ def job_ifind_daily_sync(pool_name: str = "自选股", lookback_days: int = 10, 
 
 
 def job_ifind_calendar(exchange: str = "SSE", **_ignored) -> str:
-    """iFinD 交易日历入库（ifind_calendar 表）——给各页面提供真实交易日历。"""
-    df, res, err = datasource.ths_trade_dates(exchange)
-    if err not in (0, None) or df is None or df.empty:
-        return f"交易日历拉取失败 err={err}（凭证问题见 📡 iFinD 页状态）"
-    col = next((c for c in df.columns if "date" in c.lower() or "time" in c.lower()), df.columns[0])
-    dates = sorted(pd.to_datetime(df[col]).dt.strftime("%Y-%m-%d").tolist())
-    with datasource._conn() as c:
-        c.executemany("INSERT OR IGNORE INTO ifind_calendar(exchange, date) VALUES (?,?)",
-                      [(exchange, d) for d in dates])
-    return f"{exchange} 交易日历 {len(dates)} 天（{dates[0]}~{dates[-1]}）"
+    """提前同步全年日历及范围凭据，休市日不依靠星期猜测。"""
+    from research_retention import sync_calendar
+    year = datetime.now().year
+    start, end = f"{year}-01-01", f"{year}-12-31"
+    count = sync_calendar(exchange, start, end)
+    return f"{exchange} 交易日历 {count} 天（已核实范围 {start}~{end}）"
 
 
 def job_ifind_basic_daily(pool_name: str = "沪深300", **_ignored) -> str:
@@ -1728,7 +1644,7 @@ def job_factor_direction(**_ignored) -> str:
     return f"方向状态机：{len(dm)} 因子在册 · 今日无反转（磁滞生效）"
 
 
-def _apply_account_risk(today: str, rk: dict, prefix: str = "") -> str:
+def _apply_account_risk(today: str, rk: dict, prefix: str = "", *, include_llm: bool = True) -> str:
     """落实账户级开仓闸；减仓部分仅生成影子建议。"""
     import broker
     import experience
@@ -1743,17 +1659,32 @@ def _apply_account_risk(today: str, rk: dict, prefix: str = "") -> str:
     reason = f"{labels[level]}：当前回撤 {rk['dd_now']*100:.2f}%"
     if dynamic_halt:
         reason += f"，触及动态熔断线 {rk['circuit_line']*100:.2f}%"
+    import account_controls
+    exposure = account_controls.snapshot()
+    over = [r['code'] for r in exposure['rows'] if r['excess_value'] is not None and r['excess_value'] > .01]
+    if not exposure['valid'] or not exposure['fresh']:
+        halt_all = True
+        reason += '；持仓敞口估值未就绪'
+    elif over:
+        halt_all = True
+        reason += '；存量单股超限：' + '、'.join(over)
+    elif sum(r['market_value']+r['pending_buy'] for r in exposure['rows']) > exposure['total']*target+.01:
+        halt_all = True
+        reason += '；账户总仓位超限'
     experience._write_risk_flag(today, halt_all, reason, level=level,
                                 target_position_ratio=target)
     cancelled = broker.cancel_pending_buys() if halt_all else 0
     plan = experience.build_risk_reduction_plan(
         rk, today, level_override=level, target_override=target)
-    advice = experience.risk_llm_advice(plan)
+    try:
+        advice = experience.risk_llm_advice(plan) if include_llm else {'status':'skipped'}
+    except Exception:
+        advice = {'status':'unavailable'}  # 模型意见失败不得撤销已经生效的确定性风控目标
     action = "正常运行"
-    if level == "yellow":
-        action = "禁止卫星来源开仓"
-    elif halt_all:
+    if halt_all:
         action = f"停止全部开仓，撤销买单 {cancelled} 笔"
+    elif level == "yellow":
+        action = "禁止卫星来源开仓"
     shadow = ""
     if plan.get("required_release", 0) > 0:
         shadow = f"；影子减仓建议释放 {plan['required_release']:.2f} 元（未自动卖出）"
@@ -1761,7 +1692,13 @@ def _apply_account_risk(today: str, rk: dict, prefix: str = "") -> str:
     if advice.get("status") == "ok":
         llm_note = f"；LLM参考：{advice.get('stance')}（置信度 {float(advice.get('confidence') or 0):.0%}）"
     return (f"{prefix}{labels[level]}：回撤 {rk['dd_now']*100:.2f}% · "
-            f"目标仓位 {target*100:.0f}% · {action}{shadow}{llm_note}")
+            f"目标仓位 {target*100:.0f}% · {action}{shadow}{llm_note}；{reason}")
+
+
+def job_account_auto_reduce(**_ignored) -> str:
+    """Authorized automatic simulation reductions; worker checks persisted mode and market gates."""
+    from account_controls import run_automatic
+    return run_automatic()['message']
 
 
 def job_risk_guard(**_ignored) -> str:
@@ -2623,7 +2560,8 @@ def revalidate_strategy(name: str, timeout_seconds: float | None = None, *, isol
         return {"ok": False, "name": name, "error": "策略包不存在"}
     if pk.get("status") in ("paused", "retired", "archived"):
         return {"ok": False, "name": name, "error": "策略停用状态保持不变"}
-    end = get_last_trade_day()
+    from selection_policy import completed_signal_day
+    end = completed_signal_day()
     from validation_trace import Trace, trace_run, ValidationTimeout
     trace = Trace(name)
     try:
@@ -2635,11 +2573,14 @@ def revalidate_strategy(name: str, timeout_seconds: float | None = None, *, isol
                 result = _compute_strategy_validation(name, pk, end)
     except (Exception, ValidationTimeout) as exc:
         result = {"ok": False, "error": str(exc), "error_type": type(exc).__name__}
+    from selection_policy import SELECTION_POLICY
+    result["selection_policy"] = SELECTION_POLICY
     result["run_id"] = trace.run_id
     result["stage_events"] = trace.events
     if not result.get("ok"):
         result.update(name=name, eval_date=end, pool_name=pk.get("pool_name"),
-                      method=pk.get("method"), status="degraded", assessment_status="compute_failed",
+                      method=pk.get("method"), status="degraded",
+                      assessment_status=("data_insufficient" if result.get("error_type") == "BenchmarkDataError" else "compute_failed"),
                       strategy_snapshot=pk, policy_version=POLICY_VERSION)
         result.update(window_contract())
     else:
@@ -2675,6 +2616,9 @@ def _compute_strategy_validation(name: str, pk: dict, end: str) -> dict:
         raise ValueError("策略股票池为空，禁止回退到其他股票池")
     with stage("market_panel"):
         panel = sig.get_panel_cached(codes, end, 800, source=datasource.get_loop_source())
+    from research_backtest import suspension_valuations
+    selection_panel = panel
+    panel = suspension_valuations(panel, datasource.get_loop_source())
     factor_vals = {}
     failed = []
     for fac in pk.get("factors", []):
@@ -2696,9 +2640,24 @@ def _compute_strategy_validation(name: str, pk: dict, end: str) -> dict:
         result = {"ok": False, "name": name, "error": "有效因子不足或部分因子失败，不能重验残缺策略",
                   "valid_factors": len(factor_vals), "failed_factors": failed}
         return result
+    from selection_policy import validate_factors, rank_snapshot, SELECTION_POLICY
+    validate_factors(pk.get("factors", []))
+    fixed_weights = {f["name"]: (f["weight"], f["direction"]) for f in pk["factors"]}
+    # Raw OHLC remain separate from suspension valuation marks.
+    rank_cache = {}
+    def ranker(weights, day):
+        cache_key = (str(day), tuple(sorted(weights.items())))
+        if cache_key in rank_cache:
+            return rank_cache[cache_key].copy()
+        factors = [{**f, "weight": weights[f["name"]][0], "direction": weights[f["name"]][1]}
+                   for f in pk["factors"]]
+        result = rank_snapshot(factor_vals, factors, selection_panel, codes, day, pk.get("filters", []))[0]
+        rank_cache[cache_key] = result
+        return result.copy()
     with stage("walk_forward"):
         wf = fe.walk_forward(factor_vals, panel, pk.get("method", "等权"),
-                             int(pk.get("top_n") or 10), fwd_days=5, step=10, min_factors=2)
+                             int(pk.get("top_n") or 10), fwd_days=5, step=5, min_factors=2,
+                             fixed_weights=fixed_weights, ranker=ranker)
     if wf.empty or "优化组合扣费超额" not in wf:
         return {"ok": False, "name": name, "error": "Walk-forward无有效窗口"}
     net = wf["优化组合扣费超额"].dropna()
@@ -2711,7 +2670,8 @@ def _compute_strategy_validation(name: str, pk: dict, end: str) -> dict:
     from execution_gate import strategy_version
     with stage("cross_validation"):
         cv = fe.time_series_cv(factor_vals, panel, pk.get("method", "等权"),
-                               int(pk.get("top_n") or 10), n_folds=3, fwd_days=5, step=5)
+                               int(pk.get("top_n") or 10), n_folds=3, fwd_days=5, step=5,
+                               fixed_weights=fixed_weights, ranker=ranker)
     from loopengine.regime import detect_regime
     with stage("regime_history"):
         labels = {}
@@ -2762,9 +2722,16 @@ def _compute_strategy_validation(name: str, pk: dict, end: str) -> dict:
     result.update(window_contract())
     result["windows"] = wf.to_dict("records")
     result["window_metrics"] = dict(wf.attrs)
+    result["research_valuation"] = panel.attrs.get("research_valuation", {})
     result["strategy_snapshot"] = pk
-    result["step_days"] = 10
-    result["metric_notes"] = "持有5日、间隔10日；存在空仓间隔，不提供连续持有期夏普。"
+    result["selection_policy"] = SELECTION_POLICY
+    result["weight_mode"] = "frozen_strategy_snapshot"
+    result["research_passed"] = bool(passed)
+    result["historical_industry_membership_verified"] = False
+    result["independent_holdout_verified"] = False
+    result["qualification_notes"] = "固定当前策略的历史诊断，不代表独立样本外验证；行业映射为当前快照，历史成分、时点与独立留出证据仍需验证，不授予交易资格。"
+    result["step_days"] = 5
+    result["metric_notes"] = "持有5日、间隔5日，窗口不重叠；夏普仅在窗口完整连续时提供。"
     if shadow_ev is not None:
         result["shadow_evidence"] = shadow_ev
     if holdout_info is not None:
@@ -2772,10 +2739,16 @@ def _compute_strategy_validation(name: str, pk: dict, end: str) -> dict:
     return result
 
 
+def job_strategy_review_batch(max_strategies=2, timeout_seconds=90):
+    from strategy_progress import review_batch
+    return review_batch(max_strategies, timeout_seconds)
+
+
 def job_strategy_revalidate(pool_name: str = "沪深300") -> str:
     """每周重验所有策略包的 OOS 表现，淘汰退化包。"""
     import library
     results = []
+    errors = 0
     from validation_worker import run_bounded
     for name, pack in library.list_strategies().items():
         if pack.get('pool_name') != pool_name or pack.get('status') in ('paused', 'retired', 'archived'):
@@ -2785,10 +2758,15 @@ def job_strategy_revalidate(pool_name: str = "沪深300") -> str:
             if r.get("ok"):
                 results.append(f"{name}: {r['status']} OOS {r['oos_winrate']:.0%}")
             else:
-                results.append(f"{name}: 异常 {r.get('error')}")
+                errors += 1
+                results.append(f"{name}: {r.get('assessment_status', '执行异常')} {r.get('error')}")
         except Exception as exc:
-            results.append(f"{name}: 异常 {exc}")
-    return f"策略包重验完成：{len(results)}个 → " + "; ".join(results[:10])
+            errors += 1
+            results.append(f"{name}: 执行异常 {exc}")
+    message = f"策略包重验：计算完成{len(results)-errors}个，执行异常或数据不足{errors}个 → " + "; ".join(results)
+    if errors:
+        raise RuntimeError(message)
+    return message
 
 
 # ====================================================================
@@ -2796,21 +2774,10 @@ def job_strategy_revalidate(pool_name: str = "沪深300") -> str:
 # ====================================================================
 
 def _satellite_trading_day(now: datetime | None = None) -> bool:
-    """判断卫星任务交易日；在线日历未覆盖到当天时按工作日兜底。"""
+    """卫星任务与柜台共享已确认交易日历。"""
+    from trading_calendar import day_status
     now = now or datetime.now()
-    if now.weekday() >= 5:
-        return False
-    today = now.strftime("%Y-%m-%d")
-    try:
-        with datasource._conn() as c:
-            dates = [str(r[0])[:10] for r in c.execute(
-                "SELECT date FROM ifind_calendar WHERE exchange='SSE' ORDER BY date")]
-        if dates and dates[0] <= today <= dates[-1]:
-            return today in set(dates)
-    except Exception:
-        pass
-    # iFinD 日历尚未同步到当天时，不再使用末端更旧的 Qlib 日历误判休市。
-    return True
+    return day_status(now.strftime('%Y-%m-%d')) is True
 
 
 def _satellite_market_open(now: datetime | None = None) -> bool:
@@ -2826,7 +2793,8 @@ def job_satellite_scan(pool_name: str = "沪深300", top_n: int = 5, **_ignored)
     if not _satellite_trading_day():
         return "卫星轨：非交易日，跳过选股"
     import experience
-    end = get_last_trade_day()
+    from selection_policy import completed_signal_day
+    end = completed_signal_day()
 
     # 1. 取卫星包
     import library
@@ -2836,7 +2804,6 @@ def job_satellite_scan(pool_name: str = "沪深300", top_n: int = 5, **_ignored)
         return "卫星轨：无可用事件策略包"
 
     pk = packs[sat_name]
-    execution_eligible = pk.get("status", "active") == "active"
     pools = all_pools()
     codes = pools.get(pk["pool_name"]) or pools.get(pool_name) or pools.get("沪深300")
 
@@ -2846,9 +2813,14 @@ def job_satellite_scan(pool_name: str = "沪深300", top_n: int = 5, **_ignored)
     try:
         with experience._conn() as c:
             row = c.execute(
-                "SELECT id FROM picks WHERE trade_date=? AND source='sched_satellite_scan' "
-                "AND pack_name=? ORDER BY id DESC LIMIT 1", (end, sat_name)).fetchone()
-        if row:
+                "SELECT p.id,e.risk_json FROM picks p LEFT JOIN pick_decision_evidence e ON e.pick_id=p.id "
+                "WHERE p.trade_date=? AND p.source='sched_satellite_scan' "
+                "AND p.pack_name=? ORDER BY p.id DESC LIMIT 1", (end, sat_name)).fetchone()
+        from execution_gate import strategy_version
+        from selection_policy import SELECTION_POLICY
+        recorded = json.loads(row[1] or '{}') if row else {}
+        if (row and recorded.get('strategy_version') == strategy_version(pk)
+                and recorded.get('selection_policy') == SELECTION_POLICY):
             observed = experience.pick_items_detail(int(row[0]))
             if not observed.empty:
                 spicks = observed.set_index("code")["score"].head(int(top_n))
@@ -2860,7 +2832,7 @@ def job_satellite_scan(pool_name: str = "沪深300", top_n: int = 5, **_ignored)
         try:
             spicks, _sn, _sw, _sf = compute_pack_picks(pk, codes, end, int(top_n))
         except Exception as e:
-            return f"卫星轨选股失败：{e}"
+            raise RuntimeError(f"卫星轨选股失败（行情截止{end}）：{e}") from e
 
     if spicks.empty:
         return "卫星轨：无候选票"
@@ -2869,11 +2841,11 @@ def job_satellite_scan(pool_name: str = "沪深300", top_n: int = 5, **_ignored)
     experience.save_pick(source="satellite_scan", pool_name=pk["pool_name"],
                          top_n=int(top_n), method=pk.get("method"),
                          filters=pk.get("filters", []), factors=pk["factors"],
-                         final_scores=spicks, pack_name=sat_name, trade_date=end)
+                         final_scores=spicks, pack_name=sat_name, trade_date=end,
+                         decision_evidence=_selection_decision_evidence(pk, list(codes), end))
 
     source_note = "复用19:00观察名单" if reused else "独立全池扫描"
-    execution_note = ("回测通过，可交由主轨统一持仓管理" if execution_eligible
-                      else "回测未通过，仅自动选股观察，不自动买入")
+    execution_note = "仅生成候选；执行须另经当前版本研究资格与账户风控校验"
     return (f"{end} 卫星轨候选名单已生成 · {sat_name} · Top{len(spicks)} · {source_note}"
             f" · {execution_note}")
 
@@ -3116,6 +3088,9 @@ JOBS = {
                          "default": {"enabled": True, "hour": 15, "minute": 35, "params": {}}},
     "max_close_update": {"name": "📉 吊灯止盈基准更新（收盘价）", "func": job_max_close_update,
                          "default": {"enabled": True, "hour": 15, "minute": 36, "params": {}}},
+    "account_auto_reduce": {"name": "🛡 账户自动降仓（每分钟）", "func": job_account_auto_reduce,
+                            "default": {"enabled": True, "hour": 9, "minute": 30,
+                                        "params": {"interval_sec": 60}, "trigger": "interval"}},
     "risk_guard": {"name": "🛡 组合风控评估（开盘前）", "func": job_risk_guard,
                    "default": {"enabled": True, "hour": 9, "minute": 20, "params": {}}},
     "risk_guard_intraday": {"name": "🛡 盘中风控重评估（10:00）", "func": job_risk_guard_intraday,
@@ -3155,6 +3130,8 @@ JOBS = {
     "pool_scan_zz500": {"name": "🏛️ 股票池扫描（中证500·名单多元化）", "func": job_pool_scan,
                         "default": {"enabled": True, "hour": 19, "minute": 8,
                                     "params": {"pool_name": "中证500", "top_n": 10, "pack": ""}}},
+    "selection_health": {"name": "选股名单产出核验", "func": job_selection_health,
+                         "default": {"enabled": True, "hour": 19, "minute": 40, "params": {}}},
     "auto_scan": {"name": "🤖 自动选股（因子价值评分）", "func": job_auto_scan,
                   "default": {"enabled": True, "hour": 19, "minute": 30,
                               "params": {"pool_name": "沪深300", "top_n": 10}}},
@@ -3261,6 +3238,9 @@ JOBS = {
     "strategy_gen": {"name": "🧬 策略包自动生成", "func": job_strategy_gen,
                      "default": {"enabled": True, "hour": 18, "minute": 30,
                                  "params": {"pool_name": "沪深300", "top_n": 10, "max_packs": 3}}},
+    "strategy_review_batch": {"name": "固定策略分批重验", "func": job_strategy_review_batch,
+                              "default": {"enabled": True, "hour": 17, "minute": 55,
+                                          "params": {"max_strategies": 2, "timeout_seconds": 90}}},
     "strategy_revalidate": {"name": "♻️ 策略包重验（每周）", "func": job_strategy_revalidate,
                              "default": {"enabled": True, "hour": 3, "minute": 0,
                                          "params": {"pool_name": "沪深300"},
@@ -3383,6 +3363,9 @@ class SchedulerManager:
                 "default": ThreadPoolExecutor(3),
                 "interval": ThreadPoolExecutor(2),
                 "le": ThreadPoolExecutor(1),
+                "risk": ThreadPoolExecutor(1),
+                "selection": ThreadPoolExecutor(1),
+                "strategy_review": ThreadPoolExecutor(1),
             },
             job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 3600},
         )
@@ -3431,7 +3414,7 @@ class SchedulerManager:
                                        executor='le', replace_existing=True)
                 continue
             if cfg.get("trigger") == "interval":
-                executor = "le" if key in ("loopengine",) else "interval"
+                executor = "risk" if key == 'account_auto_reduce' else "le" if key in ("loopengine",) else "interval"
                 params = {"seconds": int(cfg["params"].get("interval_sec", 30)),
                           "executor": executor}
                 if existing:
@@ -3444,6 +3427,8 @@ class SchedulerManager:
                                    **params, replace_existing=True)
             else:
                 params = {"day_of_week": cfg.get("day_of_week", "mon-fri"), "hour": cfg["hour"], "minute": cfg["minute"]}
+                executor = ('selection' if key in ('pool_scan', 'pool_scan_zz500', 'satellite_scan')
+                            else 'strategy_review' if key in ('strategy_review_batch', 'strategy_revalidate') else 'default')
                 if existing:
                     try:
                         self.sched.modify_job(key, **params)
@@ -3451,7 +3436,7 @@ class SchedulerManager:
                     except Exception:
                         self.sched.remove_job(key)
                 self.sched.add_job(lambda k=key: self._run(k), "cron", id=key,
-                                   **params, replace_existing=True)
+                                   **params, executor=executor, replace_existing=True)
 
     # ---- 运行与记录 ----
     def _run(self, key: str, manual: bool = False):
@@ -3481,9 +3466,18 @@ class SchedulerManager:
                      params=cfg.get("params", {}))
         except Exception:
             pass
+        error_type = None
         try:
             msg = JOBS[key]["func"](**cfg.get("params", {}))
-            ok, detail = True, msg
+            # A job may complete its main output while a required secondary
+            # track is unavailable. Preserve the output, but mark the run
+            # unhealthy so the scheduler page cannot show a false success.
+            warning_markers = ('选股失败', '扫描失败', '未达标', '仅研究、无自动买入资格')
+            ok = not (key in ('pool_scan', 'pool_scan_zz500', 'satellite_scan', 'selection_health')
+                      and any(marker in str(msg) for marker in warning_markers))
+            detail = msg
+            if not ok:
+                error_type = "SelectionNotReady"
         except Exception as e:
             ok, detail = False, f"{e}"
             error_type = type(e).__name__
@@ -3507,14 +3501,18 @@ class SchedulerManager:
                      duration_ms=dur_ms)
         except Exception:
             pass
-        with self._last_lock:
+        # Manual workers and the owner are separate processes: use a file lock
+        # as well as the thread lock to avoid losing each other's latest status.
+        import fcntl
+        with self._last_lock, SCHED_LAST_FILE.with_suffix('.lock').open('a') as last_lock:
+            fcntl.flock(last_lock, fcntl.LOCK_EX)
             last = load_json(SCHED_LAST_FILE, {})
             last[key] = {"time": now, "ok": ok, "msg": detail}
             save_json(SCHED_LAST_FILE, last)
-        hist = Path(SCHED_LAST_FILE).parent / "scheduler_history.jsonl"
-        with hist.open("a") as f:
-            f.write(json.dumps({"job": key, **last[key]}, ensure_ascii=False) + "\n")
-            f.flush()
+            hist = Path(SCHED_LAST_FILE).parent / "scheduler_history.jsonl"
+            with hist.open("a") as f:
+                f.write(json.dumps({"job": key, **last[key]}, ensure_ascii=False) + "\n")
+                f.flush()
         # 落库 sched_exec_log
         try:
             import library

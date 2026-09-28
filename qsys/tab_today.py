@@ -28,6 +28,20 @@ def render():
     end = get_last_trade_day()
     today = pd.Timestamp.now().strftime("%Y-%m-%d")
     packs = library.list_strategies()
+    from strategy_progress import latest_reports, progress_rows
+    from execution_gate import APPROVAL_FILE
+    try:
+        from loopengine.regime import detect_regime
+        regime = (detect_regime() or {}).get('regime', 'unknown')
+    except Exception:
+        regime = 'unknown'
+    approvals = load_json(APPROVAL_FILE, {})
+    if not isinstance(approvals, dict):
+        approvals = {}
+    qualification = progress_rows(packs, latest_reports(), approvals, regime, today)
+    with st.expander('策略验证与执行资格', expanded=False):
+        st.caption('研究达标、策略执行资格、账户风控分别核验；历史模拟胜率不是账户实际成交胜率。')
+        st.dataframe(pd.DataFrame(qualification), hide_index=True, width='stretch')
     TRACK_FILE = DATA_DIR / "today_tracks.json"
     RULES = experience.get_risk_rules("main")
 
@@ -62,6 +76,17 @@ def render():
 
     # ---------------------------------------------------------------- 需要干预的横幅（全托管的"出事才说话"）
     alerts = []
+    from trading_calendar import previous_session, day_status
+    if day_status(today) is True:
+        expected = previous_session(today)
+        with experience._conn() as c:
+            latest_main = c.execute(
+                "SELECT MAX(trade_date) FROM picks WHERE source='sched_pool_scan'").fetchone()[0]
+        if expected is None:
+            alerts.append('⚠️ 交易日历覆盖不足，不能确认选股名单时效，自动开仓已拦截。')
+        elif latest_main is None or latest_main < expected:
+            alerts.append(f'⚠️ 正式选股名单停在 {latest_main or "尚无名单"}，当前需要 {expected} 的盘后名单；'
+                          '过期名单不会用于自动开仓，请检查股票池扫描任务。')
     if end < today and pd.Timestamp.now().weekday() < 5:
         alerts.append(f"⚠️ 行情数据停在 {end}（今天 {today}）——数据更新任务可能没跑，去 ⏰定时任务 看「每日数据更新」")
     if not packs:
@@ -104,32 +129,35 @@ def render():
 
 
     def _gen(pack_name, kp):
+        from selection_policy import completed_signal_day
+        signal_day = completed_signal_day()
         pk = packs[pack_name]
         codes = all_pools().get(pk["pool_name"]) or []
-        sel, note, _w, _fs = scheduler.compute_pack_picks(pk, codes, end, pk["top_n"])
+        sel, note, _w, _fs = scheduler.compute_pack_picks(pk, codes, signal_day, pk["top_n"])
         experience.save_pick(source=f"track_{kp}", pool_name=pk["pool_name"], top_n=len(sel),
                              method=pk.get("method"), filters=pk.get("filters", []),
                              factors=pk["factors"], final_scores=sel, pack_name=pack_name,
-                             oos_winrate=_pct(pk.get("oos_winrate")), trade_date=end)
+                             oos_winrate=_pct(pk.get("oos_winrate")), trade_date=signal_day,
+                             decision_evidence=scheduler._selection_decision_evidence(pk, codes, signal_day))
         return len(sel)
 
 
     def _live_badge(pack_name):
-        """实战红绿灯：只看最近实战胜率。"""
+        """历史研究模拟结果，不代表账户成交收益。"""
         if not pack_name or lb.empty:
-            return "⚪ 还没实战记录"
+            return "⚪ 还没历史模拟记录"
         row = lb[lb["策略包"] == pack_name]
         if row.empty:
-            return "⚪ 还没实战记录"
+            return "⚪ 还没历史模拟记录"
         r = row.iloc[0]
         if int(r["已回填战果"]) < 3:
-            return f"⚪ 实战积累中（{int(r['已回填战果'])} 期，≥3 期才亮灯）"
+            return f"⚪ 研究样本积累中（{int(r['已回填战果'])} 期，≥3 期才亮灯）"
         wins = [float(r[c]) for c in r.index if c.endswith("日胜率") and pd.notna(r[c]) and isinstance(r[c], float)]
         if not wins:
-            return "⚪ 还没实战记录"
+            return "⚪ 还没历史模拟记录"
         w = sum(wins) / len(wins)
-        return (f"🟢 最近实战赚钱（命中率 {w:.0%}）" if w >= 0.55
-                else f"🔴 最近实战不赚钱（命中率 {w:.0%}）——考虑换代")
+        return (f"🟢 历史模拟命中率较高（ {w:.0%}）" if w >= 0.55
+                else f"🔴 历史模拟命中率较低（ {w:.0%}）——考虑换代")
 
 
     def _render_track(icon, title, pack_name, pick, kp, budget_pct):
@@ -139,6 +167,9 @@ def render():
                        + ("（先攒 ev_ 因子再组涨停包：专业区「🔬个股分析」底部定向挖）" if kp == "sat" else ""))
             return
         st.markdown(f"**{_live_badge(pack_name)}**　·　策略包「{pack_name}」")
+        readiness = next((r for r in qualification if r['策略'] == pack_name), None)
+        if readiness and readiness['自动买入'] == '未放行':
+            st.info('当前名单仅用于研究观察，不会因出现在本页就自动买入。原因：' + readiness['执行限制'])
         if kp == "sat" and packs[pack_name].get("status", "active") != "active":
             st.warning("该卫星策略当前回测未通过：名单继续自动生成，仅供观察，不会自动开仓。")
         if pick is None:
@@ -157,9 +188,9 @@ def render():
             return
         n = len(items)
         plan = experience.trade_plan(None, sel_date)
-        st.markdown(f"**📌 {sel_date} 名单：{n} 只，等分买入（每只 = {budget_pct} 的 1/{n}）· "
-                    f"{plan['买入时间']}开盘买 · 跌 {RULES['stop_loss']:.0%} 无条件卖 · "
-                    f"涨 {RULES['take_profit']:.0%} 落袋 · 最迟 {plan['最迟平仓']} 必须卖**")
+        st.markdown(f"**📌 {sel_date} 候选名单：{n} 只**")
+        st.caption(f"研究参考：止损 {RULES['stop_loss']:.0%}、止盈 {RULES['take_profit']:.0%}；"
+                   '实际委托须通过策略资格、账户风控和可成交条件检查。')
 
         nmap = _name_map(list(items["code"]))
         codes = list(items["code"])

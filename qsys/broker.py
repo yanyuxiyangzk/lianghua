@@ -16,6 +16,7 @@ from datetime import datetime
 import pandas as pd
 
 from common import DATA_DIR
+from trading_calendar import day_status
 
 DB_PATH = DATA_DIR / "experience.db"
 INIT_CASH = 200000.0
@@ -69,7 +70,8 @@ def _conn():
     cols = {r[1] for r in c.execute("PRAGMA table_info(broker_orders)")}
     if "position_id" not in cols:
         c.execute("ALTER TABLE broker_orders ADD COLUMN position_id INTEGER")
-    for col in ("signal_source", "strategy_name"):
+    for col in ("signal_source", "strategy_name", "strategy_version", "signal_batch_id",
+                "factor_snapshot", "attribution_status", "decision_reason", "risk_plan_id"):
         if col not in cols:
             c.execute(f"ALTER TABLE broker_orders ADD COLUMN {col} TEXT")
     c.commit()
@@ -192,19 +194,19 @@ def _settle_today():
 
 # ---------------------------------------------------------------- 行情
 def _latest_prices(codes: list[str]) -> dict:
-    """ifind_realtime 每代码各自最新快照 {code: (price, prev_close, open, limit_up, limit_down)}。
+    """每代码最新快照 (price, prev_close, open, limit_up, limit_down, datetime)。
     按代码取最新：热码高频快照与全市场批次同表共存时冷码不丢（2026-09-11）。"""
     import datasource
     if not codes:
         return {}
     with datasource._qconn() as c:
         df = pd.read_sql(
-            f"""SELECT r.code, r.price, r.prev_close, r.open, r.limit_up, r.limit_down
+            f"""SELECT r.code, r.price, r.prev_close, r.open, r.limit_up, r.limit_down, r.datetime
                 FROM ifind_realtime r
                 JOIN (SELECT code, MAX(datetime) md FROM ifind_realtime
                       WHERE code IN ({','.join('?' * len(codes))}) GROUP BY code) t
                   ON r.code = t.code AND r.datetime = t.md""", c, params=codes)
-    return {r.code: (r.price, r.prev_close, r.open, r.limit_up, r.limit_down)
+    return {r.code: (r.price, r.prev_close, r.open, r.limit_up, r.limit_down, r.datetime)
             for r in df.itertuples()}
 
 
@@ -222,13 +224,9 @@ def get_name(code: str) -> str:
 
 
 def _market_open() -> bool:
-    import experience
     now = datetime.now()
     day, hm = now.strftime('%Y-%m-%d'), now.strftime('%H%M')
-    cal = experience._calendar()
-    if cal and cal[0] <= day <= cal[-1] and day not in cal:
-        return False
-    return now.weekday() < 5 and ('0930' <= hm < '1130' or '1300' <= hm < '1500')
+    return day_status(day) is True and ('0930' <= hm < '1130' or '1300' <= hm < '1500')
 
 
 def _quote_fresh(code: str) -> bool:
@@ -236,7 +234,9 @@ def _quote_fresh(code: str) -> bool:
     try:
         ts = experience._latest_price_times([code]).get(code)
         dt = datetime.fromisoformat(ts) if ts else None
-        return dt is not None and dt.strftime('%Y-%m-%d') == _today() and -60 <= (datetime.now() - dt).total_seconds() <= 600
+        return (day_status(_today()) is True and dt is not None
+                and dt.strftime('%Y-%m-%d') == _today() and dt.strftime('%H%M') >= '0925'
+                and -60 <= (datetime.now() - dt).total_seconds() <= 600)
     except Exception:
         return False
 
@@ -289,6 +289,12 @@ def _buy_rejection(c, code, source, shares, price, exclude_order=-1) -> str:
     single_pending = sum(sh * px for cd, sh, px in orders if cd == code)
     if total <= 0 or not math.isfinite(total) or price <= 0 or not math.isfinite(price):
         return '风控拦截：账户估值或价格无效'
+    exposures = dict(values)
+    for cd, sh, px in orders:
+        exposures[cd] = exposures.get(cd, 0) + sh * px
+    over = sorted(cd for cd, value in exposures.items() if value > total * .15 + .01)
+    if over:
+        return '风控拦截：存量单票敞口超限，暂停全部新增买入：' + '、'.join(over)
     if values.get(code, 0) + single_pending + price * shares > total * .15:
         return '风控拦截：单票总敞口不得超过总资产15%'
     target = experience.get_account_risk_config()['normal_target']
@@ -348,7 +354,8 @@ def sell_position(position_id: int, shares: int, price=None, reason='手动卖�
         if row[3] >= _today():
             return 'T+1：当日买入不可当日卖出'
         c.execute('UPDATE positions SET sell_attempts=COALESCE(sell_attempts,0)+1,last_sell_attempt=? WHERE id=?', (_now(), position_id))
-        msg = place_order(row[0], 'sell', price, shares, source='ai', _connection=c, _position_id=position_id)
+        msg = place_order(row[0], 'sell', price, shares, source='ai', _connection=c,
+                          _position_id=position_id, _decision_reason=reason)
         if '已挂单' in msg or '已成交' in msg:
             oid = c.execute('SELECT id FROM broker_orders WHERE position_id=? AND side=\'sell\' ORDER BY id DESC LIMIT 1', (position_id,)).fetchone()[0]
             c.execute('UPDATE positions SET sell_reason=?,sell_order_id=? WHERE id=?', (reason, oid, position_id))
@@ -360,7 +367,7 @@ def sell_position(position_id: int, shares: int, price=None, reason='手动卖�
 # ---------------------------------------------------------------- 委托/成交
 def place_order(code: str, side: str, price: float | None, shares: int,
                 source: str = "manual", *, _connection=None, _max_buy_price=None,
-                _position_id=None) -> str:
+                _position_id=None, _decision_reason=None) -> str:
     """下单。side: buy/sell。price 空或 0 = 市价单。返回消息。
     source: manual=手动买入页下单；ai=每日名单自动开仓（类型列区分）。"""
     if _connection is None:
@@ -381,7 +388,7 @@ def place_order(code: str, side: str, price: float | None, shares: int,
     except (TypeError, ValueError, OverflowError):
         return "委托价格或数量无效"
     if not _market_open():
-        return "非交易时段，禁止下单"
+        return "非交易时段或交易日历未确认，禁止下单"
     if side == "buy" and (shares <= 0 or shares % 100 != 0):
         return "买入数量须为 100 股整数倍"
     if shares <= 0:
@@ -447,10 +454,24 @@ def place_order(code: str, side: str, price: float | None, shares: int,
                 return f"可用资金不足（约需 {need:,.2f} 元，含佣金及挂单占用）"
         origin = c.execute("SELECT source,pack_name FROM positions WHERE id=?", (_position_id,)).fetchone() if _position_id is not None else None
         signal_source, strategy_name = origin if origin else (source, None)
+        import trade_attribution
+        try:
+            evidence = trade_attribution.capture(c, _position_id, side, source)
+        except Exception:
+            return '执行归因不可用，未提交委托'
+        if side == 'sell' and evidence['attribution_status'] == 'verified_snapshot':
+            original = c.execute("SELECT signal_source,strategy_name FROM broker_orders WHERE position_id=? "
+                                 "AND side='buy' AND status='已成'", (_position_id,)).fetchall()
+            if len(original) == 1:
+                signal_source, strategy_name = original[0]
+        decision = _decision_reason or ('策略信号开仓' if source == 'ai' and side == 'buy' else '用户手动委托')
         cur_o = c.execute(
             "INSERT INTO broker_orders (date, ts, code, name, side, price, shares, status, source, position_id, signal_source, strategy_name)"
             " VALUES (?,?,?,?,?,?,?, '已报', ?, ?, ?, ?)",
             (_today(), _now(), code, name, side, price or 0, shares, source, _position_id, signal_source, strategy_name)).lastrowid
+        c.execute('UPDATE broker_orders SET strategy_version=?,signal_batch_id=?,factor_snapshot=?,attribution_status=?,decision_reason=? WHERE id=?',
+                  (evidence['strategy_version'], evidence['signal_batch_id'], evidence['factor_snapshot'],
+                   evidence['attribution_status'], decision, cur_o))
         if fill_now:
             if cur is None:
                 c.execute("UPDATE broker_orders SET status='已撤', cancel_ts=? WHERE id=?",
@@ -530,6 +551,14 @@ def _fill(c, order_id: int, fill_price: float):
             import execution_gate
             if execution_gate.position_rejection(c, position_id, _today()):
                 return False
+            import trade_attribution
+            try:
+                current = trade_attribution.capture(c, position_id, 'buy', source)
+                original = c.execute('SELECT strategy_version FROM broker_orders WHERE id=?', (order_id,)).fetchone()
+                if not original or not original[0] or original[0] != current['strategy_version']:
+                    return False
+            except Exception:
+                return False
         if source == 'ai' and position_id is None:
             return False  # 旧版无任务关联的自动买单不得直接恢复执行
         if _buy_rejection(c, code, source, shares, fill_price, order_id):
@@ -595,7 +624,7 @@ def _fill(c, order_id: int, fill_price: float):
     return True
 
 
-def fill_pending_orders() -> int:
+def fill_pending_orders(order_ids: list[int] | None = None) -> int:
     """盘中由持仓跟踪任务调用：检查已报挂单，价格触及限价即成交。返回成交笔数。
     可成交性约束（实盘规则）：买单在涨停价上、卖单在跌停价上不予成交（挂起等开板）。"""
     _init_account()
@@ -605,8 +634,12 @@ def fill_pending_orders() -> int:
         return 0
     with _conn() as c:
         c.execute("BEGIN IMMEDIATE")
-        pending = c.execute(
-            "SELECT id, code, side, price FROM broker_orders WHERE status='已报'").fetchall()
+        sql = "SELECT id, code, side, price FROM broker_orders WHERE status='已报'"
+        if order_ids is not None:
+            if not order_ids:
+                return 0
+            sql += f" AND id IN ({','.join('?' for _ in order_ids)})"
+        pending = c.execute(sql,order_ids or []).fetchall()
         if not pending:
             return 0
         prices = _latest_prices([p[1] for p in pending])
@@ -676,7 +709,8 @@ def check_stop_exits() -> int:
         tp = r["tp_price"] if r["tp_price"] else r["cost"] * (1 + tp_rate)
         sl = r["sl_price"] if r["sl_price"] else r["cost"] * (1 - sl_rate)
         if cur >= tp or cur <= sl:
-            msg = place_order(r["code"], "sell", None, int(r["sellable"]), source="manual")
+            msg = place_order(r["code"], "sell", None, int(r["sellable"]), source="manual",
+                              _decision_reason='止盈' if cur >= tp else '止损')
             if "已成交" in msg:
                 n += 1
     return n
@@ -713,8 +747,15 @@ def _day_pnl_by_code(positions: pd.DataFrame, fills: pd.DataFrame, prices: dict)
     held = positions.groupby('code')['shares'].sum().to_dict() if not positions.empty else {}
     codes = set(held) | (set(fills['code']) if not fills.empty else set())
     result = {}
+    session = day_status(_today())
     for code in codes:
         trades = fills[fills['code'] == code] if not fills.empty else fills
+        if session is False and trades.empty:
+            result[code] = 0.0
+            continue
+        if session is not True or not _quote_is_today(prices.get(code)):
+            result[code] = float('nan')
+            continue
         bought = sold = buy_amount = sell_amount = fees = 0.0
         if not trades.empty:
             buys = trades[trades['side'] == 'buy']
@@ -736,6 +777,32 @@ def _day_pnl_by_code(positions: pd.DataFrame, fills: pd.DataFrame, prices: dict)
     return result
 
 
+def _quote_is_today(quote) -> bool:
+    """Collection time is only usable on a confirmed session after opening auction."""
+    try:
+        stamp = datetime.fromisoformat(str(quote[5]))
+        return (stamp.strftime('%Y-%m-%d') == _today() and stamp.strftime('%H%M') >= '0925'
+                and stamp <= datetime.now())
+    except (IndexError, TypeError, ValueError):
+        return False
+
+
+def _pnl_metadata(prices, day_pnl):
+    session = day_status(_today())
+    valid = math.isfinite(day_pnl) and session is not None
+    dates = sorted({str(q[5])[:10] for q in prices.values() if len(q) > 5 and q[5]})
+    status = ('休市，无当日市场盈亏' if session is False and valid else
+              '当日行情' if valid else
+              '交易日历未确认，暂停撮合' if session is None else
+              '休市日存在成交，需核对账本' if session is False else
+              '当日行情缺失或日期不符，等待更新')
+    return {'日盈亏有效': valid, '日盈亏状态': status, '盈亏日期': _today(),
+            '行情采集日期': '、'.join(dates) or '无行情',
+            '收盘估值有效': (valid and session is True and datetime.now().strftime('%H%M') >= '1500'
+                            and all(_quote_is_today(q) and str(q[5])[11:16] >= '15:00'
+                                    for q in prices.values()))}
+
+
 # ---------------------------------------------------------------- 查询
 def get_account(require_fresh: bool = False) -> dict:
     """账户总览：总资产/可用资金/持仓市值/持仓盈亏/今日盈亏。"""
@@ -747,9 +814,14 @@ def get_account(require_fresh: bool = False) -> dict:
         cash = float(c.execute("SELECT value FROM broker_account WHERE key='cash'").fetchone()[0])
         available = max(0.0, _available_cash(c, 'manual'))
         fills = pd.read_sql("SELECT * FROM broker_fills WHERE date=? AND source!='satellite'", c, params=(_today(),))
+        initial = c.execute("SELECT COALESCE(SUM(amount),0) FROM broker_cashflows "
+                            "WHERE type='初始入金' AND source!='satellite'").fetchone()[0]
     codes = set(poss['code']) | set(fills['code'])
     prices = _latest_prices(list(codes))
     day_pnl = sum(_day_pnl_by_code(poss, fills, prices).values())
+    pnl_metadata = _pnl_metadata(prices, day_pnl)
+    if not pnl_metadata['日盈亏有效']:
+        day_pnl = float('nan')
     invalid_codes = []
     for code in set(poss.loc[poss['shares'] > 0, 'code']):
         mark = (prices.get(code) or (None,))[0]
@@ -760,7 +832,7 @@ def get_account(require_fresh: bool = False) -> dict:
         if not valid or (require_fresh and not _quote_fresh(code)):
             invalid_codes.append(code)
     valuation = {"估值有效": not invalid_codes and math.isfinite(cash),
-                 "估值异常股票": sorted(invalid_codes)}
+                 "估值异常股票": sorted(invalid_codes), '初始入金': initial, **pnl_metadata}
     if poss.empty:
         return {"总资产": cash, "可用资金": available, "冻结资金": cash - available, "持仓市值": 0.0,
                 "持仓盈亏": 0.0, "今日盈亏": day_pnl, **valuation}
@@ -807,7 +879,8 @@ def list_orders(today_only: bool = True) -> pd.DataFrame:
 
 def list_fills(today_only: bool = True) -> pd.DataFrame:
     with _conn() as c:
-        q = ("SELECT f.*,o.position_id,o.signal_source,o.strategy_name FROM broker_fills f "
+        q = ("SELECT f.*,o.position_id,o.signal_source,o.strategy_name,o.strategy_version,o.signal_batch_id,"
+             "o.attribution_status,o.decision_reason,o.factor_snapshot,o.risk_plan_id FROM broker_fills f "
              "LEFT JOIN broker_orders o ON o.id=f.order_id")
         if today_only:
             q += " WHERE f.date=?"
@@ -819,3 +892,31 @@ def list_cashflows(limit: int = 200) -> pd.DataFrame:
     with _conn() as c:
         return pd.read_sql(
             "SELECT * FROM broker_cashflows ORDER BY id DESC LIMIT ?", c, params=(limit,))
+
+
+def get_nav_history() -> tuple[pd.DataFrame, dict]:
+    """账户日历与看板共用盘后净值，禁止独立估值或拿指数冒充账户收益。"""
+    from trading_calendar import calendar_data
+    with sqlite3.connect(DB_PATH.resolve().as_uri() + '?mode=ro', uri=True) as c:
+        c.execute('BEGIN')
+        history = pd.read_sql('SELECT * FROM account_nav_daily ORDER BY date', c)
+        flows = pd.read_sql("SELECT substr(ts,1,10) AS date,type,amount FROM broker_cashflows "
+                            "WHERE source!='satellite' AND type IN ('初始入金','入金','出金') ORDER BY ts,id", c)
+    if history.empty:
+        return pd.DataFrame(), {}
+    calendar = calendar_data()
+    if any(day_status(d, calendar) is not True for d in history['date']):
+        raise ValueError('历史净值含未确认交易日，请重建净值')
+    if not history[['total_assets','nav','daily_ret']].apply(lambda s: s.map(math.isfinite)).all().all():
+        raise ValueError('历史净值存在无效数据')
+    previous, rows = '', []
+    previous_total = 0.0
+    for r in history.itertuples():
+        external = float(flows.loc[(flows['date'] > previous) & (flows['date'] <= r.date),'amount'].sum())
+        rows.append(dict(date=pd.Timestamp(r.date), equity=r.total_assets, cash=r.cash,
+                         mv=r.position_mv, nav=r.nav, pnl=round(r.total_assets-previous_total-external,2),
+                         ret_pct=r.daily_ret*100))
+        previous, previous_total = r.date, r.total_assets
+    relevant = flows[flows['date'] <= previous]
+    return pd.DataFrame(rows), {'init':float(relevant.loc[relevant['type']=='初始入金','amount'].sum()),
+                                'ext_total':float(relevant['amount'].sum()), 'asof':previous}

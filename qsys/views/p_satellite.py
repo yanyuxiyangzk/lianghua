@@ -30,10 +30,12 @@ def _render_pack_info(pack: dict):
     oos = pack.get("oos_winrate")
     if oos:
         st.caption(f"OOS胜率: {oos}")
-    if pack.get("status") == "active":
-        st.success("回测状态：通过，可进入自动执行风控链路。")
+    from strategy_progress import latest_reports, research_reason
+    reason = research_reason(pack, latest_reports().get(pack['name']))
+    if reason:
+        st.warning(f"研究资格：{reason}。候选仅供观察，不代表可以自动买入。")
     else:
-        st.warning("回测状态：未通过。仍会自动选股并积累前瞻样本，但不会自动买入。")
+        st.info("当前版本研究已通过；执行仍须独立资格与账户风控校验。")
     factors = pack.get("factors", [])
     if factors:
         rows = []
@@ -47,19 +49,12 @@ def _render_pack_info(pack: dict):
 
 
 def _get_todays_satellite_pick(observation: bool = False) -> pd.DataFrame:
-    """正式候选只读 satellite_scan；观察名单单独读取 sched_satellite_scan。"""
-    try:
-        source = "sched_satellite_scan" if observation else "satellite_scan"
-        with exp._conn() as c:
-            df = pd.read_sql(
-                "SELECT p.trade_date,p.source,p.pack_name,pi.code,pi.score FROM picks p"
-                " JOIN pick_items pi ON pi.pick_id = p.id"
-                " WHERE p.source=?"
-                " AND p.trade_date=(SELECT MAX(trade_date) FROM picks"
-                " WHERE source=?) ORDER BY pi.rank", c, params=(source, source))
-        return df
-    except Exception:
+    from satellite_candidates import latest_candidates
+    from selection_policy import completed_signal_day
+    pack = _get_satellite_pack_info()
+    if not pack:
         return pd.DataFrame()
+    return latest_candidates(pack['name'], pack, completed_signal_day(), observation)
 
 
 def _render_position_summary():
@@ -175,20 +170,62 @@ def _render_tab_today():
 
 
 def _render_observation_only():
-    """展示正式选股建议，缺失时回退观察名单；执行交由统一账户。"""
-    today = get_last_trade_day()
-    st.caption(f"当前交易日 {today} · 卫星选股建议由统一资金账户执行")
-    pack = _get_satellite_pack_info()
-    if pack:
-        _render_pack_info(pack)
-    picks = _get_todays_satellite_pick(False)
-    observation = picks.empty
-    if observation:
-        picks = _get_todays_satellite_pick(True)
-    if picks.empty:
-        st.info("暂无卫星轨观察名单，请等待自动扫描任务完成。")
+    """当前候选必须匹配已收盘日期和策略版本，历史名单单独展示。"""
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from selection_policy import completed_signal_day
+    from satellite_candidates import latest_candidates
+    today = datetime.now(ZoneInfo('Asia/Shanghai')).strftime('%Y-%m-%d')
+    try:
+        day = completed_signal_day()
+    except ValueError as exc:
+        st.error(str(exc))
         return
-    st.caption(f"名单日期：{picks['trade_date'].max()} · {'观察名单' if observation else '正式卫星选股建议'}")
+    st.caption(f"查看日期：{today} · 目标行情截止日期：{day}（仅使用已收盘数据）")
+    pack = _get_satellite_pack_info()
+    if not pack:
+        st.warning("暂无可用卫星事件策略包。")
+        return
+    _render_pack_info(pack)
+    status = scheduler.get_scheduler().view().get('satellite_scan', {})
+    last = status.get('last') or {}
+    if status.get('running_since'):
+        st.info("卫星候选正在生成，请稍后刷新状态。")
+    if last:
+        st.caption(f"最近扫描：{last.get('time')} · {last.get('msg')}")
+        if last.get('ok') is False:
+            st.warning("最近扫描未完成，旧名单不会作为当前候选展示。")
+    st.caption(f"下次自动扫描：{status.get('next') or '未排程'}；盘后扫描才使用当日收盘行情。")
+    st.button("刷新候选与任务状态", key="refresh_satellite_candidates")
+    stale_display = False
+    try:
+        picks = latest_candidates(pack['name'], pack, day)
+        observation = picks.empty
+        if observation:
+            picks = latest_candidates(pack['name'], pack, day, observation=True)
+        with st.expander("历史候选（不作为当前名单）", expanded=False):
+            old = latest_candidates(pack['name'], pack, history=True)
+            if old.empty:
+                old = latest_candidates(pack['name'], pack, observation=True, history=True)
+            if old.empty:
+                st.caption("暂无历史候选")
+            else:
+                st.caption(f"历史行情日期：{old.iloc[0]['trade_date']} · 生成时间：{old.iloc[0]['created_at']}")
+                st.dataframe(old, hide_index=True, width="stretch")
+    except Exception as exc:
+        st.error(f"读取卫星名单失败：{exc}")
+        return
+    if picks.empty:
+        # 收盘后尚未到下一次扫描时，保留最近一批供查看，但明确标为旧批次。
+        picks = latest_candidates(pack['name'], pack, history=True)
+        observation = False
+        stale_display = not picks.empty
+        if not stale_display:
+            st.warning(f"尚无行情截止 {day}、匹配当前策略版本的候选。请等待下一次扫描。")
+            return
+    if stale_display:
+        st.warning(f"当前尚无行情截止 {day} 的新名单；以下为最近一批候选，仅供查看，不作为当前信号。")
+    st.caption(f"生成时间：{picks.iloc[0]['created_at']} · 行情截止日期：{picks.iloc[0]['trade_date']} · {'历史候选' if stale_display else ('观察名单' if observation else '卫星扫描候选')}")
     try:
         prices = bk._latest_prices(picks["code"].tolist())
     except Exception:
@@ -199,11 +236,13 @@ def _render_observation_only():
         cur = pr[0] if len(pr) > 0 else None
         prev = pr[1] if len(pr) > 1 else None
         chg = ((cur / prev - 1) * 100) if cur and prev else None
-        rows.append({"交易日": row["trade_date"], "股票代码": row["code"],
+        rows.append({"行情截止日期": row["trade_date"], "股票代码": row["code"],
                      "策略评分": row["score"], "最新价": cur, "涨跌幅(%)": chg})
     st.subheader(f"候选股票（{len(rows)} 只）")
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
-    if observation:
+    if stale_display:
+        st.caption("该批次已过当前目标日期，待下一次扫描生成新信号。")
+    elif observation:
         st.caption("当前仅有观察名单，待正式扫描确认后交给统一账户评估。")
     else:
         st.caption("正式建议通过策略资格、买点及账户风控后，由统一资金账户买入；委托、成交和持仓标记卫星来源。")

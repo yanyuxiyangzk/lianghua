@@ -465,6 +465,8 @@ class APIBackend(ABC):
         """This function to share operation between embedding and chat completion"""
         assert not (chat_completion and embedding), "chat_completion and embedding cannot be True at the same time"
         max_retry = LLM_SETTINGS.max_retry if LLM_SETTINGS.max_retry is not None else max_retry
+        if chat_completion:
+            max_retry = min(max_retry, 2)
         timeout_count = 0
         violation_count = 0
         embedding_truncated = False  # Track if we've already tried truncation
@@ -476,6 +478,9 @@ class APIBackend(ABC):
                 if chat_completion:
                     return self._create_chat_completion_auto_continue(*args, **kwargs)
             except Exception as e:  # noqa: BLE001
+                from rdagent.oai.cost_control import CostLimitError
+                if isinstance(e, CostLimitError):
+                    raise
                 if hasattr(e, "message") and (
                     "'messages' must contain the word 'json' in some form" in e.message
                     or "\\'messages\\' must contain the word \\'json\\' in some form" in e.message

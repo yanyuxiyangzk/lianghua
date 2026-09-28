@@ -4,12 +4,16 @@ import json
 import streamlit as st
 import datasource
 import research_retention as rr
+import single_stock_jobs as jobs
 
 
 def render(code):
     rr.setup()
     st.subheader('增量研究与原始数据保留')
     st.info('长期保留历史日线、成交约束、每日特征版本和研究报告。只有过保留期且校验通过的数据可清理；新数据先计算特征，5交易日标签成熟后再评估。')
+    active=next((r for r in jobs.jobs(code) if r['status'] in ('queued','running')),None)
+    if active:
+        st.info(f"当前任务正在排队或执行，请勿重复清理。任务：{active['id']}；进度见上方，每2秒自动更新。")
     p=rr.policy(code)
     with st.form(f'retention_policy_{code}'):
         minute=st.number_input('分钟原始数据保留交易日',1,2000,int(p['minute_days']))
@@ -57,7 +61,7 @@ def render(code):
     start=a.date_input('清理开始日期',date.fromisoformat(first) if first else date.today()-timedelta(days=730))
     end=b.date_input('清理结束日期',date.today()-timedelta(days=1),max_value=date.today()-timedelta(days=1))
     st.caption('启用自动清理只影响后续后台执行，不会立即删除，也不会缩短当前保留期。')
-    if st.button('校验并归档所选范围（不删除）',key=f'prepare_cleanup_{code}'):
+    if st.button('校验并归档所选范围（不删除）',key=f'prepare_cleanup_{code}',disabled=bool(active)):
         try:
             with st.spinner('保存分钟、盘口等特征并校验，每次最多40个日期/来源…'):
                 prepared=rr.prepare_cleanup(code,start.isoformat(),end.isoformat())
@@ -66,7 +70,7 @@ def render(code):
             st.error(f'归档未完成：{exc}')
     receipt=st.session_state.pop(f'cleanup_receipt_{code}',None)
     if receipt:
-        st.success(receipt)
+        st.toast(receipt)
     try: preview=rr.preview(code,start.isoformat(),end.isoformat())
     except ValueError as exc: st.error(str(exc));return
     st.write({'符合删除条件的行数':preview['eligible'],'被保护或待核实行数':preview['blocked_rows']})
@@ -77,7 +81,7 @@ def render(code):
         if not preview['details']:
             st.info('当前日期范围内没有原始高频数据，无需清理；可调整清理日期范围。')
         else:
-            st.warning('当前符合删除条件的记录为 0 行；可使用“一键归档并清理”先自动处理归档。')
+            st.warning('当前符合删除条件的记录为 0 行。请查看下方原因；归档不能解除保留期、人工保护或修复缺失数据。')
             reasons={}
             for row in preview['details']:
                 if not row['eligible']:
@@ -91,21 +95,26 @@ def render(code):
             st.caption('日线因子挖掘完成不代表分钟、盘口等原始数据已完成特征归档。')
     st.caption('一键归档并清理会在后台处理所选范围全部日期/来源，无需反复点击40日归档；只删除归档通过且超过保留期的数据。关闭页面不影响后台任务。')
     confirm=st.checkbox('确认仅删除所选范围内归档合格且超过保留期的原始分钟、盘口、快照和逐笔记录，保留历史日线与全部研究特征')
-    if st.button('一键归档并清理',disabled=not confirm or not preview['details'],type='primary'):
+    if st.button('一键归档并清理',disabled=bool(active) or not confirm or not preview['details'],type='primary'):
         try:
-            import single_stock_jobs as jobs
             rid=jobs.submit(code,'cleanup',dict(start=start.isoformat(),end=end.isoformat()))
-            st.session_state[f'cleanup_receipt_{code}']=f'任务 {rid} 已进入后台队列，进度见上方任务状态；若已有任务，将先显示已有任务。'
+            st.session_state[f'cleanup_popup_task_{code}']=rid
             st.rerun()
         except Exception as exc:
             st.error(f'任务提交失败：{exc}')
     if eligible_rows and not confirm:
         st.info(f'可清理 {eligible_rows:,} 行：请先勾选上方确认框，再点击“确认清理原始高频”。')
-    if st.button('确认清理原始高频',disabled=not confirm or not any(preview['eligible'].values()),type='primary'):
+    if st.button('确认清理原始高频',disabled=bool(active) or not confirm or not any(preview['eligible'].values()),type='primary'):
         try:
-            result=rr.cleanup(code,start.isoformat(),end.isoformat())
+            popup=st.empty()
+            popup.markdown('<div role="status" style="position:fixed;right:24px;top:72px;z-index:99999;padding:16px 22px;border-radius:10px;background:#17324d;color:white">正在删除，请稍候…</div>',unsafe_allow_html=True)
+            try:
+                with st.spinner('正在删除…'):
+                    result=rr.cleanup(code,start.isoformat(),end.isoformat())
+            finally:
+                popup.empty()
             deleted=sum(result['deleted'].values())
-            st.session_state[f'cleanup_receipt_{code}']=f"本次实际删除 {deleted} 行：{result['deleted']}；审计编号：{result['id']}"
+            st.session_state[f'cleanup_receipt_{code}']=f"{'删除完成' if deleted else '检查完成，本次未删除数据'}：本次实际删除 {deleted} 行：{result['deleted']}；审计编号：{result['id']}"
             st.rerun()
         except Exception as exc: st.error(f'清理未完成：{exc}')
     with st.expander('最近清理记录'):

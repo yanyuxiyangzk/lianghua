@@ -48,5 +48,6 @@ class WorkerTests(unittest.TestCase):
         import library
         with patch.object(library, 'list_strategies', return_value=packs), \
              patch.object(worker, 'run_bounded', return_value={'ok': False, 'error': 'timeout'}) as run:
-            scheduler.job_strategy_revalidate('p')
+            with self.assertRaisesRegex(RuntimeError, 'timeout'):
+                scheduler.job_strategy_revalidate('p')
         run.assert_called_once_with('a', timeout_seconds=180)

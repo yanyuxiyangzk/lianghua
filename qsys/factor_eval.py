@@ -326,7 +326,8 @@ def _cache(name: str, payload: str) -> Path:
 
 def forward_returns(panel: pd.DataFrame, days: int) -> pd.DataFrame:
     """datetime × instrument 的远期收益表。"""
-    close = panel["$close"].unstack("instrument").sort_index()
+    from research_backtest import research_close
+    close = research_close(panel)
     return close.shift(-days) / close - 1
 
 
@@ -1071,7 +1072,8 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
                  min_factors: int = 2,
                  norms: dict[str, str] | None = None,
                  start_idx: int | None = None,
-                 end_idx: int | None = None) -> pd.DataFrame:
+                 end_idx: int | None = None,
+                 fixed_weights: dict | None = None, ranker=None) -> pd.DataFrame:
     """滚动样本外：每个应用点 t，用 [t-est, t-fwd] 的 IC 统计定权重与方向，
     在 t 截面打分取 Top-N，记录随后 fwd_days 的超额收益。
 
@@ -1089,7 +1091,8 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
     from research_backtest import validate_windows, window_metrics, benchmark_returns, window_contract
     validate_windows(fwd_days, step, top_n, cost)
     fwd = forward_returns(panel, fwd_days)
-    close = panel["$close"].unstack("instrument").sort_index()
+    from research_backtest import research_close
+    close = research_close(panel)
     # 全历史 IC 序列（每个因子算一次，应用点只做切片统计 → 快）
     vals_norm = {}
     for name, s in factor_vals.items():
@@ -1099,7 +1102,12 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
         vals_norm[name] = s2
     if norms is None:
         norms = sig.scoring_norms(list(vals_norm))
-    if ic_full is None:
+    if fixed_weights is not None:
+        from selection_policy import validate_factors
+        validate_factors([dict(name=n, weight=w, direction=d) for n, (w,d) in fixed_weights.items()])
+        if set(fixed_weights) != set(factor_vals):
+            raise ValueError("固定策略因子与求值结果不一致")
+    if ic_full is None and fixed_weights is None:
         ic_full = {name: ic_series(s, fwd) for name, s in vals_norm.items()}
     days = list(fwd.index) if vals_norm else []
     # start/end 约束应用日期；训练窗口始终位于应用日期之前。
@@ -1118,22 +1126,26 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
         est_lo = days[t_global - est]
         est_hi = days[t_global - fwd_days - 1]  # IC 可观测右端（防未来函数）
         # 切片统计 → 权重
-        stats = {}
-        for name, ic in ic_full.items():
-            if name not in vals_norm:
+        if fixed_weights is not None:
+            w_opt = dict(fixed_weights)
+            names = list(w_opt)
+        else:
+            stats = {}
+            for name, ic in ic_full.items():
+                if name not in vals_norm:
+                    continue
+                seg = ic[(ic.index >= est_lo) & (ic.index <= est_hi)]
+                if len(seg) < 60:
+                    stats[name] = None
+                    continue
+                stats[name] = (seg.mean(), seg.mean() / (seg.std() + 1e-12), (seg > 0).mean())
+            valid = {n: s for n, s in stats.items() if s is not None}
+            if len(valid) < min_factors:
                 continue
-            seg = ic[(ic.index >= est_lo) & (ic.index <= est_hi)]
-            if len(seg) < 60:
-                stats[name] = None
-                continue
-            stats[name] = (seg.mean(), seg.mean() / (seg.std() + 1e-12), (seg > 0).mean())
-        valid = {n: s for n, s in stats.items() if s is not None}
-        if len(valid) < min_factors:
-            continue
-        sc = pd.DataFrame({n: {"IC均值": v[0], "ICIR": v[1], "Top组胜率": v[2]}
-                           for n, v in valid.items()}).T
-        names = list(valid.keys())
-        w_opt = compute_weights(sc.reset_index(names="因子"), method, names, use_direction_state=False)
+            sc = pd.DataFrame({n: {"IC均值": v[0], "ICIR": v[1], "Top组胜率": v[2]}
+                               for n, v in valid.items()}).T
+            names = list(valid.keys())
+            w_opt = compute_weights(sc.reset_index(names="因子"), method, names, use_direction_state=False)
         w_eq = {n: (1.0 / len(names), w_opt[n][1]) for n in names}
 
         fr = benchmark_returns(close, fwd, t)
@@ -1143,7 +1155,7 @@ def walk_forward(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method:
             for name in weights:
                 if t not in vals_norm[name].index.get_level_values("datetime"):
                     raise ValueError(f"调仓日因子 {name} 缺失，不能压缩回测日历")
-            sc_t = _score_at(vals_norm, weights, t, norms=norms)
+            sc_t = ranker(weights, t) if ranker is not None else _score_at(vals_norm, weights, t, norms=norms)
             ranked = sc_t.dropna().sort_values(ascending=False)
             prev = prev_picks[label]
             if buffer_n > 0 and prev:
@@ -1262,7 +1274,8 @@ def combo_false_discovery_rate(n_candidates: int, n_rounds: int,
 def time_series_cv(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, method: str,
                    top_n: int, n_folds: int = 5, fwd_days: int = MAIN_FWD,
                    step: int = STEP_DAYS, cost: float = 0.0025,
-                   buffer_n: int = 0, min_points: int = 8) -> dict:
+                   buffer_n: int = 0, min_points: int = 8,
+                   fixed_weights: dict | None = None, ranker=None) -> dict:
     """时间序列交叉验证：n_folds 个时间切分，每个切分独立 walk-forward。
 
     返回各 fold 的 OOS 胜率分布，用中位数（而非均值）作为稳健估计。
@@ -1298,6 +1311,7 @@ def time_series_cv(factor_vals: dict[str, pd.Series], panel: pd.DataFrame, metho
             step=step, fwd_days=fwd_days, cost=cost,
             buffer_n=buffer_n, ic_full=ic_full, min_factors=1,
             start_idx=test_start, end_idx=test_end,
+            fixed_weights=fixed_weights, ranker=ranker,
         )
         if not wf.empty and "优化组合扣费超额" in wf and len(wf) >= min_points:
             net = wf["优化组合扣费超额"]
@@ -1349,7 +1363,8 @@ def static_backtest(factor_vals: dict[str, pd.Series], panel: pd.DataFrame,
     if upto:
         panel = panel[panel.index.get_level_values("datetime") <= pd.Timestamp(upto)]
     fwd = forward_returns(panel, fwd_days)
-    close = panel["$close"].unstack("instrument").sort_index()
+    from research_backtest import research_close
+    close = research_close(panel)
     vals_norm = {n: _norm(s.dropna()) for n, s in factor_vals.items() if not s.dropna().empty}
     if not vals_norm:
         return pd.DataFrame()

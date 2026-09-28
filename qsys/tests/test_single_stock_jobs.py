@@ -100,6 +100,39 @@ class JobsTests(TestCase):
         self.assertFalse(app.exception)
         self.assertTrue(any('实际删除' in x.value for x in app.success))
         self.assertEqual(len(j.jobs('SH600664')),1)
+        self.assertTrue(any('实际删除' in x.value for x in app.get('toast')))
+        self.assertFalse(any('position:fixed' in x.value for x in app.markdown))
+        app.run()
+        self.assertFalse(app.get('toast'))
+
+    def test_conflicting_job_is_not_reported_as_cleanup_submission(self):
+        j.submit('SH600664','mine',self.p)
+        with self.assertRaisesRegex(ValueError,'已有其他任务'):
+            j.submit('SH600664','cleanup',dict(start='2025-01-01',end='2025-12-31'))
+        self.assertEqual(len(j.jobs('SH600664')),1)
+
+    def test_cleanup_status_and_repeat_buttons(self):
+        from streamlit.testing.v1 import AppTest
+        rid=j.submit('SH600664','cleanup',dict(start='2025-01-01',end='2025-12-31'))
+        app=AppTest.from_string("from stock_factor_view import render\nrender('SH600664','cleanup')").run()
+        self.assertFalse(app.exception)
+        self.assertTrue(any('排队中' in x.value for x in app.info))
+        next(x for x in app.checkbox if x.label.startswith('确认仅删除')).check().run()
+        for label in ['一键归档并清理','确认清理原始高频','校验并归档所选范围（不删除）']:
+            self.assertTrue(next(x for x in app.button if x.label==label).disabled)
+        for progress,label in [(20,'归档中'),(92,'删除中')]:
+            with j.connect() as c:
+                c.execute("UPDATE single_jobs SET status='running',progress=?,message=? WHERE id=?",(progress,label,rid))
+            app.run()
+            self.assertFalse(app.exception)
+            self.assertTrue(any(label in x.value for x in app.info))
+            self.assertTrue(any('position:fixed' in x.value for x in app.markdown))
+        with j.connect() as c:
+            c.execute("UPDATE single_jobs SET status='failed',message='模拟归档异常' WHERE id=?",(rid,))
+        app.run()
+        self.assertTrue(any('模拟归档异常' in x.value for x in app.error))
+        next(x for x in app.checkbox if x.label.startswith('确认仅删除')).check().run()
+        self.assertFalse(next(x for x in app.button if x.label=='一键归档并清理').disabled)
 
     def test_constraint_repair_job_records_unresolved_result(self):
         exp=self.fixture.exp

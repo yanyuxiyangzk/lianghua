@@ -810,6 +810,10 @@ def apply_filters(codes: list[str], panel: pd.DataFrame, filters: list[str]) -> 
     last_day = panel.index.get_level_values("datetime").max()
     snap = panel[panel.index.get_level_values("datetime") == last_day]
     snap.index = snap.index.get_level_values("instrument")
+    if set(filters) == {"tradable"}:
+        # This filter only needs today's volume, not every historical indicator.
+        eligible = set(snap.index[snap['$volume'].gt(0)])
+        return [code for code in codes if code in eligible]
     g = panel.groupby(level="instrument", group_keys=False)
 
     def _last(s: pd.Series) -> pd.Series:  # 每只标的最新值快照（一次性算好，避免逐股扫描）
@@ -899,7 +903,7 @@ def apply_filters(codes: list[str], panel: pd.DataFrame, filters: list[str]) -> 
         regime_now = "unknown"
         try:
             from loopengine.regime import detect_regime
-            rg = detect_regime()
+            rg = detect_regime(end=str(last_day)[:10])
             regime_now = rg.get("regime", "unknown")
         except Exception:
             pass

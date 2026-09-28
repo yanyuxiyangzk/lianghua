@@ -245,8 +245,8 @@ def archive_and_cleanup(code,start,end,emit):
                                 (code,row['day'],row['table'],VERSION)).fetchone()
             state='ready' if ready else process_day(code,row['day'],row['table'])
             counts[state]=counts.get(state,0)+1
-            emit(5+int(85*(index+1)/max(1,len(rows))),f"归档 {index+1}/{len(rows)}：{row['day']} {row['table']} · {state}")
-        emit(92,'归档结束，重新检查保留期、人工保护和数据版本后删除')
+            emit(5+int(85*(index+1)/max(1,len(rows))),f"归档中 {index+1}/{len(rows)}：{row['day']} {row['table']} · {state}")
+        emit(92,'删除中：重新检查保留期、人工保护和数据版本，提交删除事务')
         result=cleanup(code,start,end)
         remaining=preview(code,start,end)
         reasons={}

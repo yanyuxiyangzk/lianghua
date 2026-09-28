@@ -121,7 +121,7 @@ def _now() -> datetime:
 
 
 def _cls(v) -> str:
-    return "up" if v > 0 else ("down" if v < 0 else "flat")
+    return "flat" if v is None else ("up" if v > 0 else ("down" if v < 0 else "flat"))
 
 
 def _fmt_money(v) -> str:
@@ -210,28 +210,15 @@ def _breadth() -> dict:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def _nav_curve(days: int = 60) -> tuple[pd.Series, str]:
-    """组合净值：已平仓持仓按卖出日累计（复利）；数据不足回退沪深300指数。"""
+    """账户盘后净值，与资金账号及组合风控使用同一口径。"""
     try:
-        hist = experience.get_position_history(limit=300)
-        if hist is not None and len(hist) >= 2:
-            hist = hist.sort_values("sell_date")
-            cutoff = pd.Timestamp.now() - pd.Timedelta(days=days)
-            hist = hist[pd.to_datetime(hist["sell_date"], errors="coerce") >= cutoff]
-            if len(hist) >= 2:
-                nav = (1 + hist["pnl_pct"] / 100).cumprod()
-                return pd.Series(nav.values, index=pd.to_datetime(hist["sell_date"])), "组合（已平仓）"
+        history, meta = broker.get_nav_history()
+        if not history.empty:
+            history = history.tail(days)
+            return pd.Series(history['nav'].values, index=history['date']), f"账户净值 · 截至 {meta['asof']} 收盘"
     except Exception:
         pass
-    try:
-        end = _now().strftime("%Y-%m-%d")
-        d = datasource.get_daily("sh000300", "2020-01-01", end)
-        if d is not None and len(d) >= 2:
-            d = d.tail(days)
-            nav = d["close"] / d["close"].iloc[0]
-            return pd.Series(nav.values, index=pd.to_datetime(d["date"])), "沪深300（回退基准）"
-    except Exception:
-        pass
-    return pd.Series(dtype=float), ""
+    return pd.Series(dtype=float), "暂无有效账户净值"
 
 
 @st.cache_data(ttl=120, show_spinner=False)
@@ -321,11 +308,11 @@ st.markdown("<hr>", unsafe_allow_html=True)
 # ---------------------------------------------------------------- KPI 卡片
 acct = _account()
 total_asset = acct.get("总资产")
-day_pnl = acct.get("今日盈亏", 0) or 0
+day_pnl = acct.get("今日盈亏") if acct.get('日盈亏有效') else None
 pos_pnl = acct.get("持仓盈亏") or 0
 cash = acct.get("可用资金") or 0
 mv = acct.get("持仓市值") or 0
-prev_total = (total_asset - day_pnl) if total_asset is not None else None
+prev_total = (total_asset - day_pnl) if total_asset is not None and day_pnl is not None else None
 asset_pct = (day_pnl / prev_total * 100) if prev_total else None
 
 # 沪深300 当日涨跌（跑赢基准对比用）
@@ -340,7 +327,7 @@ yest_n = counts.get(dates[-2], 0) if len(dates) > 1 else 0
 sig_delta = today_n - yest_n
 
 # 风险评分：仓位暴露 + 当日波动
-if total_asset and total_asset > 0:
+if total_asset and total_asset > 0 and day_pnl is not None:
     exposure = mv / total_asset
     day_ret = (day_pnl / total_asset * 100)
     risk = max(1, min(99, round(30 + 60 * exposure + abs(day_ret) * 1.2)))
@@ -357,7 +344,8 @@ if len(nav_s) >= 2:
 k1, k2, k3, k4 = st.columns(4)
 with k1:
     delta_html = (f'<span class="{_cls(day_pnl)}">{"+" if day_pnl > 0 else ""}'
-                  f'{day_pnl:+,.0f}</span>' if day_pnl else '<span class="flat">±0</span>')
+                  f'{day_pnl:+,.0f}</span>' if day_pnl else
+                  '<span class="flat">待更新</span>' if day_pnl is None else '<span class="flat">±0</span>')
     _kpi("账户总资产", _fmt_money(total_asset), delta_html, _cls(day_pnl or 0),
          f"持仓市值 {_fmt_money(mv)} · 现金 {_fmt_money(cash)}")
 with k2:
@@ -366,8 +354,8 @@ with k2:
     if hs300_chg is not None and asset_pct is not None:
         beat_v = asset_pct - hs300_chg
         beat = f"　{('跑赢' if beat_v > 0 else '跑输')}沪深300 {abs(beat_v):.2f}%"
-    _kpi("今日盈亏", f'{day_pnl:+,.0f}' if day_pnl else "¥0",
-         pct_html, _cls(day_pnl), f"持仓盈亏 {pos_pnl:+,.0f}{beat}")
+    _kpi("今日盈亏", "待更新" if day_pnl is None else f'{day_pnl:+,.0f}',
+         pct_html, _cls(day_pnl), f"{acct.get('日盈亏状态', '')} · 持仓盈亏 {pos_pnl:+,.0f}{beat}")
 with k3:
     _kpi("策略信号", f"{today_n:02d}",
          f"{'↑' if sig_delta > 0 else ('↓' if sig_delta < 0 else '—')} "

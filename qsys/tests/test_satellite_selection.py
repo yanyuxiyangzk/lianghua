@@ -2,6 +2,7 @@
 import sys
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import scheduler
@@ -28,9 +29,13 @@ def test_degraded_satellite_still_selected_for_observation():
 
 
 def test_satellite_weekday_not_blocked_by_stale_calendar():
-    # 数据库日历末端早于目标日时，工作日必须兜底放行。
-    assert scheduler._satellite_trading_day(datetime(2026, 9, 22, 19, 10)) is True
-    assert scheduler._satellite_trading_day(datetime(2026, 9, 20, 19, 10)) is False
+    # 日历缺失不得以工作日兜底；只放行已确认交易日。
+    with patch('trading_calendar.day_status', return_value=None):
+        assert scheduler._satellite_trading_day(datetime(2026, 9, 22, 19, 10)) is False
+    with patch('trading_calendar.day_status', return_value=True):
+        assert scheduler._satellite_trading_day(datetime(2026, 9, 22, 19, 10)) is True
+    with patch('trading_calendar.day_status', return_value=False):
+        assert scheduler._satellite_trading_day(datetime(2026, 9, 20, 19, 10)) is False
     print("PASS: test_satellite_weekday_not_blocked_by_stale_calendar")
 
 

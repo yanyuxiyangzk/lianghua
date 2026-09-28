@@ -6,6 +6,7 @@
 
 import json
 import logging
+import os
 import random
 import re
 from datetime import datetime
@@ -163,7 +164,7 @@ class LoopEngine:
         src = self.state["budget"].choose(rng)
         # 每轮独立生成预算，避免 batch 增大导致 LLM 调用线性膨胀
         import os
-        gen_limit = int(os.environ.get("LLM_LOOPENGINE_GENERATE_LIMIT", "5"))
+        gen_limit = int(os.environ.get("LLM_LOOPENGINE_GENERATE_LIMIT", "2"))
         if src == "llm" and stats is not None and stats.get("llm_gen_used", 0) >= gen_limit:
             src = "mutate"
         self._signal_id_in_prompt = None  # 每候选重置；仅 LLM 真正产出且 prompt 含信号时挂标
@@ -418,7 +419,7 @@ class LoopEngine:
                 hypotheses=hypotheses,
                 theories=theories)
             text = llm_chat(system_prompt, user_prompt, max_tokens=500,
-                            label="loopengine_generate") or ""
+                            label="loopengine_generate", max_retries=0) or ""
             cand = _extract_sexpr(text)
             if cand is None:
                 if stats is not None:
@@ -583,8 +584,8 @@ class LoopEngine:
             bus.push(EventType.STEP_UPDATE, step=3, name="衰减检测", status="error",
                      error=str(e))
 
-        # 成本闸门：每轮最多 3 次 LLM 审查；规则审查仍覆盖全部候选
-        llm_review_budget = 3
+        # 每轮默认最多一次通过统计闸门后的语义审查；规则审查覆盖所有候选
+        llm_review_budget = max(0, int(os.environ.get("LLM_LOOPENGINE_REVIEW_LIMIT", "1")))
         for _ in range(batch):
             # Step 4: 生成候选
             src, tree = self._gen_candidate(rng, gaps, proven, live_boost, factor_type, regime,
@@ -604,30 +605,6 @@ class LoopEngine:
                          source=src, passed=False, reason=why)
                 continue
             sexpr = tree.sexpr()
-
-            # Step 6: LLM语义审查（仅作风险标注，不覆盖硬规则/统计闸门）
-            # 优先审查候选，预算用尽后跳过；LLM 不再直接淘汰因子。
-            do_llm = llm_review_budget > 0 and rng.random() < 0.5
-            bus.push(EventType.STEP_UPDATE, step=6, name="LLM审查", status="running",
-                     source=src, sampled=do_llm)
-            if do_llm:
-                from loopengine.llm_review import llm_review
-                llm_review_budget -= 1
-                passed_review, reason = llm_review(sexpr)
-                if reason.endswith("-fallback"):  # LLM 不可用/JSON 解析失败的回退率（可观测性）
-                    stats["llm_review_fallback"] = stats.get("llm_review_fallback", 0) + 1
-                bus.push(EventType.STEP_UPDATE, step=6, name="LLM审查",
-                         status="pass" if passed_review else "fail", source=src, reason=reason if not passed_review else None)
-                if not passed_review:
-                    stats["llm_rejected"] += 1  # 兼容旧统计：表示风险标记，不是硬拒绝
-                stats.setdefault("llm_flags", []).append({"sexpr": sexpr[:120],
-                                                            "passed": passed_review,
-                                                            "reason": reason})
-                bus.push(EventType.LLM_RESULT, iteration=s["iteration"],
-                         source=src, passed=passed_review, reason=reason)
-            else:
-                bus.push(EventType.STEP_UPDATE, step=6, name="LLM审查",
-                         status="skip", source=src)
 
             # Step 7: 去重
             h = G.factor_hash(sexpr)
@@ -658,6 +635,30 @@ class LoopEngine:
                 result = G.evaluate_gates(vals, panel, factor_type=factor_type)
             except Exception as e:
                 result = {"pass": False, "reasons": [f"eval error: {e}"], "metrics": {}}
+
+            # Step 6: LLM语义审查（仅作风险标注，不覆盖硬规则/统计闸门）
+            # 仅审查去重、冻结检查和统计闸门均通过的候选；只作风险标注。
+            do_llm = result["pass"] and llm_review_budget > 0
+            bus.push(EventType.STEP_UPDATE, step=6, name="LLM审查", status="running",
+                     source=src, sampled=do_llm)
+            if do_llm:
+                from loopengine.llm_review import llm_review
+                llm_review_budget -= 1
+                passed_review, reason = llm_review(sexpr, factor_type=factor_type)
+                if reason.endswith("-fallback"):  # LLM 不可用/JSON 解析失败的回退率（可观测性）
+                    stats["llm_review_fallback"] = stats.get("llm_review_fallback", 0) + 1
+                bus.push(EventType.STEP_UPDATE, step=6, name="LLM审查",
+                         status="pass" if passed_review else "fail", source=src, reason=reason if not passed_review else None)
+                if not passed_review:
+                    stats["llm_rejected"] += 1  # 兼容旧统计：表示风险标记，不是硬拒绝
+                stats.setdefault("llm_flags", []).append({"sexpr": sexpr[:120],
+                                                            "passed": passed_review,
+                                                            "reason": reason})
+                bus.push(EventType.LLM_RESULT, iteration=s["iteration"],
+                         source=src, passed=passed_review, reason=reason)
+            else:
+                bus.push(EventType.STEP_UPDATE, step=6, name="LLM审查",
+                         status="skip", source=src)
 
             fam = structure.assign_family(sexpr, sk) if sk else "unknown"
             fname = f"le_{fam}_{h[:6]}"
@@ -1014,27 +1015,15 @@ class LoopEngine:
 
         stats = {"tested": 0, "rejected_review": 0, "llm_rejected": 0, "dup": 0,
                  "frozen": 0, "passed": 0, "new": [], "factor_type": factor_type}
-        llm_review_budget = 3
+        llm_review_budget = max(0, int(os.environ.get("LLM_LOOPENGINE_REVIEW_LIMIT", "1")))
         for _ in range(batch):
-            src, tree = self._gen_candidate(rng, gaps, proven, live_boost, factor_type)
+            src, tree = self._gen_candidate(rng, gaps, proven, live_boost, factor_type, stats=stats)
             ok, _why = review.review(tree, factor_type)
             if not ok:
                 stats["rejected_review"] += 1
                 s["budget"].record(src, False)
                 continue
             sexpr = tree.sexpr()
-            if llm_review_budget > 0 and rng.random() < 0.3:
-                from loopengine.llm_review import llm_review
-
-                llm_review_budget -= 1
-                passed_review, reason = llm_review(sexpr)
-                if reason.endswith("-fallback"):  # LLM 不可用/JSON 解析失败的回退率
-                    stats["llm_review_fallback"] = stats.get("llm_review_fallback", 0) + 1
-                if not passed_review:
-                    stats["llm_rejected"] += 1  # 兼容旧统计：表示风险标记，不是硬拒绝
-                stats.setdefault("llm_flags", []).append({"sexpr": sexpr[:120],
-                                                            "passed": passed_review,
-                                                            "reason": reason})
             h = f"ev:{kind}:" + G.factor_hash(sexpr)
             if library.is_tested(h):
                 stats["dup"] += 1
@@ -1053,6 +1042,19 @@ class LoopEngine:
                 result = G.evaluate_event_gates(vals, panel, kind, horizon, library_ics=passed_ics)
             except Exception:
                 result = {"pass": False, "reasons": ["eval error"], "metrics": {}}
+
+            if result["pass"] and llm_review_budget > 0:
+                from loopengine.llm_review import llm_review
+
+                llm_review_budget -= 1
+                passed_review, reason = llm_review(sexpr, factor_type=factor_type)
+                if reason.endswith("-fallback"):  # LLM 不可用/JSON 解析失败的回退率
+                    stats["llm_review_fallback"] = stats.get("llm_review_fallback", 0) + 1
+                if not passed_review:
+                    stats["llm_rejected"] += 1  # 兼容旧统计：表示风险标记，不是硬拒绝
+                stats.setdefault("llm_flags", []).append({"sexpr": sexpr[:120],
+                                                            "passed": passed_review,
+                                                            "reason": reason})
 
             library.record_tested(h, sexpr[:60], "loopengine", "loopengine", end,
                                   result["pass"], result["metrics"].get("事件IC"),

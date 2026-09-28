@@ -9,9 +9,14 @@ import pandas as pd
 import experience
 import broker
 import datasource
+import trading_calendar
 
 class Tests(unittest.TestCase):
     def setUp(self):
+        p = patch.object(trading_calendar, 'calendar_data', return_value=(
+            {'2026-09-23'}, [('2026-09-01','2026-09-30')]))
+        p.start()
+        self.addCleanup(p.stop)
         with experience._conn() as c:
             c.executescript(experience._NAV_SCHEMA)
             c.execute('DELETE FROM account_nav_daily')
@@ -39,5 +44,35 @@ class Tests(unittest.TestCase):
             self.assertEqual(experience.rebuild_nav_history(), 1)
         with experience._conn() as c:
             self.assertEqual(c.execute('SELECT total_assets,cash,position_mv FROM account_nav_daily').fetchone(), (99.,90.,9.))
+
+    def test_non_session_deposit_and_historical_fill_are_not_lost(self):
+        fills = pd.concat([self.fills, pd.DataFrame([dict(date='2026-09-25',ts='2026-09-25 10:00:00',
+            code='SZ002709',side='sell',amount=9.,fee=1.,tax=0.,shares=1)])], ignore_index=True)
+        flows = pd.concat([self.flows, pd.DataFrame([dict(ts='2026-09-25 09:00:00',type='入金',amount=50.)])],ignore_index=True)
+        prices = pd.DataFrame([dict(code='SZ002709',date=d,close=9.) for d in ['2026-09-23','2026-09-28']])
+        from datetime import datetime
+        class ClosedTime(datetime):
+            @classmethod
+            def now(cls): return cls(2026,9,28,16)
+        with patch.object(experience,'datetime',ClosedTime), patch.object(trading_calendar,'calendar_data',return_value=(
+                {'2026-09-23','2026-09-28'},[('2026-09-01','2026-09-30')])), \
+                patch.object(broker,'_conn',return_value=MagicMock()), patch.object(datasource,'_conn',return_value=MagicMock()), \
+                patch.object(experience.pd,'read_sql',side_effect=[fills,flows,prices]):
+            self.assertEqual(experience.rebuild_nav_history(),2)
+        with experience._conn() as c:
+            rows = c.execute('SELECT date,total_assets,cash,position_mv,daily_ret FROM account_nav_daily ORDER BY date').fetchall()
+        self.assertEqual(rows[-1][:4],('2026-09-28',148.,148.,0.))
+        self.assertAlmostEqual(rows[-1][4],-1/99,places=6)
+
+    def test_missing_held_price_on_calendar_session_preserves_original(self):
+        prices = pd.DataFrame([dict(code='SZ002709',date=d,close=9.) for d in ['2026-09-23','2026-09-25']])
+        with patch.object(trading_calendar,'calendar_data',return_value=(
+                {'2026-09-23','2026-09-24'},[('2026-09-01','2026-09-30')])), \
+                patch.object(broker,'_conn',return_value=MagicMock()), patch.object(datasource,'_conn',return_value=MagicMock()), \
+                patch.object(experience.pd,'read_sql',side_effect=[self.fills,self.flows,prices]):
+            with self.assertRaisesRegex(ValueError,'缺少有效价格'):
+                experience.rebuild_nav_history()
+        with experience._conn() as c:
+            self.assertEqual(c.execute('SELECT date,total_assets FROM account_nav_daily').fetchall(),[('2026-09-23',100.)])
 
 if __name__ == '__main__': unittest.main()

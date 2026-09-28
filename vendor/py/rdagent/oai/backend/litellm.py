@@ -99,7 +99,7 @@ class LiteLLMAPIBackend(APIBackend):
         # Call LiteLLM completion
         model = LITELLM_SETTINGS.chat_model
         temperature = LITELLM_SETTINGS.chat_temperature
-        max_tokens = LITELLM_SETTINGS.chat_max_tokens
+        max_tokens = LITELLM_SETTINGS.chat_max_tokens or 2048
         reasoning_effort = LITELLM_SETTINGS.reasoning_effort
 
         if LITELLM_SETTINGS.chat_model_map:
@@ -119,11 +119,27 @@ class LiteLLMAPIBackend(APIBackend):
         return self.CompleteKwargs(
             model=model,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=min(max_tokens or 2048, 2048),
             reasoning_effort=reasoning_effort,
         )
 
-    def _create_chat_completion_inner_function(  # type: ignore[no-untyped-def] # noqa: C901, PLR0912, PLR0915
+    def _create_chat_completion_inner_function(self, messages, **kwargs):
+        from rdagent.oai import cost_control
+        options=self.get_complete_kwargs()
+        model=options['model']
+        identifier=cost_control.reserve(model,token_counter(model=model,messages=messages),options['max_tokens'])
+        if 'flash' in model.lower():
+            kwargs.setdefault('extra_body', {'thinking': {'type': 'disabled'}})
+        try:
+            content,finish_reason=self._create_chat_completion_guarded_body(messages,**kwargs)
+        except Exception as exc:
+            if cost_control.finish(identifier,model,error=exc):
+                raise cost_control.CostLimitError('RD-Agent 模型权限错误，已熔断24小时，未重试') from exc
+            raise
+        cost_control.finish(identifier,model,output_tokens=token_counter(model=model,text=content))
+        return content,finish_reason
+
+    def _create_chat_completion_guarded_body(  # type: ignore[no-untyped-def] # noqa: C901, PLR0912, PLR0915
         self,
         messages: list[dict[str, Any]],
         response_format: Optional[Union[dict, Type[BaseModel]]] = None,

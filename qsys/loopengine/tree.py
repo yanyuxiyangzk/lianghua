@@ -264,6 +264,21 @@ def build_field_frames(panel, extra_frames: dict | None = None):
     return frames
 
 
+def required_observations(tree):
+    """Conservative warmup rows; nested windows accumulate along each branch."""
+    if isinstance(tree, Leaf):
+        return 2 if tree.field in {"overnight", "amplitude", "upper_shadow", "lower_shadow"} else 1
+    child = max(required_observations(c) for c in tree.children)
+    if tree.window is None:
+        return child
+    window = int(tree.window)
+    if window < 1:
+        raise ValueError("因子窗口必须为正数")
+    # EMA has no finite exact warmup; retain five spans conservatively.
+    extra = 5 * window if tree.op == "ema" else window if tree.op in {"delta", "roc"} else window - 1
+    return child + extra
+
+
 def evaluate_tree(tree, frames):
     """返回因子值 DataFrame（datetime×instrument）。"""
     def ev(t):

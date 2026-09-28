@@ -173,7 +173,7 @@ if plan:
     rows = pd.DataFrame(plan.get("positions") or [])
     if not rows.empty:
         st.dataframe(rows, hide_index=True, width="stretch")
-    st.warning("这是影子计划，仅用于验证账户级风控，不会自动提交卖单。")
+    st.info("这是风险建议。自动模式启用后，后台会按最新数据重新计算并执行；具体委托和成交结果请查看资金账号的“账户超限检查与降仓执行”。")
 
     advice = experience.latest_risk_llm_advice()
     st.markdown("##### LLM 风控参考")

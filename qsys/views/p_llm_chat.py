@@ -16,7 +16,7 @@ import common
 import datasource
 import density_sr
 import experience
-from llmutil import llm_chat_multi, llm_available
+from llmutil import llm_chat_multi, llm_available, llm_failure_reason
 
 
 # ---------------------------------------------------------------- 涨停检测
@@ -318,7 +318,7 @@ def _send(question: str, code: str | None):
         with st.spinner("DeepSeek v4-pro 思考中…"):
             reply = llm_chat_multi(msgs, max_tokens=1200, label="chat_general")
         if not reply:
-            reply = "⚠️ LLM 暂不可用或思考超长，请稍后重试。"
+            reply = "⚠️ " + llm_failure_reason()
         hist.append({"role": "user", "content": question})
         hist.append({"role": "assistant", "content": reply})
         st.session_state[hist_key] = hist
@@ -353,7 +353,7 @@ def _send(question: str, code: str | None):
     with st.spinner("DeepSeek v4-pro 思考中…（推理模型，约 5-15 秒）"):
         reply = llm_chat_multi(msgs, max_tokens=1600, label="chat_stock")
     if not reply:  # None（异常）或空串（推理把配额想完了）都按失败提示
-        reply = "⚠️ LLM 暂不可用或思考超长（检查 DEEPSEEK_API_KEY / 网络），请稍后重试。"
+        reply = "⚠️ " + llm_failure_reason()
     hist.append({"role": "user", "content": question})
     hist.append({"role": "assistant", "content": reply})
     st.session_state[hist_key] = hist

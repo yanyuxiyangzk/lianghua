@@ -76,7 +76,18 @@ class GateTests(unittest.TestCase):
         self.addCleanup(c.close)
         c.execute('CREATE TABLE positions(id INTEGER,pack_name TEXT,source TEXT,code TEXT,status TEXT,buy_date TEXT)')
         c.execute("INSERT INTO positions VALUES(1,'p','satellite_scan','SZ002709','pending','2026-09-23')")
+        from selection_policy import SELECTION_POLICY
+        c.execute('ALTER TABLE positions ADD COLUMN pick_id INTEGER')
+        c.execute('UPDATE positions SET pick_id=1')
+        c.execute('CREATE TABLE picks(id INTEGER, trade_date TEXT)')
+        c.execute("INSERT INTO picks VALUES(1,'2026-09-22')")
+        c.execute('CREATE TABLE pick_decision_evidence(pick_id INTEGER,risk_json TEXT)')
+        c.execute('INSERT INTO pick_decision_evidence VALUES(1,?)',
+                  (json.dumps(dict(strategy_version=strategy_version(self.pack), selection_policy=SELECTION_POLICY)),))
         with patch.dict(sys.modules, {'library':types.SimpleNamespace(list_strategies=lambda:{'p':self.pack})}), \
+             patch('strategy_progress.latest_reports',return_value={}), \
+             patch('strategy_progress.research_reason',return_value=''), \
+             patch('selection_policy.signal_date_rejection',return_value=''), \
              patch('loopengine.regime.detect_regime',return_value={'regime':'bull'}), \
              patch.object(Path,'read_text',return_value=json.dumps({'p':self.approval})), \
              patch('selection_gate.evaluate_candidate',return_value=types.SimpleNamespace(status='reject',reason='quote stale')) as evaluate:

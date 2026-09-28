@@ -26,7 +26,7 @@ class TradeDisplayTests(unittest.TestCase):
     def test_new_sources_preserved(self):
         new = pd.DataFrame({"signal_source": ["satellite_scan", None],
                             "strategy_name": ["事件卫星", None]})
-        pd.testing.assert_frame_equal(with_signal_columns(new), new)
+        pd.testing.assert_frame_equal(with_signal_columns(new)[new.columns], new)
 
     def test_partial_and_empty_formats(self):
         partial = pd.DataFrame({"signal_source": ["satellite_scan"]})
@@ -35,7 +35,8 @@ class TradeDisplayTests(unittest.TestCase):
         self.assertTrue(pd.isna(result.iloc[0]["strategy_name"]))
         empty = with_signal_columns(pd.DataFrame())
         self.assertTrue(empty.empty)
-        self.assertEqual(list(empty.columns), ["signal_source", "strategy_name"])
+        self.assertTrue({'signal_source','strategy_name','attribution_status','strategy_version'}.issubset(empty.columns))
+        self.assertEqual(result.iloc[0]['attribution_status'],'历史来源未完整记录')
 
 
 if __name__ == "__main__":

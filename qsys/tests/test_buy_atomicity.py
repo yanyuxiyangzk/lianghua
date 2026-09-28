@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import broker
 import experience
 import execution_gate
+import library
 _REAL_RISK_HALT = experience.risk_halt_today
 
 
@@ -29,14 +30,17 @@ class AtomicBuyTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         path = Path(self.tmp.name) / 'experience.db'
         patches = [patch.object(broker, 'DB_PATH', path),
+                   patch.object(library, 'list_strategies', lambda: {'fixture': {'factors':[{'name':'test','expr':'$close'}]},
+                                                                  '事件卫星测试': {'factors':[{'name':'test','expr':'$close'}]}}),
                    patch.object(execution_gate, 'position_rejection', lambda *args: ''),
                    patch.object(experience, 'DB_PATH', path),
                    patch.object(broker, 'datetime', TradingTime),
+                   patch.object(broker, 'day_status', lambda _: True),
                    patch.object(broker, '_quote_fresh', lambda _: True),
                    patch.object(experience, 'satellite_halt_today', lambda _: (False, '')),
                    patch.object(experience, '_RISK_FLAG', Path(self.tmp.name) / 'risk.json'),
                    patch.object(broker, 'get_name', lambda code: code),
-                   patch.object(broker, '_latest_prices', lambda codes: {c: (10., 10., 10., 11., 9.) for c in codes}),
+                   patch.object(broker, '_latest_prices', lambda codes: {c: (10., 10., 10., 11., 9., '2026-09-23 10:00:00') for c in codes}),
                    patch.object(experience, 'risk_halt_today', lambda _: (False, ''))]
         for p in patches:
             p.start()
@@ -49,7 +53,7 @@ class AtomicBuyTests(unittest.TestCase):
 
     def pending(self, code, source='sched_pool_scan'):
         with experience._conn() as c:
-            return c.execute("INSERT INTO positions(code,buy_date,source,status,limit_price) VALUES (?, '2026-09-23',?,'pending',11)", (code, source)).lastrowid
+            return c.execute("INSERT INTO positions(code,buy_date,source,status,limit_price,pack_name) VALUES (?, '2026-09-23',?,'pending',11,'fixture')", (code, source)).lastrowid
 
     def counts(self):
         with broker._conn() as c:
@@ -304,7 +308,7 @@ class AtomicBuyTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location('broker_time_test', broker.__file__)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        with patch.object(module,'datetime',TradingTime):
+        with patch.object(module,'datetime',TradingTime), patch.object(module,'day_status',return_value=True):
             for ts,expected in [('2026-09-23 09:59:30',True),('2026-09-22 10:00:00',False),('2026-09-23 09:00:00',False),('2026-09-23 10:10:00',False)]:
                 with patch.object(experience,'_latest_price_times',lambda codes:{c:ts for c in codes}):
                     self.assertEqual(module._quote_fresh('SZ002709'),expected)
@@ -373,7 +377,7 @@ class AtomicBuyTests(unittest.TestCase):
 
     def test_daily_pnl_uses_actual_intraday_buy_price_and_fee(self):
         self.assertIn('已成交',broker.buy_position(self.pid,100))
-        with patch.object(broker,'_latest_prices',lambda codes:{c:(9.,12.,10.,13.,8.) for c in codes}):
+        with patch.object(broker,'_latest_prices',lambda codes:{c:(9.,12.,10.,13.,8.,'2026-09-23 10:00:00') for c in codes}):
             self.assertAlmostEqual(broker.get_account()['今日盈亏'],-105.)
             self.assertAlmostEqual(broker.get_positions().iloc[0]['今日盈亏'],-105.)
 
@@ -388,7 +392,7 @@ class AtomicBuyTests(unittest.TestCase):
         self.make_sellable()
         with broker._conn() as c:
             c.execute("UPDATE broker_fills SET date='2026-09-22'")
-        with patch.object(broker,'_latest_prices',lambda codes:{c:(9.,10.,10.,11.,8.) for c in codes}):
+        with patch.object(broker,'_latest_prices',lambda codes:{c:(9.,10.,10.,11.,8.,'2026-09-23 10:00:00') for c in codes}):
             self.assertIn('已成交',broker.sell_position(self.pid,100))
             self.assertAlmostEqual(broker.get_account()['今日盈亏'],-205.45)
 

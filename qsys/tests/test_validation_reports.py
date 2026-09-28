@@ -39,7 +39,7 @@ class ReportTests(unittest.TestCase):
 
     def test_exception_is_persisted(self):
         with patch.object(library, 'list_strategies', return_value={'s': self.pack}), \
-             patch.object(scheduler, 'get_last_trade_day', return_value='2026-09-24'), \
+             patch('selection_policy.completed_signal_day', return_value='2026-09-24'), \
              patch.object(scheduler, '_compute_strategy_validation', side_effect=ValueError('missing price')):
             result = scheduler.revalidate_strategy('s')
         self.assertFalse(result['ok'])
@@ -51,7 +51,7 @@ class ReportTests(unittest.TestCase):
     def test_version_drift_archives_without_publishing(self):
         changed = {**self.pack, 'pool_name': 'other'}
         with patch.object(library, 'list_strategies', side_effect=[{'s': self.pack}, {'s': changed}]), \
-             patch.object(scheduler, 'get_last_trade_day', return_value='2026-09-24'), \
+             patch('selection_policy.completed_signal_day', return_value='2026-09-24'), \
              patch.object(scheduler, '_compute_strategy_validation', side_effect=ValueError('missing')):
             result = scheduler.revalidate_strategy('s')
         self.assertEqual(result['assessment_status'], 'stale_version')
@@ -128,7 +128,7 @@ class ReportTests(unittest.TestCase):
     def test_deadline_archives_and_preserves_old_status(self):
         import time
         with patch.object(library, 'list_strategies', return_value={'s': self.pack}), \
-             patch.object(scheduler, 'get_last_trade_day', return_value='2026-09-24'), \
+             patch('selection_policy.completed_signal_day', return_value='2026-09-24'), \
              patch.object(scheduler, '_compute_strategy_validation', side_effect=lambda *args: time.sleep(.2)):
             result = scheduler.revalidate_strategy('s', timeout_seconds=.02)
         self.assertEqual(result['assessment_status'], 'timeout')

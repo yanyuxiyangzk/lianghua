@@ -521,18 +521,25 @@ def _render_stock_detail(code: str):
     page_key = f"daily_{code}"
     page, pages, start_idx = _page_slice(len(daily), page_key, page_size)
     part = daily.iloc[start_idx:start_idx + page_size]
+    from stock_history_display import confirmed_suspensions, daily_value
+    suspended_days = confirmed_suspensions(code, part)
+    st.caption('空行情显示说明：已由独立历史状态确认停牌的空值显示“停牌”，其他空值显示“缺失”；仅修改页面显示，不填充原始行情。')
     headers = st.columns([1.0, 0.7, 0.7, 0.7, 0.7, .9, 1.05, .85, 1.45])
     for col, label in zip(headers, ["日期", "开盘", "最高", "最低", "收盘",
                                     "成交量", "成交额", "分钟状态", "操作"]):
         col.markdown(f"**{label}**")
     for row in part.itertuples(index=False):
         cols = st.columns([1.0, 0.7, 0.7, 0.7, 0.7, .9, 1.05, .85, 1.45])
-        vals = [row.date, row.open, row.high, row.low, row.close,
-                f"{float(row.volume or 0):,.0f}", f"{float(row.amount or 0):,.0f}"]
+        suspended = str(row.date) in suspended_days
+        vals = [row.date] + [daily_value(value, suspended=suspended) for value in
+                            (row.open, row.high, row.low, row.close)] + [
+            daily_value(value, suspended=suspended, integer=True) for value in (row.volume, row.amount)]
         for col, value in zip(cols[:7], vals):
             col.write(value)
         minute_count = int(count_map.get(str(row.date), 0))
-        if minute_count >= 200:
+        if suspended:
+            cols[7].caption('停牌，无需同步')
+        elif minute_count >= 200:
             cols[7].success(f"已同步 {minute_count}")
         elif minute_count > 0:
             cols[7].warning(f"不完整 {minute_count}")
@@ -541,7 +548,7 @@ def _render_stock_detail(code: str):
         with cols[8]:
             sync_col, detail_col = st.columns(2)
             if sync_col.button("同步分钟", key=f"day_sync_{code}_{row.date}",
-                               disabled=minute_count >= 200,
+                               disabled=suspended or minute_count >= 200,
                                use_container_width=True,
                                help="从同花顺抓取该交易日的1分钟历史并写入本地库"):
                 try:

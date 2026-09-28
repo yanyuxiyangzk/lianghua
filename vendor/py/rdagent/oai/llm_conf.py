@@ -40,8 +40,8 @@ class LLMSettings(ExtendedBaseSettings):
     managed_identity_client_id: str | None = None
     max_retry: int = 10
     retry_wait_seconds: int = 1
-    dump_chat_cache: bool = False
-    use_chat_cache: bool = False
+    dump_chat_cache: bool = True
+    use_chat_cache: bool = True
     dump_embedding_cache: bool = False
     use_embedding_cache: bool = False
     prompt_cache_path: str = str(Path.cwd() / "prompt_cache.db")

@@ -42,7 +42,11 @@ def _stock_inventory() -> pd.DataFrame:
                        MAX(substr(datetime,1,10)) AS minute_end
                 FROM ifind_minute GROUP BY code
             ), codes AS (
-                SELECT DISTINCT code FROM stock_history_jobs_v2
+                SELECT code FROM daily
+                UNION
+                SELECT DISTINCT code FROM minute
+                UNION
+                SELECT code FROM stock_history_jobs_v2
                 WHERE status <> 'deleted' AND row_count > 0
             )
             SELECT codes.code, COALESCE(s.name,'') AS name,

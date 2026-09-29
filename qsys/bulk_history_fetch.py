@@ -41,6 +41,25 @@ def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _record_stock_job(code: str, data_type: str, start: str, end: str,
+                      count: int, status: str = "success", completeness: dict | None = None):
+    """写 stock_history_jobs_v2（与页面 _record_job 同口径）——单股票历史数据页的
+    列表/分钟完整性跟踪依赖这张表，批量抓取必须同步登记。"""
+    comp = completeness or {}
+    try:
+        stock_id = datasource.get_or_create_stock_id(code)
+        with datasource._conn() as c:
+            c.execute(
+                "INSERT OR REPLACE INTO stock_history_jobs_v2"
+                "(stock_id,code,source,data_type,start_date,end_date,row_count,expected_days,"
+                "complete_days,missing_days,last_fetched_at,status,error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (stock_id, code, "ths_ifind", data_type, start, end, int(count),
+                 int(comp.get("expected_days", 0)), int(comp.get("complete_days", 0)),
+                 int(comp.get("missing_count", 0)), _now(), status, None))
+    except Exception:
+        pass  # 登记失败不拖垮抓取
+
+
 def _progress_conn():
     c = datasource._conn()
     c.executescript(PROGRESS_SCHEMA)
@@ -141,9 +160,13 @@ def run_daily(start: str, end: str, pause: float = 0.3) -> dict:
     codes = non_st_codes()
     todo = pending_daily(codes, start, end)
     print(f"[日线] 非ST {len(codes)} 只 · 需补 {len(todo)} 只", flush=True)
-    return _run("daily", todo, start, end, pause,
-                lambda code: f"{datasource._ths_fetch_daily(code, start, end)} 行",
-                "日线")
+
+    def _one(code: str) -> str:
+        n = datasource._ths_fetch_daily(code, start, end)
+        _record_stock_job(code, "daily", start, end, n)
+        return f"{n} 行"
+
+    return _run("daily", todo, start, end, pause, _one, "日线")
 
 
 def run_minute(start: str, end: str, pause: float = 1.5, start_from: str = "") -> dict:
@@ -155,6 +178,11 @@ def run_minute(start: str, end: str, pause: float = 1.5, start_from: str = "") -
 
     def _one(code: str) -> str:
         r = datasource.fetch_minute_period_to_db(code, start, end)
+        _record_stock_job(code, "minute_1m", start, end, r["written"],
+                          status="success" if r["complete_days"] == r["days"] else "partial",
+                          completeness={"expected_days": r["days"],
+                                        "complete_days": r["complete_days"],
+                                        "missing_count": r["days"] - r["complete_days"]})
         return f"{r['written']}行 {r['complete_days']}/{r['days']}天"
 
     return _run("minute", todo, start, end, pause, _one, "分钟线")

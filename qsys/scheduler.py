@@ -2579,7 +2579,7 @@ def revalidate_strategy(name: str, timeout_seconds: float | None = None, *, isol
     result["stage_events"] = trace.events
     if not result.get("ok"):
         result.update(name=name, eval_date=end, pool_name=pk.get("pool_name"),
-                      method=pk.get("method"), status="degraded",
+                      method=pk.get("method"),
                       assessment_status=("data_insufficient" if result.get("error_type") == "BenchmarkDataError" else "compute_failed"),
                       strategy_snapshot=pk, policy_version=POLICY_VERSION)
         result.update(window_contract())
@@ -2589,6 +2589,13 @@ def revalidate_strategy(name: str, timeout_seconds: float | None = None, *, isol
         result.update(assessment_status="timeout", strategy_version=strategy_version(pk))
         saved = library.save_strategy_validation(name, result, publish=False)
         trace.emit('run', 'timeout_archived', report_id=saved['report_id'])
+        return saved
+    if not result.get("ok"):
+        # 数据缺口/计算异常是证据缺失，不是策略退化证据（BenchmarkDataError  docstring
+        # 原意）：只归档供排查，不改变包状态——瞬时故障不得把包打成 degraded。
+        saved = library.save_strategy_validation(name, result, publish=False)
+        trace.emit('run', 'failure_archived_unpublished', report_id=saved['report_id'],
+                   assessment_status=result.get('assessment_status'))
         return saved
     # Detect definition drift before publishing evidence for the captured pack.
     latest = library.list_strategies().get(name)
@@ -2614,6 +2621,11 @@ def _compute_strategy_validation(name: str, pk: dict, end: str) -> dict:
         codes = all_pools().get(pool_name)
     if not codes:
         raise ValueError("策略股票池为空，禁止回退到其他股票池")
+    if pk.get("risk_class") == "event":
+        # 事件类包走专用评估合同（涨停接力：T+1开盘买/1-2日出场），
+        # 不适用主轨 5 日前瞻 walk-forward 尺子。
+        from event_eval import event_relay_eval
+        return event_relay_eval(name, pk, codes, end)
     with stage("market_panel"):
         panel = sig.get_panel_cached(codes, end, 800, source=datasource.get_loop_source())
     from research_backtest import suspension_valuations
@@ -2745,7 +2757,10 @@ def job_strategy_review_batch(max_strategies=2, timeout_seconds=90):
 
 
 def job_strategy_revalidate(pool_name: str = "沪深300") -> str:
-    """每周重验所有策略包的 OOS 表现，淘汰退化包。"""
+    """每周重验所有策略包的 OOS 表现，淘汰退化包。
+
+    事件类包（event_relay_v1 合同）需逐日回放涨停候选，耗时高于标准 walk-forward，
+    超时给 600s（周日凌晨无资源竞争）。"""
     import library
     results = []
     errors = 0
@@ -2754,7 +2769,7 @@ def job_strategy_revalidate(pool_name: str = "沪深300") -> str:
         if pack.get('pool_name') != pool_name or pack.get('status') in ('paused', 'retired', 'archived'):
             continue
         try:
-            r = run_bounded(name, timeout_seconds=180)
+            r = run_bounded(name, timeout_seconds=600)
             if r.get("ok"):
                 results.append(f"{name}: {r['status']} OOS {r['oos_winrate']:.0%}")
             else:
@@ -2868,6 +2883,52 @@ def job_satellite_close(**_ignored) -> str:
     close_msg = experience.satellite_close_check(today)
     nav_msg = experience.satellite_nav_update(today)
     return f"{close_msg} | {nav_msg}"
+
+
+def job_limit_up_events(**_ignored) -> str:
+    """涨停事件与打板情绪加工（盘后 19:05，卫星扫描前）：
+
+    对当日触板股补采盘口快照（封单金额来源），再落库 limit_up_events（封板
+    时间/开板次数/封单/连板）与 limit_up_sentiment（炸板率/最高板/打板指数）。
+    分钟线/快照被保留策略清理后事件档案仍然完整。
+    """
+    if not _satellite_trading_day():
+        return "涨停事件：非交易日，跳过"
+    import limit_up_events as lue
+    today = get_last_trade_day()
+    prep = lue.prepare_orderbook(today)
+    ev = lue.build_events(today)
+    sent = lue.build_sentiment(today)
+    return (f"{today} 涨停事件：触板 {ev['events']} · 封板 {ev['sealed']}"
+            f"（盘口补采 {prep['fetched']} 只/跳过 {prep['skipped']}/失败 {prep['failed']}）"
+            f" · 情绪：炸板率 {sent['炸板率']} 最高板 {sent['最高板']} 打板指数 {sent['打板指数']}")
+
+
+def job_intraday_limit_watch(slot: str = "0945", **_ignored) -> str:
+    """盘中涨停预警影子扫描（09:45/10:15）：只记录候选，不下单。
+
+    命中率攒 2-4 周后再评估是否接入选股系统（0-2 只/日，事件轨风控）。"""
+    if not _satellite_trading_day():
+        return "盘中涨停预警：非交易日，跳过"
+    import intraday_limit_watch as ilw
+    r = ilw.scan(slot=slot)
+    return (f"盘中涨停预警[{slot}]：命中 {r['hits']} 只"
+            f"（快照 {r.get('snapshot_time', '无')}）· 只记录不下单")
+
+
+def job_intraday_limit_settle(**_ignored) -> str:
+    """盘中涨停预警 EOD 结算（19:20，涨停事件加工之后）。"""
+    if not _satellite_trading_day():
+        return "盘中涨停预警结算：非交易日，跳过"
+    import intraday_limit_watch as ilw
+    today = get_last_trade_day()
+    r = ilw.settle(today)
+    rep = ilw.watch_report(20)
+    head = f"{today} 预警结算：{r['settled']} 条"
+    if rep.get("样本"):
+        head += (f" · 近20日影子战绩：样本{rep['样本']} 封板率{rep['封板命中率']:.0%}"
+                 f" alert→收盘{rep.get('alert→收盘平均') or 0:+.2%}")
+    return head
 
 
 def job_probability_shadow_update(max_codes: int = 30, top_n: int = 10,
@@ -3240,7 +3301,7 @@ JOBS = {
                                  "params": {"pool_name": "沪深300", "top_n": 10, "max_packs": 3}}},
     "strategy_review_batch": {"name": "固定策略分批重验", "func": job_strategy_review_batch,
                               "default": {"enabled": True, "hour": 17, "minute": 55,
-                                          "params": {"max_strategies": 2, "timeout_seconds": 90}}},
+                                          "params": {"max_strategies": 2, "timeout_seconds": 300}}},
     "strategy_revalidate": {"name": "♻️ 策略包重验（每周）", "func": job_strategy_revalidate,
                              "default": {"enabled": True, "hour": 3, "minute": 0,
                                          "params": {"pool_name": "沪深300"},
@@ -3248,6 +3309,20 @@ JOBS = {
     "satellite_scan": {"name": "🎲 卫星轨选股（独立）", "func": job_satellite_scan,
                        "default": {"enabled": True, "hour": 19, "minute": 10,
                                    "params": {"pool_name": "沪深300", "top_n": 5}}},
+    "limit_up_events": {"name": "🚀 涨停事件与打板情绪加工", "func": job_limit_up_events,
+                        "default": {"enabled": True, "hour": 19, "minute": 5, "params": {}}},
+    "intraday_limit_watch_0945": {"name": "⚡ 盘中涨停预警（影子·09:45）",
+                                  "func": job_intraday_limit_watch,
+                                  "default": {"enabled": True, "hour": 9, "minute": 45,
+                                              "params": {"slot": "0945"}}},
+    "intraday_limit_watch_1015": {"name": "⚡ 盘中涨停预警（影子·10:15）",
+                                  "func": job_intraday_limit_watch,
+                                  "default": {"enabled": True, "hour": 10, "minute": 15,
+                                              "params": {"slot": "1015"}}},
+    "intraday_limit_settle": {"name": "⚡ 盘中涨停预警结算（EOD）",
+                              "func": job_intraday_limit_settle,
+                              "default": {"enabled": True, "hour": 19, "minute": 20,
+                                          "params": {}}},
     "satellite_fill": {"name": "🎲 卫星轨盘中撮合", "func": job_satellite_fill,
                        "default": {"enabled": False, "hour": 9, "minute": 30,
                                    "params": {"interval_sec": 300},

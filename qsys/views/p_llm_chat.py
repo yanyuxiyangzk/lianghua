@@ -46,7 +46,11 @@ def _today_limit_ups() -> pd.DataFrame:
 
 
 def _limit_streak(code: str) -> int:
-    """截至最新日的连续涨停天数（market_daily 日线口径）。"""
+    """截至最新日的连续涨停天数（market_daily 日线口径）。
+
+    收盘价为空的行（停牌占位，如 2026-09-28 有 725 行）视为断链：
+    空值既无法判定涨停也不能跳过（跳过会把缺口两侧错误续上）。
+    """
     with datasource._conn() as c:
         rows = c.execute(
             "SELECT date, close, open FROM market_daily WHERE source='ths_ifind' AND code=? "
@@ -57,7 +61,10 @@ def _limit_streak(code: str) -> int:
     streak = 0
     closes = [(r[0], r[1]) for r in rows]
     for i in range(len(closes) - 1):
-        chg = (closes[i][1] / closes[i + 1][1] - 1) * 100 if closes[i + 1][1] else 0
+        cur, prev = closes[i][1], closes[i + 1][1]
+        if not cur or not prev or prev <= 0:
+            break
+        chg = (cur / prev - 1) * 100
         if chg >= thr - 0.15:
             streak += 1
         else:
@@ -95,8 +102,15 @@ def _build_context(code: str) -> tuple[str, dict]:
         last = bars.iloc[-1]
         # 开板判定看最低价是否跌破当日最高（涨停价）：close==high 但 low 远低于 high
         # = 盘中开过板后回封（通鼎互联 09-15 正是如此，原来只看 close<high 误判成一字）
-        open_board = "否（一字/封死）" if last["low"] >= last["high"] * 0.9999 else "是（盘中开过板）"
-        chg5 = (bars["close"].iloc[-1] / bars["close"].iloc[-6] - 1) * 100 if len(bars) >= 6 else None
+        if pd.notna(last["low"]) and pd.notna(last["high"]):
+            open_board = "否（一字/封死）" if last["low"] >= last["high"] * 0.9999 else "是（盘中开过板）"
+        else:
+            open_board = "数据缺失"
+        chg5 = None
+        if len(bars) >= 6:
+            c0, c1 = bars["close"].iloc[-6], bars["close"].iloc[-1]
+            if pd.notna(c0) and pd.notna(c1) and c0 > 0:
+                chg5 = (c1 / c0 - 1) * 100
         S.append(f"【连板】近10日第{streak}板 · 今日是否开板：{open_board}"
                  + (f" · 近5日涨幅 {chg5:+.1f}%" if chg5 is not None else "（本地日线数据不足5日）"))
 

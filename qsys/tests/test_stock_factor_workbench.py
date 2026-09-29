@@ -65,6 +65,54 @@ else:
             self.assertFalse(app.exception)
             self.assertEqual(app.session_state['stock_history_view'],view)
             self.assertEqual(app.session_state['stock_history_code'],'SH600664')
+    def test_minute_sync_button_starts_task_without_navigation(self):
+        from streamlit.testing.v1 import AppTest
+        import ast
+        source=Path('/app/views/p_stock_history.py').read_text()
+        module=ast.parse(source)
+        names=('_go','_render_stock_rows','_start_minute_sync_from_row',
+               '_render_row_sync_progress','_render_minute_sync_progress')
+        functions='\n\n'.join(ast.get_source_segment(source,n) for n in module.body if isinstance(n,ast.FunctionDef) and n.name in names)
+        app_source='import streamlit as st\nimport pandas as pd\nimport datasource\n'+functions+'''
+if st.session_state.get('stock_history_view','list')=='list':
+    _render_stock_rows(pd.DataFrame([dict(code='SH600664',name='fixture',daily_days=180,daily_start='2025-01-01',daily_end='2025-09-01',minute_days=1,minute_rows=200,minute_start='2025-05-01',minute_end='2025-05-01')]))
+else:
+    st.write(st.session_state['stock_history_view'])
+'''
+        started=[]
+        running={'status':'running','total_days':10,'synced_days':1,'skipped_days':0,
+                 'failed_days':0,'current_date':'2025-05-01','worker_alive':True,'last_error':None}
+        with patch.object(datasource,'expected_trade_days',return_value=['2025-05-01','2025-05-02']), \
+             patch.object(datasource,'start_minute_sync_task',side_effect=lambda code,days:started.append((code,list(days))) or {'started':True}), \
+             patch.object(datasource,'minute_sync_task_status',return_value=running):
+            app=AppTest.from_string(app_source).run()
+            self.assertFalse(app.exception)
+            next(b for b in app.button if b.label=='同步分钟').click().run()
+            self.assertFalse(app.exception)
+        self.assertEqual(started,[('SH600664',['2025-05-01','2025-05-02'])])
+        self.assertIn('SH600664',app.session_state['stock_history_sync_codes'])
+        self.assertNotIn('stock_history_view',app.session_state)  # 不跳转
+        self.assertTrue(any('每5秒自动刷新' in (c.value or '') for c in app.caption))
+    def test_minute_sync_button_skips_when_already_complete(self):
+        from streamlit.testing.v1 import AppTest
+        import ast
+        source=Path('/app/views/p_stock_history.py').read_text()
+        module=ast.parse(source)
+        names=('_go','_render_stock_rows','_start_minute_sync_from_row',
+               '_render_row_sync_progress','_render_minute_sync_progress')
+        functions='\n\n'.join(ast.get_source_segment(source,n) for n in module.body if isinstance(n,ast.FunctionDef) and n.name in names)
+        app_source='import streamlit as st\nimport pandas as pd\nimport datasource\n'+functions+'''
+_render_stock_rows(pd.DataFrame([dict(code='SH600664',name='fixture',daily_days=180,daily_start='2025-01-01',daily_end='2025-09-01',minute_days=1,minute_rows=200,minute_start='2025-05-01',minute_end='2025-05-01')]))
+flash=st.session_state.pop('stock_history_list_flash',None)
+if flash: st.write(flash[0]+':'+flash[1])
+'''
+        with patch.object(datasource,'expected_trade_days',return_value=['2025-05-01']), \
+             patch.object(datasource,'start_minute_sync_task',return_value={'started':False,'already_complete':True}):
+            app=AppTest.from_string(app_source).run()
+            next(b for b in app.button if b.label=='同步分钟').click().run()
+            self.assertFalse(app.exception)
+        self.assertNotIn('stock_history_sync_codes',app.session_state)
+        self.assertTrue(any('已完整' in (x.value or '') for x in app.markdown))
     def test_mining_progress_finishes_only_after_save(self):
         events=[]
         result=w.mine('SH600664','2025-01-01','2025-12-01',progress=lambda p,m:events.append((p,m)))

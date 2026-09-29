@@ -247,6 +247,57 @@ def _pagination_bottom(total: int, key: str, current: int,
         st.rerun()
 
 
+def _start_minute_sync_from_row(code: str, daily_start, daily_end):
+    """列表行内启动分钟同步：不跳转页面，进度显示在该行下方。"""
+    if not daily_start or not daily_end:
+        st.session_state["stock_history_list_flash"] = (
+            "error", f"{code} 缺少日线范围，无法确定交易日，请先补抓日线。")
+        return
+    try:
+        days = datasource.expected_trade_days(str(daily_start), str(daily_end))
+        result = datasource.start_minute_sync_task(code, days)
+    except Exception as exc:
+        st.session_state["stock_history_list_flash"] = (
+            "error", f"{code} 分钟同步启动失败：{exc}")
+        return
+    if result.get("already_complete"):
+        st.session_state["stock_history_list_flash"] = (
+            "success", f"{code} 分钟数据已完整，无需同步。")
+        return
+    if not result.get("started"):
+        st.session_state["stock_history_list_flash"] = (
+            "info", f"{code} 分钟同步任务已在运行中。")
+    sync_codes = set(st.session_state.get("stock_history_sync_codes") or [])
+    sync_codes.add(code)
+    st.session_state["stock_history_sync_codes"] = sorted(sync_codes)
+
+
+def _render_row_sync_progress(code: str):
+    """行下方的分钟同步进度：运行中每5秒自动刷新；终态显示摘要并可收起。"""
+    task = datasource.minute_sync_task_status(code)
+    status = task.get("status")
+    if not task:
+        sync_codes = set(st.session_state.get("stock_history_sync_codes") or [])
+        sync_codes.discard(code)
+        st.session_state["stock_history_sync_codes"] = sorted(sync_codes)
+        return
+    if status in ("completed", "failed", "interrupted") and not task.get("worker_alive"):
+        label = {"completed": "完成", "failed": "失败", "interrupted": "中断"}.get(status, status)
+        summary = (f"{code} 分钟同步{label}：新同步 {task.get('synced_days', 0)} 天 · "
+                   f"已有数据跳过 {task.get('skipped_days', 0)} 天 · 失败 {task.get('failed_days', 0)} 天")
+        if status == "interrupted":
+            summary += "；可再次点击“同步分钟”从未完成日期继续"
+        info_col, dismiss_col = st.columns([6, 1])
+        info_col.info(summary)
+        if dismiss_col.button("收起", key=f"sync_dismiss_{code}", use_container_width=True):
+            sync_codes = set(st.session_state.get("stock_history_sync_codes") or [])
+            sync_codes.discard(code)
+            st.session_state["stock_history_sync_codes"] = sorted(sync_codes)
+            st.rerun()
+        return
+    _render_minute_sync_progress(code)
+
+
 def _render_stock_rows(inventory: pd.DataFrame):
     headers = st.columns([1.6, 0.75, 1.4, 0.85, 0.95, 1.4, 1.9])
     for col, label in zip(headers, ["股票", "日线天数", "日线范围", "分钟交易日",
@@ -293,9 +344,14 @@ def _render_stock_rows(inventory: pd.DataFrame):
                 _go("factor_mine", row.code)
             if r2.button("因子回测", key=f"stock_factor_backtest_{row.code}", use_container_width=True):
                 _go("factor_backtest", row.code)
-            if st.button("清理高频", key=f"stock_hf_cleanup_{row.code}", use_container_width=True,
+            m1, m2 = st.columns(2)
+            if m1.button("清理高频", key=f"stock_hf_cleanup_{row.code}", use_container_width=True,
                          help="手动清理盘口/逐笔，可选分钟线；保留日线和研究报告"):
                 _go("factor_cleanup", row.code)
+            if m2.button("同步分钟", key=f"stock_minute_sync_{row.code}", use_container_width=True,
+                         help="后台补齐日线范围内的全部分钟线（已完整日期自动跳过），不跳转页面，进度显示在该行下方"):
+                _start_minute_sync_from_row(row.code, row.daily_start, row.daily_end)
+                st.rerun()
             if b4.button("全删", key=f"stock_delete_{row.code}", use_container_width=True):
                 st.session_state["stock_history_delete"] = row.code
                 st.rerun()
@@ -311,6 +367,8 @@ def _render_stock_rows(inventory: pd.DataFrame):
             if no.button("取消", key=f"stock_delete_no_{row.code}"):
                 st.session_state.pop("stock_history_delete", None)
                 st.rerun()
+        if row.code in set(st.session_state.get("stock_history_sync_codes") or []):
+            _render_row_sync_progress(row.code)
 
 
 def _render_market_depth(code: str, trade_date: str, minute_ts: str):

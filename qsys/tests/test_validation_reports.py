@@ -37,22 +37,41 @@ class ReportTests(unittest.TestCase):
             doc = json.loads(c.execute('SELECT metrics_json FROM strategy_validation').fetchone()[0])
             self.assertIsNone(doc['sharpe'])
 
-    def test_exception_is_persisted(self):
+    def test_exception_is_archived_without_status_change(self):
+        """计算/数据异常是证据缺失而非退化证据：只归档，包状态保持不变。"""
         with patch.object(library, 'list_strategies', return_value={'s': self.pack}), \
              patch('selection_policy.completed_signal_day', return_value='2026-09-24'), \
              patch.object(scheduler, '_compute_strategy_validation', side_effect=ValueError('missing price')):
             result = scheduler.revalidate_strategy('s')
         self.assertFalse(result['ok'])
         self.assertEqual(result['error_type'], 'ValueError')
+        self.assertEqual(result['assessment_status'], 'compute_failed')
+        self.assertFalse(result['published'])
         self.assertIn('report_id', result)
         with sqlite3.connect(self.path) as c:
-            self.assertEqual(c.execute('SELECT status FROM strategies').fetchone()[0], 'degraded')
+            self.assertEqual(c.execute('SELECT status FROM strategies').fetchone()[0], 'active')
+            self.assertEqual(c.execute('SELECT count(*) FROM strategy_validation_reports').fetchone()[0], 1)
+            self.assertEqual(c.execute('SELECT count(*) FROM strategy_validation').fetchone()[0], 0)
+
+    def test_completed_but_failed_evaluation_still_degrades(self):
+        """评估正常完成但未达门槛：降级是有效的证据结论，照常发布。"""
+        verdict = {'ok': True, 'eval_date': '2026-09-24', 'pool_name': '沪深300', 'method': '等权合成',
+                   'top_n': 5, 'fwd_days': 5, 'oos_windows': 40, 'oos_winrate': 0.4,
+                   'avg_net_excess': -0.001, 'max_drawdown': -0.1, 'sharpe': 0.2, 'status': 'degraded'}
+        with patch.object(library, 'list_strategies', return_value={'s': self.pack}), \
+             patch('selection_policy.completed_signal_day', return_value='2026-09-24'), \
+             patch.object(scheduler, '_compute_strategy_validation', return_value=dict(verdict)):
+            result = scheduler.revalidate_strategy('s')
+        self.assertTrue(result['published'])
+        with sqlite3.connect(self.path) as c:
+            self.assertEqual(c.execute('SELECT status,oos_winrate FROM strategies').fetchone(), ('degraded', '40%'))
 
     def test_version_drift_archives_without_publishing(self):
         changed = {**self.pack, 'pool_name': 'other'}
+        verdict = {'ok': True, 'eval_date': '2026-09-24', 'status': 'active', 'oos_winrate': .8}
         with patch.object(library, 'list_strategies', side_effect=[{'s': self.pack}, {'s': changed}]), \
              patch('selection_policy.completed_signal_day', return_value='2026-09-24'), \
-             patch.object(scheduler, '_compute_strategy_validation', side_effect=ValueError('missing')):
+             patch.object(scheduler, '_compute_strategy_validation', return_value=dict(verdict)):
             result = scheduler.revalidate_strategy('s')
         self.assertEqual(result['assessment_status'], 'stale_version')
         with sqlite3.connect(self.path) as c:

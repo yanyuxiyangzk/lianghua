@@ -434,8 +434,10 @@ def expected_eval_dates(trade_date: str, source: str | None = None) -> dict:
 # ---------------------------------------------------------------- 模拟交易（买入价→卖出价→平仓→盈亏）
 DEFAULT_RULES = {"take_profit": 0.15, "stop_loss": -0.08, "hold_days": 20, "cost": 0.0025,
                   "atr_period": 14, "atr_tp_multiplier": 2.5, "use_atr_tp": True}
-# 事件增强票规则：止损更紧（-5% vs -8%）、止盈更保守（+12% vs +15%）
-EVENT_RULES = {"take_profit": 0.12, "stop_loss": -0.05, "hold_days": 15, "cost": 0.0025,
+# 事件/打板规则（2026-09-29 机械风控改版）：1-2 日判断期（事件隔夜兑现，没有"再等等"）、
+# 硬止损 -5%（卖出侧再按 1.5×ATR 收紧到 [-5%,-2%]）、+12% 止盈限价单仅作天花板，
+# 实际落袋靠 +6% 启动的移动止盈（max_close 回撤 3%）与结构退出（破 VWAP/尾盘不封板）。
+EVENT_RULES = {"take_profit": 0.12, "stop_loss": -0.05, "hold_days": 2, "cost": 0.0025,
                "atr_period": 14, "atr_tp_multiplier": 2.0, "use_atr_tp": True}
 RISK_RULES_FILE = DATA_DIR / "risk_rules.json"
 ACCOUNT_RISK_DEFAULTS = {
@@ -860,6 +862,20 @@ def position_open_from_picks(trade_date: str, today: str) -> str:
                 if sat_halt:
                     n_defer += len(items)
                     continue
+                # 轨道月度熔断（时间盒止损）：当月亏损超 8%×轨道预算 → 本月停开仓。
+                # 回测（一年 120 窗）：DD -32.9%→-21.6% 且期望不降——坏月份止血，不预测行情。
+                if _satellite_month_halt(c, today):
+                    n_defer += len(items)
+                    continue
+                # 打板闸门（2026-09-29 一年回放校准）：只保留"同板块 ≤1 只"——
+                # 唯一被数据证明全面正向的闸（期望/超额/胜率/夏普全升）。
+                # 候选<3 与盈亏比闸已被回测否决：前者把高赔率集中日也拦了（期望
+                # +1.00%→+0.21%），后者对天然高 ATR 的涨停股是样本灭绝（全年 2 笔）。
+                seen_industries = _event_open_industries(c)
+                batch_industries = _industry_map(list(items["code"]))
+            else:
+                seen_industries = None
+                batch_industries = {}
             codes = list(items["code"])
             names = _position_names(codes)
             # 参考买入价 = 扫描日收盘价（名单生成时的价格）
@@ -930,6 +946,15 @@ def position_open_from_picks(trade_date: str, today: str) -> str:
                 if chg is not None and pd.notna(chg) and chg > chase_thr:
                     n_chase += 1
                     continue
+                if r.source == "satellite_scan":
+                    # 打板闸门：同板块 ≤1 只（按名单排名取先，后者让路）——
+                    # 回测唯一全面正向的闸；候选数/盈亏比闸已被数据否决，不设。
+                    ind = batch_industries.get(it.code)
+                    if ind and ind in seen_industries:
+                        n_defer += 1
+                        continue
+                    if ind:
+                        seen_industries.add(ind)
                 # P2-7修复：最小流动性过滤（流通市值 < 30亿 → 跳过，避免低流动性股票）
                 try:
                     import datasource
@@ -997,6 +1022,87 @@ def _is_event_enhanced_pick(pack_name: str) -> bool:
         return any(f.get("name", "").startswith("ev_") for f in factors)
     except Exception:
         return False
+
+
+def _industry_map(codes: list[str]) -> dict:
+    """股票 → 板块名（market.db stock_industry，取最新映射）；缺失返回 {}。"""
+    if not codes:
+        return {}
+    try:
+        import datasource
+        with datasource._conn() as c:
+            tables = {r[0] for r in c.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='stock_industry'")}
+            if not tables:
+                return {}
+            rows = c.execute(
+                f"SELECT code,sector_name FROM stock_industry"
+                f" WHERE code IN ({','.join('?' * len(codes))}) ORDER BY updated_at DESC",
+                list(codes)).fetchall()
+        out = {}
+        for code, sector in rows:
+            out.setdefault(code, sector)
+        return out
+    except Exception:
+        return {}
+
+
+def _satellite_month_pnl(c, today: str) -> float:
+    """卫星轨当月盈亏（已实现 + 浮动），轨道月度熔断用。
+
+    回测校准（2026-09-29，一年 120 窗）：月度亏损上限 -8% 把回撤 -32.9%→-21.6%
+    且期望不降（+0.74%→+0.93%）——时间盒止损，不预测行情，坏月份止血。
+    """
+    month = today[:7]
+    realized = c.execute(
+        "SELECT COALESCE(SUM(pnl_pct*buy_amount),0) FROM positions"
+        " WHERE source IN ('satellite_scan','sched_satellite_scan')"
+        " AND status='closed' AND sell_date LIKE ?", (month + "%",)).fetchone()[0]
+    opens = pd.read_sql(
+        "SELECT code,shares,buy_price FROM positions"
+        " WHERE source IN ('satellite_scan','sched_satellite_scan')"
+        " AND status IN ('open','closing','pending')", c)
+    floating = 0.0
+    if not opens.empty:
+        prices = _latest_prices(list(opens["code"]))
+        for _, p in opens.iterrows():
+            pr = prices.get(p["code"])
+            cur = (pr[0] if pr and pr[0] else None) or p["buy_price"]
+            if cur and p["buy_price"]:
+                floating += (float(cur) / float(p["buy_price"]) - 1) * float(p["buy_amount"] or 0)
+    return float(realized or 0) + floating
+
+
+def _satellite_month_halt(c, today: str) -> bool:
+    """当月轨道亏损 ≤ -8% × 轨道预算 → 本月停止开新仓（下月自动复位）。"""
+    return _satellite_month_pnl(c, today) <= -0.08 * TRACK_BUDGET["satellite_scan"]
+
+
+def _event_open_industries(c) -> set:
+    """卫星来源在持/在平仓股票的板块集合（同板块≤1 闸的在持侧）。"""
+    try:
+        codes = [r[0] for r in c.execute(
+            "SELECT DISTINCT code FROM positions WHERE source IN ('satellite_scan','sched_satellite_scan')"
+            " AND status IN ('open','closing')").fetchall()]
+        return {v for v in _industry_map(codes).values() if v}
+    except Exception:
+        return set()
+
+
+def _event_stop_distance(atr: float | None, price: float) -> float:
+    """事件轨止损距离 = min(5%, max(2%, 1.5×ATR%))——与卖出侧 M4 止损同一口径。"""
+    if atr is None or not price or price <= 0 or not pd.notna(atr):
+        return 0.05
+    return min(0.05, max(0.02, 1.5 * float(atr) / float(price)))
+
+
+def _event_trailing_trigger() -> float:
+    """事件轨移动止盈启动线：浮盈 +6% 后按 max_close 回撤 3% 落袋。"""
+    return 0.06
+
+
+def _event_trailing_drawdown() -> float:
+    return 0.03
 
 
 def _get_position_rules(pos_row) -> dict:
@@ -1094,6 +1200,10 @@ def position_fill_check(today: str) -> str:
                                     or sat_value + per > 0.15 * _total):
                                 n_sat_limit += 1
                                 continue
+                            # 固定风险比例 sizing（2026-09-29 机械风控改版）：每笔风险 =
+                            # 净值 × 0.5%，预算 = 风险额 / 止损距离——选错的代价开仓前锁死。
+                            stop_dist = (min(0.05, max(0.02, 1.5 * atr_pct)) if atr_pct else 0.05)
+                            per = min(per, 0.005 * _total / stop_dist)
                 except Exception:
                     continue  # 风险数据读取失败时不得放行买入
                 # 候选 pending 不占已成交名额；柜台另校验真实未成交买单。
@@ -1374,6 +1484,42 @@ def position_close_check(today: str) -> str:
     except Exception:
         broker_shares = {}
     open_sum = opens.groupby("code")["shares"].sum()
+    # 事件轨结构退出数据：当日 VWAP（破均价走）、接力票的昨日封板档案（尾盘不封板走）
+    is_event_map = {}
+    for _, p in opens.iterrows():
+        src = str(p.get("source") or "")
+        is_event_map[int(p["id"])] = (src in ("satellite_scan", "sched_satellite_scan")
+                                      or _is_event_enhanced_pick(str(p.get("pack_name") or "")))
+    event_codes = sorted({str(p["code"]) for _, p in opens.iterrows() if is_event_map.get(int(p["id"]))})
+    vwap_map = {}
+    relay_map = {}
+    if event_codes:
+        try:
+            import datasource
+            with datasource._conn() as dc:
+                marks = ",".join("?" * len(event_codes))
+                for code, amt, vol in dc.execute(
+                        "SELECT r.code, r.amount, r.volume FROM ifind_realtime r "
+                        "JOIN (SELECT code, MAX(datetime) md FROM ifind_realtime "
+                        "WHERE datetime BETWEEN ? AND ? AND code IN (" + marks + ") GROUP BY code) t "
+                        "ON t.code=r.code AND t.md=r.datetime",
+                        (today + " 00:00:00", today + " 23:59:59", *event_codes)):
+                    if vol and amt:
+                        vwap_map[code] = float(amt) / (float(vol) * 100)
+                cal = _calendar()
+                for _, p in opens.iterrows():
+                    if not is_event_map.get(int(p["id"])):
+                        continue
+                    bd = str(p["buy_date"])
+                    if bd in cal and cal.index(bd) > 0:
+                        prev_day = cal[cal.index(bd) - 1]
+                        row = dc.execute(
+                            "SELECT 1 FROM limit_up_events WHERE date=? AND code=? AND sealed_close=1",
+                            (prev_day, str(p["code"]))).fetchone()
+                        relay_map[str(p["code"])] = bool(row)
+        except Exception:
+            vwap_map = vwap_map or {}
+    now_hm = datetime.now().strftime("%H%M")
     n_close = n_skip = n_order = n_stale = n_sell_fail = 0
     _mc_updates = []  # M3 吊灯基准的滚动最高收盘，循环末统一写（防与柜台写锁自锁）
     with _conn() as c:
@@ -1403,12 +1549,15 @@ def position_close_check(today: str) -> str:
             # 每个仓位独立选规则：事件增强票用更紧的止损/止盈
             pk_name = str(p.get("pack_name") or "")
             r = _get_position_rules(p)
+            is_event = bool(is_event_map.get(int(p["id"])))
             entry = p["buy_price"]
             tp, sl = entry * (1 + r["take_profit"]), entry * (1 + r["stop_loss"])
-            # M4 自适应止损：有入场 ATR 上下文的仓位，止损收紧到 1.5×ATR%（夹取 [-8%,-2%]）
+            # M4 自适应止损：有入场 ATR 上下文的仓位，止损收紧到 1.5×ATR%
+            # （事件轨夹取 [-5%,-2%]，主轨 [-8%,-2%]——尾部风险快刀 vs 趋势慢磨）
             atr_e0 = p["atr_entry"] if "atr_entry" in p.index else None
             if atr_e0 is not None and pd.notna(atr_e0) and entry:
-                sl_dyn = -min(0.08, max(0.02, 1.5 * atr_e0 / entry))
+                sl_dyn = (-_event_stop_distance(atr_e0, entry) if is_event
+                          else -min(0.08, max(0.02, 1.5 * atr_e0 / entry)))
                 sl = max(sl, entry * (1 + sl_dyn))  # 取更紧（更高）者，更早止血
             reason = limit_price = None
             if cur >= tp:
@@ -1418,13 +1567,25 @@ def position_close_check(today: str) -> str:
                 # 止损：要务是成交——限价略低于触发价让半步（跌停板上broker会自动转挂等开板）
                 reason, limit_price = "止损", round(cur * 0.995, 2)
             else:
-                # ---- M3 双腿：破位（跌破入场时登记的支撑区下沿）/ 吊灯止盈（入场最高点回撤）----
+                # ---- 事件轨机械三退出（优先于 M3 双腿）：移动止盈 / 破均价 / 尾盘不封板 ----
                 atr_e = p["atr_entry"] if "atr_entry" in p.index else None
-                sup_e = p["sup_lo_entry"] if "sup_lo_entry" in p.index else None
                 mc_old = p["max_close"] if "max_close" in p.index else None
-                # P1-1修复：吊灯止盈的 max_close 只用已确认收盘价，不用盘中快照
-                # 盘中检查时用 mc_old 做比较；收盘后 job_max_close_update 统一用当日收盘更新
                 mc = max(x for x in [entry, mc_old] if x and pd.notna(x))
+                if is_event:
+                    if entry and mc and mc / entry - 1 >= _event_trailing_trigger() \
+                            and cur < mc * (1 - _event_trailing_drawdown()):
+                        # 浮盈曾到 +6%，从最高确认收盘回撤 3% 落袋（打板不坐满回撤）
+                        reason, limit_price = "移动止盈", round(cur * 0.995, 2)
+                    elif vwap_map.get(code) and cur < vwap_map[code]:
+                        # 破当日 VWAP：弱势确认比价格止损早半天
+                        reason, limit_price = "破均价", round(cur * 0.995, 2)
+                    elif relay_map.get(code) and now_hm >= "1430":
+                        limit_up = pr[3] if pr and len(pr) > 3 else None
+                        if limit_up and cur < limit_up * 0.995:
+                            # 接力票次日不能封板，尾盘走人（事件预期已兑现或证伪）
+                            reason, limit_price = "尾盘不封板", round(cur * 0.995, 2)
+                # ---- M3 双腿：破位（跌破入场时登记的支撑区下沿）/ 吊灯止盈（入场最高点回撤）----
+                sup_e = p["sup_lo_entry"] if "sup_lo_entry" in p.index else None
                 if atr_e is not None and pd.notna(atr_e) and sup_e is not None and pd.notna(sup_e):
                     if cur < sup_e - 0.5 * atr_e:
                         reason, limit_price = "破位(SR)", round(cur * 0.995, 2)
@@ -1447,11 +1608,13 @@ def position_close_check(today: str) -> str:
                         if next_review and today < next_review:
                             continue
                         # M3 逻辑腿：到期且转弱才平；仍强则顺延（防好票被日历赶下车）
+                        # 事件轨不展期：1-2 日判断期内事件预期已兑现或证伪，
+                        # "再等等"对打板是亏损放大器（2026-09-29 机械风控改版）。
                         extend = int(p["extend_count"] or 0) if "extend_count" in p.index else 0
                         # P2-10修复：strength_states()失败时默认"strong"而非"weak"，避免强制平仓
                         state = "strong" if _states_map is None else _states_map.get(code, "weak")
-                        # P2-3修复：自适应顺延上限（strong=2次, neutral=1次, weak=0次）
-                        max_extend = 2 if state == "strong" else (1 if state == "neutral" else 0)
+                        # P2-3修复：自适应顺延上限（strong=2次, neutral=1次, weak=0次；事件轨恒0次）
+                        max_extend = 0 if is_event else (2 if state == "strong" else (1 if state == "neutral" else 0))
                         if extend < max_extend and str(p.get("last_extend_date") or "") != today:
                             # 强势每次顺延3个交易日，中性顺延2个；同一交易日只记一次。
                             review_days = 3 if state == "strong" else 2
@@ -2345,6 +2508,37 @@ def satellite_nav_history(limit: int = 60) -> pd.DataFrame:
         return pd.read_sql(
             "SELECT * FROM satellite_nav ORDER BY date DESC LIMIT ?",
             c, params=(limit,))
+
+
+# 卫星来源标记：正式扫描 / 顺带影子扫描（历史上影子也真实成交过，2026-09 中旬起仅观察）
+SATELLITE_SOURCES = ("satellite_scan", "sched_satellite_scan")
+
+
+def satellite_track_positions(statuses=("open", "pending", "closing")) -> pd.DataFrame:
+    """卫星轨在主账户的真实持仓/挂单（positions 表，source 为卫星来源）。
+
+    旧的 satellite_positions 独立台账已废弃（无写入方）；卫星候选经统一资金账户
+    执行，真实记录以主账户 positions 表为准。
+    """
+    marks = ",".join("?" * len(tuple(statuses)))
+    with _conn() as c:
+        return pd.read_sql(
+            "SELECT * FROM positions WHERE source IN ('satellite_scan','sched_satellite_scan')"
+            f" AND status IN ({marks}) ORDER BY buy_date DESC, id DESC",
+            c, params=tuple(statuses))
+
+
+def satellite_track_record(limit: int = 200) -> pd.DataFrame:
+    """卫星轨已平仓记录（status='closed'）。
+
+    pnl_pct 为扣双边费用后的净收益；对账合并/幽灵仓清理等非交易记录 pnl_pct 为空，
+    由调用方决定是否剔除。
+    """
+    with _conn() as c:
+        return pd.read_sql(
+            "SELECT * FROM positions WHERE source IN ('satellite_scan','sched_satellite_scan')"
+            " AND status='closed' ORDER BY sell_date DESC, id DESC LIMIT ?",
+            c, params=(int(limit),))
 
 
 def satellite_open_from_picks(picks_df: pd.DataFrame, available_cash: float,

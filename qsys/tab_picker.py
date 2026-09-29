@@ -59,16 +59,20 @@ def render():
     bias_info = experience.track_oos_vs_live(90)
     if bias_info.get("n_samples", 0) >= 5:
         bi = bias_info
+        # 口径：名单级 5 日前瞻超额命中率（非实盘成交）；n<30 时统计功效不足只提示不报警
         if bi["status"] == "⚠️ 过拟合加剧":
             st.error(f"⚠️ **回测-实盘偏差 {bi['bias']:+.1%}** — 回测 OOS {bi['avg_oos_winrate']:.0%} vs "
-                     f"实盘 {bi['avg_live_winrate']:.0%}（{bi['n_samples']} 笔），"
+                     f"名单5日 {bi['avg_live_winrate']:.0%}（{bi['n_samples']} 个名单日），"
                      "过拟合信号！建议：减因子数、换低相关因子、延长持有期。")
         elif bi["status"] == "注意":
             st.warning(f"🔍 **回测-实盘偏差 {bi['bias']:+.1%}** — 回测 OOS {bi['avg_oos_winrate']:.0%} vs "
-                       f"实盘 {bi['avg_live_winrate']:.0%}（{bi['n_samples']} 笔），持续观察。")
+                       f"名单5日 {bi['avg_live_winrate']:.0%}（{bi['n_samples']} 个名单日），持续观察。")
+        elif bi["status"] == "样本不足":
+            st.caption(f"回测-实盘偏差 {bi['bias']:+.1%}（{bi['n_samples']} 个名单日 < 30，"
+                       "统计功效不足，不评判过拟合）")
         else:
             st.caption(f"✅ 回测-实盘偏差 {bi['bias']:+.1%}（回测 {bi['avg_oos_winrate']:.0%} vs "
-                       f"实盘 {bi['avg_live_winrate']:.0%}，{bi['n_samples']} 笔）")
+                       f"名单5日 {bi['avg_live_winrate']:.0%}，{bi['n_samples']} 个名单日）")
 
     facs = _factor_universe()
 

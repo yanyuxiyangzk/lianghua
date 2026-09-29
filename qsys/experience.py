@@ -3068,6 +3068,10 @@ def track_oos_vs_live(window_days: int = 90) -> dict:
         status = "注意"
     else:
         status = "⚠️ 过拟合加剧"
+    # 统计功效门槛：二项标准误在 n=9 时约 ±17%，远超 8% 报警线——
+    # n<30 的"偏差"全是噪音，不许报过拟合（2026-09-29：9 个名单日触发误报）
+    if len(df) < 30:
+        status = "样本不足"
 
     return {
         "avg_oos_winrate": round(avg_oos, 3),

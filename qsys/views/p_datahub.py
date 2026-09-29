@@ -68,11 +68,25 @@ PIPELINES = [
      "tables": [("ifind_indexlist", None)], "daily_cutoff": "09:30"},
     {"key": "ifind_cleanup", "channel": "本地清理", "group": "每日例行",
      "tables": [], "daily_cutoff": "16:30"},
+    # ---- 打板数据链（2026-09-29 上线）----
+    {"key": "intraday_limit_watch_0945", "channel": "iFinD HTTP", "group": "盘中高频",
+     "tables": [("intraday_limit_watch", "ts")], "sla_trading_sec": 3600},
+    {"key": "intraday_limit_watch_1015", "channel": "iFinD HTTP", "group": "盘中高频",
+     "tables": [("intraday_limit_watch", "ts")], "sla_trading_sec": 3600},
+    {"key": "limit_up_events", "channel": "iFinD HTTP", "group": "盘后批量",
+     "tables": [("limit_up_events", "date"), ("limit_up_sentiment", "date")],
+     "daily_cutoff": "19:10"},
+    {"key": "intraday_limit_settle", "channel": "本地聚合", "group": "盘后批量",
+     "tables": [("intraday_limit_watch", "ts")], "daily_cutoff": "19:25"},
+    {"key": "bulk_minute_drip", "channel": "iFinD HTTP", "group": "每日例行",
+     "tables": [("ifind_minute", "datetime")], "daily_cutoff": "21:40"},
 ]
 
 # 数据表健康看板额外关注的表（不属于任何单一管道）
 EXTRA_TABLES = [
     ("stock_fundflow_intraday", "datetime"),
+    ("crawl_events", "ts"),
+    ("bulk_fetch_progress", "updated_at"),
 ]
 
 _CHANNEL_COLOR = {
@@ -84,6 +98,23 @@ _CHANNEL_COLOR = {
 
 
 # ---------------------------------------------------------------- 数据加载
+@st.cache_data(ttl=30, show_spinner=False)
+def _today_crawl_events(today: str) -> pd.DataFrame:
+    """今日爬取事件（crawl_events 打点表，新的先排）。"""
+    import datasource
+    try:
+        with datasource._conn() as c:
+            tables = {r[0] for r in c.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='crawl_events'")}
+            if not tables:
+                return pd.DataFrame()
+            return pd.read_sql_query(
+                "SELECT ts,action,target,rows,status,detail,duration_sec FROM crawl_events"
+                " WHERE ts>=? ORDER BY ts DESC LIMIT 300", c, params=(today + " 00:00:00",))
+    except Exception:
+        return pd.DataFrame()
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def _table_stats() -> dict:
     """{表名: {"rows": 行数, "latest": 最新时间 str|None}}。"""
@@ -302,6 +333,24 @@ def _body():
         rows.append({"表": t, "行数": s.get("rows"),
                      "最新数据": str(latest) if latest else "-"})
     st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch")
+
+    # ---- 今日爬取时间线（crawl_events：几点爬了什么、多少行、成败）----
+    st.markdown("### 今日爬取时间线")
+    timeline = _today_crawl_events(today)
+    if timeline.empty:
+        st.caption("今日尚无打点记录的抓取（打点覆盖：日线/分钟区间/盘口补采/全市场快照/指数同步/事件加工/预警扫描）")
+    else:
+        show = timeline.copy()
+        show["状态"] = show["status"].map({"ok": "✅", "failed": "❌"}).fillna(show["status"])
+        show["耗时"] = show["duration_sec"].map(lambda x: f"{x:.1f}s" if pd.notna(x) else "-")
+        show["行数"] = show["rows"].map(lambda x: f"{int(x):,}" if pd.notna(x) else "-")
+        st.dataframe(
+            show[["ts", "action", "target", "行数", "状态", "耗时", "detail"]].rename(
+                columns={"ts": "时间", "action": "动作", "target": "对象", "detail": "备注"}),
+            hide_index=True, width="stretch", height=320)
+        n_fail = int((timeline["status"] == "failed").sum())
+        if n_fail:
+            st.warning(f"今日抓取失败 {n_fail} 次，明细见上表 ❌ 行。")
 
     # ---- 实时活动流 ----
     st.markdown("### 实时活动流")

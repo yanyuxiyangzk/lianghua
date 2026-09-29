@@ -2899,6 +2899,9 @@ def job_limit_up_events(**_ignored) -> str:
     prep = lue.prepare_orderbook(today)
     ev = lue.build_events(today)
     sent = lue.build_sentiment(today)
+    from crawl_journal import record as _cj
+    _cj("scheduler.limit_up_events", "events_build", today, rows=ev.get("events", 0),
+        detail=f"封板{ev.get('sealed')} 盘口补采{prep['fetched']}/跳{prep['skipped']}/败{prep['failed']}")
     return (f"{today} 涨停事件：触板 {ev['events']} · 封板 {ev['sealed']}"
             f"（盘口补采 {prep['fetched']} 只/跳过 {prep['skipped']}/失败 {prep['failed']}）"
             f" · 情绪：炸板率 {sent['炸板率']} 最高板 {sent['最高板']} 打板指数 {sent['打板指数']}")
@@ -2912,6 +2915,9 @@ def job_intraday_limit_watch(slot: str = "0945", **_ignored) -> str:
         return "盘中涨停预警：非交易日，跳过"
     import intraday_limit_watch as ilw
     r = ilw.scan(slot=slot)
+    from crawl_journal import record as _cj
+    _cj(f"scheduler.intraday_limit_watch_{slot}", "intraday_watch", r["day"],
+        rows=r["hits"], detail=f"快照 {r.get('snapshot_time', '无')}")
     return (f"盘中涨停预警[{slot}]：命中 {r['hits']} 只"
             f"（快照 {r.get('snapshot_time', '无')}）· 只记录不下单")
 
@@ -2929,6 +2935,23 @@ def job_intraday_limit_settle(**_ignored) -> str:
         head += (f" · 近20日影子战绩：样本{rep['样本']} 封板率{rep['封板命中率']:.0%}"
                  f" alert→收盘{rep.get('alert→收盘平均') or 0:+.2%}")
     return head
+
+
+def job_bulk_minute_drip(**_ignored) -> str:
+    """全市场分钟线滴灌（每晚 21:35）：启动批量补齐进程。
+
+    iFinD 高频当日配额有限（实测约 350 只/一年区间即 -4302），进程配额耗尽自动停止，
+    次日配额恢复后本任务再启动续跑（进度表跳过已完成）。脚本自带单实例锁，
+    重复启动自动退出。只工作日晚间跑（避开周末占用配额窗口）。"""
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5:
+        return "分钟线滴灌：周末配额留给研究用，跳过"
+    import subprocess
+    log = open("/data/bulk_fetch.log", "a")
+    proc = subprocess.Popen([sys.executable, "/app/bulk_history_fetch.py", "--mode", "minute"],
+                            stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    return f"分钟线滴灌进程已启动 PID {proc.pid}（配额耗尽自动停止，明日续跑）"
 
 
 def job_probability_shadow_update(max_codes: int = 30, top_n: int = 10,
@@ -3327,6 +3350,9 @@ JOBS = {
                               "func": job_intraday_limit_settle,
                               "default": {"enabled": True, "hour": 19, "minute": 20,
                                           "params": {}}},
+    "bulk_minute_drip": {"name": "🌊 全市场分钟线滴灌补齐",
+                         "func": job_bulk_minute_drip,
+                         "default": {"enabled": True, "hour": 21, "minute": 35, "params": {}}},
     "satellite_fill": {"name": "🎲 卫星轨盘中撮合", "func": job_satellite_fill,
                        "default": {"enabled": False, "hour": 9, "minute": 30,
                                    "params": {"interval_sec": 300},

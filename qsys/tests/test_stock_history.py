@@ -340,7 +340,8 @@ def test_background_minute_sync_is_serial_and_skips_complete_days():
 
 def test_single_request_minute_period_writes_multiple_days():
     temp, old = _use_temp_db()
-    original_highfreq = datasource.ths_highfreq
+    import ifind_client
+    original_highfreq = ifind_client.ths_highfreq
     try:
         frames = []
         for day in ("2026-09-21", "2026-09-22"):
@@ -350,7 +351,7 @@ def test_single_request_minute_period_writes_multiple_days():
                 frames.append({"time": f"{day} {hour:02d}:{minute:02d}:00",
                                "open": 10, "high": 10.1, "low": 9.9,
                                "close": 10, "volume": 100, "amount": 1000})
-        datasource.ths_highfreq = lambda *args, **kwargs: (pd.DataFrame(frames), None, 0)
+        ifind_client.ths_highfreq = lambda *args, **kwargs: (pd.DataFrame(frames), None, 0)
         result = datasource.fetch_minute_period_to_db(
             "SZ001216", "2026-09-21", "2026-09-22")
         assert result["written"] == 482
@@ -358,7 +359,7 @@ def test_single_request_minute_period_writes_multiple_days():
         with datasource._conn() as c:
             assert c.execute("SELECT COUNT(*) FROM ifind_minute").fetchone()[0] == 482
     finally:
-        datasource.ths_highfreq = original_highfreq
+        ifind_client.ths_highfreq = original_highfreq
         datasource.MKT_DB = old
         temp.cleanup()
     print("PASS: test_single_request_minute_period_writes_multiple_days")
@@ -374,7 +375,8 @@ def test_minute_period_chunks_long_range_under_4304_cap():
         assert pd.Timestamp(a_end) + pd.Timedelta(days=1) == pd.Timestamp(b_start)
 
     temp, old = _use_temp_db()
-    original_highfreq = datasource.ths_highfreq
+    import ifind_client
+    original_highfreq = ifind_client.ths_highfreq
     try:
         calls = []
 
@@ -390,7 +392,7 @@ def test_minute_period_chunks_long_range_under_4304_cap():
                 "close": [1.0, 1.0], "volume": [1.0, 1.0],
                 "amount": [1.0, 1.0]}), None, 0
 
-        datasource.ths_highfreq = fake_highfreq
+        ifind_client.ths_highfreq = fake_highfreq
         result = datasource.fetch_minute_period_to_db("SH000001", "1990-12-19", "2026-09-22")
         ok_calls = [c for c in calls
                     if (pd.Timestamp(c[1]) - pd.Timestamp(c[0])).days <= 1000]
@@ -399,14 +401,14 @@ def test_minute_period_chunks_long_range_under_4304_cap():
         assert result["days"] == len(ok_calls)
 
         # 其他错误码原样抛出并带分段区间，便于定位
-        datasource.ths_highfreq = lambda *args, **kwargs: (None, None, -999)
+        ifind_client.ths_highfreq = lambda *args, **kwargs: (None, None, -999)
         try:
             datasource.fetch_minute_period_to_db("SH000001", "1990-12-19", "2026-09-22")
             raise AssertionError("-999 should propagate")
         except RuntimeError as exc:
             assert "-999" in str(exc) and "分段" in str(exc)
     finally:
-        datasource.ths_highfreq = original_highfreq
+        ifind_client.ths_highfreq = original_highfreq
         datasource.MKT_DB = old
         temp.cleanup()
     print("PASS: test_minute_period_chunks_long_range_under_4304_cap")

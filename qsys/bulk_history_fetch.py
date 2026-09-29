@@ -109,6 +109,11 @@ def _run(mode: str, codes: list[str], start: str, end: str, pause: float,
                 ok += 1
             except Exception as exc:
                 msg = str(exc)
+                if "-4302" in msg:
+                    # iFinD 高频当日配额耗尽：停止本轮、不标记失败（明日配额恢复后续跑）
+                    print(f"[{label}] ⛔ iFinD 高频当日配额耗尽（-4302），本轮停止；"
+                          f"剩余股票明日自动续跑（{code} 起）", flush=True)
+                    return {"ok": ok, "failed": fail, "aborted": True, "reason": "quota_exhausted"}
                 if "-9" in msg or "会话" in msg:
                     print(f"[{label}] iFinD 会话超限，60s 退避后重试一次 {code}…", flush=True)
                     time.sleep(60)
@@ -183,7 +188,9 @@ def _acquire_singleton_lock():
 def main():
     ap = argparse.ArgumentParser(description="全市场批量历史补齐（非ST）")
     ap.add_argument("--mode", choices=["daily", "minute", "all"], default="minute")
-    ap.add_argument("--days", type=int, default=365, help="补齐最近 N 天（默认 365）")
+    ap.add_argument("--days", type=int, default=90,
+                        help="补齐最近 N 天（默认 90 天≈65 交易日，与分钟保留期匹配；"
+                             "iFinD 高频日配额约 350 只/年区间，一年区间需滴灌 ~15 天）")
     ap.add_argument("--pause", type=float, default=1.5, help="每分钟线股间隔秒数（默认 1.5）")
     ap.add_argument("--start-from", default="", help="从某只股票续跑（分钟线）")
     ap.add_argument("--status", action="store_true", help="只看进度")

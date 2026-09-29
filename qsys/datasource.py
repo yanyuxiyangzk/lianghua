@@ -1786,13 +1786,22 @@ def fetch_index_list() -> pd.DataFrame:
     rows = []
     for code, meta in idx_map.items():
         rq = rq_data.get(code, {})
+        price, prev = rq.get("price"), rq.get("prev_close")
+        # 单位归一（2026-09-29 修复）：HTTP 与 SDK 返回的 changeRatio 单位不一致
+        # （百分数 vs 小数），统一用 price/prev_close 自算百分数；振幅同理。
+        if price and prev and prev > 0:
+            chg = (price / prev - 1) * 100
+            hi, lo = rq.get("high"), rq.get("low")
+            amp = (hi - lo) / prev * 100 if (hi and lo and hi >= lo) else rq.get("amplitude")
+        else:
+            chg, amp = rq.get("change_pct"), rq.get("amplitude")
         rows.append({
             "code": code, "name": meta["name"], "market": code.split(".")[-1],
             "category": meta["category"],
-            "price": rq.get("price"), "prev_close": rq.get("prev_close"),
+            "price": price, "prev_close": prev,
             "open": rq.get("open"), "high": rq.get("high"), "low": rq.get("low"),
-            "change_pct": rq.get("change_pct"), "volume": rq.get("volume"),
-            "amount": rq.get("amount"), "amplitude": rq.get("amplitude"),
+            "change_pct": chg, "volume": rq.get("volume"),
+            "amount": rq.get("amount"), "amplitude": amp,
             "fetched_at": now})
     df = pd.DataFrame(rows)
     cat_order = {"宽基指数": 0, "沪深指数": 1, "行业指数": 2, "主题指数": 3}

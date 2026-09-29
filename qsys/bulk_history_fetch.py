@@ -167,6 +167,19 @@ def show_status():
         print(f"{mode:8s} {status:8s} {n:5d} 只 · 最近更新 {ts}")
 
 
+def _acquire_singleton_lock():
+    """单实例锁：重复启动直接退出（flock 随进程退出自动释放）。"""
+    import fcntl
+    lock_path = Path(datasource.DATA_DIR) / "bulk_history_fetch.lock"
+    fd = open(lock_path, "a")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("已有批量补齐进程在运行，本次启动退出（进度共享，无需重复）", flush=True)
+        sys.exit(0)
+    return fd  # 保持引用，进程退出时释放
+
+
 def main():
     ap = argparse.ArgumentParser(description="全市场批量历史补齐（非ST）")
     ap.add_argument("--mode", choices=["daily", "minute", "all"], default="minute")
@@ -178,6 +191,7 @@ def main():
     if args.status:
         show_status()
         return
+    _lock = _acquire_singleton_lock()  # noqa: F841
     # 结束日 = 最近已收盘交易日（不含今天：今天的日线由晚间同步任务处理，
     # 否则 4900 只股票的"最新日期 < 今天"会造成无谓的全量重抓）
     today = datetime.now().strftime("%Y-%m-%d")

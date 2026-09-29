@@ -379,10 +379,13 @@ def _render_index_list():
     display_df["最新价"] = [f"{v:.2f}" if pd.notna(v) else "" for v in page_df["price"]]
     display_df["涨跌额"] = [f"{(p - pc):+.2f}" if pd.notna(p) and pd.notna(pc) else ""
                           for p, pc in zip(page_df["price"], page_df["prev_close"])]
+    # change_pct 落库前已统一为百分数（fetch_index_list 用 price/prev_close 自算）
     display_df["涨跌幅(%)"] = [f"{v:+.2f}" if pd.notna(v) else "" for v in page_df["change_pct"]]
     display_df["昨收"] = [f"{v:.2f}" if pd.notna(v) else "" for v in page_df["prev_close"]]
-    display_df["今开"] = [f"{v:.2f}" if pd.notna(v) else "" for v in page_df["open"]]
-    display_df["最高价"] = [f"{v:.2f}" if pd.notna(v) else "" for v in page_df["high"]]
+    # 盘前同步（09:05）拿不到当日开/高/低（API 返回 0）——0 视为缺失展示为占位符，
+    # 真实值由 15:08 收盘后同步刷新
+    display_df["今开"] = [f"{v:.2f}" if pd.notna(v) and v > 0 else "—" for v in page_df["open"]]
+    display_df["最高价"] = [f"{v:.2f}" if pd.notna(v) and v > 0 else "—" for v in page_df["high"]]
     display_df["成交量(亿手)"] = [f"{v/1e8:.2f}" if pd.notna(v) else "" for v in page_df["volume"]]
     display_df["成交额(亿)"] = [f"{v/1e8:.1f}" if pd.notna(v) else "" for v in page_df["amount"]]
     display_df.insert(0, "序号", range(start + 1, start + 1 + len(display_df)))

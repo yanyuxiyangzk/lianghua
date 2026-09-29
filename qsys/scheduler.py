@@ -3168,6 +3168,10 @@ JOBS = {
                        "default": {"enabled": True, "hour": 21, "minute": 50, "params": {}}},
     "ifind_indexlist_sync": {"name": "📉 iFinD 指数列表同步（每日）", "func": job_ifind_indexlist_sync,
                              "default": {"enabled": True, "hour": 9, "minute": 5, "params": {}}},
+    # 收盘后补刷一次：09:05 盘前同步拿不到当日开/高/低（API 返回 0），15:08 用最终值覆盖
+    "ifind_indexlist_sync_close": {"name": "📉 iFinD 指数列表同步（收盘定稿）",
+                                   "func": job_ifind_indexlist_sync,
+                                   "default": {"enabled": True, "hour": 15, "minute": 8, "params": {}}},
     "ifind_realtime_sync": {"name": "📊 iFinD 实时快照同步（盘中）", "func": job_ifind_realtime_sync,
                             "default": {"enabled": True, "hour": 9, "minute": 30,
                                         "params": {"interval_sec": 300},

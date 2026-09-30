@@ -2938,20 +2938,21 @@ def job_intraday_limit_settle(**_ignored) -> str:
 
 
 def job_bulk_minute_drip(**_ignored) -> str:
-    """全市场分钟线滴灌（每晚 21:35）：启动批量补齐进程。
+    """全市场分钟线周末集中回补（周六日 10:05）。
 
-    iFinD 高频当日配额有限（实测约 350 只/一年区间即 -4302），进程配额耗尽自动停止，
-    次日配额恢复后本任务再启动续跑（进度表跳过已完成）。脚本自带单实例锁，
-    重复启动自动退出。只工作日晚间跑（避开周末占用配额窗口）。"""
+    排期依据（2026-09-30 实测）：iFinD quote 数据为每周 150M 点预算。
+    工作日配额全留给交易数据链（全市场 5 分钟轮询 ~23M/周 + 日线同步）；
+    分钟回补放周末——休市期轮询空转，配额全部可用（5371 只 × 90 天 ≈ 78M 点，
+    约 1-2 个周末补完）。脚本自带单实例锁与配额耗尽优雅停止，重复启动自动退出。"""
     from zoneinfo import ZoneInfo
     now = datetime.now(ZoneInfo(TZ))
-    if now.weekday() >= 5:
-        return "分钟线滴灌：周末配额留给研究用，跳过"
+    if now.weekday() < 5:
+        return "分钟线回补：工作日配额留给轮询，跳过"
     import subprocess
     log = open("/data/bulk_fetch.log", "a")
     proc = subprocess.Popen([sys.executable, "/app/bulk_history_fetch.py", "--mode", "minute"],
                             stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
-    return f"分钟线滴灌进程已启动 PID {proc.pid}（配额耗尽自动停止，明日续跑）"
+    return f"分钟线周末回补进程已启动 PID {proc.pid}（配额耗尽自动停止，次日续跑）"
 
 
 def job_probability_shadow_update(max_codes: int = 30, top_n: int = 10,
@@ -3350,9 +3351,10 @@ JOBS = {
                               "func": job_intraday_limit_settle,
                               "default": {"enabled": True, "hour": 19, "minute": 20,
                                           "params": {}}},
-    "bulk_minute_drip": {"name": "🌊 全市场分钟线滴灌补齐",
+    "bulk_minute_drip": {"name": "🌊 全市场分钟线周末集中回补",
                          "func": job_bulk_minute_drip,
-                         "default": {"enabled": True, "hour": 21, "minute": 35, "params": {}}},
+                         "default": {"enabled": True, "hour": 10, "minute": 5,
+                                     "params": {}, "day_of_week": "sat,sun"}},
     "satellite_fill": {"name": "🎲 卫星轨盘中撮合", "func": job_satellite_fill,
                        "default": {"enabled": False, "hour": 9, "minute": 30,
                                    "params": {"interval_sec": 300},

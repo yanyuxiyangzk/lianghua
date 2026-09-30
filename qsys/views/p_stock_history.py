@@ -757,7 +757,9 @@ def render():
         i1.metric("已抓取股票", inventory["code"].nunique())
         i2.metric("有分钟数据", int((inventory["minute_rows"] > 0).sum()))
         i3.metric("分钟数据总量", f"{int(inventory['minute_rows'].sum()):,} 条")
-        _render_stock_rows(inventory)
+        page, pages, start = _page_slice(len(inventory), "stock_list", 20)
+        _render_stock_rows(inventory.iloc[start:start + 20])
+        _pagination_bottom(len(inventory), "stock_list", page, pages, 20)
     st.divider()
     _render_fetch_form()
 

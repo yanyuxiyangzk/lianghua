@@ -113,6 +113,28 @@ if flash: st.write(flash[0]+':'+flash[1])
             self.assertFalse(app.exception)
         self.assertNotIn('stock_history_sync_codes',app.session_state)
         self.assertTrue(any('已完整' in (x.value or '') for x in app.markdown))
+    def test_stock_list_paginated_20_per_page(self):
+        from streamlit.testing.v1 import AppTest
+        import ast
+        source=Path('/app/views/p_stock_history.py').read_text()
+        module=ast.parse(source)
+        names=('_go','_render_stock_rows','_start_minute_sync_from_row',
+               '_render_row_sync_progress','_render_minute_sync_progress',
+               '_page_slice','_pagination_bottom')
+        functions='\n\n'.join(ast.get_source_segment(source,n) for n in module.body if isinstance(n,ast.FunctionDef) and n.name in names)
+        app_source='import streamlit as st\nimport pandas as pd\nimport datasource\n'+functions+'''
+inventory = pd.DataFrame([dict(code=f'SH6000{i:02d}',name='x',daily_days=1,daily_start='2026-01-01',daily_end='2026-01-02',minute_days=0,minute_rows=0,minute_start=None,minute_end=None) for i in range(45)])
+page, pages, start = _page_slice(len(inventory), "stock_list", 20)
+_render_stock_rows(inventory.iloc[start:start+20])
+_pagination_bottom(len(inventory), "stock_list", page, pages, 20)
+st.write(f'shown={start+20}/45 pages={pages} cur={page}')
+'''
+        app=AppTest.from_string(app_source).run()
+        self.assertFalse(app.exception)
+        self.assertTrue(any('shown=20/45 pages=3 cur=1' in (m.value or '') for m in app.markdown))
+        # 翻到第 2 页 → 显示 40/45
+        next(b for b in app.button if '下一页' in b.label).click().run()
+        self.assertTrue(any('shown=40/45' in (m.value or '') for m in app.markdown))
     def test_mining_progress_finishes_only_after_save(self):
         events=[]
         result=w.mine('SH600664','2025-01-01','2025-12-01',progress=lambda p,m:events.append((p,m)))

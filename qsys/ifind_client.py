@@ -393,7 +393,9 @@ def ths_history(codes: list[str], indicators: str, start: str, end: str,
 def ths_highfreq(code: str, indicators: str, start: str, end: str, interval: str = "1min"):
     """高频数据（SDK: THS_HF / HTTP: high_frequency）。start/end 形如 2026-08-27 09:30:00。
     实测（2026-08 Linux SDK）：SDK 指标分号分隔、Interval 为裸数字分钟（1 分钟传空参）；
-    HTTP 端指标逗号分隔。"""
+    HTTP 端指标逗号分隔。
+    2026-09-30 修复：HTTP 对历史区间会静默返回空表（errorcode=0 但 tables 无数据），
+    空结果不再视为成功——回落 SDK THS_HF。"""
     m = re.match(r"\s*(\d+)", interval or "")
     sdk_ind = indicators.replace(",", ";")
     sdk_param = f"Interval:{m.group(1)}" if m and m.group(1) != "1" else ""
@@ -405,8 +407,21 @@ def ths_highfreq(code: str, indicators: str, start: str, end: str, interval: str
             payload["functionpara"] = {"Interval": m.group(1)}
         return _ths_http("high_frequency", payload)
 
-    return _sdk_or_http(
-        lambda: ths_call("THS_HF", _to_ths_code(code), sdk_ind, sdk_param, start, end), http)
+    def sdk():
+        return ths_call("THS_HF", _to_ths_code(code), sdk_ind, sdk_param, start, end)
+
+    df, res, err = _sdk_or_http(sdk, http)
+    if (df is None or df.empty) and err in (0, None):
+        try:
+            _ths_login()
+            df2, res2, err2 = sdk()
+            if df2 is not None and not df2.empty:
+                return df2, res2, err2
+            if df is None or df.empty:
+                return df2, res2, err2  # SDK 也空/报错则如实返回，由上层判断
+        except Exception:
+            pass
+    return df, res, err
 
 
 def ths_snapshot(codes: list[str], indicators: str, snap_time: str = ""):

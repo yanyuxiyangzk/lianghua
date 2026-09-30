@@ -3314,7 +3314,7 @@ JOBS = {
     "outcome_backfill": {"name": "🎯 战果回填（经验库）", "func": job_outcome_backfill,
                          "default": {"enabled": True, "hour": 18, "minute": 45, "params": {}}},
     "evolution_distill": {"name": "🧬 进化信号蒸馏（战报→引擎）", "func": job_evolution_distill,
-                          "default": {"enabled": True, "hour": 18, "minute": 55, "params": {}}},
+                          "default": {"enabled": False, "hour": 18, "minute": 55, "params": {}}},
     "gate_check": {"name": "🛡 硬闸门筛查（因子库）", "func": job_gate_check,
                    "default": {"enabled": True, "hour": 18, "minute": 0,
                                "params": {"pool_name": "沪深300"}}},

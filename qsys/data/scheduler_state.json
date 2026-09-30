@@ -1,0 +1,286 @@
+{
+  "update_data": {
+    "enabled": true,
+    "hour": 17,
+    "minute": 35,
+    "params": {}
+  },
+  "ifind_daily_sync": {
+    "enabled": true,
+    "hour": 15,
+    "minute": 40,
+    "params": {
+      "pool_name": "自选股",
+      "lookback_days": 10
+    }
+  },
+  "ifind_calendar": {
+    "enabled": true,
+    "hour": 8,
+    "minute": 30,
+    "params": {
+      "exchange": "SSE"
+    }
+  },
+  "ifind_basic_daily": {
+    "enabled": true,
+    "hour": 15,
+    "minute": 50,
+    "params": {
+      "pool_name": "自选股"
+    }
+  },
+  "ifind_announce": {
+    "enabled": true,
+    "hour": 16,
+    "minute": 30,
+    "params": {
+      "pool_name": "自选股",
+      "days": 7
+    }
+  },
+  "ifind_stocklist_sync": {
+    "enabled": true,
+    "hour": 9,
+    "minute": 0,
+    "params": {}
+  },
+  "ifind_indexlist_sync": {
+    "enabled": true,
+    "hour": 9,
+    "minute": 5,
+    "params": {}
+  },
+  "ifind_realtime_sync": {
+    "enabled": false
+  },
+  "ifind_cleanup": {
+    "enabled": true,
+    "hour": 16,
+    "minute": 0,
+    "params": {}
+  },
+  "watchlist_signals": {
+    "enabled": true,
+    "hour": 18,
+    "minute": 30,
+    "params": {}
+  },
+  "pool_scan": {
+    "enabled": true,
+    "hour": 19,
+    "minute": 0,
+    "params": {
+      "pool_name": "沪深300",
+      "top_n": 10,
+      "pack": ""
+    }
+  },
+  "auto_scan": {
+    "enabled": false,
+    "hour": 19,
+    "minute": 30,
+    "params": {
+      "pool_name": "沪深300",
+      "top_n": 10
+    }
+  },
+  "outcome_backfill": {
+    "enabled": true,
+    "hour": 18,
+    "minute": 45,
+    "params": {}
+  },
+  "gate_check": {
+    "enabled": true,
+    "hour": 18,
+    "minute": 0,
+    "params": {
+      "pool_name": "沪深300"
+    }
+  },
+  "quote_collect": {
+    "enabled": true,
+    "hour": 0,
+    "minute": 0,
+    "params": {
+      "pool_name": "沪深300",
+      "interval_sec": 30
+    },
+    "trigger": "interval"
+  },
+  "sector_flow_collect": {
+    "enabled": true,
+    "hour": 0,
+    "minute": 0,
+    "params": {
+      "pool_name": "沪深300",
+      "interval_sec": 30
+    },
+    "trigger": "interval"
+  },
+  "loopengine": {
+    "enabled": false,
+    "hour": 0,
+    "minute": 0,
+    "params": {
+      "pool_name": "沪深300",
+      "interval_sec": 900
+    },
+    "trigger": "interval"
+  },
+  "multitype_mine": {
+    "enabled": true,
+    "hour": 19,
+    "minute": 30,
+    "params": {
+      "batch_per_type": 15,
+      "factor_types": "",
+      "pool_name": "沪深300",
+      "rotations": 2,
+      "daily_batches": 1
+    },
+    "day_of_week": "mon-fri",
+    "trigger": "cron"
+  },
+  "top5_composite": {
+    "enabled": true,
+    "hour": 18,
+    "minute": 20,
+    "params": {}
+  },
+  "trade_simulate": {
+    "enabled": true,
+    "hour": 20,
+    "minute": 5,
+    "params": {}
+  },
+  "position_track": {
+    "enabled": true,
+    "hour": 0,
+    "minute": 0,
+    "params": {
+      "pool_name": "沪深300",
+      "interval_sec": 300
+    },
+    "trigger": "interval"
+  },
+  "minute_sync": {
+    "enabled": true,
+    "hour": 0,
+    "minute": 0,
+    "params": {
+      "pool_name": "沪深300",
+      "interval_sec": 300
+    },
+    "trigger": "interval"
+  },
+  "tick_sync": {
+    "enabled": false,
+    "hour": 9,
+    "minute": 30,
+    "params": {
+      "pool_name": "沪深300",
+      "interval_sec": 10
+    },
+    "trigger": "interval"
+  },
+  "realtime_kline": {
+    "enabled": true,
+    "hour": 9,
+    "minute": 30,
+    "params": {
+      "pool_name": "沪深300",
+      "interval_sec": 10
+    },
+    "trigger": "interval"
+  },
+  "auction_confirm": {
+    "enabled": true,
+    "hour": 9,
+    "minute": 26,
+    "params": {}
+  },
+  "le_factor_eval": {
+    "enabled": true,
+    "hour": 21,
+    "minute": 30,
+    "params": {
+      "batch": 30,
+      "pool_name": "沪深300"
+    }
+  },
+  "event_mine": {
+    "enabled": false,
+    "hour": 22,
+    "minute": 30,
+    "params": {
+      "kind": "涨停",
+      "batch": 30,
+      "horizon": 5
+    }
+  },
+  "fundflow_sync": {
+    "enabled": true,
+    "hour": 17,
+    "minute": 45,
+    "params": {
+      "pool_name": "沪深300"
+    }
+  },
+  "lhb_sync": {
+    "enabled": true,
+    "hour": 17,
+    "minute": 50,
+    "params": {
+      "lookback_days": 30
+    }
+  },
+  "factor_lifecycle": {
+    "enabled": true,
+    "hour": 2,
+    "minute": 0,
+    "params": {},
+    "day_of_week": "sun"
+  },
+  "le_factor_eval_noon": {
+    "enabled": true,
+    "hour": 12,
+    "minute": 30,
+    "params": {
+      "batch": 20,
+      "pool_name": "沪深300"
+    }
+  },
+  "le_factor_eval_pm": {
+    "enabled": true,
+    "hour": 18,
+    "minute": 0,
+    "params": {
+      "batch": 20,
+      "pool_name": "沪深300"
+    }
+  },
+  "strategy_gen": {
+    "enabled": true,
+    "hour": 18,
+    "minute": 30,
+    "params": {
+      "pool_name": "沪深300",
+      "top_n": 10,
+      "max_packs": 3
+    }
+  },
+  "satellite_fill": {
+    "enabled": false
+  },
+  "satellite_close": {
+    "enabled": false
+  },
+  "bulk_minute_drip": {
+    "enabled": true
+  },
+  "evolution_distill": {
+    "enabled": false
+  }
+}

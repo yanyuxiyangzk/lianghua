@@ -24,6 +24,12 @@ def connect():
 def bump_revision(code):
     with closing(connect()) as c,c:
         c.execute('INSERT OR REPLACE INTO revisions VALUES (?,?)',(code,str(time.time_ns())))
+    try:
+        from automatic_backtest import notify
+        notify('daily:'+code)
+    except Exception:
+        import logging
+        logging.exception('历史回测唤醒失败，等待定时扫描补漏')
 
 
 def revision(codes,source):

@@ -54,6 +54,13 @@ def save(table, payload):
             c.execute('INSERT INTO reports VALUES (?,?,?,?,?)', (payload['id'],payload['experiment_id'],payload['code'],payload['created'],json.dumps(payload,ensure_ascii=False,allow_nan=False)))
         else:
             raise ValueError('未知结果类型')
+    if table == 'experiments':
+        try:
+            from automatic_backtest import notify
+            notify('new_single_experiment:'+payload['id'])
+        except Exception:
+            import logging
+            logging.exception('自动回测唤醒失败，等待定时扫描补漏')
 
 
 def list_results(code, table='experiments'):

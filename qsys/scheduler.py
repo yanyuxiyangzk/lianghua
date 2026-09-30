@@ -2176,6 +2176,11 @@ def job_ifind_cleanup(**_ignored) -> str:
     return f"{now.strftime('%Y-%m-%d %H:%M:%S')} SQLite 过期数据清理完成"
 
 
+def job_automatic_history(**_ignored):
+    from automatic_backtest import run_batch
+    return run_batch()
+
+
 def job_le_factor_eval(batch: int = 500, pool_name: str = "沪深300") -> str:
     """统一版本化体检队列，生成唤醒与定时任务共用跨进程锁。"""
     from factor_evaluation_queue import run, coverage
@@ -3353,6 +3358,9 @@ JOBS = {
                                    "trigger": "interval"}},
     "auction_confirm": {"name": "🔔 竞价确认（09:26 对最新名单）", "func": job_auction_confirm,
                         "default": {"enabled": True, "hour": 9, "minute": 26, "params": {}}},
+    "automatic_history": {"name": "自动历史周期回测", "func": job_automatic_history,
+                          "default": {"enabled": True, "hour": 0, "minute": 0,
+                                      "trigger": "interval", "params": {"interval_sec": 300}}},
     "le_factor_eval": {"name": "🧪 LoopEngine 因子滚动体检", "func": job_le_factor_eval,
                        "default": {"enabled": True, "hour": 21, "minute": 30,
                                    "params": {"batch": 100, "pool_name": "沪深300"}}},
@@ -3529,6 +3537,7 @@ class SchedulerManager:
                 "risk": ThreadPoolExecutor(1),
                 "selection": ThreadPoolExecutor(1),
                 "strategy_review": ThreadPoolExecutor(1),
+                "historical": ThreadPoolExecutor(1),
             },
             job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 3600},
         )
@@ -3577,7 +3586,7 @@ class SchedulerManager:
                                        executor='le', replace_existing=True)
                 continue
             if cfg.get("trigger") == "interval":
-                executor = "risk" if key == 'account_auto_reduce' else "le" if key in ("loopengine",) else "interval"
+                executor = "historical" if key == "automatic_history" else "risk" if key == 'account_auto_reduce' else "le" if key in ("loopengine",) else "interval"
                 params = {"seconds": int(cfg["params"].get("interval_sec", 30)),
                           "executor": executor}
                 if existing:

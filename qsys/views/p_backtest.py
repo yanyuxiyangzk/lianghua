@@ -7,7 +7,11 @@ import streamlit as st
 from common import LOG_DIR, WORKSPACE_ROOT, quick_stats
 
 st.title("📊 回测浏览")
-view = st.radio("查看内容", ["日期回测明细", "Qlib历史产物"], horizontal=True)
+view = st.radio("查看内容", ["自动历史回测", "日期回测明细", "Qlib历史产物"], horizontal=True)
+if view == "自动历史回测":
+    from automatic_backtest_view import render
+    render()
+    st.stop()
 if view == "日期回测明细":
     from execution_detail_view import render
     render()

@@ -68,7 +68,8 @@ def _fixture(tmpdir: str):
 def test_scan_filters_and_linkage():
     with tempfile.TemporaryDirectory() as tmp:
         db = _fixture(tmp)
-        with patch.object(datasource, "MKT_DB", db):
+        with patch.object(datasource, "MKT_DB", db), \
+             patch.object(datasource, "fetch_realtime_to_db", return_value=0):
             r = ilw.scan(day=DAY, slot="0945")
             assert r["hits"] == 2, r  # 只有 SH600001(板块联动) 和 SH600002(接力)
             with datasource._conn() as c:
@@ -84,7 +85,8 @@ def test_scan_filters_and_linkage():
 def test_scan_is_idempotent_per_slot():
     with tempfile.TemporaryDirectory() as tmp:
         db = _fixture(tmp)
-        with patch.object(datasource, "MKT_DB", db):
+        with patch.object(datasource, "MKT_DB", db), \
+             patch.object(datasource, "fetch_realtime_to_db", return_value=0):
             ilw.scan(day=DAY, slot="0945")
             ilw.scan(day=DAY, slot="0945")
             with datasource._conn() as c:
@@ -100,7 +102,8 @@ def test_scan_is_idempotent_per_slot():
 def test_settle_and_report():
     with tempfile.TemporaryDirectory() as tmp:
         db = _fixture(tmp)
-        with patch.object(datasource, "MKT_DB", db):
+        with patch.object(datasource, "MKT_DB", db), \
+             patch.object(datasource, "fetch_realtime_to_db", return_value=0):
             ilw.scan(day=DAY, slot="0945")
             r = ilw.settle(DAY)
             assert r["settled"] == 2, r

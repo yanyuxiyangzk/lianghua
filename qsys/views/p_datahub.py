@@ -99,6 +99,16 @@ _CHANNEL_COLOR = {
 
 # ---------------------------------------------------------------- 数据加载
 @st.cache_data(ttl=30, show_spinner=False)
+def _cursor_report() -> pd.DataFrame:
+    """增量同步游标台账（sync_cursor 表）。"""
+    try:
+        import sync_ledger
+        return sync_ledger.cursor_report()
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=30, show_spinner=False)
 def _today_crawl_events(today: str) -> pd.DataFrame:
     """今日爬取事件（crawl_events 打点表，新的先排）。"""
     import datasource
@@ -351,6 +361,24 @@ def _body():
         n_fail = int((timeline["status"] == "failed").sum())
         if n_fail:
             st.warning(f"今日抓取失败 {n_fail} 次，明细见上表 ❌ 行。")
+
+    # ---- 增量同步游标台账（每股：上次更新到哪天 → 本次目标/成败）----
+    st.markdown("### 增量同步游标台账")
+    cur = _cursor_report()
+    if cur.empty:
+        st.caption("游标台账为空——盘后 16:05 增量同步任务首次运行后这里逐股列出上次/本次更新日期。")
+    else:
+        n_ok = int((cur["status"] == "ok").sum())
+        n_nodata = int((cur["status"] == "no_data").sum())
+        n_fail2 = int(cur["status"].str.startswith("failed").sum())
+        c1, c2, c3 = st.columns(3)
+        c1.metric("已同步", f"{n_ok:,}")
+        c2.metric("无数据（停牌等）", f"{n_nodata:,}")
+        c3.metric("失败", f"{n_fail2:,}")
+        show = cur[["code", "data_type", "last_synced_date", "target_date",
+                    "rows_written", "status", "updated_at"]].head(300).copy()
+        show.columns = ["股票", "数据类型", "上次更新到", "本次目标", "写入行数", "状态", "登记时间"]
+        st.dataframe(show, hide_index=True, width="stretch", height=280)
 
     # ---- 实时活动流 ----
     st.markdown("### 实时活动流")

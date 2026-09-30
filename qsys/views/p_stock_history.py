@@ -409,6 +409,13 @@ def _render_day_detail(code: str, trade_date: str):
         _go("detail", code)
     st.title(f"{code} · {trade_date} 分钟数据")
     minute_day = _load_minute_day(code, trade_date)
+    if minute_day.empty and str(trade_date) == date.today().isoformat():
+        # 盘中分时 0 配额方案：当日快照（热码 15s）聚合成分钟线临时展示；
+        # 盘后 16:05 增量任务用 THS_HF 校准写入正式分钟线
+        from sync_ledger import snapshot_minutes
+        minute_day = snapshot_minutes(code, trade_date)
+        if not minute_day.empty:
+            st.caption("⏱ 盘中分钟由快照聚合（临时口径）；盘后增量同步会用 iFinD 正式分钟线校准覆盖。")
     d1, d2, d3 = st.columns(3)
     d1.metric("分钟记录", len(minute_day))
     d2.metric("最早时间", str(minute_day["datetime"].min())[11:19] if not minute_day.empty else "—")
@@ -515,6 +522,21 @@ def _render_stock_detail(code: str):
     name = str(matched.iloc[0]["name"]) if not matched.empty else ""
     st.title(f"{code} {name}".strip())
     st.caption("股票详情以日线为主列表；点击每行右侧“分钟详情”查看当天全部1分钟数据。")
+    # 按需实时拉取：现场直采该票最新快照+当日分钟（单票成本忽略），并标注数据时点
+    from datetime import datetime as _dt
+    today = _dt.now().strftime("%Y-%m-%d")
+    if st.button("🔄 实时拉取最新行情（快照+今日分钟）", key=f"live_fetch_{code}",
+                 help="现场调用 iFinD 接口补采该股票最新快照与当日分钟线，随后刷新本页"):
+        with st.spinner("正在从 iFinD 直采该票最新数据…"):
+            try:
+                n_snap = datasource.fetch_realtime_hot([code])
+                n_min = datasource.fetch_minute_period_to_db(code, today, today)
+                st.session_state["stock_history_detail_flash"] = (
+                    "success", f"已直采：快照 {n_snap} 行 · 今日分钟 {n_min['written']} 行"
+                    f"（{n_min['days']} 天）· 数据时点 {_dt.now().strftime('%H:%M:%S')}")
+            except Exception as exc:
+                st.session_state["stock_history_detail_flash"] = ("error", f"直采失败：{exc}")
+        st.rerun()
     with datasource._conn() as c:
         daily = pd.read_sql_query(
             """SELECT date,open,high,low,close,volume,amount,fetched_at

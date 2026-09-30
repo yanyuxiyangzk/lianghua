@@ -102,13 +102,23 @@ def _prev_sealed_map(day: str) -> dict:
 
 
 def scan(day: str | None = None, slot: str = "0945") -> dict:
-    """扫一次全市场快照，命中即落库（幂等：同日同 slot 重跑覆盖）。返回扫描摘要。"""
+    """扫一次全市场快照，命中即落库（幂等：同日同 slot 重跑覆盖）。返回扫描摘要。
+
+    全市场 5 分钟轮询已取消（2026-09-30 配额改版）：扫描时点现场直采一张全市场
+    快照（比轮询数据更新鲜）；直采失败则回退用库内最新快照，不中断扫描。
+    """
     setup()
     day = day or datetime.now().strftime("%Y-%m-%d")
     ts = f"{day} {'09:45' if slot == '0945' else '10:15'}:00"
+    fetch_note = ""
+    try:
+        n = datasource.fetch_realtime_to_db()
+        fetch_note = f"直采 {n} 行"
+    except Exception as exc:
+        fetch_note = f"直采失败({type(exc).__name__})，用库内最新快照"
     snap = _latest_snapshot(day)
     if snap.empty:
-        return {"day": day, "slot": slot, "hits": 0, "note": "无当日快照"}
+        return {"day": day, "slot": slot, "hits": 0, "note": f"无当日快照（{fetch_note}）"}
     names = _names(snap["code"].tolist())
 
     # 板块涨停计数（当前快照口径：涨幅达阈值即视为涨停/贴板）
@@ -151,7 +161,7 @@ def scan(day: str | None = None, slot: str = "0945") -> dict:
     with datasource._conn() as c:
         c.executemany("INSERT OR REPLACE INTO intraday_limit_watch VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
     return {"day": day, "slot": slot, "hits": len(rows),
-            "snapshot_time": str(snap["datetime"].max())}
+            "snapshot_time": str(snap["datetime"].max()), "fetch": fetch_note}
 
 
 def settle(day: str) -> dict:

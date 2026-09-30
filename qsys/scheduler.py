@@ -2115,6 +2115,17 @@ def job_ifind_hot_sync(**_ignored) -> str:
         for r in experience.picks_on_date(latest[0]).itertuples():
             for it in experience.pick_items_detail(int(r.id)).itertuples():
                 codes.add(it.code)
+    # 当日盘中预警命中股也进热码（命中即享高频价，风控/持仓决策用）
+    try:
+        with datasource._conn() as c:
+            tables = {r[0] for r in c.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='intraday_limit_watch'")}
+            if tables:
+                for r in c.execute("SELECT DISTINCT code FROM intraday_limit_watch WHERE date=?",
+                                   (now.strftime("%Y-%m-%d"),)):
+                    codes.add(r[0])
+    except Exception:
+        pass
 
     n = datasource.fetch_realtime_hot(sorted(codes))
 
@@ -2937,17 +2948,51 @@ def job_intraday_limit_settle(**_ignored) -> str:
     return head
 
 
-def job_bulk_minute_drip(**_ignored) -> str:
-    """全市场分钟线周末集中回补（周六日 10:05）。
+def job_incremental_sync(**_ignored) -> str:
+    """盘后增量同步（16:05）：全市场日线（批量）+ 三类热票分钟线，游标台账推进。
 
-    排期依据（2026-09-30 实测）：iFinD quote 数据为每周 150M 点预算。
-    工作日配额全留给交易数据链（全市场 5 分钟轮询 ~23M/周 + 日线同步）；
-    分钟回补放周末——休市期轮询空转，配额全部可用（5371 只 × 90 天 ≈ 78M 点，
-    约 1-2 个周末补完）。脚本自带单实例锁与配额耗尽优雅停止，重复启动自动退出。"""
+    sync_cursor 表逐股记录"上次更新到哪天 → 本次目标哪天 / 行数 / 成败"。"""
     from zoneinfo import ZoneInfo
     now = datetime.now(ZoneInfo(TZ))
-    if now.weekday() < 5:
-        return "分钟线回补：工作日配额留给轮询，跳过"
+    if now.weekday() >= 5:
+        return "增量同步：非交易日，跳过"
+    import sync_ledger
+    today = get_last_trade_day()
+    daily = sync_ledger.daily_incremental(today)
+    minute = sync_ledger.minute_hot_incremental(today)
+    return (f"{today} 增量同步：日线 {daily['written']} 只（失败 {daily['failed']}，"
+            f"{daily['elapsed_sec']}s）· 热票分钟 {minute['ok']}/{minute['codes']} 只")
+
+
+def job_event_pos_fast_sync(**_ignored) -> str:
+    """事件轨持仓 5 秒高频快照：打板票的破均价/尾盘退出纪律值得这个频率。
+
+    无事件持仓时立即返回（绝大多数时间如此），不占配额。"""
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5 or not ("0925" <= now.strftime("%H%M") <= "1505"):
+        return "非交易时段，跳过"
+    import experience
+    with experience._conn() as c:
+        codes = [r[0] for r in c.execute(
+            "SELECT DISTINCT code FROM positions WHERE status IN ('open','pending')"
+            " AND source IN ('satellite_scan','sched_satellite_scan')").fetchall()]
+    if not codes:
+        return "无事件持仓，跳过"
+    n = datasource.fetch_realtime_hot(sorted(codes))
+    return f"{now.strftime('%H:%M:%S')} 事件持仓快照 {n}/{len(codes)} 只（5s 档）"
+
+
+def job_bulk_minute_drip(**_ignored) -> str:
+    """全市场分钟线滴灌回补（工作日 21:35）。
+
+    配额排期（2026-09-30 定）：全市场 5 分钟轮询已由三层架构取代（热码 15s/事件 5s
+    + 预警按需直采 + 16:05 增量同步），轮询省下的 ~23M 点/周让分钟回补在工作日
+    晚上就能跑。进程配额耗尽自动停止，次日续跑；脚本自带单实例锁。"""
+    from zoneinfo import ZoneInfo
+    now = datetime.now(ZoneInfo(TZ))
+    if now.weekday() >= 5:
+        return "分钟线回补：非工作日，跳过"
     import subprocess
     log = open("/data/bulk_fetch.log", "a")
     proc = subprocess.Popen([sys.executable, "/app/bulk_history_fetch.py", "--mode", "minute"],
@@ -3204,6 +3249,11 @@ JOBS = {
                        "default": {"enabled": True, "hour": 9, "minute": 30,
                                    "params": {"interval_sec": 15},
                                    "trigger": "interval"}},
+    "event_pos_fast_sync": {"name": "⚡ 事件轨持仓快照（盘中·5s）",
+                            "func": job_event_pos_fast_sync,
+                            "default": {"enabled": True, "hour": 9, "minute": 30,
+                                        "params": {"interval_sec": 5},
+                                        "trigger": "interval"}},
     "ifind_cleanup": {"name": "🧹 iFinD 过期数据清理", "func": job_ifind_cleanup,
                       "default": {"enabled": True, "hour": 16, "minute": 0, "params": {}}},
     "sector_industry_sync": {"name": "🏭 行业分类同步（每日·iFinD）", "func": job_sector_industry_sync,
@@ -3351,10 +3401,16 @@ JOBS = {
                               "func": job_intraday_limit_settle,
                               "default": {"enabled": True, "hour": 19, "minute": 20,
                                           "params": {}}},
-    "bulk_minute_drip": {"name": "🌊 全市场分钟线周末集中回补",
+    # 配额排期（2026-09-30 定）：周配额 150M 点；全市场 5 分钟轮询已由三层架构取代
+    # （热码 15s/事件 5s + 预警按需直采 + 16:05 增量），配额让给分钟回补——
+    # 滴灌回到工作日晚上跑。
+    "bulk_minute_drip": {"name": "🌊 全市场分钟线滴灌回补",
                          "func": job_bulk_minute_drip,
-                         "default": {"enabled": True, "hour": 10, "minute": 5,
-                                     "params": {}, "day_of_week": "sat,sun"}},
+                         "default": {"enabled": True, "hour": 21, "minute": 35,
+                                     "params": {}, "day_of_week": "mon-fri"}},
+    "incremental_sync": {"name": "📚 盘后增量同步（日线全市场+热票分钟，游标台账）",
+                         "func": job_incremental_sync,
+                         "default": {"enabled": True, "hour": 16, "minute": 5, "params": {}}},
     "satellite_fill": {"name": "🎲 卫星轨盘中撮合", "func": job_satellite_fill,
                        "default": {"enabled": False, "hour": 9, "minute": 30,
                                    "params": {"interval_sec": 300},

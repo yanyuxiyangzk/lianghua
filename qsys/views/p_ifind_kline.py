@@ -132,7 +132,7 @@ def _local_daily(code: str, start: str, end: str) -> pd.DataFrame:
     """本地 market_daily（source='ths_ifind'）读穿缓存：区间缺数时自动爬取落库，
     之后都从本地库展示（不重复打 iFinD）。返回 datetime 索引 ohlcv 帧。"""
     db_code = to_db_code(code)
-    # 先读本地；区间不完整时才做一次后台补抓，已有本地数据继续无感展示。
+    # 历史日K只读本地数据库；页面不触发同花顺历史接口。
     fetch_error = None
     with datasource._conn() as c:
         have = c.execute("SELECT MIN(date), MAX(date), COUNT(*) FROM market_daily"
@@ -211,14 +211,8 @@ def _load_kline(code: str, period: str) -> pd.DataFrame:
             result = local if iv == "D" else _resample_period(local, iv)
             result.attrs.update(local.attrs)
             return result
-        # 本地确实无缓存时，兼容原有线上直取；失败时由页面统一展示可读提示。
-        df, response, err = datasource.ths_history(
-            [code], "open,high,low,close,volume,amount",
-            start, today.strftime("%Y-%m-%d"),
-            params=f"Interval:{iv},CPS:2,Fill:Omit")
-        if err not in (0, None):
-            raise RuntimeError(datasource.ths_error_message(response, err))
-        return _norm_ohlcv(df)
+        # 本地无历史数据时保持空态，由独立同步任务负责补齐。
+        return pd.DataFrame()
     # 分钟K：本地 1 分钟线（读穿缓存）聚合
     # 只回抓最近 3 天（防首次打开就补抓十天打满 iFinD）；更早的由每日盘中 minute_sync 逐步积累
     n = period.replace("分", "")

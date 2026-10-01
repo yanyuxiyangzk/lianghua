@@ -735,7 +735,7 @@ def render():
             st.warning(f"{code} {period} 数据获取失败：{e}（可稍后重试或换周期）")
             return
     if df.empty:
-        st.warning(f"{code} {period} 暂无可展示数据：本地缓存与接口返回均为空，尚不能确定具体原因")
+        st.warning(f"{code} {period} 暂无可展示数据：本地数据库 market_daily 中没有可用历史记录，请先运行独立历史同步任务。")
         return
     if df.attrs.get('data_warning'):
         st.warning(df.attrs['data_warning'])

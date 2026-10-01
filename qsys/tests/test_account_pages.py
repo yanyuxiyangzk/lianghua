@@ -24,6 +24,14 @@ class Clock(datetime):
 class Tests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        # Environment variables do not relocate modules imported by another
+        # test first. Bind every fixture database explicitly before any write.
+        import common
+        for target, name, path in [(broker,'DB_PATH',Path(TMP.name)/'experience.db'),
+                                   (experience,'DB_PATH',Path(TMP.name)/'experience.db'),
+                                   (datasource,'MKT_DB',Path(TMP.name)/'market.db'),
+                                   (common,'DATA_DIR',Path(TMP.name))]:
+            cls.enterClassContext(patch.object(target,name,path))
         broker._init_account()
         with broker._conn() as c:
             c.execute("UPDATE broker_cashflows SET ts='2026-09-23 09:00:00'")

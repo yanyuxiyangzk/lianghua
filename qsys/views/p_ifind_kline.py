@@ -132,23 +132,29 @@ def _local_daily(code: str, start: str, end: str) -> pd.DataFrame:
     """本地 market_daily（source='ths_ifind'）读穿缓存：区间缺数时自动爬取落库，
     之后都从本地库展示（不重复打 iFinD）。返回 datetime 索引 ohlcv 帧。"""
     db_code = to_db_code(code)
+    fetch_error = None
     with datasource._conn() as c:
         have = c.execute("SELECT MIN(date), MAX(date), COUNT(*) FROM market_daily"
                          " WHERE source='ths_ifind' AND code=?", (db_code,)).fetchone()
     if not (have and have[2] > 0 and have[0] <= start and have[1] >= end):
         try:
             datasource._ths_fetch_daily(db_code, start, end)  # 抓取并落库（INSERT OR REPLACE）
-        except Exception:
-            pass  # 抓取失败 → 返回空，由调用方回退线上直取
+        except Exception as exc:
+            fetch_error = str(exc)
     with datasource._conn() as c:
         df = pd.read_sql(
             "SELECT date, open, high, low, close, volume, amount FROM market_daily"
             " WHERE source='ths_ifind' AND code=? AND date BETWEEN ? AND ? ORDER BY date",
             c, params=(db_code, start, end))
     if df.empty:
+        if fetch_error:
+            raise RuntimeError(fetch_error+'；本地尚无该股票在所选区间的日线缓存')
         return pd.DataFrame()
     df["datetime"] = pd.to_datetime(df["date"])
-    return df.drop(columns=["date"]).set_index("datetime")
+    result = df.drop(columns=["date"]).set_index("datetime")
+    if fetch_error:
+        result.attrs['data_warning'] = fetch_error+'；当前展示已有本地缓存，未补齐最新行情'
+    return result
 
 
 def _resample_period(df: pd.DataFrame, iv: str) -> pd.DataFrame:
@@ -203,11 +209,20 @@ def _load_kline(code: str, period: str) -> pd.DataFrame:
         start = (today - timedelta(days=days)).strftime("%Y-%m-%d")
         local = _local_daily(code, start, today.strftime("%Y-%m-%d"))
         if not local.empty:
-            return local if iv == "D" else _resample_period(local, iv)
-        df, _, err = datasource.ths_history(
+            result = local if iv == "D" else _resample_period(local, iv)
+            result.attrs.update(local.attrs)
+            return result
+        df, response, err = datasource.ths_history(
             [code], "open,high,low,close,volume,amount",
             start, today.strftime("%Y-%m-%d"),
             params=f"Interval:{iv},CPS:2,Fill:Omit")  # CPS:2 前复权
+        if err not in (0,None):
+            # 同花顺周额度超限时，指数日K走东方财富历史接口备用通道。
+            if str(code).upper().endswith((".CSI", ".SH", ".SZ", ".BJ")):
+                fallback = datasource.fetch_index_history_fallback(code, start, today.strftime("%Y-%m-%d"))
+                if not fallback.empty:
+                    return _norm_ohlcv(fallback)
+            raise RuntimeError(datasource.ths_error_message(response,err))
         return _norm_ohlcv(df)
     # 分钟K：本地 1 分钟线（读穿缓存）聚合
     # 只回抓最近 3 天（防首次打开就补抓十天打满 iFinD）；更早的由每日盘中 minute_sync 逐步积累
@@ -731,8 +746,10 @@ def render():
             st.warning(f"{code} {period} 数据获取失败：{e}（可稍后重试或换周期）")
             return
     if df.empty:
-        st.warning(f"{code} {period} 数据获取失败（非交易时段/接口限流/代码不支持）")
+        st.warning(f"{code} {period} 暂无可展示数据：本地缓存与接口返回均为空，尚不能确定具体原因")
         return
+    if df.attrs.get('data_warning'):
+        st.warning(df.attrs['data_warning'])
 
     # 演化因子/策略求值（仅日K；策略包优先于单因子）
     factor_series, factor_name = None, ""

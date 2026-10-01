@@ -322,7 +322,14 @@ def _render_index_list():
         if st.button("🔄 同步数据", type="primary", key="index_sync_first"):
             with st.spinner("正在通过 iFinD 同步指数数据（约30秒）…"):
                 n = datasource.fetch_indexlist_to_db()
-            st.success(f"同步完成：{n} 条指数")
+            # 清理页面缓存并回读数据库，确保同步后的最新快照立即显示。
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+            latest = datasource.get_indexlist_from_db()
+            latest_at = latest["fetched_at"].max() if not latest.empty and "fetched_at" in latest.columns else "未知"
+            st.success(f"同步完成：{n} 条指数，数据库更新时间：{latest_at}")
             st.rerun()
         return
 
@@ -339,7 +346,14 @@ def _render_index_list():
         if st.button("🔄 同步数据", key="index_sync"):
             with st.spinner("正在通过 iFinD 同步指数数据（约30秒）…"):
                 n = datasource.fetch_indexlist_to_db()
-            st.success(f"同步完成：{n} 条指数")
+            # 清理页面缓存并回读数据库，确保同步后的最新快照立即显示。
+            try:
+                st.cache_data.clear()
+            except Exception:
+                pass
+            latest = datasource.get_indexlist_from_db()
+            latest_at = latest["fetched_at"].max() if not latest.empty and "fetched_at" in latest.columns else "未知"
+            st.success(f"同步完成：{n} 条指数，数据库更新时间：{latest_at}")
             st.rerun()
 
     # 应用筛选
@@ -363,12 +377,18 @@ def _render_index_list():
     if page_key not in st.session_state:
         st.session_state[page_key] = 0
     page = st.session_state[page_key]
-    if page >= total_pages:
-        page = total_pages - 1
+    if page >= total_pages or page < 0:
+        page = 0 if total_pages else 0
         st.session_state[page_key] = page
 
     start = page * INDEX_PAGE_SIZE
     page_df = df.iloc[start:start + INDEX_PAGE_SIZE]
+    # 数据刚同步或旧会话页码失效时，强制回到第一页，避免出现“有数据但列表空白”。
+    if page_df.empty and not df.empty:
+        page = 0
+        st.session_state[page_key] = 0
+        start = 0
+        page_df = df.iloc[:INDEX_PAGE_SIZE]
 
     # 格式化显示
     display_df = pd.DataFrame()

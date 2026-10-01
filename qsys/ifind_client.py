@@ -262,6 +262,22 @@ def _ths_access_token() -> str:
     return at
 
 
+def describe_error(result, error):
+    if error == -4302:
+        return '同花顺行情数据额度已超限（-4302），需等待额度恢复或向同花顺确认账户额度'
+    message = result.get('errmsg') if isinstance(result, dict) else getattr(result, 'errmsg', None)
+    return f'iFinD接口错误 {error}'+(f'：{str(message)[:200]}' if message else '')
+
+
+def quote_service_status():
+    """Last quota response, shared across workers; no credentials or payloads."""
+    try:
+        status = json.loads(_config_get('quote_service_status') or '{}')
+        return status if isinstance(status, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
 def _ths_http(endpoint: str, payload: dict, _retried: bool = False):
     """iFinD HTTP API 调用 → (df, res, errcode)；tables JSON 复用 _tables_to_df 解析。
     -1302（access_token 失效/被轮换）时自动作废旧 token 重取一次再重试。"""
@@ -270,6 +286,13 @@ def _ths_http(endpoint: str, payload: dict, _retried: bool = False):
     res = requests.post(f"{_THS_API}/{endpoint}", json=payload, timeout=30,
                         headers={"Content-Type": "application/json", "access_token": at}).json()
     err = res.get("errorcode", -1)
+    if endpoint in ('cmd_history_quotation','real_time_quotation','high_frequency'):
+        if err == -4302:
+            _config_set('quote_service_status', json.dumps(dict(error=err,
+                message=describe_error(res,err),endpoint=endpoint,
+                at=datetime.now().isoformat(timespec='seconds')),ensure_ascii=False))
+        elif err == 0 and _config_get('quote_service_status'):
+            _config_set('quote_service_status', '')
     if err == -1302 and not _retried:
         # token 失效（可能被其他进程/终端轮换）：作废缓存并重取
         _THS_HTTP.update(access_token="", until=0.0)
@@ -296,6 +319,8 @@ def _sdk_or_http(sdk_call, http_call):
         if err in (0, None):
             return df, res, err
         http_res = (df, res, err)
+        if err == -4302:
+            return http_res  # Preserve the explicit quota denial; no login retry.
     except Exception:
         pass
     try:

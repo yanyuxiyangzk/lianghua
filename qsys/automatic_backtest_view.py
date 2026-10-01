@@ -35,10 +35,15 @@ def render():
 
 @st.fragment(run_every=10)
 def _status():
-    if q.setting('error'): st.error(q.setting('error'))
+    if q.setting('error'):
+        st.error(q.setting('error'))
+        st.caption('覆盖扫描负责发现新版本；扫描失败不删除历史报告，已有排队任务仍会继续处理。')
     discovery=q.setting('discovery',{})
     if discovery:
-        st.caption(f"最近覆盖扫描：{datetime.fromtimestamp(discovery['at']):%Y-%m-%d %H:%M:%S} · 已收盘数据截止 {discovery['end']} · 股票池：{'、'.join(discovery['pools'])}")
+        st.caption(f"最近覆盖扫描：{datetime.fromtimestamp(discovery['at']):%Y-%m-%d %H:%M:%S} · 市场已收盘日期 {discovery['end']} · 股票池：{'、'.join(discovery['pools'])}")
+        for pool,window in discovery.get('windows',{}).items():
+            note=q.window_note(window)
+            if note: st.info(f'{pool}：{note}')
     else: st.caption('等待首次覆盖扫描；开启页面不会同步执行重计算。')
     counts,rows=q.overview()
     total=sum(counts.values());done=total-counts.get('pending',0)-counts.get('running',0)
@@ -48,6 +53,8 @@ def _status():
     c[2].metric('完整计算结果',good);c[3].metric('排队 / 运行',f"{counts.get('pending',0)} / {counts.get('running',0)}")
     if total: st.progress(done/total,text=f'处理覆盖 {done}/{total}；完整结果覆盖 {good}/{total}')
     st.write({q.LABELS.get(k,k):v for k,v in counts.items()})
+    if counts.get('waiting_data',0):
+        st.info('“等待数据”表示任务所需的日期或字段未通过校验，不代表本地没有历史数据。请查看下表“说明”；数据补齐后，后台会按新数据版本重新排队。')
     if not rows:
         st.info('尚未生成任务。后台首次扫描后，这里会显示覆盖情况和进度。');return
     query=st.text_input('筛选最近任务：因子名或股票代码',key='auto_history_search')
@@ -57,7 +64,10 @@ def _status():
         if query and query.lower() not in (p['name']+' '+p['scope']).lower():continue
         visible.append((row,p))
     st.caption('下表展示最近200条当前版本任务；完整覆盖计数来自全部任务。')
-    st.dataframe(pd.DataFrame([dict(因子=p['name'],范围=p['scope'],开始=p['start'],截止=p['end'],状态=q.LABELS[r['status']],阶段=r['stage'],说明=r['reason'],任务=r['id'][:12]) for r,p in visible]),hide_index=True,width='stretch')
+    st.dataframe(pd.DataFrame([dict(因子=p['name'],范围=p['scope'],开始=p['start'],
+        回测截止=p['end'],市场截止=p.get('data_window',{}).get('requested_end',p['end']),
+        数据范围说明=q.window_note(p.get('data_window',{})),
+        状态=q.LABELS[r['status']],阶段=r['stage'],说明=r['reason'],任务=r['id'][:12]) for r,p in visible]),hide_index=True,width='stretch')
     if not visible:return
     chosen=st.selectbox('查看任务及历史报告',[r['id'] for r,p in visible],format_func=lambda rid:next(f"{p['name']} · {p['scope']} · {q.LABELS[r['status']]}" for r,p in visible if r['id']==rid))
     row=next(r for r,p in visible if r['id']==chosen)
@@ -67,6 +77,9 @@ def _status():
     raw=next(r['report'] for r in history if r['id']==report_id)
     if not raw:st.caption('尚无报告，任务进度见上表。');return
     report=json.loads(raw)
+    if report.get('data_window'):
+        window=report['data_window']
+        st.caption(f"本报告计划回测截止：{window['effective_end']} · 市场已收盘日期：{window['requested_end']}")
     st.write(report.get('reason',''))
     for warning in report.get('limitations',[]): st.caption(warning)
     if report.get('summary'):

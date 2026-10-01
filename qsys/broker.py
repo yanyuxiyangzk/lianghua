@@ -818,7 +818,8 @@ def get_account(require_fresh: bool = False) -> dict:
                             "WHERE type='初始入金' AND source!='satellite'").fetchone()[0]
     codes = set(poss['code']) | set(fills['code'])
     prices = _latest_prices(list(codes))
-    day_pnl = sum(_day_pnl_by_code(poss, fills, prices).values())
+    by_code = _day_pnl_by_code(poss, fills, prices)
+    day_pnl = sum(by_code.values())
     pnl_metadata = _pnl_metadata(prices, day_pnl)
     if not pnl_metadata['日盈亏有效']:
         day_pnl = float('nan')
@@ -831,7 +832,10 @@ def get_account(require_fresh: bool = False) -> dict:
             valid = False
         if not valid or (require_fresh and not _quote_fresh(code)):
             invalid_codes.append(code)
+    missing_quotes = [dict(code=code, latest_quote_at=prices[code][5] if len(prices.get(code) or ()) > 5 else None)
+                      for code,value in sorted(by_code.items()) if not math.isfinite(value)]
     valuation = {"估值有效": not invalid_codes and math.isfinite(cash),
+                 '日盈亏缺失行情': missing_quotes,
                  "估值异常股票": sorted(invalid_codes), '初始入金': initial, **pnl_metadata}
     if poss.empty:
         return {"总资产": cash, "可用资金": available, "冻结资金": cash - available, "持仓市值": 0.0,

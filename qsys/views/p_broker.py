@@ -123,6 +123,15 @@ def render():
     c5.metric("今日盈亏", _pnl(acc["今日盈亏"]) if acc.get('日盈亏有效') else "待更新")
     st.caption(f"盈亏日期：{acc.get('盈亏日期', '未知')} · {acc.get('日盈亏状态', '')} · "
                f"行情采集日期：{acc.get('行情采集日期', '未知')}（采集日期不等于行情交易日）")
+    if not acc.get('日盈亏有效'):
+        missing = acc.get('日盈亏缺失行情',[])
+        if missing:
+            st.warning('今日盈亏暂不可计算，以下股票缺少有效当日行情或昨收：'+
+                       '；'.join(f"{r['code']}（最新快照：{r['latest_quote_at'] or '无'}）" for r in missing))
+        import datasource
+        provider = datasource.ths_quote_service_status()
+        if provider.get('error') == -4302:
+            st.warning(f"最近行情接口反馈：{provider['message']}（{provider['at']}）。额度恢复并补齐当日行情后才能计算；不会用昨日盈亏代替今日。")
     st.caption(f"初始入金 {acc['初始入金']:,.0f} 元 · 佣金万2.5(最低5元)双边 · 印花税0.05%仅卖出 · T+1 · 100股整手")
     from account_controls_view import render as render_account_controls
     render_account_controls()

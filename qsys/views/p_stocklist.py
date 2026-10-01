@@ -132,7 +132,13 @@ def _render_index_list():
             with st.spinner("正在通过 iFinD 同步指数数据…"):
                 n = datasource.fetch_indexlist_to_db()
             if n > 0:
-                st.success(f"同步完成：{n} 条指数")
+                try:
+                    st.cache_data.clear()
+                except Exception:
+                    pass
+                latest = datasource.get_indexlist_from_db()
+                latest_at = latest["fetched_at"].max() if not latest.empty and "fetched_at" in latest.columns else "未知"
+                st.success(f"同步完成：{n} 条指数，数据库更新时间：{latest_at}")
                 st.rerun()
             else:
                 st.error("同步失败：请检查 iFinD 凭证/额度（可到 ⏰定时任务 页看日志）")

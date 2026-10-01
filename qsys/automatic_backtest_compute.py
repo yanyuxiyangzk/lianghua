@@ -73,7 +73,7 @@ def historical_stats(values, close, horizons=(1,5,10,20), minimum=30):
 
 def load_daily(task):
     import datasource
-    from trading_calendar import calendar_data
+    from trading_calendar import calendar_data, covers_interval
     from single_stock_jobs import validated_daily
     codes = task['codes']
     if not codes: raise WaitingData('股票池为空，未改用其他股票池')
@@ -97,7 +97,7 @@ def load_daily(task):
         days,receipts=calendars[exchange]
         expected=sorted(day for day in days if start<=day<=end)
         try:
-            if not expected or not any(a<=start and b>=end for a,b in receipts):
+            if not expected or not covers_interval(start,end,receipts):
                 raise WaitingData(f'{start}～{end} 缺少完整可信交易日历')
             clean,quality=validated_daily(code,d,expected)
             clean.index=pd.to_datetime(clean.index)
@@ -181,6 +181,20 @@ def strict_fund_frames(task,panel):
 
 
 def compute(task):
+    window=task.get('data_window',{})
+    if window.get('error'):
+        result=dict(status='waiting_data',reason=window['error'])
+    else:
+        result=_compute(task)
+    if window:
+        result['data_window']=window
+        note=queue.window_note(window)
+        if note and not window.get('error'):
+            result['reason']=result.get('reason','')+'；'+note
+    return result
+
+
+def _compute(task):
     queue.stage(task['id'],'历史数据与交易日历预检')
     if task['kind']=='single':
         return compute_single(task)

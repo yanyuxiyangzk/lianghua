@@ -15,7 +15,7 @@ import time
 from common import DATA_DIR
 
 DB = DATA_DIR / 'automatic_backtest.db'
-POLICY = 'automatic-history-v1'
+POLICY = 'automatic-history-v3-local-cutoff'
 DEFAULT = dict(enabled=True, pools=['沪深300'], single_stock=True, batch=3,
                timeout=120, discover_seconds=1800)
 TABLES = ('market_daily', 'ifind_calendar', 'research_calendar_receipts',
@@ -48,6 +48,7 @@ def connect():
       reason TEXT,created REAL,updated REAL,attempts INTEGER DEFAULT 0,report TEXT);
     CREATE INDEX IF NOT EXISTS auto_tasks_status ON tasks(status,created);
     CREATE INDEX IF NOT EXISTS auto_tasks_logical ON tasks(logical_key);
+    CREATE INDEX IF NOT EXISTS auto_tasks_logical_status ON tasks(logical_key,status,created);
     CREATE TABLE IF NOT EXISTS manifests(id TEXT PRIMARY KEY,payload TEXT,created REAL);
     ''')
     return c
@@ -117,10 +118,19 @@ def manifest(end):
     import execution_constraints as ec
     hashes = {}
     with closing(read_db(datasource.MKT_DB)) as c:
-        deadline = time.monotonic() + 180
-        c.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
         for table in TABLES:
-            hashes[table] = table_digest(c, table, end)
+            # The previous shared deadline counted time hashing earlier tables,
+            # so a healthy query on the next table was immediately interrupted.
+            deadline = time.monotonic() + 180
+            c.set_progress_handler(lambda: int(time.monotonic() > deadline), 10000)
+            put('scan_progress', dict(table=table, started=time.time(), end=end))
+            try:
+                hashes[table] = table_digest(c, table, end)
+            except sqlite3.OperationalError as exc:
+                if str(exc) == 'interrupted':
+                    raise TimeoutError(f'{table} 数据指纹扫描超过180秒，已有排队任务继续处理') from exc
+                raise
+        c.set_progress_handler(None, 0)
         coverage = [dict(code=r[0], start=r[1], end=r[2], rows=r[3]) for r in c.execute(
             "SELECT code,MIN(date),MAX(date),COUNT(*) FROM market_daily WHERE source='ths_ifind' AND date<=? GROUP BY code", (end,))]
     if ec.DB.exists():
@@ -133,7 +143,7 @@ def manifest(end):
     return result
 
 
-def dependency_revision(manifest, codes, factor):
+def dependency_revision(manifest, codes, factor, cache=None):
     """Only referenced data invalidates a factor, not live quotes or other stocks."""
     from loopengine.tree import TYPE_FIELDS
     text=factor.get('code') or ''
@@ -144,6 +154,11 @@ def dependency_revision(manifest, codes, factor):
                   '支撑阻力':['sr_scan_daily'], '事件记忆':['ifind_announcements']}
     for kind,fields in TYPE_FIELDS.items():
         if any(field in text for field in fields): tables+=dependencies.get(kind,[])
+    # Many thousands of expressions use exactly the same source tables and
+    # stock pool. Hash that dependency set once within this frozen manifest.
+    key=(manifest.get('id'),tuple(codes),tuple(sorted(set(tables))))
+    if cache is not None and key in cache:
+        return cache[key]
     pieces={}
     for table in tables:
         data=manifest['tables'].get(table,{'hash':'missing'})
@@ -153,20 +168,70 @@ def dependency_revision(manifest, codes, factor):
     # Independent suspension flags affect price validity for every expression.
     states=manifest['tables'].get('execution_constraints',{})
     pieces['suspensions']={code:states.get('codes',{}).get(code,'missing') for code in codes}
-    return digest(pieces)
+    result=digest(pieces)
+    if cache is not None:
+        cache[key]=result
+    return result
 
 
-def enqueue(payload):
+def enqueue(payload, connection=None):
+    if connection is None:
+        with closing(connect()) as c, c:
+            return enqueue(payload, c)
     payload = {**payload, 'policy':POLICY}
     identity = digest(payload)
     logical = digest([payload['kind'], payload['name'], payload['scope']])
     now = time.time()
-    with closing(connect()) as c, c:
-        previous = c.execute("SELECT MIN(created) FROM tasks WHERE logical_key=? AND status IN ('pending','running')", (logical,)).fetchone()[0]
-        c.execute("UPDATE tasks SET status='superseded',updated=? WHERE logical_key=? AND id<>? AND status='pending'", (now, logical, identity))
-        c.execute("INSERT OR IGNORE INTO tasks(id,logical_key,payload,status,stage,reason,created,updated) VALUES (?,?,?,'pending','等待独立进程','',?,?)",
-                  (identity,logical,dumps(payload),previous or now,now))
+    c = connection
+    previous = c.execute("SELECT MIN(created) FROM tasks WHERE logical_key=? AND status IN ('pending','running')", (logical,)).fetchone()[0]
+    c.execute("UPDATE tasks SET status='superseded',updated=? WHERE logical_key=? AND id<>? AND status='pending'", (now, logical, identity))
+    c.execute("INSERT OR IGNORE INTO tasks(id,logical_key,payload,status,stage,reason,created,updated) VALUES (?,?,?,'pending','等待独立进程','',?,?)",
+              (identity,logical,dumps(payload),previous or now,now))
     return identity
+
+
+def enqueue_many(payloads):
+    """Bounded transactions avoid reconnecting and fsyncing per factor."""
+    count = 0
+    with closing(connect()) as c, c:
+        for payload in payloads:
+            enqueue(payload, c)
+            count += 1
+            if count % 200 == 0:
+                c.commit()
+    return count
+
+
+def local_window(codes, coverage, requested_end, required_start=None):
+    """Freeze one observed cutoff for the entire pool, never filter by price validity.
+
+    A stored null/invalid bar still counts as an observed date and must fail
+    normal validation. Only the not-yet-collected tail is left for a later run.
+    """
+    missing = [code for code in codes if code not in coverage]
+    result = dict(requested_end=requested_end, effective_end=requested_end,
+                  policy='pool-common-observed-end-v1', tail_pending=False, error='')
+    if not codes or missing:
+        result['error'] = ('股票池为空，无法确定本地统一截止日' if not codes else
+                           f'股票池有{len(missing)}只缺少本地日线，未缩减股票池：'+','.join(missing[:8]))
+        return result
+    end = min(requested_end, min(coverage[c]['end'] for c in codes))
+    start = max(coverage[c]['start'] for c in codes)
+    if required_start:
+        start = max(start, required_start)
+    result.update(effective_end=end, tail_pending=end < requested_end)
+    if start > end:
+        result['error'] = f'股票池本地数据无共同研究区间：最晚起点{start}，统一截止{end}；未缩减股票池'
+    return result
+
+
+def window_note(window):
+    if window.get('error'):
+        return window['error']
+    if window.get('tail_pending'):
+        return (f"本地统一回测截至{window['effective_end']}；"
+                f"该日之后至{window['requested_end']}待同步，未纳入本次评估")
+    return ''
 
 
 def discover(force=False):
@@ -188,6 +253,7 @@ def discover(force=False):
     reg = library.get_factor_registry()
     factors = json.loads(reg.to_json(orient='records')) if not reg.empty else []
     count = 0
+    windows = {}
     # Keep task identity independent from changing scorecard/health metadata.
     from factor_evaluation_queue import factor_version
     factor_keys=('name','kind','code','factor_type','first_seen','version_seen_at','norm','regime_scope')
@@ -196,27 +262,35 @@ def discover(force=False):
     for pool in cfg['pools']:
         codes = sorted(set(pools.get(pool) or []))
         starts = [coverage[c]['start'] for c in codes if c in coverage]
-        for f in factors:
-            enqueue(dict(kind='registry', name=f['name'], factor=f, scope=pool,
-                         codes=codes, start=min(starts) if starts else end, end=end,
-                         manifest=dependency_revision(m,codes,f), horizons=[1,5,10,20], primary_horizon=5))
-            count += 1
+        window = local_window(codes, coverage, end)
+        windows[pool] = window
+        revisions = {}
+        count += enqueue_many(
+            dict(kind='registry', name=f['name'], factor=f, scope=pool,
+                         codes=codes, start=min(starts) if starts else end,
+                         end=window['effective_end'], data_window=window,
+                         manifest=dependency_revision(m,codes,f,revisions), horizons=[1,5,10,20], primary_horizon=5)
+            for f in factors)
     if cfg['single_stock'] and work.DB.exists():
         with closing(read_db(work.DB)) as c:
             exists = c.execute("SELECT 1 FROM sqlite_master WHERE name='experiments'").fetchone()
             rows = c.execute('SELECT payload FROM experiments ORDER BY created').fetchall() if exists else []
         for row in rows:
             exp = json.loads(row[0])
+            window = local_window([exp['code']], coverage, end, exp['test_start'])
             for candidate in exp.get('candidates', []):
                 if candidate.get('status') != 'research_candidate': continue
                 enqueue(dict(kind='single',name=candidate['name'],scope=exp['code']+'/'+exp['id'],
                              code=exp['code'],experiment_id=exp['id'],candidate=candidate,
-                             input_hash=exp['input_hash'],start=exp['test_start'],end=end,
+                             input_hash=exp['input_hash'],start=exp['test_start'],
+                             end=window['effective_end'],data_window=window,
                              manifest=dependency_revision(m,[exp['code']],{'code':' '.join(['盘口异动'] if exp['source']!='日线量价' else [])})+digest([m['tables'].get('research_day_archive',{}).get('codes',{}).get(exp['code']),m['tables'].get('research_raw_revision',{}).get('codes',{}).get(exp['code'])])))
                 count += 1
     result = dict(at=time.time(), started=now, end=end, manifest=m['id'],
-                  tasks_seen=count, stocks=len(coverage), pools=cfg['pools'])
+                  tasks_seen=count, stocks=len(coverage), pools=cfg['pools'], windows=windows)
     put('discovery', result)
+    put('scan_progress', {})
+    put('error', '')
     return result
 
 
@@ -256,10 +330,9 @@ def run_batch(force=False):
             c.execute("UPDATE tasks SET status='pending',stage='进程中断，恢复排队' WHERE status='running'")
         try:
             discover(force)
-            put('error', '')
         except Exception as exc:
             put('error', f'覆盖扫描失败：{exc}')
-            raise
+            # Discovery is additive; a scan failure must not starve existing work.
         counts = {}
         for _ in range(int(cfg['batch'])):
             if not config()['enabled']: break

@@ -2,8 +2,25 @@
 import hashlib
 import json
 import sqlite3
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
+
+
+def covers_interval(start, end, receipts):
+    """Union already verified calendar receipts without bridging unknown days."""
+    cursor, last = date.fromisoformat(start), date.fromisoformat(end)
+    if cursor > last:
+        return False
+    for lo, hi in sorted(receipts):
+        lo, hi = date.fromisoformat(lo), date.fromisoformat(hi)
+        if hi < cursor:
+            continue
+        if lo > cursor:
+            return False
+        if hi >= last:
+            return True
+        cursor = hi + timedelta(days=1)
+    return False
 
 
 def calendar_data(exchange="SSE"):
